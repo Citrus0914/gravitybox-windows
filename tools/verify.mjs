@@ -141,20 +141,21 @@ async function main() {
       const detail = String(error.stdout ?? '') + String(error.stderr ?? '');
       await writeFile(join(out, `${name}.log`), detail);
       if (detail.trim()) process.stderr.write(`\n--- [${name} 错误详情] ---\n${detail}\n------------------------\n`);
-      await reportFailureToStepSummary({ name, binary, args, error, detail, completedSteps });
+      await reportFailureToStepSummary({ name, binary, args, error, detail, completedSteps: [...completedSteps] });
       throw new Error(`${name} 未通过，见质检报告`);
     }
   }
+
+  let swiftPromise = null;
+  if (!dictOnly) {
+    await mkdir(join(root, '.cache'), { recursive: true });
+    swiftPromise = step('Swift检查', '/usr/bin/swiftc', await nativeBuildArgs(root, join(root, '.cache/GravityBox-native-verified')));
+  }
+
   await step('清理孤儿构建产物', process.execPath, [join(root, 'tools/clean-dist.mjs')]);
   await step('构建', process.execPath, [join(root, 'node_modules/typescript/bin/tsc')]);
   await step('运行时', process.execPath, [join(root, 'tools/copy-runtime.mjs')]);
   await step('价格资产', process.execPath, [join(root, 'tools/sync-pricing-feed.mjs')]);
-  if (!dictOnly) {
-    await step('单元与集成', process.execPath, [join(root, 'tools/run-tests.mjs')]);
-    await step('浏览器回归', process.execPath, [join(root, 'test/browser.mjs')]);
-    await mkdir(join(root, '.cache'), { recursive: true });
-    await step('Swift检查', '/usr/bin/swiftc', await nativeBuildArgs(root, join(root, '.cache/GravityBox-native-verified')));
-  }
 
   const { SUPPORTED_BUNDLES } = await import(pathToFileURL(join(root, 'dist', 'bundle.js')).href);
   const supportedVersions = [...SUPPORTED_BUNDLES.keys()];
@@ -170,34 +171,46 @@ async function main() {
   const noVendor = argv.includes('--no-vendor') || process.env.GRAVITYBOX_NO_VENDOR === '1';
   const fullVendor = argv.includes('--full-vendor') || process.env.GRAVITYBOX_FULL_VENDOR === '1';
   const latestVersion = scope.targetAppVersions[scope.targetAppVersions.length - 1];
-  const vendorVersions = [];
-  const lightweightVersions = [];
+  const gateTasks = [];
   for (const targetVersion of scope.targetAppVersions) {
     const cachedBundle = join(root, 'vendor', 'antigravity', targetVersion, 'main.js');
     const shouldVerifyVendor = !noVendor && existsSync(cachedBundle) && (fullVendor || scope.mode === VALIDATION_SCOPE_TARGETED || targetVersion === latestVersion);
-    if (shouldVerifyVendor) vendorVersions.push({ targetVersion, cachedBundle });
-    else lightweightVersions.push(targetVersion);
-  }
-  const concurrency = Math.max(1, Math.min(4, cpus().length || 2));
-  let cursor = 0;
-  await Promise.all(Array.from({ length: Math.min(concurrency, lightweightVersions.length) }, async () => {
-    while (cursor < lightweightVersions.length) {
-      const targetVersion = lightweightVersions[cursor++];
-      const file = `${targetVersion}.json`, expected = SUPPORTED_BUNDLES.get(targetVersion);
-      const gateArgs = [join(root, 'tools/coverage-report.mjs'), '--strings', join(root, 'ui-strings', file), '--gate', '--out', join(out, `coverage-${file}`)];
-      if (expected) gateArgs.push('--expect-bundle-sha256', expected);
+    const file = `${targetVersion}.json`, expected = SUPPORTED_BUNDLES.get(targetVersion);
+    const gateArgs = [join(root, 'tools/coverage-report.mjs'), '--strings', join(root, 'ui-strings', file), '--gate', '--skip-advisory-scan', '--out', join(out, `coverage-${file}`)];
+    if (expected) gateArgs.push('--expect-bundle-sha256', expected);
+    if (shouldVerifyVendor) {
+      gateArgs.push('--bundle', cachedBundle);
+    } else {
       gateArgs.push('--no-vendor');
       process.stdout.write(`[verify] ${targetVersion} 启用免 vendor 校验模式（基于 ui-strings/${file} 验证词典）\n`);
-      await step(`词典门禁-${targetVersion}`, process.execPath, gateArgs);
     }
-  }));
-  for (const { targetVersion, cachedBundle } of vendorVersions) {
-    const file = `${targetVersion}.json`, expected = SUPPORTED_BUNDLES.get(targetVersion);
-    const gateArgs = [join(root, 'tools/coverage-report.mjs'), '--strings', join(root, 'ui-strings', file), '--gate', '--out', join(out, `coverage-${file}`)];
-    if (expected) gateArgs.push('--expect-bundle-sha256', expected);
-    gateArgs.push('--bundle', cachedBundle);
-    await step(`词典门禁-${targetVersion}`, process.execPath, gateArgs);
+    gateTasks.push({ targetVersion, gateArgs });
   }
+
+  async function runDictionaryGates() {
+    const concurrency = Math.max(1, Math.min(4, cpus().length || 2));
+    let cursor = 0;
+    await Promise.all(Array.from({ length: Math.min(concurrency, gateTasks.length) }, async () => {
+      while (cursor < gateTasks.length) {
+        const { targetVersion, gateArgs } = gateTasks[cursor++];
+        await step(`词典门禁-${targetVersion}`, process.execPath, gateArgs);
+      }
+    }));
+  }
+
+  if (dictOnly) {
+    await runDictionaryGates();
+  } else {
+    const settled = await Promise.allSettled([
+      swiftPromise,
+      step('单元与集成', process.execPath, [join(root, 'tools/run-tests.mjs')]),
+      step('浏览器回归', process.execPath, [join(root, 'test/browser.mjs')]),
+      runDictionaryGates(),
+    ]);
+    const failed = settled.find(item => item.status === 'rejected');
+    if (failed) throw failed.reason;
+  }
+
   for (const historical of scope.historicalUnverified) {
     process.stdout.write(`[verify] 词典门禁-${historical}：本轮未验证（定向发布 ${scope.targetAppVersions.join('、')}），不视为通过\n`);
   }

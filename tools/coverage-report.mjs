@@ -307,10 +307,13 @@ async function main() {
     noVendor,
   });
   if (!sourceVerification.verified) console.error(`[coverage-report] 界面包来源未验证（fail-closed）：${sourceVerification.reason}`);
+  const skipAdvisoryScan = noVendor || args.includes('--skip-advisory-scan');
   let bundleSource;
-  const bundlePath = option('--bundle') ?? sourceVerification.bundleSource ?? resolveRecordedSource(uiStrings.source);
-  if (typeof bundlePath === 'string' && existsSync(bundlePath)) {
-    try { bundleSource = await readFile(bundlePath, 'utf8'); } catch { bundleSource = undefined; }
+  if (!skipAdvisoryScan) {
+    const bundlePath = option('--bundle') ?? sourceVerification.bundleSource ?? resolveRecordedSource(uiStrings.source);
+    if (typeof bundlePath === 'string' && existsSync(bundlePath)) {
+      try { bundleSource = await readFile(bundlePath, 'utf8'); } catch { bundleSource = undefined; }
+    }
   }
   const { covered, missing, caseOnly, templates, fragments, obsolete, notExtracted } = reconcile(uiStrings, entries, bundleSource);
   const violations = properNounViolations(entries);

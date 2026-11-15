@@ -253,6 +253,32 @@ test('I04 免 vendor 模式：verifyBundleSource 与 coverage-report CLI 门禁�
     assert.equal(report.gate.pass, true);
     assert.equal(report.summary.sourceVerified, true);
     assert.equal(report.sourceVerification.noVendor, true);
+
+    // 6. --no-vendor 即使存在物理 source 也不得做耗时的 advisory 字符串扫描；--skip-advisory-scan 仍严格执行门禁判定
+    const fakeBundle = join(dir, 'existing-bundle.js');
+    await writeFile(fakeBundle, '"Save"');
+    const extractionWithSource = join(dir, 'trusted-with-source.json');
+    await writeFile(extractionWithSource, JSON.stringify({ ...trusted, source: fakeBundle }));
+    const runNoVendorWithSource = await runTool('coverage-report.mjs', [
+      '--strings', extractionWithSource,
+      '--dict', dictDir,
+      '--out', join(dir, 'rep-novendor-skip-scan.json'),
+      '--gate',
+      '--no-vendor',
+    ]);
+    assert.equal(runNoVendorWithSource.code, 2, '词典覆盖不足时即便启用 --no-vendor 仍必须阻断门禁');
+    const skipScanReport = JSON.parse(await readFile(join(dir, 'rep-novendor-skip-scan.json'), 'utf8'));
+    assert.equal(skipScanReport.summary.notExtracted, 0, '--no-vendor 不应扫描 source 仅为了填充 advisory notExtracted');
+
+    const runExplicitSkipScan = await runTool('coverage-report.mjs', [
+      '--strings', extractionPath,
+      '--dict', join(process.cwd(), 'dict'),
+      '--out', join(dir, 'rep-explicit-skip-scan.json'),
+      '--gate',
+      '--no-vendor',
+      '--skip-advisory-scan',
+    ]);
+    assert.equal(runExplicitSkipScan.code, 0, '--skip-advisory-scan 在门禁全绿时应通过');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
