@@ -333,4 +333,38 @@ test('基础词典零大小写异译冲突、零术语表违规且无控制台�
   assert.deepEqual(glossaryViolations, [], '不应存在违反 GLOSSARY_RULES 的译文');
   assert.deepEqual(consoleDirty, [], '不应包含无界面引用的控制台/JS 调试脏键');
 });
+
+test('P1-37/P1-39：dict/base.json 无首尾空格，HUD 与 engine.js 术语和 2.32.1 模板防回归', async () => {
+  const rootDir = join(fileURLToPath(new URL('.', import.meta.url)), '..');
+  const [baseRaw, zhPackRaw, engineSrc, hudMod] = await Promise.all([
+    readFile(join(rootDir, 'dict', 'base.json'), 'utf8'),
+    readFile(join(rootDir, 'assets', 'i18n', 'zh-Hans.json'), 'utf8'),
+    readFile(join(rootDir, 'runtime', 'engine.js'), 'utf8'),
+    import('../runtime/hud-i18n.js'),
+  ]);
+  const baseDict = JSON.parse(baseRaw);
+  const zhPack = JSON.parse(zhPackRaw);
+
+  const untrimmed = [];
+  for (const [k, v] of Object.entries(baseDict)) {
+    if (k !== k.trim() || (typeof v === 'string' && v !== v.trim())) {
+      untrimmed.push({ key: k, value: v });
+    }
+  }
+  assert.deepEqual(untrimmed, [], 'dict/base.json 键与译文均不应包含首尾空白字符');
+
+  for (const [k, v] of Object.entries(hudMod.HUD_I18N['zh-Hans'])) {
+    assert.equal(String(v).includes('会话'), false, `HUD_I18N["zh-Hans"].${k} 不应出现旧术语“会话”`);
+    assert.equal(zhPack.hud[k], v);
+  }
+  assert.equal(hudMod.HUD_I18N['zh-Hans'].tpsMeasuring, '计算中...');
+  assert.equal(hudMod.HUD_I18N.en.tpsMeasuring, 'Measuring…');
+
+  assert.match(engineSrc, /'sessions':\s*'会话'/);
+  assert.match(engineSrc, /dialogLabel === '设置'/);
+  assert.match(engineSrc, /'gravitybox'/);
+  assert.match(engineSrc, /function syncElementLocFlag/);
+  assert.match(engineSrc, /⚠️ Failed to render LaTeX: \{reason\}/);
+  assert.match(engineSrc, /Working directory: \{path\}/);
+});
 });

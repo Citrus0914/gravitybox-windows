@@ -43,7 +43,7 @@ body:
     attributes:
       label: GravityBox 版本
       description: 你当前使用的 GravityBox 版本号（可在主界面左侧栏「关于」中查看）。
-      placeholder: "例如：1.1.0"
+      placeholder: "例如：1.1.1"
     validations:
       required: true
 

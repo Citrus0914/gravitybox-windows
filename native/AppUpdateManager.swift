@@ -67,7 +67,7 @@ final class AppUpdateManager {
                 return Self.normalizeVersion(ver)
             }
         }
-        return "1.1.0"
+        return "1.1.1"
     }
 
     var currentBuildDisplay: String {
@@ -82,7 +82,7 @@ final class AppUpdateManager {
         for infoURL in infoURLs {
             if let data = try? Data(contentsOf: infoURL),
                let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                if buildStr.isEmpty, let buildNum = info["buildNumber"] {
+                if buildStr.isEmpty, let buildNum = info["build"] ?? info["buildNumber"] {
                     buildStr = "\(buildNum)"
                 }
                 if let rev = (info["revision"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -92,7 +92,7 @@ final class AppUpdateManager {
                 break
             }
         }
-        return buildStr.isEmpty ? "10005" : buildStr
+        return buildStr.isEmpty ? "10101" : buildStr
     }
 
     static func normalizeVersion(_ raw: String) -> String {
@@ -204,7 +204,7 @@ final class AppUpdateManager {
             defer { self.checkInFlight = false }
             if let error {
                 if !silent {
-                    self.transition(.failed("无法连接 GitHub Releases：\(error.localizedDescription)"))
+                    self.transition(.failed(L10n.t("update.error.github_connect", ["error": error.localizedDescription], fallback: "无法连接 GitHub Releases：\(error.localizedDescription)")))
                 } else {
                     self.transition(self.availableRelease.map { .updateAvailable($0) } ?? .idle)
                 }
@@ -212,45 +212,39 @@ final class AppUpdateManager {
             }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             if statusCode == 404 {
-                DispatchQueue.main.async {
-                    self.availableRelease = nil
-                    self.downloadedDMGURL = nil
-                    self.transition(.upToDate)
-                }
+                self.availableRelease = nil
+                self.downloadedDMGURL = nil
+                self.transition(.upToDate)
                 return
             }
             guard statusCode == 200, let data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 if !silent {
-                    self.transition(.failed("获取 GitHub 版本信息失败（HTTP \(statusCode)）"))
+                    self.transition(.failed(L10n.t("update.error.github_http", ["status": statusCode], fallback: "获取 GitHub 版本信息失败（HTTP \(statusCode)）")))
                 } else {
                     self.transition(self.availableRelease.map { .updateAvailable($0) } ?? .idle)
                 }
                 return
             }
             if (json["draft"] as? Bool) == true || (json["prerelease"] as? Bool) == true {
-                DispatchQueue.main.async {
-                    self.availableRelease = nil
-                    self.downloadedDMGURL = nil
-                    self.transition(.upToDate)
-                }
+                self.availableRelease = nil
+                self.downloadedDMGURL = nil
+                self.transition(.upToDate)
                 return
             }
             let tagName = (json["tag_name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let remoteVersion = Self.normalizeVersion(tagName)
             guard !remoteVersion.isEmpty, Self.isNewerVersion(remoteVersion, than: self.currentVersion) else {
-                DispatchQueue.main.async {
-                    self.availableRelease = nil
-                    self.downloadedDMGURL = nil
-                    self.transition(.upToDate)
-                }
+                self.availableRelease = nil
+                self.downloadedDMGURL = nil
+                self.transition(.upToDate)
                 return
             }
 
             let name = (json["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "GravityBox v\(remoteVersion)"
             let body = (json["body"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let publishedRaw = (json["published_at"] as? String) ?? ""
-            let publishedDate = publishedRaw.count >= 10 ? String(publishedRaw.prefix(10)) : "最新构建"
+            let publishedDate = publishedRaw.count >= 10 ? String(publishedRaw.prefix(10)) : L10n.t("update.latest_build", fallback: "最新构建")
             let htmlURL = (json["html_url"] as? String).flatMap(URL.init(string:)) ?? Self.releasesPageURL
 
             var dmgURL: URL?
@@ -270,21 +264,19 @@ final class AppUpdateManager {
                 version: remoteVersion,
                 tagName: tagName.isEmpty ? "v\(remoteVersion)" : tagName,
                 title: name,
-                changelog: body.isEmpty ? "• 包含稳定性提升与细节体验优化。" : body,
+                changelog: body.isEmpty ? L10n.t("update.default_changelog", fallback: "• 包含稳定性提升与细节体验优化。") : body,
                 publishedDate: publishedDate,
                 htmlURL: htmlURL,
                 dmgURL: dmgURL,
                 sha256URL: sha256URL
             )
 
-            DispatchQueue.main.async {
-                self.availableRelease = info
-                let cached = self.cachedDMGPath(for: info.version)
-                self.downloadedDMGURL = nil
-                self.transition(.updateAvailable(info))
-                if FileManager.default.fileExists(atPath: cached.path) || self.app.configuration.value.autoUpdateEnabled {
-                    self.preDownloadRelease(info, silent: true)
-                }
+            self.availableRelease = info
+            let cached = self.cachedDMGPath(for: info.version)
+            self.downloadedDMGURL = nil
+            self.transition(.updateAvailable(info))
+            if FileManager.default.fileExists(atPath: cached.path) || self.app.configuration.value.autoUpdateEnabled {
+                self.preDownloadRelease(info, silent: true)
             }
           }
         }
@@ -302,6 +294,12 @@ final class AppUpdateManager {
             let lower = heading.lowercased()
             return lower.contains("sha-256") ||
                 lower.contains("sha256") ||
+                lower.contains("checksum") ||
+                lower.contains("verification") ||
+                lower.contains("installation & first launch") ||
+                lower.contains("installation and first launch") ||
+                lower.contains("manual installation") ||
+                lower.contains("first launch") ||
                 heading.contains("附件校验") ||
                 heading.contains("安装与首次打开") ||
                 heading.contains("手动安装")
@@ -374,7 +372,7 @@ final class AppUpdateManager {
             result = result.replacingOccurrences(of: "\n\n\n", with: "\n\n")
         }
         result = result.trimmingCharacters(in: .whitespacesAndNewlines)
-        return result.isEmpty ? "• 包含稳定性提升与细节体验优化。" : result
+        return result.isEmpty ? L10n.t("update.default_changelog", fallback: "• 包含稳定性提升与细节体验优化。") : result
     }
 
     private func cachedDMGPath(for version: String) -> URL {
@@ -406,7 +404,7 @@ final class AppUpdateManager {
             do {
             let file = try await { () async throws -> URL in
                 guard release.version.range(of: #"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"#, options: .regularExpression) != nil else {
-                    throw UpdatePackageIntegrity.failure("更新版本号无效，已停止更新。")
+                    throw UpdatePackageIntegrity.failure(L10n.t("update.error.invalid_version", fallback: "更新版本号无效，已停止更新。"))
                 }
                 let fm = FileManager.default
                 // Rehash on every reuse, including installation. Old unverified caches never qualify.
@@ -414,11 +412,11 @@ final class AppUpdateManager {
                     return targetFile
                 }
                 guard let dmgURL = release.dmgURL, let shaURL = release.sha256URL else {
-                    throw UpdatePackageIntegrity.failure("该版本缺少安装包或 SHA-256 校验文件，已停止更新；当前版本仍可继续使用。")
+                    throw UpdatePackageIntegrity.failure(L10n.t("update.error.missing_assets", fallback: "该版本缺少安装包或 SHA-256 校验文件，已停止更新；当前版本仍可继续使用。"))
                 }
                 let shaText: String
                 do { let (data, response) = try await URLSession.shared.data(from: shaURL); guard (response as? HTTPURLResponse)?.statusCode == 200, data.count < 65536, let decoded = String(data: data, encoding: .utf8) else { throw URLError(.badServerResponse) }; shaText = decoded }
-                catch { throw UpdatePackageIntegrity.failure("无法读取 SHA-256 校验文件，已停止更新，请稍后重试。") }
+                catch { throw UpdatePackageIntegrity.failure(L10n.t("update.error.sha_read_failed", fallback: "无法读取 SHA-256 校验文件，已停止更新，请稍后重试。")) }
                 let expected = try UpdatePackageIntegrity.expectedHash(shaText, fileName: targetFile.lastPathComponent)
                 let dir = targetFile.deletingLastPathComponent()
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -434,9 +432,9 @@ final class AppUpdateManager {
                 verify.arguments = ["verify", "-quiet", tempDMG.path]
                 Self.configureSilentProcess(verify)
                 try verify.run(); verify.waitUntilExit()
-                guard verify.terminationStatus == 0 else { throw UpdatePackageIntegrity.failure("DMG 磁盘映像完整性校验未通过。") }
+                guard verify.terminationStatus == 0 else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.dmg_verify_failed", fallback: "DMG 磁盘映像完整性校验未通过。")) }
                 try Task.checkCancellation()
-                guard rename(tempDMG.path, targetFile.path) == 0 else { throw UpdatePackageIntegrity.failure("无法保存已校验安装包，请稍后重试。") }
+                guard rename(tempDMG.path, targetFile.path) == 0 else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.save_failed", fallback: "无法保存已校验安装包，请稍后重试。")) }
                 // A crash between these writes leaves an unusable cache, never an unchecked ready state.
                 try Data("\(expected)  \(targetFile.lastPathComponent)\n".utf8).write(to: targetFile.appendingPathExtension("sha256"), options: .atomic)
                 try Self.verifyCachedDownload(targetFile)
@@ -729,9 +727,23 @@ final class AppUpdateManager {
 
     static func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }
 
-    static func buildDetachedUpdaterScript(myPid: Int32, stagedAppPath _: String = "", targetAppPath _: String = "", workDirPath: String, dmgFilePath _: String = "") -> String {
+    static func buildDetachedUpdaterScript(
+        myPid: Int32,
+        stagedAppPath _: String = "",
+        targetAppPath _: String = "",
+        workDirPath: String,
+        dmgFilePath _: String = "",
+        i18nDirPath: String? = nil,
+        appLanguage: String? = nil
+    ) -> String {
         let helper = URL(fileURLWithPath: workDirPath).appendingPathComponent("installer").path
         let receipt = URL(fileURLWithPath: workDirPath).appendingPathComponent(UpdateInstaller.receiptName).path
+        let resolvedI18n = (i18nDirPath?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? URL(fileURLWithPath: workDirPath).appendingPathComponent("i18n").path
+        var envAssignments = ["GRAVITYBOX_I18N_DIR=" + shellQuote(resolvedI18n)]
+        if let lang = appLanguage?.trimmingCharacters(in: .whitespacesAndNewlines), !lang.isEmpty {
+            envAssignments.append("GRAVITYBOX_LANGUAGE=" + shellQuote(lang))
+        }
         let body = """
         trap "" HUP TERM INT QUIT PIPE
         i=0
@@ -743,12 +755,35 @@ final class AppUpdateManager {
           kill -9 \(myPid) 2>/dev/null || true
           sleep 0.2
         fi
+        export \(envAssignments.joined(separator: " "))
         exec \(shellQuote(helper)) --install-update \(shellQuote(receipt))
         """
         return "nohup /bin/sh -c " + shellQuote(body) + " >/dev/null 2>&1 &"
     }
 
+    private static func findBundledI18nDirectory(fileManager: FileManager = .default) -> URL? {
+        var candidates: [URL] = []
+        if let envI18n = ProcessInfo.processInfo.environment["GRAVITYBOX_I18N_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envI18n.isEmpty {
+            candidates.append(URL(fileURLWithPath: envI18n, isDirectory: true))
+        }
+        if let res = Bundle.main.resourceURL {
+            candidates.append(res.appendingPathComponent("i18n", isDirectory: true))
+        }
+        if let exeDir = Bundle.main.executableURL?.deletingLastPathComponent() {
+            candidates.append(exeDir.appendingPathComponent("i18n", isDirectory: true))
+        }
+        candidates.append(
+            URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
+                .appendingPathComponent("assets/i18n", isDirectory: true)
+        )
+        return candidates.first { dir in
+            fileManager.fileExists(atPath: dir.appendingPathComponent("en.json").path)
+        }
+    }
+
     private func executeInstall(release: AppReleaseInfo, dmgFile: URL) {
+        let configuredLang = app.effectiveConfiguredLanguage()
         transition(.installing(release))
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -766,7 +801,7 @@ final class AppUpdateManager {
                 try attach.run()
                 attach.waitUntilExit()
                 guard attach.terminationStatus == 0 else {
-                    throw NSError(domain: "GravityBoxUpdate", code: 4, userInfo: [NSLocalizedDescriptionKey: "无法挂载更新镜像，安装包已保留，请重试或重新下载。"])
+                    throw NSError(domain: "GravityBoxUpdate", code: 4, userInfo: [NSLocalizedDescriptionKey: L10n.t("update.error.mount_failed", fallback: "无法挂载更新镜像，安装包已保留，请重试或重新下载。")])
                 }
                 defer {
                     let detach = Process()
@@ -779,7 +814,7 @@ final class AppUpdateManager {
 
                 let mountedApp = mountDir.appendingPathComponent("GravityBox.app")
                 guard fm.fileExists(atPath: mountedApp.appendingPathComponent("Contents/MacOS/GravityBox").path) else {
-                    throw NSError(domain: "GravityBoxUpdate", code: 5, userInfo: [NSLocalizedDescriptionKey: "更新镜像内未找到有效的 GravityBox.app。"])
+                    throw NSError(domain: "GravityBoxUpdate", code: 5, userInfo: [NSLocalizedDescriptionKey: L10n.t("update.error.app_not_found", fallback: "更新镜像内未找到有效的 GravityBox.app。")])
                 }
                 try fm.copyItem(at: mountedApp, to: stagedApp)
 
@@ -790,15 +825,10 @@ final class AppUpdateManager {
                 try? xattrProc.run()
                 xattrProc.waitUntilExit()
 
-                let signCheck = Process()
-                signCheck.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-                signCheck.arguments = ["--verify", "--deep", "--strict", stagedApp.path]
-                Self.configureSilentProcess(signCheck)
-                try signCheck.run()
-                signCheck.waitUntilExit()
-                guard signCheck.terminationStatus == 0 else {
-                    throw NSError(domain: "GravityBoxUpdate", code: 6, userInfo: [NSLocalizedDescriptionKey: "新版本应用包代码签名校验未通过。"])
-                }
+                try UpdateInstaller.verifyCodeSignature(
+                    stagedApp,
+                    failureMessage: L10n.t("update.error.codesign_failed", fallback: "新版本应用包代码签名校验未通过。")
+                )
 
                 let targetAppPath = Self.resolveInstallTargetAppPath()
                 let receipt = try UpdateInstaller.prepare(stagedApp: stagedApp, target: URL(fileURLWithPath: targetAppPath),
@@ -806,8 +836,15 @@ final class AppUpdateManager {
                 let helper = workDir.appendingPathComponent("installer")
                 try fm.copyItem(at: Bundle.main.executableURL!, to: helper)
                 try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+                let stagedI18n = workDir.appendingPathComponent("i18n", isDirectory: true)
+                if let srcI18n = Self.findBundledI18nDirectory(fileManager: fm) {
+                    if fm.fileExists(atPath: stagedI18n.path) {
+                        try? fm.removeItem(at: stagedI18n)
+                    }
+                    try? fm.copyItem(at: srcI18n, to: stagedI18n)
+                }
                 // The signed helper is the currently running binary, independent of the app being exchanged.
-                guard fm.fileExists(atPath: receipt.path) else { throw UpdatePackageIntegrity.failure("更新恢复记录未能保存。") }
+                guard fm.fileExists(atPath: receipt.path) else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.receipt_save_failed", fallback: "更新恢复记录未能保存。")) }
                 DispatchQueue.main.async {
                     self.app.suppressLifecycleAutoQuit(seconds: 60)
                     let myPid = getpid()
@@ -816,7 +853,9 @@ final class AppUpdateManager {
                         stagedAppPath: stagedApp.path,
                         targetAppPath: targetAppPath,
                         workDirPath: workDir.path,
-                        dmgFilePath: dmgFile.path
+                        dmgFilePath: dmgFile.path,
+                        i18nDirPath: stagedI18n.path,
+                        appLanguage: configuredLang
                     )
                     let updater = Process()
                     updater.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -828,7 +867,7 @@ final class AppUpdateManager {
                         self.app.quitForUpdate()
                     } catch {
                         self.installationInFlight = false
-                        self.transition(.failed("无法启动安装辅助脚本，旧版本和恢复材料已保留：\(error.localizedDescription)"))
+                        self.transition(.failed(L10n.t("update.error.helper_launch_failed", ["error": error.localizedDescription], fallback: "无法启动安装辅助脚本，旧版本和恢复材料已保留：\(error.localizedDescription)")))
                     }
                 }
             } catch {

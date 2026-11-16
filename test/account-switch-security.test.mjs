@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { AccountSwitchService } from '../dist/account-switch.js';
+import { AccountSwitchService, DatabaseTransaction } from '../dist/account-switch.js';
 import { AccountsManager, MockKeychainAdapter } from '../dist/accounts.js';
 
 const run = promisify(execFile);
@@ -222,6 +222,77 @@ test('S3 智能调度: Round-Robin 算法在多账号轮转时严格按序完整
     // 验证选中的账号集合包含全部 4 个账号，无一遗漏饥饿
     const uniqueChosen = new Set(chosenSequence);
     assert.equal(uniqueChosen.size, 4, `4 轮轮换必须包含全部候选账号，实际选择序列: ${chosenSequence.join(' -> ')}`);
+  } finally {
+    await rm(env.root, { recursive: true, force: true });
+  }
+});
+
+test('P0-09: switchAccount 提交前失败回滚时日志脱敏，且 reconcileRollback 复用 databaseFactory', async () => {
+  const env = await setupSandbox();
+  try {
+    const acc1 = await env.manager.upsertAccount(makeAccount('acc-p009-1', 'p009-1@test.com'));
+    const failService = new AccountSwitchService(env.manager, {
+      stateDir: env.stateDir,
+      profile: env.profile,
+      keychain: env.keychain,
+      isRunning: async () => false,
+      databaseFactory: path => {
+        const tx = new DatabaseTransaction(path);
+        const origFinish = tx.finish.bind(tx);
+        tx.finish = async commit => {
+          await origFinish(false);
+          if (commit) throw new Error('simulated pre-commit failure');
+        };
+        return tx;
+      },
+    });
+
+    await assert.rejects(failService.switchAccount(acc1.id), /simulated pre-commit failure/);
+    const journalPath = join(env.stateDir, 'account-switch-journal-stable.json');
+    const journalRaw = await readFile(journalPath, 'utf8');
+    const journal = JSON.parse(journalRaw);
+    assert.equal(journal.status, 'rolled-back');
+    assert.equal(journal.keychainBefore, null);
+    assert.equal(journal.keychainAfter, '');
+    assert.equal(journal.keychainAfterDigest, undefined);
+    assert.ok(!journalRaw.includes('1//token-refresh-acc-p009-1'));
+    assert.ok(!journalRaw.includes('token-access-acc-p009-1'));
+    assert.ok(!journalRaw.includes('initial-keychain-pass'));
+    assert.equal(await env.keychain.readPassword('gemini', 'antigravity'), 'initial-keychain-pass');
+
+    const okService = new AccountSwitchService(env.manager, {
+      stateDir: env.stateDir,
+      profile: env.profile,
+      keychain: env.keychain,
+      isRunning: async () => false,
+    });
+    await okService.switchAccount(acc1.id);
+
+    let factoryCalls = 0;
+    const rollbackService = new AccountSwitchService(env.manager, {
+      stateDir: env.stateDir,
+      profile: env.profile,
+      keychain: env.keychain,
+      isRunning: async () => false,
+      databaseFactory: path => {
+        factoryCalls += 1;
+        const tx = new DatabaseTransaction(path);
+        if (factoryCalls === 1) {
+          const origFinish = tx.finish.bind(tx);
+          tx.finish = async commit => {
+            if (commit) {
+              await origFinish(false);
+              throw new Error('simulated rollback crash');
+            }
+            return origFinish(commit);
+          };
+        }
+        return tx;
+      },
+    });
+
+    await assert.rejects(rollbackService.rollback(), /simulated rollback crash/);
+    assert.equal(factoryCalls, 2, 'reconcileRollback 必须通过 this.database() 调用注入的 databaseFactory');
   } finally {
     await rm(env.root, { recursive: true, force: true });
   }

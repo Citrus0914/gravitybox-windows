@@ -104,7 +104,7 @@ test('复验 3: 有效输出速度保留原始精度、拒绝无效耗时且不�
   assert.equal(computeTps(NaN, 100).formatted, '—');
   assert.equal(computeTps(2, Infinity).formatted, '—');
   assert.equal(computeTps(0.05, 50).outputTps, 1000);
-  assert.equal(computeTps(0.1, 100).formatted, '1000.00 tok/s');
+  assert.equal(computeTps(0.1, 100).formatted, '1000 tok/s');
   const normal = computeTps(3, 100);
   assert.equal(normal.outputTps, 100 / 3);
   assert.equal(normal.formatted, '33.33 tok/s');
@@ -203,11 +203,11 @@ test('复验 5: ConversationMetricsEngine 两级 lstat 门控、子智能体会�
     assert.equal(m1.session.turns, 1);
     assert.equal(m1.session.steps, 2);
     assert.equal(m1.tokens.totalTokens, 100500);
-    assert.equal(m1.tokens.cacheHitRateFormatted, '90.00%');
+    assert.equal(m1.tokens.cacheHitRateFormatted, '90%');
     assert.equal(m1.session.outputTpsFormatted, '41.67 tok/s');
     assert.equal(m1.context.usedTokens, 100000);
     assert.equal(m1.context.capacityTokens, 200000);
-    assert.equal(m1.context.usedRatioFormatted, '50.00%');
+    assert.equal(m1.context.usedRatioFormatted, '50%');
     assert.equal(m1.context.breakdown.cachedContextTokens, 90000);
     assert.equal(m1.context.breakdown.uncachedContextTokens, 10000);
 
@@ -278,7 +278,7 @@ test('复验 5: ConversationMetricsEngine 两级 lstat 门控、子智能体会�
     assert.equal(m2.tokens.totalTokens, 100500 + 201000 + 50250, '累计 Token 应自动汇总子智能体消耗');
     // 主会话当前单步上下文仍保持主会话最后一步的 200,000 tok (100%)，不被子智能体的 50,000 tok 覆盖
     assert.equal(m2.context.usedTokens, 200000);
-    assert.equal(m2.context.usedRatioFormatted, '100.00%');
+    assert.equal(m2.context.usedRatioFormatted, '100%');
 
     // 验证 Antigravity 2.30.0 真实表结构 (无 data 列，使用 render_info + trajectory_metadata_blob) 与防无关 UUID 串号污染
     const realMainId = '11111111-2222-4333-8444-555555555555';
@@ -379,7 +379,7 @@ test('Case A: 新会话空状态 (0 Token, 0 轮次, 0 步数) - 真实引擎模
   assert.equal(m.session.outputTpsFormatted, '—');
   assert.equal(Number.isFinite(m.session.outputTps), true);
   assert.equal(m.context.usedRatio, 0);
-  assert.equal(m.context.usedRatioFormatted, '0.00%');
+  assert.equal(m.context.usedRatioFormatted, '0%');
   assert.equal(m.context.capacityTokens, 200000, 'Antigravity 标准上下文容量应为 200K 而非虚假 1M');
   assert.equal(m.context.capacityTokensCompact, '~200K');
 });
@@ -481,7 +481,7 @@ test('Case D: 超出默认阈值与未知模型 ~200K 回退及显式 DB 容量�
   assert.equal(mUnknown.context.capacityTokens, 200000);
   assert.equal(mUnknown.context.capacityTokensCompact, '~200K', '未知模型容量应回退为 ~200K 而非虚假 1M');
   assert.equal(mUnknown.context.usedRatio, 0.75);
-  assert.equal(mUnknown.context.usedRatioFormatted, '75.00%');
+  assert.equal(mUnknown.context.usedRatioFormatted, '75%');
 
   // 当底层 gen_metadata 显式提供 maxContextTokens 时严格以底层数据为准
   const mExplicit = buildConversationHudMetrics({
@@ -572,8 +572,8 @@ test('Case E: 客户端时间戳逆序、多类型工具步耗时聚合与实机
   assert.equal(mRef.tokens.totalTokens, 23196078);
   assert.equal(mRef.tokens.totalTokensCompact, '23.2M tok');
   assert.equal(mRef.tokens.totalTokensFormatted, '23,196,078 tok');
-  assert.equal(mRef.tokens.cacheHitRateFormatted, '96.93%');
-  assert.equal(mRef.session.averageTtftFormatted, '5.60 秒');
+  assert.equal(mRef.tokens.cacheHitRateFormatted, '96.9%');
+  assert.equal(mRef.session.averageTtftFormatted, '5.6 秒');
   assert.equal(mRef.session.outputTpsFormatted, '312.14 tok/s');
   assert.equal(mRef.context.modelId, 'gemini-3.8-flash');
   assert.equal(mRef.context.modelDisplayName, 'Gemini 3.8 Flash');
@@ -615,11 +615,147 @@ test('Case F: 推理输出使用完整请求耗时，不推算思维链时间或
   });
 
   assert.equal(m.tokens.totalTokens, 15504736);
-  assert.equal(m.tokens.cacheHitRateFormatted, '97.14%');
+  assert.equal(m.tokens.cacheHitRateFormatted, '97.1%');
   assert.equal(m.session.modelDurationFormatted, '22分43秒');
   // 校准后 TPS 必须反映真实物理流式速率 (~82 tok/s)，绝不再出现将 65,352 除以 184s 得出的 355 tok/s
   assert.equal(m.session.outputTps, 65352 / 1363);
   assert.equal(m.session.outputTpsFormatted, '47.95 tok/s');
   assert.equal(m.session.averageTtftFormatted, '1178.91 秒');
+});
+
+test('Case G: Orchestrator (Carbon / Hydrogen) 双阶段分模型独立水位与峰值隔离 + 手动切换未发言模型不串算容量', () => {
+  const carbonStep = {
+    idx: 1,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 100,
+    endTimeSeconds: 110,
+    rawInputTokens: 2485,
+    cachedReadTokens: 459413,
+    cacheWriteTokens: 0,
+    outputTokens: 16074,
+    generation: {
+      modelEnum: 1667,
+      responseModel: 'gemini-pro-orchestrator',
+      modelDisplayName: 'Orchestrator (Carbon)',
+      maxContextTokens: 512000,
+    },
+  };
+
+  // 1. 仅跑完 Carbon 规划阶段（461,898 / 512,000）
+  const phase1 = buildConversationHudMetrics({
+    conversationId: 'conv-orch-dual',
+    sessionRevision: 1,
+    modelId: 'Orchestrator (Carbon)',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, carbonStep],
+  });
+  assert.equal(phase1.context.isOrchestrator, true);
+  assert.equal(phase1.context.isMultiModel, true);
+  assert.equal(phase1.context.modelShortLabel, 'Carbon');
+  assert.equal(phase1.context.modelCompactLabel, 'C');
+  assert.equal(phase1.context.usedTokens, 461898);
+  assert.equal(phase1.context.peakContextTokens, 461898);
+  assert.equal(phase1.context.capacityTokens, 512000);
+  assert.equal(phase1.context.modelStages?.length, 2);
+  assert.equal(phase1.context.modelStages?.[0]?.role, 'planner');
+  assert.equal(phase1.context.modelStages?.[0]?.shortLabel, 'Carbon');
+  assert.equal(phase1.context.modelStages?.[0]?.isActive, true);
+  assert.equal(phase1.context.modelStages?.[0]?.hasUsageData, true);
+  assert.equal(phase1.context.modelStages?.[0]?.usedTokens, 461898);
+  assert.equal(phase1.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(phase1.context.modelStages?.[1]?.shortLabel, 'Hydrogen');
+  assert.equal(phase1.context.modelStages?.[1]?.isActive, false);
+  assert.equal(phase1.context.modelStages?.[1]?.hasUsageData, false);
+  assert.equal(phase1.context.modelStages?.[1]?.capacityTokens, 512000);
+
+  // 2. 切入 Hydrogen 执行首步（401,280 / 512,000）：Hydrogen 自身峰值严禁混入 Carbon 的 461,898
+  const hydrogenStep1 = {
+    idx: 2,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 112,
+    endTimeSeconds: 118,
+    rawInputTokens: 401280,
+    cachedReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 516,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  };
+  const phase2 = buildConversationHudMetrics({
+    conversationId: 'conv-orch-dual',
+    sessionRevision: 2,
+    modelId: 'Orchestrator (Carbon)',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, carbonStep, hydrogenStep1],
+  });
+  assert.equal(phase2.context.modelShortLabel, 'Hydrogen');
+  assert.equal(phase2.context.modelCompactLabel, 'H');
+  assert.equal(phase2.context.usedTokens, 401280);
+  assert.equal(phase2.context.peakContextTokens, 401280, 'Hydrogen 当前模型峰值不得混入 Carbon 的 461,898');
+  assert.equal(phase2.context.sessionPeakContextTokens, 461898);
+  assert.equal(phase2.context.modelStages?.length, 2);
+  assert.equal(phase2.context.modelStages?.[0]?.shortLabel, 'Carbon');
+  assert.equal(phase2.context.modelStages?.[0]?.usedTokens, 461898);
+  assert.equal(phase2.context.modelStages?.[0]?.peakContextTokens, 461898);
+  assert.equal(phase2.context.modelStages?.[0]?.isActive, false);
+  assert.equal(phase2.context.modelStages?.[1]?.shortLabel, 'Hydrogen');
+  assert.equal(phase2.context.modelStages?.[1]?.usedTokens, 401280);
+  assert.equal(phase2.context.modelStages?.[1]?.peakContextTokens, 401280);
+  assert.equal(phase2.context.modelStages?.[1]?.isActive, true);
+
+  // 3. Hydrogen 涨到 467,900：两模型水位与各自峰值独立更新
+  const hydrogenStep2 = {
+    idx: 3,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 120,
+    endTimeSeconds: 126,
+    rawInputTokens: 2425,
+    cachedReadTokens: 465475,
+    cacheWriteTokens: 0,
+    outputTokens: 3732,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  };
+  const phase3 = buildConversationHudMetrics({
+    conversationId: 'conv-orch-dual',
+    sessionRevision: 3,
+    modelId: 'Orchestrator (Carbon)',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, carbonStep, hydrogenStep1, hydrogenStep2],
+  });
+  assert.equal(phase3.context.usedTokens, 467900);
+  assert.equal(phase3.context.peakContextTokens, 467900);
+  assert.equal(phase3.context.usedRatioFormatted, '91.4%');
+  assert.equal(phase3.context.modelStages?.[0]?.usedTokens, 461898);
+  assert.equal(phase3.context.modelStages?.[0]?.usedRatioFormatted, '90.2%');
+  assert.equal(phase3.context.modelStages?.[1]?.usedTokens, 467900);
+  assert.equal(phase3.context.modelStages?.[1]?.peakContextTokens, 467900);
+
+  // 4. 手动切换至尚未发言的 Claude Sonnet 4.6（200K）：不得拿 Hydrogen 的 467,900 除以 200,000
+  const switchedPending = buildConversationHudMetrics({
+    conversationId: 'conv-orch-dual',
+    sessionRevision: 4,
+    modelId: 'Claude Sonnet 4.6',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, carbonStep, hydrogenStep1, hydrogenStep2],
+  });
+  assert.equal(switchedPending.context.modelShortLabel, 'Hydrogen');
+  assert.equal(switchedPending.context.usedTokens, 467900);
+  assert.equal(switchedPending.context.capacityTokens, 512000, '未产生新步前不得拿新模型 200K 覆盖旧用量分母');
+  assert.equal(switchedPending.context.usedRatioFormatted, '91.4%');
+  assert.equal(switchedPending.context.modelStages?.length, 3);
+  assert.equal(switchedPending.context.modelStages?.[2]?.modelId, 'claude-sonnet-4-6');
+  assert.equal(switchedPending.context.modelStages?.[2]?.hasUsageData, false);
+  assert.equal(switchedPending.context.modelStages?.[2]?.capacityTokens, 200000);
 });
 });

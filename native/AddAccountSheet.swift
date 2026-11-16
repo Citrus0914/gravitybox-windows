@@ -14,9 +14,9 @@ final class AddAccountSheet: NSObject {
     )
     let status = text("", size: 12, color: Design.secondary, wrap: true)
     let spinner = NSProgressIndicator()
-    let currentButton = button("保存当前账号", target: nil, action: #selector(saveCurrent))
-    let googleButton = button("Google 授权登录…", target: nil, action: #selector(signIn))
-    let cancelButton = button("取消", target: nil, action: #selector(cancel))
+    let currentButton = button(L10n.t("add_account.save_current", fallback: "保存当前账号"), target: nil, action: #selector(saveCurrent))
+    let googleButton = button(L10n.t("add_account.google_btn", fallback: "Google 授权登录…"), target: nil, action: #selector(signIn))
+    let cancelButton = button(L10n.t("common.cancel", fallback: "取消"), target: nil, action: #selector(cancel))
     private var feedback: NSStackView!
     var sessionID: String?
     var pollTimer: Timer?
@@ -29,19 +29,23 @@ final class AddAccountSheet: NSObject {
         self.app = app
         self.saved = saved
         super.init()
-        window.title = "添加账号"
+        window.title = L10n.t("add_account.title", fallback: "添加账号")
         window.isReleasedWhenClosed = false
         currentButton.target = self
         googleButton.target = self
-        // F06: 只保留一个实心主按钮（Google 授权登录）；“保存当前账号”降级为描边次级按钮，
-        // 并把初始键盘焦点与默认 Enter 都交给主按钮，避免两个“主按钮”竞争。
+        // F06: 始终只保留一个实心主按钮：已配置 OAuth 客户端凭据时以 Google 授权为主按钮，
+        // 未配置时自动将即开即用的“保存当前账号”提升为主按钮，避免默认回车直接落入未配置提示。
         let currentEmail = app.statusValue.liveAccountEmail.isEmpty ? app.statusValue.activeAccountEmail : app.statusValue.liveAccountEmail
-        currentButton.title = "保存当前账号"
+        let preferCurrentAccount = !app.statusValue.oauthClientConfigured
+        let primaryButton = preferCurrentAccount ? currentButton : googleButton
+        let secondaryButton = preferCurrentAccount ? googleButton : currentButton
+        currentButton.title = L10n.t("add_account.save_current", fallback: "保存当前账号")
         currentButton.isEnabled = true
-        currentButton.bezelColor = nil
-        googleButton.bezelColor = Design.blue
-        googleButton.keyEquivalent = "\r"
-        window.initialFirstResponder = googleButton
+        secondaryButton.bezelColor = nil
+        secondaryButton.keyEquivalent = ""
+        primaryButton.bezelColor = Design.blue
+        primaryButton.keyEquivalent = "\r"
+        window.initialFirstResponder = primaryButton
         cancelButton.target = self
         cancelButton.keyEquivalent = "\u{1b}"
         spinner.style = .spinning
@@ -61,7 +65,7 @@ final class AddAccountSheet: NSObject {
             var textViews: [NSView] = [titleLbl, subLbl]
             if action === currentButton, !currentEmail.isEmpty {
                 let emailLbl = text(currentEmail, size: 10.5, color: .secondaryLabelColor)
-                enableTextCopy(emailLbl, title: "复制完整邮箱")
+                enableTextCopy(emailLbl, title: L10n.t("common.copy_full_email", fallback: "复制完整邮箱"))
                 emailLbl.font = .systemFont(ofSize: 11.5, weight: .regular)
                 emailLbl.lineBreakMode = .byTruncatingMiddle
                 emailLbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -87,13 +91,13 @@ final class AddAccountSheet: NSObject {
         feedback = horizontal([spinner, status], spacing: 8)
         feedback.isHidden = true
         let headerBadge = iconBadge("person.badge.plus", tint: Design.blue, size: 32)
-        let headerTitle = text("添加账号", size: 16, weight: .semibold, color: .labelColor)
+        let headerTitle = text(L10n.t("add_account.title", fallback: "添加账号"), size: 16, weight: .semibold, color: .labelColor)
         let headerRow = horizontal([headerBadge, headerTitle, flexibleSpace()], spacing: 10)
         headerRow.alignment = .centerY
         let root = vertical([
             headerRow,
-            choice("person.crop.rectangle", "保存当前账号", "导入当前 Antigravity 登录账号", currentButton),
-            choice("globe", "Google 授权登录", "通过浏览器授权，凭据仅存本机", googleButton),
+            choice("person.crop.rectangle", L10n.t("add_account.save_current", fallback: "保存当前账号"), L10n.t("add_account.save_current_sub", fallback: "导入当前 Antigravity 登录账号"), currentButton),
+            choice("globe", L10n.t("add_account.google_title", fallback: "Google 授权登录"), L10n.t("add_account.google_sub", fallback: "通过浏览器授权，凭据仅存本机"), googleButton),
             feedback,
             horizontal([flexibleSpace(), cancelButton])
         ], spacing: 12)
@@ -115,14 +119,15 @@ final class AddAccountSheet: NSObject {
 
     func show(in parent: NSWindow, onDismiss: @escaping () -> Void) {
         self.onDismiss = onDismiss
-        parent.beginSheet(window) { [weak self] _ in
+        app.presentRetainedSheet(controller: self, sheet: window, in: parent) { [weak self] _ in
             self?.pollTimer?.invalidate()
             self?.onDismiss?()
         }
         // F06: Sheet 成为 key 后再锁定一次初始焦点，避免 AppKit 按视图顺序落到次级按钮。
         DispatchQueue.main.async { [weak self] in
             guard let self, self.window.sheetParent != nil else { return }
-            self.window.makeFirstResponder(self.googleButton)
+            let targetResponder = self.app.statusValue.oauthClientConfigured ? self.googleButton : self.currentButton
+            self.window.makeFirstResponder(targetResponder)
         }
     }
 
@@ -150,7 +155,7 @@ final class AddAccountSheet: NSObject {
     }
 
     @objc func saveCurrent() {
-        status.stringValue = "正在读取当前账号…"
+        status.stringValue = L10n.t("add_account.status.reading_current")
         status.textColor = Design.secondary
         busy(true)
         cancelButton.isEnabled = false
@@ -167,7 +172,7 @@ final class AddAccountSheet: NSObject {
     }
 
     @objc func signIn() {
-        status.stringValue = "正在打开 Google 授权…"
+        status.stringValue = L10n.t("add_account.status.opening_google")
         status.textColor = Design.secondary
         busy(true)
         requestInFlight = true
@@ -186,18 +191,18 @@ final class AddAccountSheet: NSObject {
                       url.scheme == "https",
                       url.host == "accounts.google.com",
                       url.path == "/o/oauth2/v2/auth" else {
-                    self.fail("授权地址无效，请重试。")
+                    self.fail(L10n.t("add_account.error.invalid_url"))
                     return
                 }
                 self.sessionID = id
                 #if !NATIVE_UI_TEST
                 guard NSWorkspace.shared.open(url) else {
                     self.app.bridge.send(["command": "account_oauth_cancel", "id": id]) { _ in }
-                    self.fail("无法打开浏览器，请重试。")
+                    self.fail(L10n.t("add_account.error.open_browser"))
                     return
                 }
                 #endif
-                self.status.stringValue = "请在浏览器中完成 Google 授权。"
+                self.status.stringValue = L10n.t("add_account.status.complete_in_browser")
                 self.pollTimer?.invalidate()
                 let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                     self?.checkLogin()
@@ -227,9 +232,9 @@ final class AddAccountSheet: NSObject {
                     self.dismiss()
                 } else if ["failed", "cancelled", "expired"].contains(phase) {
                     self.pollTimer?.invalidate()
-                    self.fail(value["message"] as? String ?? "授权未完成，请重试。")
+                    self.fail(value["message"] as? String ?? L10n.t("add_account.error.incomplete"))
                 } else if phase == "saving" {
-                    self.status.stringValue = "正在保存账号…"
+                    self.status.stringValue = L10n.t("add_account.status.saving")
                 }
             }
         }
@@ -248,7 +253,7 @@ final class AddAccountSheet: NSObject {
             self.closing = false
             switch response {
             case .failure:
-                self.fail("无法取消授权，请重试。")
+                self.fail(L10n.t("add_account.error.cancel_failed"))
             case .success(let value):
                 if value["phase"] as? String == "saving" { return }
                 self.dismiss()

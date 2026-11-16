@@ -354,6 +354,19 @@ export class CdpHudBridge implements ICdpHudBridge {
     }
   }
 
+  /**
+   * 语言切换后清空各分栏指纹缓存并立即重推本地化后的 HUD 度量快照
+   */
+  public async refreshAllForLocaleChange(): Promise<void> {
+    if (this.disposed || this.activePanes.size === 0) return;
+    for (const session of this.activePanes.values()) {
+      session.lastMetricsKey = '';
+    }
+    await Promise.allSettled(
+      [...this.activePanes.keys()].map((paneKey) => this.refreshPaneMetrics(paneKey, true))
+    );
+  }
+
   public onClientEvent(handler: (event: HudClientEvent) => void): void {
     this.clientEventHandlers.add(handler);
   }

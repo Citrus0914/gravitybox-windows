@@ -47,6 +47,24 @@ test('I06: cleanDist 只删孤儿，不删对应产物/白名单/资源文件', 
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('I06: cleanDist 一并清理无 src 对应的 .d.ts / .js.map / .d.ts.map 编译残留，并保留有效产物', async () => {
+  const root = await makeProject();
+  try {
+    await writeFile(join(root, 'dist', 'a.d.ts'), 'export declare const a: number;\n');
+    await writeFile(join(root, 'dist', 'a.js.map'), '{}\n');
+    await writeFile(join(root, 'dist', 'a.d.ts.map'), '{}\n');
+    await writeFile(join(root, 'dist', 'orphan.d.ts'), 'export declare const o: number;\n');
+    await writeFile(join(root, 'dist', 'orphan.js.map'), '{}\n');
+    await writeFile(join(root, 'dist', 'orphan.d.ts.map'), '{}\n');
+    const result = await cleanDist({ projectRoot: root });
+    assert.deepEqual(result.removed, ['orphan.d.ts', 'orphan.d.ts.map', 'orphan.js', 'orphan.js.map']);
+    assert.equal(existsSync(join(root, 'dist', 'a.d.ts')), true);
+    assert.equal(existsSync(join(root, 'dist', 'a.js.map')), true);
+    assert.equal(existsSync(join(root, 'dist', 'a.d.ts.map')), true);
+    assert.equal(existsSync(join(root, 'dist', 'notes.txt')), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('I06: 缺失 dist 目录时不报错（全新克隆可 build）', async () => {
   const root = await mkdtemp(join(tmpdir(), 'gb-clean-dist-empty-'));
   try {

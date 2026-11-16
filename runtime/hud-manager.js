@@ -1,3 +1,4 @@
+import { normalizeHudLocale } from './hud-i18n.js';
 import { HudInstance } from './hud-instance.js';
 import { computeUpwardPopoverPosition } from './hud-popover.js';
 
@@ -21,7 +22,8 @@ export class AntigravityHudManager {
     this.active = false;
     this.enabled = options.enabled !== false;
     this.routeExcluded = false;
-    this.languageMode = options.languageMode === 'en' ? 'en' : 'zh';
+    this.locale = normalizeHudLocale(options.locale || options.languageMode || 'zh-Hans');
+    this.languageMode = this.locale === 'zh-Hans' ? 'zh' : this.locale;
     this.onBridgeEvent = typeof options.onBridgeEvent === 'function' ? options.onBridgeEvent : null;
   }
 
@@ -174,10 +176,12 @@ export class AntigravityHudManager {
   }
 
   setLanguage(mode) {
-    const next = mode === 'en' ? 'en' : 'zh';
+    const resolved = normalizeHudLocale(mode);
+    const next = resolved === 'zh-Hans' ? 'zh' : resolved;
+    this.locale = resolved;
     this.languageMode = next;
     for (const instance of this.instances.values()) {
-      instance.setLanguage(next);
+      instance.setLanguage(resolved);
     }
   }
 
@@ -244,7 +248,7 @@ export class AntigravityHudManager {
       let instance = this.instances.get(slotId);
       if (!instance) {
         instance = new InstanceCtor(slotId, { paneSlotId: slotId, isPrimaryPane: index === 0 && !isSubpane,
-          isSubpane, languageMode: this.languageMode, onBridgeEvent: this.onBridgeEvent,
+          isSubpane, locale: this.locale, languageMode: this.languageMode, onBridgeEvent: this.onBridgeEvent,
           allocateRevision: () => this.allocateSessionRevision() });
         this.instances.set(slotId, instance); instance.mount(composer);
       } else instance.reconcile(composer);
@@ -411,7 +415,7 @@ export class AntigravityHudManager {
         buttons.forEach((btn) => {
           if (matchedModel) return;
           const t = (btn.textContent || '').replace(/\s+/g, ' ').trim();
-          if (/\b(?:Gemini|Claude|GPT|o1|o3|o4)\b/i.test(t)) {
+          if (/\b(?:Orchestrator|Gemini|Claude|GPT|o1|o3|o4)\b/i.test(t)) {
             matchedModel = t;
           }
         });
@@ -793,15 +797,17 @@ export class AntigravityHudManager {
   const boot = globalThis.__GRAVITYBOX_BOOT__;
   if (boot !== undefined && !globalThis.__GRAVITYBOX_ENGINE_V1__) return;
   const initialEnabled = boot?.hudEnabled !== false;
+  const initialLang = normalizeHudLocale(boot?.locale || globalThis.__GRAVITYBOX_ENGINE_V1__?.getLanguageMode?.() || 'zh-Hans');
   if (globalThis.__GRAVITYBOX_HUD_V1__?.active) {
+    globalThis.__GRAVITYBOX_HUD_V1__.setLanguage?.(initialLang);
     globalThis.__GRAVITYBOX_HUD_V1__.setEnabled?.(initialEnabled);
     globalThis.__GRAVITYBOX_HUD_V1__.reconcileMounts();
     return;
   }
   if (!document.body && boot === undefined) return;
-  const initialLang = globalThis.__GRAVITYBOX_ENGINE_V1__?.getLanguageMode?.() || 'zh';
   const manager = new AntigravityHudManager({
-    languageMode: initialLang,
+    locale: initialLang,
+    languageMode: initialLang === 'zh-Hans' ? 'zh' : initialLang,
     enabled: initialEnabled,
   });
   manager.start();

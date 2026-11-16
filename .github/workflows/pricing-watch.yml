@@ -1,0 +1,95 @@
+name: Pricing Watch
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: true
+  TZ: UTC
+
+permissions:
+  contents: read
+
+jobs:
+  pricing-audit:
+    name: Model Catalog & Pricing Feed Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build TypeScript & Runtime
+        run: npm run build
+
+      - name: Verify Catalog & Public Pricing Feed Parity
+        run: node tools/sync-pricing-feed.mjs
+
+      - name: Run Pricing Interval & Tier Regression Tests
+        run: |
+          node --test \
+            test/pricing-contracts.test.mjs \
+            test/pricing-intervals.test.mjs \
+            test/pricing-tiers-and-merge.test.mjs
+
+      - name: Audit Expiring Promotional Intervals & Source Reachability
+        shell: bash
+        run: |
+          node --input-type=module -e '
+            import { readFile } from "node:fs/promises";
+            const catalog = JSON.parse(await readFile("assets/model-catalog.json", "utf8"));
+            const nowMs = Date.now();
+            const warnHorizonMs = 14 * 24 * 60 * 60 * 1000;
+            const expiring = [];
+            const sources = new Set();
+
+            for (const [key, entry] of Object.entries(catalog.prices ?? {})) {
+              const items = Array.isArray(entry) ? entry : [entry, ...(entry.intervals ?? [])];
+              for (const item of items) {
+                const url = item?.provenance?.sourceUrl;
+                if (typeof url === "string" && url.startsWith("https://")) sources.add(url);
+                const validUntil = item?.validUntil ?? item?.provenance?.validUntil;
+                if (!validUntil) continue;
+                const untilMs = Date.parse(validUntil);
+                if (!Number.isFinite(untilMs)) continue;
+                const hasSuccessor = Array.isArray(entry?.intervals) && entry.intervals.some(iv => {
+                  const fromMs = iv?.validFrom ? Date.parse(iv.validFrom) : NaN;
+                  return Number.isFinite(fromMs) && fromMs >= untilMs - 1000 && !iv.validUntil;
+                });
+                if (!hasSuccessor && untilMs - nowMs <= warnHorizonMs) {
+                  expiring.push({ key, validUntil });
+                }
+              }
+            }
+
+            for (const item of expiring) {
+              console.log(`::warning file=assets/model-catalog.json::Model ${item.key} has validUntil=${item.validUntil} without an open-ended successor interval.`);
+            }
+
+            for (const url of sources) {
+              try {
+                const res = await fetch(url, {
+                  method: "HEAD",
+                  redirect: "follow",
+                  signal: AbortSignal.timeout(8000),
+                });
+                console.log(`[source-probe] ${res.status} ${url}`);
+              } catch (err) {
+                console.log(`::notice::Upstream source probe skipped/unreachable for ${url}: ${err?.message ?? err}`);
+              }
+            }
+            console.log(`Audited ${Object.keys(catalog.prices ?? {}).length} priced models across ${sources.size} official pricing URLs.`);
+          '

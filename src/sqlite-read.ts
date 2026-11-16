@@ -1,6 +1,7 @@
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import type { HudWorkerScanRequest, HudWorkerScanResult } from './sqlite-worker.js';
+import { bt, getActiveLocale } from './i18n.js';
 
 const MAX_IDLE_WORKERS = 8;
 const IDLE_WORKER_TTL_MS = 35_000;
@@ -13,12 +14,12 @@ function acquirePooledWorker(path: string): Worker {
     if (entry.worker.threadId < 0) continue;
     entry.worker.ref();
     if (path.length > 0) {
-      entry.worker.postMessage({ id: 'open', open: path });
+      entry.worker.postMessage({ id: 'open', open: path, locale: getActiveLocale() });
     }
     return entry.worker;
   }
   return new Worker(new URL('./sqlite-worker.js', import.meta.url), {
-    workerData: { path },
+    workerData: { path, locale: getActiveLocale() },
     execArgv: ['--disable-warning=ExperimentalWarning'],
     resourceLimits: { maxOldGenerationSizeMb: 128 },
   });
@@ -68,7 +69,7 @@ export class SqliteReadSnapshot {
     this.onExit = () => {
       this.ended = true;
       this.tainted = true;
-      this.fail(this.failure || 'SQLite 读取连接已关闭');
+      this.fail(this.failure || bt('sqlite.err.connection_closed'));
       this.closeWaiter?.resolve();
     };
     this.onError = (error: Error) => {
@@ -96,7 +97,7 @@ export class SqliteReadSnapshot {
   }
   private abort = () => {
     this.tainted = true;
-    this.fail(String(this.signal?.reason?.message ?? '读取已取消'));
+    this.fail(String(this.signal?.reason?.message ?? bt('sqlite.err.read_cancelled')));
     void this.worker.terminate();
   };
   private fail(message: string) {
@@ -116,20 +117,20 @@ export class SqliteReadSnapshot {
     return this.request({projection:{table,column,idx}});
   }
   private async request(payload: object): Promise<{ok:boolean;rows:any[];error?:string}> {
-    if(this.signal?.aborted)return{ok:false,rows:[],error:String(this.signal.reason?.message??'读取已取消')};
-    if(this.ended||this.failure)return{ok:false,rows:[],error:this.failure||'SQLite 读取连接已关闭'};
-    if(this.pending)return{ok:false,rows:[],error:'同一只读快照不能并发查询'};
+    if(this.signal?.aborted)return{ok:false,rows:[],error:String(this.signal.reason?.message??bt('sqlite.err.read_cancelled'))};
+    if(this.ended||this.failure)return{ok:false,rows:[],error:this.failure||bt('sqlite.err.connection_closed')};
+    if(this.pending)return{ok:false,rows:[],error:bt('sqlite.err.concurrent_query')};
     const id=randomUUID();
     return new Promise(resolve=>{
-      const timer=setTimeout(()=>{this.tainted=true;this.fail('数据库读取超出单批预算');void this.worker.terminate();},8000);
-      this.pending={id,resolve,timer};this.worker.postMessage({id,...payload});
+      const timer=setTimeout(()=>{this.tainted=true;this.fail(bt('sqlite.err.batch_budget'));void this.worker.terminate();},8000);
+      this.pending={id,resolve,timer};this.worker.postMessage({id,locale:getActiveLocale(),...payload});
     });
   }
   async close() {
     this.signal?.removeEventListener('abort', this.abort);
     if (this.pending) {
       this.tainted = true;
-      this.fail('SQLite 读取连接已关闭');
+      this.fail(bt('sqlite.err.connection_closed'));
     }
     if (!this.ended && !this.tainted) {
       const closeId = `close-${randomUUID()}`;
@@ -183,7 +184,7 @@ export async function runHudDbScanInWorker(
       if (msg.ok && msg.hudResult) {
         resolve(msg.hudResult as HudWorkerScanResult);
       } else {
-        reject(new Error(msg.error || 'HUD 数据库读取失败'));
+        reject(new Error(msg.error || bt('sqlite.err.hud_read_failed')));
       }
     };
     const onError = (err: Error) => {
@@ -197,19 +198,19 @@ export async function runHudDbScanInWorker(
       if (settled) return;
       settled = true;
       cleanup();
-      reject(new Error('HUD 数据库读取工作线程异常退出'));
+      reject(new Error(bt('sqlite.err.hud_worker_crashed')));
     };
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       cleanup();
       void worker.terminate();
-      reject(new Error('HUD 数据库读取超出单次时间预算'));
+      reject(new Error(bt('sqlite.err.hud_timeout_budget')));
     }, timeoutMs);
 
     worker.on('message', onMessage);
     worker.once('error', onError);
     worker.once('exit', onExit);
-    worker.postMessage({ id, hudScan });
+    worker.postMessage({ id, hudScan, locale: getActiveLocale() });
   });
 }

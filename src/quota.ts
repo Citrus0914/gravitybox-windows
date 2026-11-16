@@ -12,12 +12,15 @@
  * - carryover 按语义 family+window 匹配，fresh 覆盖；旧值单独带 observedAt/stale，不冒充新采样。
  */
 
+import { bt } from './i18n.js';
+
 export type WindowKind = '5h' | 'weekly' | 'unspecified';
 export type Family = 'gemini' | 'claude' | 'argon' | 'carbon' | 'other';
 export type QuotaSource = 'cloud' | 'live' | 'carried';
 export type Availability = 'available' | 'disabled' | 'unknown';
 export type QuotaState = 'known' | 'not_reported' | 'stale';
 export type ArgonPeriod = '5h' | 'weekly' | 'unspecified' | null;
+export type StandaloneMode = 'unified' | 'standalone' | 'disabled' | 'unknown';
 
 export interface WindowStatus {
   remaining: number | null;
@@ -44,6 +47,8 @@ export interface ArgonStatus {
   message: string;
   observedAt: number | null;
   source?: QuotaSource;
+  mode?: StandaloneMode;
+  pooledInFamily?: 'gemini' | 'claude' | null;
 }
 
 export interface StandaloneModelStatus extends ArgonStatus {
@@ -101,6 +106,7 @@ export interface NormalizedModel {
   effective_known: boolean;
   reset_time: string;
   quota_bucket_id?: string;
+  quota_bucket_name?: string | null;
   reset_countdown?: string;
   quota_source: QuotaSource;
   stale: boolean;
@@ -178,7 +184,7 @@ export function classifyFamily(input: {
       return 'other';
     }
   }
-  if (/claude|gpt|openai|anthropic|3p\b/.test(text)) return 'claude';
+  if (/claude|gpt|openai|anthropic|3p\b|\bo[134](?:-(?:mini|pro|preview))?\b/.test(text)) return 'claude';
   if (/gemini|google/.test(text)) return 'gemini';
   return 'other';
 }
@@ -200,15 +206,15 @@ export function formatCountdown(
   if (!normalized) return options?.preserveUnparsed ? String(resetTime) : '';
   const tsMs = Date.parse(normalized);
   const diffMs = tsMs - nowMs;
-  if (diffMs <= 0) return '重置时间已过';
-  if (diffMs <= 60000) return '即将重置';
+  if (diffMs <= 0) return bt('quota.countdown.passed');
+  if (diffMs <= 60000) return bt('quota.countdown.soon');
   const totalMin = Math.floor(diffMs / 60000);
   const days = Math.floor(totalMin / (24 * 60));
   const hours = Math.floor((totalMin % (24 * 60)) / 60);
   const mins = totalMin % 60;
-  if (days > 0) return `${days}天 ${hours}小时后重置`;
-  if (hours > 0) return `${hours}小时 ${mins}分后重置`;
-  return `${mins}分钟后重置`;
+  if (days > 0) return bt('quota.countdown.days_hours', { days, hours });
+  if (hours > 0) return bt('quota.countdown.hours_mins', { hours, mins });
+  return bt('quota.countdown.mins', { mins });
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +251,8 @@ export function normalizeCloudModels(payload: any, observedAt: number): Normaliz
     const alias = info.modelOrAlias?.model ?? info.model_or_alias ?? metadata.model ?? info.model;
     const modelOrAlias = typeof alias === 'string' ? alias : null;
     const modelProvider = info.modelProvider ?? metadata.modelProvider ?? '';
+    const rawBucketName = info.quotaBucketName ?? info.quota_bucket_name ?? metadata.quotaBucketName ?? metadata.quota_bucket_name;
+    const quotaBucketName = typeof rawBucketName === 'string' && rawBucketName.trim() ? rawBucketName.trim() : null;
     const quotaInfo = info.quotaInfo ?? info.quota_info ?? {};
     const fraction = normalizeFraction(quotaInfo?.remainingFraction ?? quotaInfo?.remaining_fraction);
     const family = classifyFamily({ modelId: id, displayName, modelProvider, modelOrAlias });
@@ -258,6 +266,7 @@ export function normalizeCloudModels(payload: any, observedAt: number): Normaliz
       is_carbon: family === 'carbon',
       disabled,
       model_or_alias: modelOrAlias,
+      ...(quotaBucketName ? { quota_bucket_name: quotaBucketName } : {}),
       own_percentage: fraction === null ? null : Math.round(fraction * 100),
       own_percentage_known: fraction !== null,
       own_reset_time: normalizeResetTime(quotaInfo?.resetTime ?? quotaInfo?.reset_time),
@@ -293,6 +302,8 @@ export function normalizeLiveModels(clientConfigs: any, observedAt: number): Nor
     if (!id) continue;
     const displayName = typeof (cfg.label ?? cfg.displayName) === 'string' ? String(cfg.label ?? cfg.displayName) : null;
     const modelOrAlias = typeof cfg.modelOrAlias?.model === 'string' ? cfg.modelOrAlias.model : null;
+    const rawBucketName = cfg.quotaBucketName ?? cfg.quota_bucket_name;
+    const quotaBucketName = typeof rawBucketName === 'string' && rawBucketName.trim() ? rawBucketName.trim() : null;
     const quotaInfo = cfg.quotaInfo ?? {};
     const fraction = normalizeFraction(quotaInfo?.remainingFraction ?? quotaInfo?.remaining_fraction);
     const family = classifyFamily({ modelId: id, displayName, modelOrAlias });
@@ -306,6 +317,7 @@ export function normalizeLiveModels(clientConfigs: any, observedAt: number): Nor
       is_carbon: family === 'carbon',
       disabled,
       model_or_alias: modelOrAlias,
+      ...(quotaBucketName ? { quota_bucket_name: quotaBucketName } : {}),
       own_percentage: fraction === null ? null : Math.round(fraction * 100),
       own_percentage_known: fraction !== null,
       own_reset_time: normalizeResetTime(quotaInfo?.resetTime ?? quotaInfo?.reset_time),
@@ -322,9 +334,11 @@ export function normalizeLiveModels(clientConfigs: any, observedAt: number): Nor
       stale: false,
       supports_images: cfg.supportsImages ?? cfg.supports_images,
       supports_thinking: cfg.supportsThinking ?? cfg.supports_thinking,
-      thinking_budget: numOrNull(cfg.thinkingBudget) ?? undefined,
+      thinking_budget: numOrNull(cfg.thinkingBudget ?? cfg.thinking_budget) ?? undefined,
       recommended: cfg.isRecommended === true || cfg.recommended === true,
-      supported_mime_types: cfg.supportedMimeTypes,
+      max_tokens: numOrNull(cfg.maxTokens ?? cfg.max_tokens) ?? undefined,
+      max_output_tokens: numOrNull(cfg.maxOutputTokens ?? cfg.max_output_tokens) ?? undefined,
+      supported_mime_types: cfg.supportedMimeTypes ?? cfg.supported_mime_types,
     });
   }
   return models;
@@ -519,6 +533,9 @@ export function mergeModelCatalogues(catalogues: NormalizedModel[][]): Normalize
       if (!merged.display_name && model.display_name) merged.display_name = model.display_name;
       if (merged.disabled === null && model.disabled !== null) merged.disabled = model.disabled;
       if (!merged.model_or_alias && model.model_or_alias) merged.model_or_alias = model.model_or_alias;
+      if (!merged.quota_bucket_name && model.quota_bucket_name) merged.quota_bucket_name = model.quota_bucket_name;
+      if (merged.max_tokens === undefined && model.max_tokens !== undefined) merged.max_tokens = model.max_tokens;
+      if (merged.max_output_tokens === undefined && model.max_output_tokens !== undefined) merged.max_output_tokens = model.max_output_tokens;
       if (!merged.own_percentage_known && model.own_percentage_known) {
         merged.own_percentage = model.own_percentage;
         merged.own_percentage_known = true;
@@ -745,49 +762,313 @@ function buildStandaloneFamilyStatus(
   const { shortLabel, fullLabel } = options;
   let message: string;
   if (availability === 'disabled') {
-    message = `当前账号无 ${fullLabel} 权限（不可用）`;
+    message = bt('quota.standalone.no_permission', { fullLabel });
   } else if (availability === 'unknown') {
-    message = familyModels.length ? `${shortLabel} 模型已列出，但接口未明确返回可用状态（不代表无权限）`
-      : `本轮接口未返回 ${shortLabel} 模型记录，无法判断 ${shortLabel} 权限或额度（不代表无权限）`;
+    message = familyModels.length ? bt('quota.standalone.listed_unknown', { shortLabel })
+      : bt('quota.standalone.not_reported', { shortLabel });
   } else if (quotaState === 'known') {
+    const pct = Math.round((remaining ?? 0) * 100);
     message = period === 'weekly'
-      ? `${shortLabel} 每周配额已取得（剩余 ${Math.round((remaining ?? 0) * 100)}%）`
+      ? bt('quota.standalone.weekly_known', { shortLabel, pct })
       : period === '5h'
-        ? `${shortLabel} 5 小时配额已取得（剩余 ${Math.round((remaining ?? 0) * 100)}%）`
-        : `${shortLabel} 模型记录存在，已取得未标明窗口的额度（剩余 ${Math.round((remaining ?? 0) * 100)}%）`;
+        ? bt('quota.standalone.5h_known', { shortLabel, pct })
+        : bt('quota.standalone.unspecified_known', { shortLabel, pct });
   } else if (quotaState === 'stale') {
-    message = `${shortLabel} 配额本轮未返回，当前展示上次真实采样（已标陈旧）`;
+    message = bt('quota.standalone.stale', { shortLabel });
   } else {
-    message = `存在 ${shortLabel} 模型记录，但本轮未返回可用配额数值`;
+    message = bt('quota.standalone.no_value', { shortLabel });
   }
-  return { availability, quotaState, period, remaining, resetCountdown, message, observedAt, source };
+  return { availability, quotaState, period, remaining, resetCountdown, message, observedAt, source, mode: availability === 'disabled' ? 'disabled' : availability === 'unknown' ? 'unknown' : 'standalone', pooledInFamily: null };
+}
+
+interface PoolCandidate {
+  family: 'gemini' | 'claude';
+  period: ArgonPeriod;
+  status: WindowStatus;
+}
+
+function collectCorePoolCandidates(
+  familyWindows: FamilyWindows,
+  groups: NormalizedGroup[],
+): PoolCandidate[] {
+  const candidates: PoolCandidate[] = [];
+  for (const family of ['gemini', 'claude'] as const) {
+    const fw = familyWindows[family];
+    if (fw.fiveHour?.known && fw.fiveHour.remaining !== null) {
+      candidates.push({ family, period: '5h', status: fw.fiveHour });
+    }
+    if (fw.weekly?.known && fw.weekly.remaining !== null) {
+      candidates.push({ family, period: 'weekly', status: fw.weekly });
+    }
+    for (const group of groups) {
+      if (group.family !== family) continue;
+      for (const bucket of group.buckets) {
+        if (bucket.window !== 'unspecified' || !bucket.remaining_fraction_known || bucket.remaining_fraction === null) continue;
+        candidates.push({
+          family,
+          period: 'unspecified',
+          status: {
+            remaining: bucket.remaining_fraction,
+            known: true,
+            stale: bucket.stale,
+            resetTime: bucket.reset_time,
+            observedAt: bucket.observed_at,
+            source: bucket.source,
+          },
+        });
+      }
+    }
+  }
+  return candidates;
+}
+
+function matchPoolByBucketName(
+  quotaBucketName: string | null | undefined,
+  groups: NormalizedGroup[],
+): 'gemini' | 'claude' | null {
+  if (!quotaBucketName) return null;
+  const norm = quotaBucketName.trim().toLowerCase();
+  if (!norm) return null;
+  for (const group of groups) {
+    if (group.family !== 'gemini' && group.family !== 'claude') continue;
+    if (group.display_name.toLowerCase() === norm) return group.family;
+    if (group.buckets.some(b => b.bucket_id.toLowerCase() === norm || (b.display_name ?? '').toLowerCase() === norm)) {
+      return group.family;
+    }
+  }
+  if (/argon|carbon/i.test(norm)) return null;
+  if (/claude|anthropic|openai|gpt|3p\b|\bo[134](?:-(?:mini|pro|preview))?\b/i.test(norm)) return 'claude';
+  if (/gemini|google/i.test(norm)) return 'gemini';
+  return null;
+}
+
+function resetTimesMatch(left: string | null, right: string | null, allowMissingOnUltra: boolean): boolean {
+  if (!left && !right) return true;
+  if (!left || !right) return allowMissingOnUltra;
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  if (Number.isNaN(leftMs) || Number.isNaN(rightMs)) return left === right;
+  return Math.abs(leftMs - rightMs) <= 60_000;
+}
+
+function isGeminiBrandModel(model: NormalizedModel): boolean {
+  if (model.family === 'argon' || model.family === 'carbon' || model.family === 'gemini') return true;
+  const text = `${model.model_id} ${model.name} ${model.display_name ?? ''} ${model.model_or_alias ?? ''}`.toLowerCase();
+  return /\bgemini\b|\bargon\b|\bcarbon\b|\borchestrator\b/.test(text);
+}
+
+function pickBestGeminiPoolCandidate(candidates: PoolCandidate[], fallbackModel: NormalizedModel): PoolCandidate {
+  const geminiCandidates = candidates.filter(c => c.family === 'gemini');
+  const fresh = geminiCandidates.find(c => c.status.known && !c.status.stale);
+  if (fresh) return fresh;
+  if (geminiCandidates.length > 0) return geminiCandidates[0]!;
+  return {
+    family: 'gemini',
+    period: 'unspecified',
+    status: {
+      remaining: fallbackModel.own_percentage !== null ? fallbackModel.own_percentage / 100 : null,
+      known: fallbackModel.own_percentage_known,
+      stale: fallbackModel.own_stale,
+      resetTime: fallbackModel.own_reset_time,
+      observedAt: fallbackModel.own_observed_at,
+      source: fallbackModel.quota_source,
+    },
+  };
+}
+
+export function matchModelToSharedPool(
+  model: NormalizedModel,
+  familyWindows: FamilyWindows,
+  groups: NormalizedGroup[] = [],
+  subscriptionTier?: string | null,
+  allModels: NormalizedModel[] = [],
+): PoolCandidate | null {
+  if (model.disabled === true) return null;
+  if (model.family === 'argon' || model.family === 'carbon') {
+    const familyWindowPair = familyWindows[model.family];
+    const hasDedicatedGroup = groups.some(g => g.family === model.family)
+      || Boolean(familyWindowPair?.fiveHour || familyWindowPair?.weekly);
+    if (hasDedicatedGroup) return null;
+  }
+
+  const isUltra = typeof subscriptionTier === 'string' && /\bultra\b/i.test(subscriptionTier);
+  const candidates = collectCorePoolCandidates(familyWindows, groups);
+  const hasGeminiGroup = groups.some(g => g.family === 'gemini') || candidates.some(c => c.family === 'gemini');
+
+  const rawBucketName = typeof model.quota_bucket_name === 'string' ? model.quota_bucket_name.trim() : '';
+  if (rawBucketName) {
+    const bucketFamily = matchPoolByBucketName(rawBucketName, groups);
+    if (!bucketFamily) return null;
+    const familyCandidates = candidates.filter(c => c.family === bucketFamily);
+    if (familyCandidates.length > 0) {
+      const exact = model.own_percentage_known && model.own_percentage !== null
+        ? familyCandidates.find(c =>
+            Math.abs(Math.round(c.status.remaining! * 100) - Math.round(model.own_percentage!)) <= 1
+            && resetTimesMatch(c.status.resetTime, model.own_reset_time, true))
+        : null;
+      return exact ?? familyCandidates.find(c => c.status.known && !c.status.stale) ?? familyCandidates[0]!;
+    }
+    if (isUltra && hasGeminiGroup && bucketFamily === 'gemini') {
+      return pickBestGeminiPoolCandidate(candidates, model);
+    }
+    return null;
+  }
+
+  const geminiBrand = isGeminiBrandModel(model);
+  const allowedCandidates = geminiBrand ? candidates.filter(c => c.family === 'gemini') : candidates;
+
+  if (model.own_percentage_known && model.own_percentage !== null) {
+    const modelPct = Math.round(model.own_percentage);
+    const matched = allowedCandidates.find(c => {
+      const candPct = Math.round(c.status.remaining! * 100);
+      if (Math.abs(candPct - modelPct) > 1) return false;
+      if (resetTimesMatch(c.status.resetTime, model.own_reset_time, isUltra)) return true;
+      if (isUltra && (model.family === 'argon' || model.family === 'carbon')
+        && modelPct === 100 && candPct === 100
+        && c.status.resetTime && model.own_reset_time) {
+        const leftMs = Date.parse(c.status.resetTime);
+        const rightMs = Date.parse(model.own_reset_time);
+        return !Number.isNaN(leftMs) && !Number.isNaN(rightMs) && Math.abs(leftMs - rightMs) <= 15 * 60_000;
+      }
+      return false;
+    });
+    if (matched) return matched;
+  }
+
+  const coSampledCoreGeminiPeers = (hasGeminiGroup && geminiBrand)
+    ? allModels.filter(peer =>
+        peer.family === 'gemini'
+        && peer.disabled !== true
+        && !peer.stale
+        && peer.quota_source === model.quota_source
+        && peer.own_percentage_known
+        && peer.own_percentage !== null
+        && (peer.own_observed_at === null || model.own_observed_at === null || Math.abs(peer.own_observed_at - model.own_observed_at) <= 60))
+    : [];
+
+  if (hasGeminiGroup && geminiBrand && model.own_percentage_known && model.own_percentage !== null && coSampledCoreGeminiPeers.length > 0) {
+    const modelPct = Math.round(model.own_percentage);
+    const matchesPeer = coSampledCoreGeminiPeers.some(peer =>
+      Math.abs(Math.round(peer.own_percentage!) - modelPct) <= 1
+      && resetTimesMatch(peer.own_reset_time, model.own_reset_time, isUltra));
+    if (matchesPeer) {
+      return pickBestGeminiPoolCandidate(allowedCandidates, model);
+    }
+  }
+
+  if (isUltra && hasGeminiGroup && (model.family === 'argon' || model.family === 'carbon')) {
+    if (!model.own_percentage_known || model.own_percentage === null || coSampledCoreGeminiPeers.length === 0) {
+      return pickBestGeminiPoolCandidate(allowedCandidates, model);
+    }
+  }
+
+  return null;
+}
+
+export function resolveStandaloneFamilyStatus(
+  family: 'argon' | 'carbon',
+  models: NormalizedModel[],
+  groups: NormalizedGroup[],
+  familyWindows: FamilyWindows,
+  nowMs: number,
+  options: { shortLabel: string; fullLabel: string; subscriptionTier?: string | null },
+): ArgonStatus {
+  const familyModels = models.filter(model =>
+    family === 'argon' ? (model.is_argon || model.family === 'argon') : (model.is_carbon || model.family === 'carbon'));
+  const familyWindowPair = family === 'argon' ? familyWindows.argon : (familyWindows.carbon ?? { fiveHour: null, weekly: null });
+  const hasDedicatedGroup = groups.some(g => g.family === family)
+    || Boolean(familyWindowPair.fiveHour || familyWindowPair.weekly);
+
+  if (hasDedicatedGroup) {
+    const status = buildStandaloneFamilyStatus(familyModels, familyWindowPair, nowMs, {
+      shortLabel: options.shortLabel,
+      fullLabel: options.fullLabel,
+    });
+    return { ...status, mode: 'standalone', pooledInFamily: null };
+  }
+
+  const nonStaleModels = familyModels.filter(m => !m.stale);
+  if (nonStaleModels.length > 0 && nonStaleModels.every(m => m.disabled === true)) {
+    const status = buildStandaloneFamilyStatus(familyModels, familyWindowPair, nowMs, {
+      shortLabel: options.shortLabel,
+      fullLabel: options.fullLabel,
+      inferredDisabled: true,
+    });
+    return { ...status, mode: 'disabled', pooledInFamily: null };
+  }
+
+  const enabledModels = nonStaleModels.filter(m => m.disabled !== true);
+  if (enabledModels.length > 0) {
+    const poolMatches = enabledModels.map(m => matchModelToSharedPool(m, familyWindows, groups, options.subscriptionTier, models));
+    if (poolMatches.every((match): match is PoolCandidate => match !== null)) {
+      const targetFamily = poolMatches[0]!.family;
+      const sameFamilyMatches = poolMatches.filter(m => m.family === targetFamily);
+      const chosen = sameFamilyMatches.find(m => m.status.known && !m.status.stale) ?? sameFamilyMatches[0]!;
+      const resetCountdown = chosen.status.resetTime ? formatCountdown(chosen.status.resetTime, nowMs) : '';
+      const quotaState: QuotaState = chosen.status.known && chosen.status.remaining !== null
+        ? (chosen.status.stale ? 'stale' : 'known')
+        : (chosen.status.stale ? 'stale' : 'not_reported');
+      const pct = Math.round((chosen.status.remaining ?? 0) * 100);
+      const message = quotaState === 'known'
+        ? (chosen.period === 'weekly'
+          ? bt('quota.standalone.weekly_known', { shortLabel: options.shortLabel, pct })
+          : chosen.period === '5h'
+            ? bt('quota.standalone.5h_known', { shortLabel: options.shortLabel, pct })
+            : bt('quota.standalone.unspecified_known', { shortLabel: options.shortLabel, pct }))
+        : bt('quota.standalone.no_value', { shortLabel: options.shortLabel });
+      return {
+        availability: 'available',
+        quotaState,
+        period: chosen.period,
+        remaining: chosen.status.remaining,
+        resetCountdown,
+        message,
+        observedAt: chosen.status.observedAt,
+        source: chosen.status.source,
+        mode: 'unified',
+        pooledInFamily: targetFamily,
+      };
+    }
+  }
+
+  const status = buildStandaloneFamilyStatus(familyModels, familyWindowPair, nowMs, {
+    shortLabel: options.shortLabel,
+    fullLabel: options.fullLabel,
+  });
+  const mode: StandaloneMode = status.availability === 'disabled'
+    ? 'disabled'
+    : (status.availability === 'available' || status.quotaState === 'stale')
+      ? 'standalone'
+      : 'unknown';
+  return { ...status, mode, pooledInFamily: null };
 }
 
 export function buildArgonStatus(
   models: NormalizedModel[],
-  _groups: NormalizedGroup[],
+  groups: NormalizedGroup[],
   familyWindows: FamilyWindows,
   nowMs: number,
+  subscriptionTier?: string | null,
 ): ArgonStatus {
-  const argonModels = models.filter(model => model.is_argon || model.family === 'argon');
-  return buildStandaloneFamilyStatus(argonModels, familyWindows.argon, nowMs, {
+  return resolveStandaloneFamilyStatus('argon', models, groups, familyWindows, nowMs, {
     shortLabel: 'Argon',
     fullLabel: 'Gemini 4 Argon',
+    subscriptionTier,
   });
 }
 
 export function buildCarbonStatus(
   models: NormalizedModel[],
-  _groups: NormalizedGroup[],
+  groups: NormalizedGroup[],
   familyWindows: FamilyWindows,
   nowMs: number,
   _argonStatus?: ArgonStatus,
-  _subscriptionTier?: string | null,
+  subscriptionTier?: string | null,
 ): ArgonStatus {
-  const carbonModels = models.filter(model => model.is_carbon || model.family === 'carbon');
-  return buildStandaloneFamilyStatus(carbonModels, familyWindows.carbon ?? { fiveHour: null, weekly: null }, nowMs, {
+  return resolveStandaloneFamilyStatus('carbon', models, groups, familyWindows, nowMs, {
     shortLabel: 'Carbon',
     fullLabel: 'Gemini 4 Carbon',
+    subscriptionTier,
   });
 }
 
@@ -804,8 +1085,8 @@ function autoPrettyModelTitle(rawIdOrName: string): string {
 
 /**
  * 构建所有独立配额模型列表：
- * - 固定包含 Gemini 4 Argon 与 Gemini 4 Carbon
- * - 自动检测接口新返回的独立配额分组（family === 'other'）或新上线的 Gemini 4+ 独立模型并同步纳入展示
+ * - 仅在拥有独立配额分组或独立有效配额时纳入 Argon / Carbon（统一归入共享池或明确无权限时不生成冗余行）
+ * - 自动检测接口新返回的独立配额分组（family === 'other'）或新上线的独立模型并同步纳入展示
  */
 export function buildStandaloneModels(
   models: NormalizedModel[],
@@ -816,13 +1097,16 @@ export function buildStandaloneModels(
   carbonStatus?: ArgonStatus,
   subscriptionTier?: string | null,
 ): StandaloneModelStatus[] {
-  const resolvedArgon = argonStatus ?? buildArgonStatus(models, groups, familyWindows, nowMs);
+  const resolvedArgon = argonStatus ?? buildArgonStatus(models, groups, familyWindows, nowMs, subscriptionTier);
   const resolvedCarbon = carbonStatus ?? buildCarbonStatus(models, groups, familyWindows, nowMs, resolvedArgon, subscriptionTier);
 
-  const list: StandaloneModelStatus[] = [
-    { key: 'argon', displayName: 'Gemini 4 Argon', ...resolvedArgon },
-    { key: 'carbon', displayName: 'Gemini 4 Carbon', ...resolvedCarbon },
-  ];
+  const list: StandaloneModelStatus[] = [];
+  if (resolvedArgon.mode === 'standalone') {
+    list.push({ key: 'argon', displayName: 'Gemini 4 Argon', ...resolvedArgon });
+  }
+  if (resolvedCarbon.mode === 'standalone') {
+    list.push({ key: 'carbon', displayName: 'Gemini 4 Carbon', ...resolvedCarbon });
+  }
   const seenKeys = new Set<string>(['argon', 'carbon', 'gemini-4-argon', 'gemini-4-carbon']);
 
   // 1. 自动发现 family === 'other' 的新配额分组
@@ -840,6 +1124,7 @@ export function buildStandaloneModels(
       ((m.display_name || '').toLowerCase().includes(rawName.toLowerCase()) ||
         m.model_id.toLowerCase().includes(normKey))
     );
+    if (matchingModels.length > 0 && matchingModels.every(m => m.disabled === true)) continue;
     const displayName = autoPrettyModelTitle(rawName);
     const status = buildStandaloneFamilyStatus(matchingModels, groupWindows, nowMs, {
       shortLabel: displayName,
@@ -849,21 +1134,9 @@ export function buildStandaloneModels(
   }
 
   // 2. 自动发现 family === 'other' 的新上线独立模型（如未来的 Gemini 4 新代号模型或其它独立计费模型）
-  const sharedPools = [
-    familyWindows.gemini.fiveHour,
-    familyWindows.gemini.weekly,
-    familyWindows.claude.fiveHour,
-    familyWindows.claude.weekly,
-  ].filter((w): w is WindowStatus => Boolean(w && w.known && w.remaining !== null && w.resetTime));
-  const matchesSharedPool = (model: NormalizedModel): boolean => {
-    if (!model.own_percentage_known || model.own_percentage === null || !model.own_reset_time) return false;
-    return sharedPools.some(w =>
-      Math.abs(Math.round(w.remaining! * 100) - Math.round(model.own_percentage!)) <= 1
-      && w.resetTime === model.own_reset_time);
-  };
   const extraByBaseKey = new Map<string, { displayName: string; items: NormalizedModel[] }>();
   for (const model of models) {
-    if (model.family !== 'other') continue;
+    if (model.family !== 'other' || model.disabled === true) continue;
     const rawId = (model.model_id || model.name || '').trim();
     if (!rawId) continue;
     let baseKey = rawId.toLowerCase();
@@ -890,7 +1163,7 @@ export function buildStandaloneModels(
 
   for (const [baseKey, entry] of extraByBaseKey.entries()) {
     if (seenKeys.has(baseKey)) continue;
-    if (entry.items.length > 0 && entry.items.every(matchesSharedPool)) continue;
+    if (entry.items.length > 0 && entry.items.every(m => matchModelToSharedPool(m, familyWindows, groups, subscriptionTier, models) !== null)) continue;
     seenKeys.add(baseKey);
     const status = buildStandaloneFamilyStatus(
       entry.items,

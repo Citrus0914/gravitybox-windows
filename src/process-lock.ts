@@ -5,13 +5,14 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { bt } from './i18n.js';
 
 const context = new AsyncLocalStorage<Map<string, string>>();
 const active = new Map<string, string>();
 export type ProcessLease = { release(): Promise<void>; releaseSync(): void };
 
 /** Same-user exclusive lease. Only a provably dead owner may be reclaimed. */
-export async function acquireProcessLease(path: string, timeoutMs = 15000, busyMessage = '已有后台或账号写入操作正在进行，请稍后重试'): Promise<ProcessLease> {
+export async function acquireProcessLease(path: string, timeoutMs = 15000, busyMessage = bt('lock.busy')): Promise<ProcessLease> {
   const deadline = Date.now() + timeoutMs, nonce = randomUUID();
   while (true) {
     try {
@@ -27,7 +28,7 @@ export async function acquireProcessLease(path: string, timeoutMs = 15000, busyM
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       const info = await lstat(path).catch(() => null);
       if (!info) continue;
-      if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error('写入锁身份不匹配');
+      if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error(bt('lock.identity_mismatch'));
       const text = await readFile(path, 'utf8').catch(() => '');
       let pid = 0;
       try { pid = JSON.parse(text).pid; } catch {

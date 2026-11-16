@@ -257,8 +257,8 @@ test('Gemini 4 Hydrogen 归入基础 Gemini 共享池，不单独列为独立配
   const applied = applyFamilyWindows(models, windows);
   const standalones = buildStandaloneModels(applied, groups, windows, now);
   // hydrogen 归属 gemini；helium 因与 gemini 共享配额窗口也不单独列出；xenon 多档位收敛为一条
-  assert.deepEqual(standalones.map(item => item.key), ['argon', 'carbon', 'gemini-4-xenon']);
-  assert.equal(standalones[2].displayName, 'Gemini 4 Xenon');
+  assert.deepEqual(standalones.map(item => item.key), ['gemini-4-xenon']);
+  assert.equal(standalones[0].displayName, 'Gemini 4 Xenon');
 });
 
 async function withQuotaAccountFixture(fn) {

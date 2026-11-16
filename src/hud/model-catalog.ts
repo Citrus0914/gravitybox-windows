@@ -1,5 +1,7 @@
 import { normalizeModelId } from '../model-identity.js';
+import { getEffectiveModelPriceAlias, getRemoteModelSpec, MODEL_NAMES } from '../model-catalog.js';
 import { resolveDatabaseModelFullName } from '../usage-types.js';
+import { bt } from '../i18n.js';
 /**
  * Antigravity 模型有效上下文窗口阈值映射目录
  * 严格对齐 Antigravity 官方运行时与 assets/model-catalog.json 标准上下文阈值 (<=200K / 256K / 128K)
@@ -120,6 +122,15 @@ const DISPLAY_NAME_MAP: Record<string, string> = {
   'gpt-oss-120b': 'GPT-OSS 120B',
 };
 
+function formatCompactCapacity(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const m = tokens / 1_000_000;
+    return `${Number.isInteger(m) ? m : Number(m.toFixed(1))}M`;
+  }
+  const k = Math.round(tokens / 1_000);
+  return `${k}K`;
+}
+
 function autoFormatDynamicModelName(normalizedId: string): string | null {
   const geminiMatch = normalizedId.match(/^gemini-([4-9](?:\.\d+)?)-([a-z][a-z0-9]*?)(?:-(trial|preview|exp))?$/i);
   if (geminiMatch) {
@@ -130,13 +141,18 @@ function autoFormatDynamicModelName(normalizedId: string): string | null {
       : '';
     return `Gemini ${ver} ${code}${suffix}`;
   }
+  const claudeMatch = normalizedId.match(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)$/i);
+  if (claudeMatch) {
+    const tier = claudeMatch[1]!.charAt(0).toUpperCase() + claudeMatch[1]!.slice(1).toLowerCase();
+    return `Claude ${tier} ${claudeMatch[2]}.${claudeMatch[3]}`;
+  }
   return null;
 }
 
 /**
  * 归一化前端 DOM 探针或 SQLite gen_metadata 传入的模型字符串，解析对应的 Antigravity 有效上下文阈值与展示名称
  */
-export function resolveModelCapacity(rawModelInput?: string | null): ModelCapacitySpec {
+export function resolveModelCapacity(rawModelInput?: string | null, depth = 0): ModelCapacitySpec {
   const raw = typeof rawModelInput === 'string' ? rawModelInput.trim() : '';
   if (!raw) {
     return {
@@ -152,14 +168,20 @@ export function resolveModelCapacity(rawModelInput?: string | null): ModelCapaci
   const withoutApiPrefix = raw.replace(/^models\//i, '').trim();
   const cleanedRaw = (withoutApiPrefix || raw)
     .replace(/^[+\s·•]+|[⌃⌄^\s]+$/g, '')
-    .replace(/[（(]\s*(?:High|Medium|Low|Extra\s+Low|Thinking|高|中|低|思考)\s*[）)]/gi, '')
-    .replace(/\s+(?:High|Medium|Low|Extra\s+Low|Thinking)\b.*$/i, '')
+    .replace(/[（(]\s*(?:Extra\s+High|Extra\s+Low|XHigh|High|Medium|Low|Max|Thinking|高|中|低|思考)\s*[）)]/gi, '')
+    .replace(/\s+(?:Extra\s+High|Extra\s+Low|XHigh|High|Medium|Low|Max|Thinking)\b.*$/i, '')
     .trim();
 
-  if (/\borchestrator\b|^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M66[789]$/i.test(cleanedRaw)) {
-    const resolvedAlias = resolveDatabaseModelFullName(cleanedRaw, cleanedRaw);
-    if (resolvedAlias && resolvedAlias !== '未知模型' && resolvedAlias !== cleanedRaw) {
-      return resolveModelCapacity(resolvedAlias);
+  if (depth < 2) {
+    const directDynamicAlias = getEffectiveModelPriceAlias(cleanedRaw);
+    if (directDynamicAlias && directDynamicAlias.toLowerCase() !== cleanedRaw.toLowerCase()) {
+      return resolveModelCapacity(directDynamicAlias, depth + 1);
+    }
+    if (/\borchestrator\b|^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M\d+$/i.test(cleanedRaw)) {
+      const resolvedAlias = resolveDatabaseModelFullName(cleanedRaw, cleanedRaw);
+      if (resolvedAlias && resolvedAlias !== '未知模型' && resolvedAlias !== 'Unknown Model' && resolvedAlias !== bt('usage.unknown_model') && resolvedAlias !== cleanedRaw) {
+        return resolveModelCapacity(resolvedAlias, depth + 1);
+      }
     }
   }
 
@@ -172,13 +194,33 @@ export function resolveModelCapacity(rawModelInput?: string | null): ModelCapaci
     .replace(/^-+|-+$/g, '');
 
   normalizedId = normalizeModelId(normalizedId)
-    .replace(/(?:-(?:high|medium|low|extra-low|thinking|latest))+$/, '');
+    .replace(/(?:-(?:extra-high|extra-low|xhigh|high|medium|low|max|thinking|latest))+$/, '');
 
+  if (depth < 2) {
+    const normalizedAlias = getEffectiveModelPriceAlias(normalizedId);
+    if (normalizedAlias && normalizedAlias.toLowerCase() !== normalizedId) {
+      return resolveModelCapacity(normalizedAlias, depth + 1);
+    }
+  }
+
+  const remoteSpec = getRemoteModelSpec(normalizedId);
   const displayName =
+    remoteSpec?.displayName ||
     DISPLAY_NAME_MAP[normalizedId] ||
+    (Object.hasOwn(MODEL_NAMES, normalizedId) ? MODEL_NAMES[normalizedId] : undefined) ||
     autoFormatDynamicModelName(normalizedId) ||
     cleanedRaw ||
     raw;
+
+  if (remoteSpec?.capacityTokens) {
+    return {
+      modelId: normalizedId,
+      displayName,
+      capacityTokens: remoteSpec.capacityTokens,
+      capacityCompact: formatCompactCapacity(remoteSpec.capacityTokens),
+      isFallback: false,
+    };
+  }
 
   for (const rule of MODEL_CAPACITY_RULES) {
     if (rule.pattern.test(normalizedId)) {
@@ -190,6 +232,16 @@ export function resolveModelCapacity(rawModelInput?: string | null): ModelCapaci
         isFallback: false,
       };
     }
+  }
+
+  if (remoteSpec?.displayName) {
+    return {
+      modelId: normalizedId,
+      displayName,
+      capacityTokens: DEFAULT_CONTEXT_CAPACITY_TOKENS,
+      capacityCompact: '200K',
+      isFallback: false,
+    };
   }
 
   return {

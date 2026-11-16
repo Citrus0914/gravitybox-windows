@@ -1,6 +1,7 @@
 import { constants } from 'node:fs';
 import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
+import { bt } from './i18n.js';
 
 export type PluginText = { id: string; name: string; description: string; source: 'installed-manifest' | 'marketplace-view' | 'installed-view'; truncated: boolean; onlineEligible: false };
 export type PluginCatalog = { entries: PluginText[]; inspectedFiles: number; skipped: number; limited: boolean; notes: string[] };
@@ -27,9 +28,9 @@ export function appendPluginViews(catalog: PluginCatalog, rows: unknown) {
   }
 }
 export async function readPluginCatalog(root: string, signal: AbortSignal): Promise<PluginCatalog> {
-  const catalog: PluginCatalog={entries:[],inspectedFiles:0,skipped:0,limited:false,notes:['仅读取插件清单的名称和展示说明，不读取规则、凭据、MCP 配置或执行代码。','说明只保存在本机报告中，不自动进入在线补译。']};
+  const catalog: PluginCatalog={entries:[],inspectedFiles:0,skipped:0,limited:false,notes:[bt('plugin_catalog.note.manifest_only'),bt('plugin_catalog.note.local_only')]};
   let base: string;
-  try { const info=await lstat(root);if(info.isSymbolicLink()||!info.isDirectory())throw new Error();base=await realpath(root); } catch { catalog.notes.push('已安装插件目录不可用；仍可采集已打开的目录页面。');return catalog; }
+  try { const info=await lstat(root);if(info.isSymbolicLink()||!info.isDirectory())throw new Error();base=await realpath(root); } catch { catalog.notes.push(bt('plugin_catalog.note.dir_unavailable'));return catalog; }
   const names=await readdir(base,{withFileTypes:true});
   for(const entry of names.sort((a,b)=>a.name.localeCompare(b.name)).slice(0,500)) {
     signal.throwIfAborted();if(entry.isSymbolicLink()||!entry.isDirectory()){catalog.skipped++;continue;}

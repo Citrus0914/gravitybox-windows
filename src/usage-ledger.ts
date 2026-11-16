@@ -6,6 +6,7 @@ import { withProcessLease } from './process-lock.js';
 import type { GenerationEvent } from './usage.js';
 import type { AggregateOptions, LedgerSnapshot } from './usage-aggregate.js';
 import type { TokenUsageSummary } from './usage.js';
+import { bt, getActiveLocale } from './i18n.js';
 export type LedgerEvent = GenerationEvent & {
     db_file?: string;
     ingested_at?: string;
@@ -36,7 +37,7 @@ export class UsageLedger {
         this.inflight = null;
         if (active) {
             clearTimeout(active.timer);
-            active.reject(reason ?? new Error('用量总账工作线程已退出'));
+            active.reject(reason ?? new Error(bt('ledger.err.worker_exited')));
         }
         const w = this.worker;
         this.worker = null;
@@ -74,7 +75,7 @@ export class UsageLedger {
         worker.on('exit', (code: number) => {
             if (this.worker === worker) this.worker = null;
             if (this.inflight) {
-                this.destroyWorker(new Error(code !== 0 ? '用量总账工作线程异常退出' : '用量总账工作线程已退出'));
+                this.destroyWorker(new Error(code !== 0 ? bt('ledger.err.worker_crashed') : bt('ledger.err.worker_exited')));
             }
         });
         this.worker = worker;
@@ -117,12 +118,13 @@ export class UsageLedger {
             const timeoutMs = ['save', 'aggregate', 'revalue'].includes(operation) ? 90000 : 30000;
             const timer = setTimeout(() => {
                 if (this.inflight?.id === id) {
-                    this.destroyWorker(new Error('用量总账操作超时，原始账本已保留'));
+                    this.destroyWorker(new Error(bt('ledger.err.timeout')));
                 }
             }, timeoutMs);
             this.inflight = { id, resolve, reject, timer };
             worker.postMessage({
                 id,
+                locale: getActiveLocale(),
                 path: this.path,
                 legacyPath: join(this.stateDir, 'usage-ledger.json'),
                 operation,

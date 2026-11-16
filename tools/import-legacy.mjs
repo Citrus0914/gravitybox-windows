@@ -1,3 +1,6 @@
+/**
+ * @deprecated 一次性历史词典目录批量导入工具，日常提取与合并请使用 `npm run i18n:extract` 与 `npm run i18n:merge`。
+ */
 import { readFile, readdir } from 'node:fs/promises';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';

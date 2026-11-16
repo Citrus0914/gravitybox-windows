@@ -3,14 +3,32 @@ import { pathToFileURL } from 'node:url';
 
 export function buildPricingFeed(catalog) {
   const prices = {};
+  const models = {};
   for (const key of catalog.feedModels ?? []) {
     const price = catalog.prices[key];
     if (!price) throw Error('公开价格表引用了不存在的模型：' + key);
     prices[key] = Array.isArray(price) ? price : price.intervals ?? [{ model: price.model, validFrom: price.provenance?.validFrom ?? null, validUntil: price.provenance?.validUntil ?? null,
-      input: price.input, output: price.output, cached: price.cached, ...(price.cacheWrite !== undefined ? { cacheWrite: price.cacheWrite } : {}), provenance: price.provenance }];
+      input: price.input, output: price.output, cached: price.cached, ...(price.cacheWrite !== undefined ? { cacheWrite: price.cacheWrite } : {}), ...(Array.isArray(price.contextTiers) ? { contextTiers: price.contextTiers } : {}), provenance: price.provenance }];
+    const displayName = catalog.names?.[key];
+    const capacityTokens = catalog.capacities?.[key];
+    if ((typeof displayName === 'string' && displayName) || (Number.isSafeInteger(capacityTokens) && capacityTokens > 0)) {
+      models[key] = {
+        ...(typeof displayName === 'string' && displayName ? { displayName } : {}),
+        ...(Number.isSafeInteger(capacityTokens) && capacityTokens > 0 ? { capacityTokens } : {}),
+      };
+    }
   }
-  return { version: catalog.pricingVersion, schema: 1, updatedAt: catalog.pricingUpdatedAt,
-    source: 'https://raw.githubusercontent.com/Enzoo404/gravitybox/main/assets/pricing-feed.json', prices };
+  const hasAliases = Boolean(catalog.aliases && typeof catalog.aliases === 'object' && Object.keys(catalog.aliases).length > 0);
+  const hasModels = Object.keys(models).length > 0;
+  return {
+    version: catalog.pricingVersion,
+    schema: 1,
+    updatedAt: catalog.pricingUpdatedAt,
+    source: 'https://raw.githubusercontent.com/Enzoo404/gravitybox/main/assets/pricing-feed.json',
+    ...(hasAliases ? { aliases: catalog.aliases } : {}),
+    ...(hasModels ? { models } : {}),
+    prices,
+  };
 }
 async function main() {
   const catalog = JSON.parse(await readFile(new URL('../assets/model-catalog.json', import.meta.url), 'utf8'));

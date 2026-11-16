@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { openAsarArchive } from './asar.js';
 import { assertLoopback } from './cdp.js';
 import { targetForApp } from './application-target.js';
+import { bt } from './i18n.js';
 const execFileRaw = promisify(execFile);
 const execute = (file: string, args: string[], timeout = 3000) => execFileRaw(file, args, { timeout });
 export type Endpoint = { port: number; pid: number; browserURL: string; appVersion: string; legacyPatch: boolean; appPath?: string; profile?: string };
@@ -17,7 +18,7 @@ export function parseListeners(stdout: string, port: number): { pid: number; nam
     if (line.startsWith('n') && current) current.names.push(line.slice(1));
   }
   for (const owner of results) for (const name of owner.names) {
-    if (![`127.0.0.1:${port}`, `[::1]:${port}`].includes(name)) throw new Error('调试接口存在非回环监听，已停止连接');
+    if (![`127.0.0.1:${port}`, `[::1]:${port}`].includes(name)) throw new Error(bt('discovery.non_loopback'));
   }
   return results.filter(owner => owner.names.length > 0);
 }
@@ -42,10 +43,10 @@ export async function inspectBundle(appPath: string): Promise<{ version: string;
   }
 
   const id = (await execute('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleIdentifier', plist])).stdout.trim();
-  if (id !== targetForApp(appPath).bundleId) throw new Error('应用身份不匹配');
+  if (id !== targetForApp(appPath).bundleId) throw new Error(bt('discovery.app_mismatch'));
   const version = (await execute('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', plist])).stdout.trim();
   const signature = await execute('/usr/bin/codesign', ['-dv', appPath]);
-  if (!signature.stderr.includes('TeamIdentifier=EQHXZ8M8AV')) throw new Error('Antigravity 签名身份未通过 Google TeamID 检查');
+  if (!signature.stderr.includes('TeamIdentifier=EQHXZ8M8AV')) throw new Error(bt('discovery.signature_failed'));
   await execute('/usr/bin/codesign', ['--verify', '--deep', '--strict', appPath]);
   const plistStat = await fsStat(plist);
   const archive = await openAsarArchive(asarPath, 16_000_000);
@@ -91,7 +92,7 @@ async function discoverSingle(appPath: string, profile: string): Promise<Endpoin
   const version = await response.json() as Record<string, string>;
   if (!version.webSocketDebuggerUrl) return undefined;
   const ws = assertLoopback(version.webSocketDebuggerUrl);
-  if (Number(ws.port) !== port) throw new Error('调试接口端口不匹配');
+  if (Number(ws.port) !== port) throw new Error(bt('discovery.port_mismatch'));
   return { port, pid: owner.pid, browserURL: ws.href, appVersion: bundle.version, legacyPatch: bundle.legacyPatch, appPath, profile };
 }
 

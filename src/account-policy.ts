@@ -1,3 +1,5 @@
+import { bt } from './i18n.js';
+
 export interface ValidatedPolicyPatch {
     enabled?: boolean;
     strategy?: 'priority' | 'round_robin';
@@ -12,20 +14,20 @@ export interface ValidatedPolicyPatch {
 /** Validate dynamic IPC/config input before it can reach the recommendation engine. */
 export function validateAccountPolicy(value: unknown): asserts value is ValidatedPolicyPatch {
     if (!value || typeof value !== 'object' || Array.isArray(value))
-        throw Error('账号推荐配置格式无效');
+        throw Error(bt('policy.err.invalid_format'));
     const data = value as Record<string, unknown>;
     if (data.enabled !== undefined && typeof data.enabled !== 'boolean')
-        throw Error('推荐开关必须为布尔值');
+        throw Error(bt('policy.err.enabled_boolean'));
     if (data.strategy !== undefined && (typeof data.strategy !== 'string' || !['priority', 'round_robin'].includes(data.strategy)))
-        throw Error('推荐策略无效');
+        throw Error(bt('policy.err.invalid_strategy'));
     if (data.monitored_model !== undefined && (typeof data.monitored_model !== 'string' || !data.monitored_model.trim() || data.monitored_model.length > 120 || /[\x00-\x1f]/.test(data.monitored_model)))
-        throw Error('监控模型名称无效');
+        throw Error(bt('policy.err.invalid_model'));
     if (data.candidate_account_ids !== undefined && (!Array.isArray(data.candidate_account_ids) || data.candidate_account_ids.length > 200 || data.candidate_account_ids.some(id => typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,120}$/.test(id)) || new Set(data.candidate_account_ids).size !== data.candidate_account_ids.length))
-        throw Error('候选账号必须是有效且不重复的账号ID列表（最多200个）');
+        throw Error(bt('policy.err.invalid_candidates'));
     if (data.last_switched_id !== undefined && data.last_switched_id !== null && (typeof data.last_switched_id !== 'string' || !/^[a-zA-Z0-9_-]{1,120}$/.test(data.last_switched_id)))
-        throw Error('推荐游标无效');
+        throw Error(bt('policy.err.invalid_cursor'));
     for (const key of ['reserve_percentage', 'reservePercentage', 'candidate_min_percentage', 'candidateMinPercentage']) {
         if (data[key] !== undefined && (typeof data[key] !== 'number' || !Number.isFinite(data[key])))
-            throw Error('配额门槛必须为有限数值');
+            throw Error(bt('policy.err.invalid_threshold'));
     }
 }

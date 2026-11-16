@@ -7,7 +7,10 @@ extension Assistant {
     static func hasRunningAntigravityProcess(psOutput: String, appPaths: [String]) -> Bool {
         psOutput.split(separator: "\n").contains { line in
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            return appPaths.contains { trimmed.hasPrefix($0 + "/Contents/") }
+            return appPaths.contains {
+                trimmed.hasPrefix($0 + "/Contents/") ||
+                trimmed.contains($0 + "/Contents/Resources/bin/language_server")
+            }
         }
     }
 
@@ -71,6 +74,89 @@ extension Assistant {
         queue.asyncAfter(deadline: .now() + .milliseconds(50)) { pollStep() }
     }
 
+    func effectiveConfiguredLanguage() -> String {
+        if let pendingLanguageTarget { return pendingLanguageTarget }
+        if let configured = configuration?.value.appLanguage?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty {
+            return configured
+        }
+        return L10n.shared.configuredLanguage
+    }
+
+    func setGlobalLanguage(_ configured: String) {
+        let trimmed = configured.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetLanguage = trimmed.isEmpty ? "system" : trimmed
+        let previousConfigured = effectiveConfiguredLanguage()
+        let previousStatus = statusValue
+        let previousLocale = bridge?.preferredLocale
+
+        languageCommandGeneration += 1
+        let commandGen = languageCommandGeneration
+        pendingLanguageTarget = targetLanguage
+        configuration.value.appLanguage = targetLanguage
+        try? configuration.save()
+        bridge?.preferredLocale = targetLanguage
+
+        let resolved = L10n.shared.setLanguage(targetLanguage, notify: true)
+        let wantsTranslation = resolved != "en"
+        statusValue.configuredLanguage = targetLanguage
+        statusValue.locale = resolved
+        statusValue.translationEnabled = wantsTranslation
+        if wantsTranslation {
+            if statusValue.mode == "paused" || statusValue.mode == "error" || statusValue.mode == "starting" {
+                statusValue.mode = "waiting"
+            }
+        } else {
+            statusValue.mode = "paused"
+        }
+        applyLocalizedChrome()
+
+        let sendCommand = { [weak self] in
+            guard let self, commandGen == self.languageCommandGeneration else { return }
+            self.bridge.send([
+                "command": "language_set",
+                "language": targetLanguage,
+                "systemLocales": Locale.preferredLanguages
+            ]) { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self, commandGen == self.languageCommandGeneration else { return }
+                    self.pendingLanguageTarget = nil
+                    switch result {
+                    case .success(let value):
+                        if let raw = value["status"] as? [String: Any] {
+                            self.reachable = true
+                            self.recoveryAttempts = 0
+                            self.statusValue = self.mergeStatusSnapshot(raw, previous: self.statusValue)
+                            self.updateViews()
+                        }
+                        self.refresh()
+                    case .failure(let error):
+                        self.configuration.value.appLanguage = previousConfigured
+                        try? self.configuration.save()
+                        self.bridge?.preferredLocale = previousLocale
+                        _ = L10n.shared.setLanguage(previousConfigured, notify: true)
+                        self.statusValue = previousStatus
+                        self.applyLocalizedChrome()
+                        self.showMessage(error.localizedDescription, error: true)
+                        self.refresh()
+                    }
+                }
+            }
+        }
+        if !reachable && !bridge.isOwnedProcessRunning {
+            recoveryAttempts = 0
+            nextRecoveryAt = .distantPast
+            bridge.launch { _ in sendCommand() }
+        } else {
+            sendCommand()
+        }
+    }
+
+    @objc func selectGlobalLanguageFromMenu(_ sender: NSMenuItem) {
+        guard let code = sender.representedObject as? String else { return }
+        setGlobalLanguage(code)
+    }
+
     func setTranslationEnabled(_ enable: Bool) {
         let previousStatus = statusValue
         translationCommandGeneration += 1
@@ -102,6 +188,7 @@ extension Assistant {
                         self.refresh()
                     case .failure(let error):
                         self.statusValue.translationEnabled = previousStatus.translationEnabled
+                        self.statusValue.mode = previousStatus.mode
                         self.updateViews()
                         self.showMessage(error.localizedDescription, error: true)
                         self.refresh()
@@ -205,8 +292,8 @@ extension Assistant {
                     let running = Self.isAntigravityRunning()
                     if !running {
                         DispatchQueue.main.async {
-                            let detail = launchError?.localizedDescription ?? "请手动打开 Antigravity"
-                            self.showMessage("账号已切换，但自动重启 Antigravity 失败：\(detail)", error: true)
+                            let detail = launchError?.localizedDescription ?? L10n.t("assistant.relaunch_manual")
+                            self.showMessage(L10n.t("assistant.relaunch_failed", ["detail": detail]), error: true)
                         }
                     }
                 }
@@ -232,7 +319,7 @@ extension Assistant {
                     }
                 } else if let error {
                     DispatchQueue.main.async {
-                        self.showMessage("账号已切换，但自动重启 Antigravity 失败：\(error.localizedDescription)", error: true)
+                        self.showMessage(L10n.t("assistant.relaunch_failed", ["detail": error.localizedDescription]), error: true)
                     }
                 }
             }
@@ -438,6 +525,7 @@ extension Assistant {
     }
 
     func dismissAllSheetsAndPopovers() {
+        cachePage?.dismissDetailPopover()
         closeMenuPopover()
         guard let window else { return }
         var safetyCounter = 0
@@ -500,7 +588,7 @@ extension Assistant {
             guard let self else { return }
             if case .success = result { self.directorySource?.cancel(); NSApp.terminate(nil) }
             else if !self.bridge.isOwnedProcessRunning { self.directorySource?.cancel(); NSApp.terminate(nil) }
-            else { self.quitting = false; self.configureRefreshTimer(); self.configureQuotaRefreshTimer(); self.configureAutoUpdateTimer(); self.showPanel(); self.showMessage("尚未确认撤销汉化，请稍后重试退出。", error:true) }
+            else { self.quitting = false; self.configureRefreshTimer(); self.configureQuotaRefreshTimer(); self.configureAutoUpdateTimer(); self.showPanel(); self.showMessage(L10n.t("assistant.quit_pending_restore"), error:true) }
         }
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply { if quitting { return .terminateNow }; quit(); return .terminateCancel }

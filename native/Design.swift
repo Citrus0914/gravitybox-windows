@@ -28,16 +28,24 @@ enum Design {
         static let compact: CGFloat = 10
     }
     static func shouldAnimate(in view: NSView?) -> Bool {
-        #if NATIVE_UI_TEST
-        return false
-        #else
-        return !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && view?.window != nil
-        #endif
+        DesignMotion.defaultShouldAnimate(in: view)
     }
     static func color(_ light: UInt32, _ dark: UInt32) -> NSColor {
         NSColor(name: nil) { appearance in
             let n = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
             return NSColor(srgbRed: CGFloat((n >> 16) & 255)/255, green: CGFloat((n >> 8) & 255)/255, blue: CGFloat(n & 255)/255, alpha: 1)
+        }
+    }
+    static func dynamicAlpha(_ base: NSColor, _ lightAlpha: CGFloat, _ darkAlpha: CGFloat? = nil) -> NSColor {
+        let darkValue = darkAlpha ?? lightAlpha
+        return NSColor(name: nil) { appearance in
+            var resolved: NSColor = base
+            appearance.performAsCurrentDrawingAppearance {
+                resolved = base.withAlphaComponent(
+                    appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? darkValue : lightAlpha
+                )
+            }
+            return resolved
         }
     }
     static let background = color(0xF5F6F9, 0x1C1C1E)
@@ -314,139 +322,7 @@ enum Design {
     }
 }
 
-// MARK: - Global Motion Engine (Unified Curve & Timing Tokens, 120Hz CADisplayLink ProMotion, 0ms in NATIVE_UI_TEST / Reduce Motion)
-final class DesignMotion: NSObject {
-    enum Curve {
-        case hover      // 130ms cubic-out
-        case press      // 140ms snappy critically-damped tactile press/release
-        case slide      // 180ms spring-out
-        case expand     // 200ms ease-in-out
-        case sweep      // 260ms cubic-out
-        case spring     // 320ms ProMotion damped spring
-        case breathe    // 1200ms gentle sinusoidal breathing pulse
-
-        var duration: CFTimeInterval {
-            switch self {
-            case .hover: return 0.13
-            case .press: return 0.14
-            case .slide: return 0.18
-            case .expand: return 0.20
-            case .sweep: return 0.26
-            case .spring: return 0.32
-            case .breathe: return 1.20
-            }
-        }
-
-        func evaluate(_ t: Double) -> CGFloat {
-            let p = min(1.0, max(0.0, t))
-            switch self {
-            case .hover, .press, .sweep:
-                return CGFloat(1.0 - pow(1.0 - p, 3.0))
-            case .slide:
-                return CGFloat(1.0 - pow(1.0 - p, 3.4))
-            case .expand:
-                return CGFloat(p < 0.5 ? 4.0 * p * p * p : 1.0 - pow(-2.0 * p + 2.0, 3.0) / 2.0)
-            case .spring:
-                return CGFloat(1.0 - exp(-6.0 * p) * cos(7.0 * p))
-            case .breathe:
-                return CGFloat(0.5 - 0.5 * cos(Double(p) * .pi))
-            }
-        }
-    }
-
-    private var timer: Timer?
-    private var displayLink: CADisplayLink?
-    private var startTime: CFTimeInterval = 0
-    private var duration: CFTimeInterval = 0
-    private var startVal: CGFloat = 0
-    private var targetVal: CGFloat = 0
-    private var activeCurve: Curve = .hover
-    private var applyBlock: ((CGFloat) -> Void)?
-    private var completionBlock: (() -> Void)?
-    private weak var boundView: NSView?
-
-    deinit {
-        cancel()
-    }
-
-    func cancel() {
-        displayLink?.invalidate()
-        displayLink?.remove(from: .main, forMode: .common)
-        displayLink = nil
-        timer?.invalidate()
-        timer = nil
-        applyBlock = nil
-        completionBlock = nil
-    }
-
-    func animate(in view: NSView?, from start: CGFloat, to target: CGFloat, curve: Curve = .hover, threshold: CGFloat = 0.01, apply: @escaping (CGFloat) -> Void, completion: (() -> Void)? = nil) {
-        cancel()
-        guard Design.shouldAnimate(in: view), abs(target - start) > threshold else {
-            apply(target)
-            completion?()
-            return
-        }
-        self.boundView = view
-        self.startVal = start
-        self.targetVal = target
-        self.activeCurve = curve
-        self.applyBlock = apply
-        self.completionBlock = completion
-        self.startTime = CACurrentMediaTime()
-        self.duration = curve.duration
-
-        var linked = false
-        if #available(macOS 14.0, *), let v = view {
-            let link = v.displayLink(target: self, selector: #selector(handleDisplayLink(_:)))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
-            link.add(to: .main, forMode: .common)
-            self.displayLink = link
-            linked = true
-        } else if #available(macOS 14.0, *), let screen = NSScreen.main {
-            let link = screen.displayLink(target: self, selector: #selector(handleDisplayLink(_:)))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
-            link.add(to: .main, forMode: .common)
-            self.displayLink = link
-            linked = true
-        }
-
-        if !linked {
-            let t = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
-                self?.stepAnimation()
-            }
-            timer = t
-            RunLoop.main.add(t, forMode: .common)
-        }
-    }
-
-    @objc private func handleDisplayLink(_ link: CADisplayLink) {
-        stepAnimation()
-    }
-
-    private func stepAnimation() {
-        guard Design.shouldAnimate(in: boundView) else {
-            let finish = targetVal
-            let comp = completionBlock
-            let app = applyBlock
-            cancel()
-            app?(finish)
-            comp?()
-            return
-        }
-        let elapsed = CACurrentMediaTime() - startTime
-        let progress = min(1.0, max(0.0, elapsed / duration))
-        let eased = activeCurve.evaluate(progress)
-        applyBlock?(startVal + (targetVal - startVal) * eased)
-        if progress >= 1.0 {
-            let comp = completionBlock
-            let app = applyBlock
-            let finish = targetVal
-            cancel()
-            app?(finish)
-            comp?()
-        }
-    }
-}
+// DesignMotion is defined in native/DesignMotion.swift
 
 class DesignButton: NSButton {
     private var hoverTracking: NSTrackingArea?
@@ -593,7 +469,7 @@ class DesignButton: NSButton {
         return NSSize(width: ceil(width) + pad + iconExtra, height: 28)
     }
 
-    func drawButtonChromeAndLabel(spinnerLeftInset: CGFloat? = nil) {
+    func drawButtonChromeAndLabel(spinnerLeftInset: CGFloat? = nil, centeredSpinnerWidth: CGFloat? = nil) {
         let primary = bezelColor != nil
         let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let inPopover = Design.isInPopover(self)
@@ -757,8 +633,24 @@ class DesignButton: NSButton {
                 spoke.stroke()
             }
         }
-        if let leftInset = resolvedSpinnerInset {
-            let style = NSMutableParagraphStyle(); style.alignment = .center
+        if let spinnerW = centeredSpinnerWidth {
+            let textSize = title.isEmpty ? .zero : (title as NSString).size(withAttributes: attrs)
+            let gap: CGFloat = title.isEmpty ? 0 : 5
+            let maxTextW = max(0, bounds.width - 16 - spinnerW - gap)
+            let clampedTextW = min(textSize.width, maxTextW)
+            let totalW = spinnerW + gap + clampedTextW
+            let startX = title.isEmpty ? round((bounds.width - spinnerW) / 2) : max(8, round((bounds.width - totalW) / 2))
+            if !title.isEmpty {
+                let textX = startX + spinnerW + gap
+                let style = NSMutableParagraphStyle(); style.alignment = .left; style.lineBreakMode = .byTruncatingTail
+                var leftAttrs = attrs; leftAttrs[.paragraphStyle] = style
+                (title as NSString).draw(
+                    in: NSRect(x: textX, y: (bounds.height - textSize.height) / 2, width: maxTextW, height: textSize.height),
+                    withAttributes: leftAttrs
+                )
+            }
+        } else if let leftInset = resolvedSpinnerInset {
+            let style = NSMutableParagraphStyle(); style.alignment = .center; style.lineBreakMode = .byTruncatingTail
             var centeredAttrs = attrs; centeredAttrs[.paragraphStyle] = style
             let size = (title as NSString).size(withAttributes: centeredAttrs)
             let rightInset: CGFloat = 6
@@ -794,11 +686,18 @@ class DesignButton: NSButton {
                 img.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)])
             }
             if !title.isEmpty {
-                (title as NSString).draw(at: NSPoint(x: startX + iconW + gap, y: (bounds.height - textSize.height) / 2), withAttributes: attrs)
+                let textX = startX + iconW + gap
+                let maxTextW = max(0, bounds.width - textX - 8)
+                let style = NSMutableParagraphStyle(); style.alignment = .left; style.lineBreakMode = .byTruncatingTail
+                var imageTextAttrs = attrs; imageTextAttrs[.paragraphStyle] = style
+                (title as NSString).draw(
+                    in: NSRect(x: textX, y: (bounds.height - textSize.height) / 2, width: maxTextW, height: textSize.height),
+                    withAttributes: imageTextAttrs
+                )
             }
         } else {
             let textSize = (title as NSString).size(withAttributes: attrs)
-            let style = NSMutableParagraphStyle(); style.alignment = .center
+            let style = NSMutableParagraphStyle(); style.alignment = .center; style.lineBreakMode = .byTruncatingTail
             var centeredAttrs = attrs; centeredAttrs[.paragraphStyle] = style
             (title as NSString).draw(in: NSRect(x: 6, y: (bounds.height - textSize.height) / 2, width: bounds.width - 12, height: textSize.height), withAttributes: centeredAttrs)
         }
@@ -811,16 +710,6 @@ class DesignButton: NSButton {
     }
 }
 
-final class DesignSurface: NSView {
-    let color: NSColor
-    init(_ color: NSColor) { self.color = color; super.init(frame: .zero) }
-    required init?(coder: NSCoder) { fatalError() }
-    override var isOpaque: Bool { true }
-    override var allowsVibrancy: Bool { false }
-    override var wantsDefaultClipping: Bool { true }
-    override func draw(_ dirtyRect: NSRect) { color.setFill(); bounds.fill() }
-    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); Design.applyControls(self); needsDisplay = true }
-}
 
 final class MetricCardBox: NSBox {
     weak var clickTarget: AnyObject?
@@ -834,6 +723,13 @@ final class MetricCardBox: NSBox {
     private let hoverMotion = DesignMotion()
     private var hoverProgress: CGFloat = 0
     override var allowsVibrancy: Bool { false }
+    deinit {
+        hoverMotion.cancel()
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { hoverMotion.cancel() }
+    }
     var hovered = false {
         didSet {
             guard oldValue != hovered, clickTarget != nil, clickAction != nil else { return }
@@ -865,7 +761,8 @@ final class MetricCardBox: NSBox {
     func refreshAccessibility() {
         let val = valueField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let det = detailField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let label = val.isEmpty ? metricTitle : "\(metricTitle)，\(val)"
+        let sep = L10n.shared.isEnglish ? ", " : "，"
+        let label = val.isEmpty ? metricTitle : "\(metricTitle)\(sep)\(val)"
         setAccessibilityLabel(label)
         setAccessibilityValue(det.isEmpty ? val : "\(val) · \(det)")
     }
@@ -873,7 +770,8 @@ final class MetricCardBox: NSBox {
     override func accessibilityLabel() -> String? {
         let val = valueField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !metricTitle.isEmpty {
-            return val.isEmpty ? metricTitle : "\(metricTitle)，\(val)"
+            let sep = L10n.shared.isEnglish ? ", " : "，"
+            return val.isEmpty ? metricTitle : "\(metricTitle)\(sep)\(val)"
         }
         return super.accessibilityLabel()
     }
@@ -949,7 +847,14 @@ func metricDetail(_ value: String) -> MetricDetailField {
     return field
 }
 
-func compactMetric(_ title: String, value: NSTextField, detail: NSTextField, action: NSButton? = nil, target: AnyObject? = nil, onClick: Selector? = nil) -> NSBox {
+enum MetricKind {
+    case tokens
+    case cost
+    case requests
+    case general
+}
+
+func compactMetric(_ title: String, value: NSTextField, detail: NSTextField, action: NSButton? = nil, target: AnyObject? = nil, onClick: Selector? = nil, kind: MetricKind? = nil) -> NSBox {
     value.font = .monospacedDigitSystemFont(ofSize: 26, weight: .bold)
     detail.font = .systemFont(ofSize: 11)
     detail.textColor = Design.secondary
@@ -961,15 +866,23 @@ func compactMetric(_ title: String, value: NSTextField, detail: NSTextField, act
     detail.setContentHuggingPriority(.defaultLow, for: .horizontal)
     detail.toolTip = nil
 
-    let (symbolName, badgeTint): (String, NSColor) = {
+    let resolvedKind: MetricKind = kind ?? {
         if title.contains("Token") {
-            return ("sparkles", Design.blue)
-        } else if title.contains("费用") {
-            return ("dollarsign.circle.fill", .systemTeal)
-        } else if title.contains("请求") {
-            return ("paperplane.fill", .systemIndigo)
+            return .tokens
+        } else if title.contains("费用") || title.localizedCaseInsensitiveContains("cost") {
+            return .cost
+        } else if title.contains("请求") || title.localizedCaseInsensitiveContains("request") {
+            return .requests
         } else {
-            return ("chart.bar.fill", Design.blue)
+            return .general
+        }
+    }()
+    let (symbolName, badgeTint): (String, NSColor) = {
+        switch resolvedKind {
+        case .tokens: return ("sparkles", Design.blue)
+        case .cost: return ("dollarsign.circle.fill", .systemTeal)
+        case .requests: return ("paperplane.fill", .systemIndigo)
+        case .general: return ("chart.bar.fill", Design.blue)
         }
     }()
     let badgeBox = NSBox()
@@ -1232,22 +1145,59 @@ final class DesignSecureCell: NSSecureTextFieldCell {
 // Shared feedback for quota actions in the dashboard and account cards.
 final class QuotaRefreshButton: DesignButton {
     let spinner = NSProgressIndicator()
+    private var spinnerLeadingConstraint: NSLayoutConstraint!
     var localBusy = false
     var lastError: String?
     private var appliedDisplayState: (busy: Bool, available: Bool, error: String)?
     override var isActivitySpinning: Bool { !spinner.isHidden }
-    override var intrinsicContentSize: NSSize { NSSize(width: 88, height: 28) }
+    override var title: String {
+        didSet {
+            guard oldValue != title else { return }
+            invalidateIntrinsicContentSize()
+            needsLayout = true
+            needsDisplay = true
+        }
+    }
+    override var intrinsicContentSize: NSSize {
+        let textW = ceil((title as NSString).size(withAttributes: [
+            .font: font ?? NSFont.systemFont(ofSize: 12, weight: .medium)
+        ]).width)
+        return NSSize(width: max(84, textW + 42), height: 28)
+    }
     init(target: AnyObject?, action: Selector) {
-        super.init(frame: .zero); title = "刷新配额"; self.target = target; self.action = action
+        super.init(frame: .zero); title = L10n.t("common.refresh_quota", fallback: "刷新配额"); self.target = target; self.action = action
         bezelStyle = .rounded; isBordered = false; font = .systemFont(ofSize: 12, weight: .medium)
         spinner.style = .spinning; spinner.controlSize = .small; spinner.isDisplayedWhenStopped = false; spinner.isHidden = true
         spinner.translatesAutoresizingMaskIntoConstraints = false; addSubview(spinner)
-        NSLayoutConstraint.activate([spinner.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),spinner.centerYAnchor.constraint(equalTo: centerYAnchor),spinner.widthAnchor.constraint(equalToConstant: 13),spinner.heightAnchor.constraint(equalToConstant: 13)])
-        setAccessibilityLabel("刷新配额")
+        spinnerLeadingConstraint = spinner.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12)
+        NSLayoutConstraint.activate([spinnerLeadingConstraint, spinner.centerYAnchor.constraint(equalTo: centerYAnchor), spinner.widthAnchor.constraint(equalToConstant: 13), spinner.heightAnchor.constraint(equalToConstant: 13)])
+        setAccessibilityLabel(L10n.t("common.refresh_quota", fallback: "刷新配额"))
     }
     required init?(coder: NSCoder) { fatalError() }
+    private func updateSpinnerLeading() {
+        let spinnerW: CGFloat = 13
+        let gap: CGFloat = title.isEmpty ? 0 : 5
+        let textW = title.isEmpty ? 0 : (title as NSString).size(withAttributes: [
+            .font: font ?? NSFont.systemFont(ofSize: 12, weight: .medium)
+        ]).width
+        let effectiveW = bounds.width > 1 ? bounds.width : intrinsicContentSize.width
+        let clampedTextW = min(textW, max(0, effectiveW - 16 - spinnerW - gap))
+        let totalW = spinnerW + gap + clampedTextW
+        spinnerLeadingConstraint.constant = title.isEmpty
+            ? round((effectiveW - spinnerW) / 2)
+            : max(8, round((effectiveW - totalW) / 2))
+    }
+    override func layout() {
+        updateSpinnerLeading()
+        super.layout()
+    }
     override func draw(_ dirtyRect: NSRect) {
-        drawButtonChromeAndLabel(spinnerLeftInset: spinner.isHidden ? 6 : 22)
+        if spinner.isHidden {
+            drawButtonChromeAndLabel(spinnerLeftInset: nil)
+        } else {
+            updateSpinnerLeading()
+            drawButtonChromeAndLabel(centeredSpinnerWidth: 13)
+        }
     }
     func setRefreshState(busy: Bool, available: Bool, error: String?) {
         localBusy = busy
@@ -1269,9 +1219,10 @@ final class QuotaRefreshButton: DesignButton {
         if spinner.isHidden != !busy {
             spinner.isHidden = !busy
             if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+            needsLayout = true
         }
         toolTip = nil
-        setAccessibilityHelp(!normalizedError.isEmpty ? ("刷新未完成：" + normalizedError) : (busy ? "正在刷新配额" : "刷新账号配额"))
+        setAccessibilityHelp(!normalizedError.isEmpty ? L10n.t("design.quota_refresh.incomplete", ["error": normalizedError], fallback: "刷新未完成：\(normalizedError)") : (busy ? L10n.t("design.quota_refresh.busy", fallback: "正在刷新配额") : L10n.t("design.quota_refresh.idle", fallback: "刷新账号配额")))
         needsDisplay = true
     }
 }
@@ -1283,8 +1234,13 @@ final class InlineRefreshButton: DesignButton {
     private(set) var isBusy = false
     private var appliedBusyState: (busy: Bool, available: Bool)?
     override var isActivitySpinning: Bool { !spinner.isHidden }
-    override var intrinsicContentSize: NSSize { NSSize(width: fixedWidth, height: 28) }
-    init(_ buttonTitle: String = "刷新", width: CGFloat = 68, target: AnyObject? = nil, action: Selector) {
+    override var intrinsicContentSize: NSSize {
+        let textWidth = ceil((title as NSString).size(withAttributes: [
+            .font: font ?? NSFont.systemFont(ofSize: 12, weight: .medium)
+        ]).width)
+        return NSSize(width: max(fixedWidth, textWidth + 32), height: 28)
+    }
+    init(_ buttonTitle: String = L10n.t("common.refresh", fallback: "刷新"), width: CGFloat = 78, target: AnyObject? = nil, action: Selector) {
         self.fixedWidth = width
         super.init(frame: .zero)
         title = buttonTitle
@@ -1322,7 +1278,7 @@ final class InlineRefreshButton: DesignButton {
             spinner.isHidden = !busy
             if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
         }
-        setAccessibilityLabel(busy ? "\(title)，刷新中" : title)
+        setAccessibilityLabel(busy ? L10n.t("design.inline_refresh.busy", ["title": title], fallback: "\(title)，刷新中") : title)
         needsDisplay = true
     }
 }
@@ -1532,6 +1488,17 @@ final class DesignSegmentedControl: NSControl {
         thumbPath.lineWidth = 0.6
         thumbPath.stroke()
         Design.drawSpecularBevel(in: thumbRect, cornerRadius: 6, isDark: isDark)
+    }
+
+    deinit {
+        slideMotion.cancel()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            slideMotion.cancel()
+        }
     }
 }
 

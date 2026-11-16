@@ -1,5 +1,8 @@
 import { CloudQuotaAuthorityError, type CloudProviderContext } from './account-probe.js';
+import { bt } from './i18n.js';
 import {
+  CodedAccountError,
+  accountErrorCode,
   endpointHost,
   endpointPriority,
   familyLabel,
@@ -11,7 +14,11 @@ import {
 } from './account-quota.js';
 import {
   applyFamilyWindows,
+  buildArgonStatus,
+  buildCarbonStatus,
+  buildStandaloneModels,
   familyWindowsFromGroups,
+  matchModelToSharedPool,
   mergeGroupSets,
   mergeGroupsWithPrevious,
   mergeModelCatalogues,
@@ -80,7 +87,7 @@ export async function fetchCloudQuotaForAccount(params: {
   let deadlineFired = false;
   const deadline = setTimeout(() => {
     deadlineFired = true;
-    budget.abort(new Error('配额刷新整体预算超时'));
+    budget.abort(new Error(bt('account_cloud.err.budget_timeout')));
   }, 12_000);
   const parentSignal = signal ? AbortSignal.any([signal, budget.signal]) : budget.signal;
   const requestSignal = (timeoutMs: number) => AbortSignal.any([parentSignal, AbortSignal.timeout(timeoutMs)]);
@@ -96,16 +103,16 @@ export async function fetchCloudQuotaForAccount(params: {
   };
   const userAborted = (): boolean => signal?.aborted === true;
   const throwIfUserAborted = () => {
-    if (userAborted()) throw signal?.reason ?? new Error('已取消');
+    if (userAborted()) throw signal?.reason ?? new Error(bt('account_cloud.err.aborted'));
   };
 
   try {
     if (needTokenRefresh) {
       const previousRefresh = account.token.refresh_token;
-      if (!account.token.refresh_token) throw new Error('此账号缺少登录凭据，请重新添加');
+      if (!account.token.refresh_token) throw new CodedAccountError('missing_refresh_token', bt('account_cloud.err.missing_refresh_token'));
       const clientId = getGoogleClientId(), clientSecret = getGoogleClientSecret();
       if (fetchImpl === globalThis.fetch && (!clientId || !clientSecret)) {
-        throw new Error('未配置 Google OAuth 凭据，备用账号无法后台刷新 Token（可在 .env 中配置可选凭据）');
+        throw new CodedAccountError('missing_oauth_client', bt('account_cloud.err.missing_oauth_client'));
       }
       try {
         const response = await fetchImpl('https://oauth2.googleapis.com/token', {
@@ -114,11 +121,11 @@ export async function fetchCloudQuotaForAccount(params: {
           body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret,
             refresh_token: account.token.refresh_token, grant_type: 'refresh_token' }).toString(),
         });
-        if (!response.ok) throw new Error('登录凭据无法刷新，请重新添加此账号');
+        if (!response.ok) throw new CodedAccountError('refresh_failed', bt('account_cloud.err.refresh_failed'));
         const data: any = typeof response.json === 'function'
           ? await response.json()
           : JSON.parse(await (response as any).text());
-        if (typeof data.access_token !== 'string' || !data.access_token) throw new Error('登录服务未返回有效凭据');
+        if (typeof data.access_token !== 'string' || !data.access_token) throw new CodedAccountError('no_access_token', bt('account_cloud.err.no_access_token'));
         account.token.access_token = data.access_token;
         account.token.expires_in = Number(data.expires_in) || 3600;
         account.token.expiry_timestamp = nowSec + account.token.expires_in;
@@ -127,15 +134,16 @@ export async function fetchCloudQuotaForAccount(params: {
         await params.onTokenRefreshed(account, previousRefresh);
       } catch (error) {
         if (userAborted()) throw error;
-        if (error instanceof Error && /凭据/.test(error.message)) throw error;
-        throw new Error('无法连接登录服务，请检查网络后重试');
+        if (accountErrorCode(error)) throw error;
+        if (error instanceof Error && /凭据|credential|已移除|已被删除|冲突|removed|deleted|conflict/i.test(error.message)) throw error;
+        throw new CodedAccountError('network', bt('account_cloud.err.network'), { cause: error });
       }
     }
 
     type EndpointResult<T> = { endpoint: string; ok: boolean; data?: T; error?: string };
     const httpFailure=async(response:Response):Promise<string>=>{
       if(response.status===403){
-        try {const data:any=await response.json();if(data?.error?.status==='PERMISSION_DENIED'&&/\(#3501\)/.test(String(data?.error?.message??'')))return 'HTTP 403（官方产品许可校验未通过，错误码 3501；请在官方应用核对该账号状态）';}catch{}
+        try {const data:any=await response.json();if(data?.error?.status==='PERMISSION_DENIED'&&/\(#3501\)/.test(String(data?.error?.message??'')))return bt('account_cloud.err.http_3501');}catch{}
       }
       return `HTTP ${response.status}`;
     };
@@ -164,7 +172,7 @@ export async function fetchCloudQuotaForAccount(params: {
                 const retry = await fetchImpl(endpoint,{method:'POST',signal:requestSignal(6000),headers:{Authorization:`Bearer ${account.token.access_token}`,'Content-Type':'application/json','User-Agent':providerAgent},body:JSON.stringify({project:projectId})});
                 if(!retry.ok)return {endpoint,ok:false,error:await httpFailure(retry)};
                 const data=await retry.json() as T;
-                if(!normalizeCloudGroups(data,nowSec).some(group=>group.buckets.some(bucket=>bucket.remaining_fraction_known)))return{endpoint,ok:false,error:'项目上下文未返回可验证配额'};
+                if(!normalizeCloudGroups(data,nowSec).some(group=>group.buckets.some(bucket=>bucket.remaining_fraction_known)))return{endpoint,ok:false,error:bt('account_cloud.err.project_no_verifiable_quota')};
                 projectContextRecovered=true;return{endpoint,ok:true,data};
               }
             }
@@ -247,18 +255,56 @@ export async function fetchCloudQuotaForAccount(params: {
     throwIfUserAborted();
     const freshGroups = mergeGroupSets(groupSets);
     const hasStandaloneOwnQuota = freshModels.some(model =>
-      (model.family === 'argon' || model.family === 'carbon') && model.disabled !== true
+      (model.family === 'argon' || model.family === 'carbon' || model.family === 'other') && model.disabled !== true
       && model.own_percentage_known && !model.own_stale);
     if(providerContext&&!freshGroups.some(group=>group.buckets.some(bucket=>bucket.remaining_fraction_known)) && !hasStandaloneOwnQuota) {
-      const reason=summaryResults.map(row=>row.error||(!row.ok?'读取失败':'未返回额度窗口')).join('；');
-      throw new CloudQuotaAuthorityError('当前官方配额服务未返回可验证额度：'+reason+'。未采用其他环境的 100% 默认值');
+      const reason=summaryResults.map(row=>row.error||(!row.ok?bt('account_cloud.reason.read_failed'):bt('account_cloud.reason.no_window'))).join(bt('common.sentence_separator'));
+      throw new CloudQuotaAuthorityError(bt('account_cloud.err.authority_empty', { reason }));
     }
 
     if (freshModels.length === 0 && freshGroups.length === 0) {
-      throw new Error('未能取得此账号的配额，已保留上次记录');
+      throw new Error(bt('account_cloud.err.no_quota_kept'));
     }
 
-    if(providerContext && ['argon','carbon'].some(family => (family === 'argon' || freshModels.some(m=>m.family===family) || freshGroups.some(g=>g.family===family)) && !freshModels.some(model=>model.family===family&&model.own_percentage_known) && !freshGroups.some(group=>group.family===family))) {
+    const freshWindows = familyWindowsFromGroups(freshGroups, Date.now());
+    const freshArgon = buildArgonStatus(freshModels, freshGroups, freshWindows, Date.now(), subscriptionTier);
+    const freshCarbon = buildCarbonStatus(freshModels, freshGroups, freshWindows, Date.now(), freshArgon, subscriptionTier);
+    const freshStandalone = buildStandaloneModels(
+      freshModels,
+      freshGroups,
+      freshWindows,
+      Date.now(),
+      freshArgon,
+      freshCarbon,
+      subscriptionTier,
+    );
+    const needOtherStandaloneQuota =
+      freshStandalone.some(
+        item => item.key !== 'argon' && item.key !== 'carbon' && item.availability !== 'disabled' && item.quotaState !== 'known'
+      ) ||
+      freshModels.some(
+        m =>
+          m.family === 'other' &&
+          m.disabled !== true &&
+          !m.own_percentage_known &&
+          !freshGroups.some(g => g.family === 'other' && g.buckets.some(b => b.remaining_fraction_known)) &&
+          matchModelToSharedPool(m, freshWindows, freshGroups, subscriptionTier, freshModels) === null
+      );
+    const needIndependentQuota = providerContext !== null && (needOtherStandaloneQuota || (['argon', 'carbon'] as const).some(family => {
+      const status = family === 'argon' ? freshArgon : freshCarbon;
+      if (status.mode === 'unified' || status.mode === 'disabled') return false;
+      const familyModels = freshModels.filter(m => m.family === family);
+      const hasFamilyGroup = freshGroups.some(g => g.family === family);
+      if (hasFamilyGroup || familyModels.some(m => m.own_percentage_known)) return false;
+      if (family === 'argon') {
+        if (familyModels.length === 0 && freshGroups.length > 0 && /free|starter|ultra/i.test(subscriptionTier ?? '')) {
+          return false;
+        }
+        return true;
+      }
+      return familyModels.length > 0;
+    }));
+    if (needIndependentQuota && providerContext) {
       const independent=await queryAll<any>([providerContext.origin+'/v1internal:retrieveUserQuota'],()=>projectContextRecovered&&projectObserved&&projectId?{project:projectId}:{});
       for(const result of independent) {note('independent-quota',result.endpoint,result.ok);if(result.ok)freshModels=mergeModelCatalogues([freshModels,normalizeIndependentArgonQuota(result.data,nowSec)]);}
     }
@@ -272,16 +318,22 @@ export async function fetchCloudQuotaForAccount(params: {
     const { models: mergedModels, carriedCount } = mergeModelsWithPrevious(freshModels, previousModels);
     const windows = familyWindowsFromGroups(mergedGroups, Date.now());
     const applied = applyFamilyWindows(mergedModels, windows);
+    const mergedArgon = buildArgonStatus(applied, mergedGroups, windows, Date.now(), subscriptionTier);
+    const mergedCarbon = buildCarbonStatus(applied, mergedGroups, windows, Date.now(), mergedArgon, subscriptionTier);
+    const isIgnoredStandaloneFamily = (family: Family): boolean =>
+      (family === 'argon' && (mergedArgon.mode === 'unified' || mergedArgon.mode === 'disabled'))
+      || (family === 'carbon' && (mergedCarbon.mode === 'unified' || mergedCarbon.mode === 'disabled'));
 
     // 6) 完整性：缺 family / 缺已知窗口 / 生产端点失败 / 预算超时 → complete=false，并保留原因。
     const expectedFamilies = new Set<Family>();
-    for (const group of previousGroups) if (group.family !== 'other') expectedFamilies.add(group.family);
-    for (const model of freshModels) if (model.family !== 'other' && model.disabled !== true) expectedFamilies.add(model.family);
+    for (const group of previousGroups) if (group.family !== 'other' && !isIgnoredStandaloneFamily(group.family)) expectedFamilies.add(group.family);
+    for (const model of freshModels) if (model.family !== 'other' && model.disabled !== true && !isIgnoredStandaloneFamily(model.family)) expectedFamilies.add(model.family);
     const presentFamilies = new Set(mergedGroups.filter(group => group.buckets.some(bucket => bucket.remaining_fraction_known && !bucket.stale)).map(group => group.family));
     for (const model of applied) if ((model.family === 'argon' || model.family === 'carbon') && model.disabled !== true && model.own_percentage_known && !model.own_stale) presentFamilies.add(model.family);
     const missingFamilies = [...expectedFamilies].filter(family => !presentFamilies.has(family));
     const missingWindows: { family: Family; window: WindowKind }[] = [];
     for (const previous of previousGroups) {
+      if (isIgnoredStandaloneFamily(previous.family)) continue;
       for (const bucket of previous.buckets) {
         if (bucket.window === 'unspecified') continue;
         const present = mergedGroups.some(group => group.family === previous.family
@@ -300,16 +352,16 @@ export async function fetchCloudQuotaForAccount(params: {
       && freshModels.length > 0 && hasFreshKnownBucket && !usedFallbackEndpoint;
 
     const warnings: string[] = [];
-    if (deadlineFired) warnings.push('REFRESH_BUDGET_TIMEOUT: 配额刷新超出整体预算，已保存本轮取得的有效数据');
-    if (usedFallbackEndpoint) warnings.push('FALLBACK_ENDPOINT: 生产端点未成功，本轮数据来自 daily/sandbox');
-    for (const family of missingFamilies) warnings.push(`MISSING_FAMILY:${family}: ${familyLabel(family)} 本轮未返回`);
-    for (const item of missingWindows) warnings.push(`MISSING_WINDOW:${item.family}:${item.window}: ${familyLabel(item.family)} ${item.window} 窗口未返回`);
-    for (const stale of staleGroups.slice(0, 12)) warnings.push(`CARRIED:${stale.name}: 沿用上次记录（${new Date(stale.observed_at * 1000).toISOString()}）`);
-    if (applied.some(model => model.family === 'argon' && model.disabled === true)) warnings.push('ARGON_DISABLED: 当前账号无 Gemini 4 Argon 权限');
-    if (applied.some(model => model.family === 'argon' && model.disabled === null && model.own_percentage_known)) warnings.push('ARGON_MODEL_QUOTA: Argon 模型自带 quotaInfo，但未返回明确周期窗口');
+    if (deadlineFired) warnings.push(bt('account_cloud.warn.budget_timeout'));
+    if (usedFallbackEndpoint) warnings.push(bt('account_cloud.warn.fallback_endpoint'));
+    for (const family of missingFamilies) warnings.push(bt('account_cloud.warn.missing_family', { family, label: familyLabel(family) }));
+    for (const item of missingWindows) warnings.push(bt('account_cloud.warn.missing_window', { family: item.family, window: item.window, label: familyLabel(item.family) }));
+    for (const stale of staleGroups.slice(0, 12)) warnings.push(bt('account_cloud.warn.carried', { name: stale.name, iso: new Date(stale.observed_at * 1000).toISOString() }));
+    if (mergedArgon.mode !== 'unified' && applied.some(model => model.family === 'argon' && model.disabled === true)) warnings.push(bt('account_cloud.warn.argon_disabled'));
+    if (mergedArgon.mode !== 'unified' && mergedArgon.mode !== 'disabled' && !mergedGroups.some(g => g.family === 'argon') && applied.some(model => model.family === 'argon' && model.disabled === null && model.own_percentage_known)) warnings.push(bt('account_cloud.warn.argon_model_quota'));
 
     const missingLabels = missingFamilies.map(familyLabel);
-    account.quota_refresh_error = missingLabels.length > 0 ? `${missingLabels.join('、')} 配额未返回，已保留上次记录` : null;
+    account.quota_refresh_error = missingLabels.length > 0 ? bt('account_cloud.refresh_err.missing_families', { labels: missingLabels.join(bt('common.list_separator')) }) : null;
 
     const groupObservations = mergedGroups
       .map(group => group.observed_at)
@@ -326,7 +378,7 @@ export async function fetchCloudQuotaForAccount(params: {
       refreshedAt: nowSec,
       usedFallbackEndpoint,
       ...(providerContext?{providerOrigin:providerContext.origin,providerUserAgent:providerContext.userAgent,requestScope:'account' as const,projectContextRecovered}:{}),
-      ...(deadlineFired ? { error: '整体预算超时，已保存部分结果' } : {}),
+      ...(deadlineFired ? { error: bt('account_cloud.refresh_state.budget_timeout') } : {}),
     };
 
     account.quota = {

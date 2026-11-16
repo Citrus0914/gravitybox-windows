@@ -1,10 +1,11 @@
 import { DatabaseSync } from 'node:sqlite';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
-import { aggregateLedger, type AggregateOptions } from './usage-aggregate.js';
-import { matchPricingKeys, resolvePricingForTimestamp } from './pricing.js';
+import { aggregateLedger, isUnpricedZeroSentinel, type AggregateOptions } from './usage-aggregate.js';
+import { matchPricingKeys, resolveContextTierPricing, resolvePricingForTimestamp, type ApiPricing } from './pricing.js';
 import { resolveDatabaseModelFullName } from './usage-types.js';
+import { bt } from './i18n.js';
 function digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 function feesDigest(db: DatabaseSync): string {
     const hash = createHash('sha256');
@@ -48,99 +49,142 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
         } catch {}
         const id = randomUUID(), backup = join(reviews, id + '-before.sqlite'), candidate = join(reviews, id + '-candidate.sqlite');
         const sourceRevision = revision(db), sourceFeesDigest = feesDigest(db);
-        db.exec(`VACUUM INTO '${backup.replace(/'/g, "''")}'`);
-        const baseline = new DatabaseSync(backup);
         const ratesPath = join(dirname(path), 'usage-rate-locks.json');
         const rateBytes = existsSync(ratesPath) ? readFileSync(ratesPath) : null;
         const rateDigest = rateBytes ? createHash('sha256').update(rateBytes).digest('hex') : null;
         if (rateBytes)
             writeFileSync(join(reviews, id + '-rates-before.json'), rateBytes, { mode: 0o600 });
+        // 仅构建轻量级 rate_locks 快照库（不复制全量 events/event_revisions），保持与 ATTACH 还原契约完全兼容
+        const backupLocks = new Map<string, { unit_price: string; usd: number }>();
+        const baseline = new DatabaseSync(backup);
         try {
+            baseline.exec('CREATE TABLE IF NOT EXISTS rate_locks(event_key TEXT PRIMARY KEY,unit_price TEXT NOT NULL,usd REAL NOT NULL);');
+            baseline.exec('BEGIN IMMEDIATE');
+            const insert = baseline.prepare('INSERT OR IGNORE INTO rate_locks VALUES(?,?,?)');
+            for (const row of db.prepare('SELECT event_key,unit_price,usd FROM rate_locks').iterate() as Iterable<any>) {
+                const key = String(row.event_key);
+                const unitPrice = String(row.unit_price);
+                const usd = Number(row.usd);
+                insert.run(key, unitPrice, usd);
+                backupLocks.set(key, { unit_price: unitPrice, usd });
+            }
             if (rateBytes) {
                 const rates = JSON.parse(rateBytes.toString());
                 if (rates.version !== 1 || !rates.entries)
-                    throw Error('历史费率账本无法验证，未生成重估候选');
-                const insert = baseline.prepare('INSERT OR IGNORE INTO rate_locks VALUES(?,?,?)');
+                    throw Error(bt('revalue.err.rate_ledger_unverified'));
                 for (const [key, value] of Object.entries<any>(rates.entries)) {
                     const price = value.price ?? rates.profiles?.[value.p];
                     if (!price || !Number.isFinite(value.usd) || value.usd < 0)
-                        throw Error('历史费率条目无效，原件已保留');
-                    insert.run(key, JSON.stringify(price), value.usd);
+                        throw Error(bt('revalue.err.rate_entry_invalid'));
+                    const unitPrice = JSON.stringify(price);
+                    const inserted = insert.run(key, unitPrice, value.usd);
+                    if (inserted.changes > 0 && !backupLocks.has(key)) {
+                        backupLocks.set(key, { unit_price: unitPrice, usd: Number(value.usd) });
+                    }
                 }
             }
-            baseline.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+            baseline.exec('COMMIT');
         }
         finally {
             baseline.close();
         }
-        copyFileSync(backup, candidate);
         chmodSync(backup, 0o600);
-        chmodSync(candidate, 0o600);
-        const next = new DatabaseSync(candidate);
-        let before = 0, after = 0, unknown = 0;
+        const liveFileSet = options.liveFiles ? new Set(options.liveFiles) : null;
+        const extraPriceKeys = Object.keys(options.prices);
+        const candidateLocks = new Map(backupLocks);
+        let before = 0, unknown = 0;
+        for (const row of db.prepare('SELECT e.event_key,e.payload FROM events e LEFT JOIN event_aliases a ON a.legacy_key=e.event_key WHERE a.legacy_key IS NULL').iterate() as Iterable<any>) {
+            const event = JSON.parse(String(row.payload));
+            if (event.db_file === 'recovered_session.db' || event.db_file === 'recovered_enterprise_session.db' || (!event.source_id && event.db_file && liveFileSet?.has(event.db_file))) {
+                continue;
+            }
+            const eventKey = String(row.event_key);
+            const lock = backupLocks.get(eventKey);
+            const locked = lock ? JSON.parse(lock.unit_price) as ApiPricing : null;
+            const cw = event.cache_write_tokens ?? 0;
+            const lockedMissingCw = Boolean(
+                locked &&
+                cw > 0 &&
+                (() => {
+                    const eff = resolveContextTierPricing(locked, event.input_tokens + event.cached_tokens + cw);
+                    return !Number.isFinite(eff.cacheWrite) || eff.cacheWrite! < 0;
+                })()
+            );
+            const zeroSentinel = isUnpricedZeroSentinel(locked);
+            if (lock && !zeroSentinel && !lockedMissingCw && event.timestamp_seconds > 0) {
+                before += lock.usd;
+            }
+            const normalizedModel = resolveDatabaseModelFullName(event.model, null);
+            const price = resolvePricingForTimestamp(
+                options.prices[normalizedModel] ?? options.prices[matchPricingKeys(normalizedModel, extraPriceKeys)],
+                event.timestamp_seconds,
+                normalizedModel
+            );
+            if (!price) {
+                unknown++;
+                continue;
+            } // Current prices are never invented for an unsupported historical interval.
+            const unpriced = !lock || zeroSentinel || lockedMissingCw;
+            if (options.mode !== 'unpriced_only' || unpriced) {
+                candidateLocks.delete(eventKey);
+            }
+        }
+        const after = aggregateLedger(db, {
+            ...options,
+            accountId: 'all',
+            accounts: [],
+            ignoreLegacyRates: true,
+            dryRunRateLocks: candidateLocks,
+        }).all_time.estimated_usd;
+        const candidateDb = new DatabaseSync(candidate);
         try {
-            before = Number(next.prepare('SELECT COALESCE(SUM(l.usd),0) AS usd FROM events e JOIN rate_locks l ON l.event_key=e.event_key').get()?.usd);
-            const remove = next.prepare('DELETE FROM rate_locks WHERE event_key=?');
-            for (const row of next.prepare('SELECT e.event_key,e.payload,l.unit_price,l.usd FROM events e LEFT JOIN rate_locks l ON l.event_key=e.event_key').iterate()) {
-                const event = JSON.parse(String(row.payload));
-                const normalizedModel = resolveDatabaseModelFullName(event.model, null);
-                const price = resolvePricingForTimestamp(
-                    options.prices[normalizedModel] ?? options.prices[matchPricingKeys(normalizedModel)],
-                    event.timestamp_seconds,
-                    normalizedModel
-                );
-                if (!price) {
-                    unknown++;
-                    continue;
-                } // Current prices are never invented for an unsupported historical interval.
-                const locked = row.unit_price ? JSON.parse(String(row.unit_price)) : null;
-                const unpriced = !locked || Number(row.usd) === 0 && [locked.input, locked.output, locked.cached, locked.cacheWrite ?? 0].every(value => value === 0);
-                if (options.mode !== 'unpriced_only' || unpriced)
-                    remove.run(String(row.event_key));
+            candidateDb.exec('CREATE TABLE IF NOT EXISTS rate_locks(event_key TEXT PRIMARY KEY,unit_price TEXT NOT NULL,usd REAL NOT NULL);');
+            candidateDb.exec('BEGIN IMMEDIATE');
+            const put = candidateDb.prepare('INSERT INTO rate_locks VALUES(?,?,?)');
+            for (const [key, lock] of candidateLocks) {
+                put.run(key, lock.unit_price, lock.usd);
             }
-            after = aggregateLedger(next, { ...options, accountId: 'all', accounts: [], ignoreLegacyRates: true }).all_time.estimated_usd;
-            const original = new DatabaseSync(backup, { readOnly: true });
-            const lookup = original.prepare('SELECT usd FROM rate_locks WHERE event_key=?');
-            const changes: {
-                key: string;
-                before: number | null;
-                after: number;
-            }[] = [];
-            let changedCount = 0;
-            for (const row of next.prepare('SELECT event_key,usd FROM rate_locks').iterate()) {
-                const old = lookup.get(String(row.event_key));
-                if (!old || Number(old.usd) !== Number(row.usd)) {
-                    changedCount++;
-                    if (changes.length < 100)
-                        changes.push({ key: String(row.event_key), before: old ? Number(old.usd) : null, after: Number(row.usd) });
-                }
-            }
-            original.close();
-            if (revision(db) !== sourceRevision || feesDigest(db) !== sourceFeesDigest)
-                throw Error('预览期间用量已变化，请重新生成预览');
-            const receipt = { schema: 1, previewId: id, sourceRevision, sourceFeesDigest, rateDigest, priceDigest: digest(options.prices), backup, candidate, mode: options.mode ?? 'force_all', before: Math.round(before * 1e8) / 1e8, after, changedCount, unverifiableCount: unknown, samples: changes, requiresConfirmation: true };
-            writeFileSync(join(reviews, id + '.json'), JSON.stringify(receipt, null, 2), { mode: 0o600, flag: 'wx' });
-            return receipt;
+            candidateDb.exec('COMMIT');
         }
         finally {
-            next.close();
+            candidateDb.close();
         }
+        chmodSync(candidate, 0o600);
+        const changes: {
+            key: string;
+            before: number | null;
+            after: number;
+        }[] = [];
+        let changedCount = 0;
+        for (const [key, row] of candidateLocks) {
+            const old = backupLocks.get(key);
+            if (!old || Number(old.usd) !== Number(row.usd)) {
+                changedCount++;
+                if (changes.length < 100)
+                    changes.push({ key, before: old ? Number(old.usd) : null, after: Number(row.usd) });
+            }
+        }
+        if (revision(db) !== sourceRevision || feesDigest(db) !== sourceFeesDigest)
+            throw Error(bt('revalue.err.usage_changed'));
+        const receipt = { schema: 1, previewId: id, sourceRevision, sourceFeesDigest, rateDigest, priceDigest: digest(options.prices), backup, candidate, mode: options.mode ?? 'force_all', before: Math.round(before * 1e8) / 1e8, after, changedCount, unverifiableCount: unknown, samples: changes, requiresConfirmation: true };
+        writeFileSync(join(reviews, id + '.json'), JSON.stringify(receipt, null, 2), { mode: 0o600, flag: 'wx' });
+        return receipt;
     }
     if (!options.confirmed || !options.previewId || !/^[a-f0-9-]{36}$/.test(options.previewId))
-        throw Error('请先查看历史重估预览，再明确确认该预览；原费率未改变');
+        throw Error(bt('revalue.err.confirm_required'));
     const receiptPath = join(reviews, options.previewId + '.json');
     const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
     const ratesPath = join(dirname(path), 'usage-rate-locks.json');
     const currentRateDigest = existsSync(ratesPath) ? createHash('sha256').update(readFileSync(ratesPath)).digest('hex') : null;
     if (receipt.schema !== 1 || receipt.sourceRevision !== revision(db) || options.action === 'apply' && (receipt.priceDigest !== digest(options.prices) || receipt.rateDigest !== currentRateDigest))
-        throw Error('预览后账本或价格已变化，请重新预览，未覆盖当前记录');
+        throw Error(bt('revalue.err.changed_after_preview'));
     if (options.action === 'restore' && (receipt.phase !== 'applied' || receipt.appliedFeesDigest !== feesDigest(db)))
-        throw Error('确认重估后费率已变化，停止覆盖；原备份仍保留');
+        throw Error(bt('revalue.err.rates_changed_after_confirm'));
     if (options.action === 'apply' && receipt.sourceFeesDigest !== feesDigest(db))
-        throw Error('预览后历史费率已变化，请重新预览');
+        throw Error(bt('revalue.err.history_changed_after_preview'));
     const selected = options.action === 'restore' ? receipt.backup : receipt.candidate;
     if (selected !== join(reviews, options.previewId + (options.action === 'restore' ? '-before.sqlite' : '-candidate.sqlite')))
-        throw Error('历史重估恢复路径无效');
+        throw Error(bt('revalue.err.restore_path_invalid'));
     db.exec(`ATTACH DATABASE '${selected.replace(/'/g, "''")}' AS reviewed`);
     try {
         db.exec('BEGIN IMMEDIATE; DELETE FROM rate_locks; INSERT INTO rate_locks SELECT * FROM reviewed.rate_locks; INSERT INTO rate_changes VALUES((SELECT COALESCE(MAX(version),0)+1 FROM rate_changes),0); COMMIT;');
@@ -181,5 +225,5 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
     }
     writeFileSync(receiptPath, JSON.stringify({ ...receipt, phase: options.action === 'restore' ? 'restored' : 'applied', appliedFeesDigest: feesDigest(db), completedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
     return { before: receipt.before, after: options.action === 'restore' ? receipt.before : receipt.after, previewId: receipt.previewId, backupPath: receipt.backup,
-        message: options.action === 'restore' ? '已恢复该预览保存的原费率；备份与差异仍保留' : '历史费用已按已确认预览重估；原费率备份及差异可回退' };
+        message: options.action === 'restore' ? bt('revalue.msg.restored') : bt('revalue.msg.applied') };
 }

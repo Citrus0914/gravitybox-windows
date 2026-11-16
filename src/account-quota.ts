@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
+import { bt, getActiveLocale, translate } from './i18n.js';
 import {
   applyFamilyWindows,
   buildArgonStatus,
@@ -18,12 +19,14 @@ import {
   normalizeStoredGroups,
   normalizeFraction,
   type ArgonStatus,
+  type Availability,
   type StandaloneModelStatus,
   type Family,
   type FamilyWindows,
   type NormalizedGroup,
   type NormalizedModel,
   type QuotaSource,
+  type QuotaState,
   type WindowKind,
   type WindowStatus,
 } from './quota.js';
@@ -62,7 +65,7 @@ export function pickNextReset(
 }
 
 export function familyLabel(family: Family): string {
-  return family === 'gemini' ? 'Gemini' : family === 'claude' ? 'Claude/GPT' : family === 'argon' ? 'Argon' : family === 'carbon' ? 'Carbon' : '其他';
+  return family === 'gemini' ? 'Gemini' : family === 'claude' ? 'Claude/GPT' : family === 'argon' ? 'Argon' : family === 'carbon' ? 'Carbon' : bt('quota.family.other');
 }
 
 /**
@@ -183,6 +186,7 @@ export interface ModelQuota {
   // 扩展配额与模型状态字段（均可选，旧数据容错）
   model_id?: string;
   model_or_alias?: string | null;
+  quota_bucket_name?: string | null;
   family?: Family;
   is_argon?: boolean;
   is_carbon?: boolean;
@@ -261,6 +265,7 @@ export interface AccountSummary {
   custom_label?: string | null;
   quota?: QuotaData | null;
   quota_refresh_error?: string | null;
+  quota_refresh_error_code?: AccountErrorCode | null;
   revision?: string;
   quota_last_updated?: number;
   credentialReadiness?: ReturnType<typeof accountCredentialReadiness>;
@@ -298,6 +303,7 @@ export function quotaSnapshotForRevision(quota: QuotaData | null | undefined): u
       model.own_reset_time ?? '', model.reset_time ?? '', model.reset_countdown ?? '',
       model.own_observed_at ?? '', model.own_stale === true ? '1' : '0',
       windowPart(model.family_5h), windowPart(model.family_weekly),
+      model.quota_bucket_name ?? '',
       model.quota_source ?? '', model.stale === true ? '1' : '0',
     ];
   });
@@ -358,6 +364,7 @@ export interface Account {
   device_profile?: DeviceProfile | null;
   quota?: QuotaData | null;
   quota_refresh_error?: string | null;
+  quota_refresh_error_code?: AccountErrorCode | null;
   insiders_quota?: QuotaData | null;
   insiders_quota_refresh_error?: string | null;
   disabled: boolean;
@@ -373,12 +380,204 @@ export interface Account {
   custom_label?: string | null;
 }
 
+export type AccountErrorCode =
+  | 'oauth_incomplete'
+  | 'oauth_no_credentials'
+  | 'oauth_verify_failed'
+  | 'oauth_unverified_email'
+  | 'oauth_network'
+  | 'missing_refresh_token'
+  | 'missing_oauth_client'
+  | 'refresh_failed'
+  | 'no_access_token'
+  | 'token_invalid'
+  | 'token_no_access'
+  | 'token_network'
+  | 'invalid_id'
+  | 'corrupt_file'
+  | 'conflict_modified'
+  | 'credentials_updated'
+  | 'deleted_stop_refresh'
+  | 'removed_stop_refresh'
+  | 'not_found'
+  | 'invalid_refresh_token'
+  | 'missing_email'
+  | 'name_too_long'
+  | 'identity_verify_failed'
+  | 'email_unverified'
+  | 'http_3501'
+  | 'network';
+
+const ACCOUNT_ERROR_CODES = new Set<string>([
+  'oauth_incomplete', 'oauth_no_credentials', 'oauth_verify_failed', 'oauth_unverified_email',
+  'oauth_network', 'missing_refresh_token', 'missing_oauth_client', 'refresh_failed',
+  'no_access_token', 'token_invalid', 'token_no_access', 'token_network', 'invalid_id',
+  'corrupt_file', 'conflict_modified', 'credentials_updated', 'deleted_stop_refresh',
+  'removed_stop_refresh', 'not_found', 'invalid_refresh_token', 'missing_email',
+  'name_too_long', 'identity_verify_failed', 'email_unverified', 'http_3501', 'network',
+]);
+
+export class CodedAccountError extends Error {
+  readonly code: AccountErrorCode;
+  constructor(code: AccountErrorCode, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'CodedAccountError';
+    this.code = code;
+  }
+}
+
+export function accountErrorCode(error: unknown): AccountErrorCode | null {
+  if (error instanceof CodedAccountError) return error.code;
+  if (error && typeof error === 'object' && 'code' in error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string' && ACCOUNT_ERROR_CODES.has(code)) return code as AccountErrorCode;
+  }
+  return null;
+}
+
+const AUTH_REQUIRED_CODES = new Set<AccountErrorCode>(['refresh_failed', 'missing_refresh_token', 'token_invalid']);
+
 export function accountCredentialReadiness(account: Account, now = Date.now() / 1000): { state: 'ready' | 'needs_refresh' | 'needs_authorization'; message: string } {
-  if (/invalid_grant|授权.*(?:失效|过期)|重新(?:登录|授权)|HTTP\s*401/i.test(account.quota_refresh_error ?? ''))
-    return { state: 'needs_authorization', message: '请重新授权后再切换' };
-  if (!account.token?.access_token || account.token.access_token === 'pending_refresh' || !Number.isFinite(account.token.expiry_timestamp) || account.token.expiry_timestamp <= now + 30)
-    return { state: 'needs_refresh', message: '切换前请刷新登录凭据；当前运行账号可重新保存当前账号' };
-  return { state: 'ready', message: '登录凭据可用于切换' };
+  const rawError = account.quota_refresh_error ?? '';
+  const errorCode = account.quota_refresh_error_code ?? null;
+  // Keep official HTTP 403 / #3501 license checks in 'ready' unless explicit auth failure also occurred.
+  const isHttp403Only = /HTTP\s*403|\b3501\b/i.test(rawError) && !/invalid_grant|HTTP\s*401/i.test(rawError);
+  if ((errorCode && AUTH_REQUIRED_CODES.has(errorCode))
+    || (!isHttp403Only && /invalid_grant|授权.*(?:失效|过期)|重新(?:登录|授权|获取)|请重新添加|登录凭据(?:无法刷新|无效|已失效)|缺少登录凭据|re-?authoriz|sign in again|expired|HTTP\s*401|Unable to refresh login credentials|missing login credentials|please add this account again/i.test(rawError))) {
+    return { state: 'needs_authorization', message: bt('account_quota.readiness.needs_auth') };
+  }
+  if (!account.token?.access_token || account.token.access_token === 'pending_refresh' || !Number.isFinite(account.token.expiry_timestamp) || account.token.expiry_timestamp <= now + 30) {
+    return { state: 'needs_refresh', message: bt('account_quota.readiness.needs_refresh') };
+  }
+  return { state: 'ready', message: bt('account_quota.readiness.ready') };
+}
+
+const KNOWN_FAMILIES = new Set<Family>(['gemini', 'claude', 'argon', 'carbon', 'other']);
+
+const STORED_QUOTA_ERROR_PATTERNS: Array<[RegExp, string]> = [
+  [/^(?:Overall budget timed out; partial results saved|整体预算超时，已保存部分结果)$/, 'account_cloud.refresh_state.budget_timeout'],
+  [/^(?:Overall quota refresh budget timed out|配额刷新整体预算超时)$/, 'account_cloud.err.budget_timeout'],
+  [/^(?:Unable to retrieve quota for this account; previous record retained|未能取得此账号的配额，已保留上次记录)$/, 'account_cloud.err.no_quota_kept'],
+  [/^HTTP 403\s*(?:\(Official product license verification failed, error 3501; check this account in the official app\)|（官方产品许可校验未通过，错误码 3501；请在官方应用核对该账号状态）)$/, 'account_cloud.err.http_3501'],
+  [/^(?:Project context returned no verifiable quota|项目上下文未返回可验证配额)$/, 'account_cloud.err.project_no_verifiable_quota'],
+  [/^(?:This account is missing login credentials; please add it again|此账号缺少登录凭据，请重新添加)$/, 'account_cloud.err.missing_refresh_token'],
+  [/^(?:Google OAuth credentials are not configured, so standby accounts cannot refresh tokens in the background \(optional credentials can be set in \.env\)|未配置 Google OAuth 凭据，备用账号无法后台刷新 Token（可在 \.env 中配置可选凭据）)$/, 'account_cloud.err.missing_oauth_client'],
+  [/^(?:Unable to refresh login credentials; please add this account again|登录凭据无法刷新，请重新添加此账号)$/, 'account_cloud.err.refresh_failed'],
+  [/^(?:Sign-in service did not return valid credentials|登录服务未返回有效凭据)$/, 'account_cloud.err.no_access_token'],
+  [/^(?:Unable to reach the sign-in service; check your network and try again|无法连接登录服务，请检查网络后重试)$/, 'account_cloud.err.network'],
+  [/^(?:Login credentials are invalid or expired; please obtain new ones|登录凭据无效或已失效，请重新获取)$/, 'accounts.err.token_invalid'],
+  [/^(?:Unable to confirm Antigravity's live quota service; launch the official app first \(did not fall back to another environment's default quota\)|无法确认 Antigravity 实际配额服务，请先运行官方应用；未采用其他环境的默认配额)$/, 'accounts.err.provider_unverified'],
+  [/^(?:Refresh failed; please try again later|刷新失败，请稍后重试)$/, 'accounts.err.refresh_failed_retry'],
+  [/^(?:Refresh failed|刷新失败)$/, 'accounts.err.refresh_failed'],
+  [/^(?:Local RPC timed out|本地 RPC 超时)$/, 'account_probe.err.rpc_timeout'],
+  [/^(?:Read failed|读取失败)$/, 'account_cloud.reason.read_failed'],
+  [/^(?:No quota window returned|未返回额度窗口)$/, 'account_cloud.reason.no_window'],
+  [/^(?:Cancelled|已取消)$/, 'account_cloud.err.aborted'],
+  [/^(?:Google sign-in was not completed; please sign in again|Google 授权未完成，请重新登录)$/, 'oauth.err.incomplete'],
+  [/^(?:Unable to obtain saveable login credentials; please re-authorize|未取得可保存的登录凭据，请重新授权)$/, 'oauth.err.no_credentials'],
+];
+
+export function localizeStoredQuotaError(error: string): string {
+  const trimmed = error.trim();
+  for (const [pattern, key] of STORED_QUOTA_ERROR_PATTERNS) {
+    if (pattern.test(trimmed)) return bt(key);
+  }
+  const missingFamMatch = trimmed.match(/^(.+?)\s+(?:quota not returned; previous record retained|配额未返回，已保留上次记录)$/);
+  if (missingFamMatch && missingFamMatch[1]) {
+    const labels = missingFamMatch[1]
+      .split(/(?:,\s*|、)/)
+      .map(part => {
+        const clean = part.trim();
+        return /^(?:其他|Other)$/i.test(clean) ? bt('quota.family.other') : clean;
+      })
+      .filter(Boolean)
+      .join(bt('common.list_separator'));
+    return bt('account_cloud.refresh_err.missing_families', { labels });
+  }
+  const authEmptyMatch = trimmed.match(/^(?:Official quota service returned no verifiable quota:\s*(.+?)\. Did not fall back to a synthetic 100% default|当前官方配额服务未返回可验证额度：(.+?)。未采用其他环境的 100% 默认值)$/);
+  if (authEmptyMatch) {
+    const rawReason = (authEmptyMatch[1] ?? authEmptyMatch[2] ?? '').trim();
+    const localizedReason = rawReason
+      .split(/(?:;\s*|；)/)
+      .map(part => localizeStoredQuotaError(part.trim()))
+      .filter(Boolean)
+      .join(bt('common.sentence_separator'));
+    return bt('account_cloud.err.authority_empty', { reason: localizedReason });
+  }
+  return error;
+}
+
+export function cleanAndLocalizeRefreshError(error: string | null | undefined): string | null {
+  if (!error) return null;
+  const trimmed = String(error).trim();
+  if (!trimmed || /双周期|dual window/i.test(trimmed)) return null;
+  return localizeStoredQuotaError(trimmed);
+}
+
+export function resolveStoredQuotaWarning(warning: string): { code: string; text: string } | null {
+  if (warning.startsWith('REFRESH_BUDGET_TIMEOUT:')) return { code: 'REFRESH_BUDGET_TIMEOUT', text: bt('account_cloud.warn.budget_timeout') };
+  if (warning.startsWith('FALLBACK_ENDPOINT:')) return { code: 'FALLBACK_ENDPOINT', text: bt('account_cloud.warn.fallback_endpoint') };
+  if (warning.startsWith('NO_QUOTA:')) return { code: 'NO_QUOTA', text: bt('account_quota.warn.no_quota') };
+  if (warning.startsWith('GROUPS_PARSE_FAILED:')) return { code: 'GROUPS_PARSE_FAILED', text: bt('account_quota.warn.groups_parse_failed') };
+  if (warning.startsWith('ARGON_DISABLED:')) return { code: 'ARGON_DISABLED', text: bt('account_quota.warn.argon_disabled') };
+  if (warning.startsWith('ARGON_MODEL_QUOTA:')) return { code: 'ARGON_MODEL_QUOTA', text: bt('account_cloud.warn.argon_model_quota') };
+  if (warning.startsWith('ARGON_QUOTA_NOT_REPORTED:')) return { code: 'ARGON_QUOTA_NOT_REPORTED', text: bt('account_quota.warn.argon_not_reported') };
+  if (warning.startsWith('ARGON_STALE:')) return { code: 'ARGON_STALE', text: bt('account_quota.warn.argon_stale') };
+  if (warning.startsWith('NO_MODEL_RECORDS:')) return { code: 'NO_MODEL_RECORDS', text: bt('account_probe.warn.no_model_records') };
+  if (warning.startsWith('MALFORMED_GROUPS:')) {
+    const mg = warning.match(/^MALFORMED_GROUPS:\s*(?:Skipped\s+)?(\d+)\b/i);
+    return { code: 'MALFORMED_GROUPS', text: mg?.[1] ? bt('account_quota.warn.malformed_groups', { count: Number(mg[1]) }) : warning };
+  }
+  if (warning.startsWith('MALFORMED_MODEL:')) {
+    const mm = warning.match(/^MALFORMED_MODEL:(\d+):/);
+    if (mm?.[1]) return { code: `MALFORMED_MODEL:${mm[1]}`, text: bt('account_quota.warn.malformed_model', { index: Number(mm[1]) }) };
+  }
+  if (warning.startsWith('MISSING_FAMILY:')) {
+    const mf = warning.match(/^MISSING_FAMILY:([a-z0-9_-]+):\s*(.*)$/i);
+    if (mf?.[1]) {
+      const family = mf[1];
+      const rest = mf[2] ?? '';
+      const label = KNOWN_FAMILIES.has(family as Family) ? familyLabel(family as Family) : family;
+      const key = /本轮未返回|not returned in this cycle/i.test(rest) ? 'account_cloud.warn.missing_family' : 'account_quota.warn.missing_family';
+      return { code: `MISSING_FAMILY:${family}`, text: bt(key, { family, label }) };
+    }
+  }
+  if (warning.startsWith('MISSING_WINDOW:')) {
+    const mw = warning.match(/^MISSING_WINDOW:([a-z0-9_-]+):([a-z0-9_-]+):\s*(.*)$/i);
+    if (mw?.[1] && mw[2]) {
+      const family = mw[1];
+      const windowName = mw[2];
+      const rest = mw[3] ?? '';
+      const label = KNOWN_FAMILIES.has(family as Family) ? familyLabel(family as Family) : family;
+      const key = /窗口未返回|window not returned/i.test(rest) ? 'account_cloud.warn.missing_window' : 'account_quota.warn.missing_window';
+      return { code: `MISSING_WINDOW:${family}:${windowName}`, text: bt(key, { family, window: windowName, label }) };
+    }
+  }
+  if (warning.startsWith('CARRIED_GROUPS:')) {
+    const cg = warning.match(/^CARRIED_GROUPS:(\d+):\s*(.+?)\s*(?:carried over from last record|沿用上次记录)\s*$/);
+    if (cg?.[1] && cg[2]) {
+      const names = cg[2].split(/(?:,\s*|、)/).map(s => s.trim()).filter(Boolean).join(bt('common.list_separator'));
+      return { code: 'CARRIED_GROUPS', text: bt('account_quota.warn.carried_groups', { count: Number(cg[1]), names }) };
+    }
+    return { code: 'CARRIED_GROUPS', text: warning };
+  }
+  if (warning.startsWith('CARRIED:')) {
+    const cr = warning.match(/^CARRIED:(.+?):\s*(?:Carried over from last record\s*\(([^)]+)\)|沿用上次记录（([^）]+)）)\s*$/);
+    if (cr?.[1]) {
+      const name = cr[1].trim();
+      const iso = (cr[2] ?? cr[3] ?? '').trim();
+      return { code: `CARRIED:${name}`, text: bt('account_cloud.warn.carried', { name, iso }) };
+    }
+  }
+  if (warning.startsWith('UNVERIFIED_CLOUD_SCOPE:')) {
+    const detail = warning.slice('UNVERIFIED_CLOUD_SCOPE:'.length).trim();
+    const localizedDetail = detail ? localizeStoredQuotaError(detail) : '';
+    return {
+      code: 'UNVERIFIED_CLOUD_SCOPE',
+      text: localizedDetail ? `UNVERIFIED_CLOUD_SCOPE: ${localizedDetail}` : 'UNVERIFIED_CLOUD_SCOPE',
+    };
+  }
+  return null;
 }
 
 export interface AccountIndex {
@@ -484,6 +683,7 @@ export function normalizedModelFromStored(model: ModelQuota, fallbackSource: Quo
     disabled: typeof model.disabled === 'boolean' ? model.disabled
       : /(?:^|[-_])disabled(?:$|[-_])/i.test(model.model_id ?? model.name) ? true : null,
     model_or_alias: model.model_or_alias ?? null,
+    ...(model.quota_bucket_name ? { quota_bucket_name: model.quota_bucket_name } : {}),
     own_percentage: ownKnown ? ownPercentage : null,
     own_percentage_known: ownKnown,
     own_reset_time: normalizeResetTime(model.own_reset_time ?? model.reset_time),
@@ -511,6 +711,30 @@ export function normalizedModelFromStored(model: ModelQuota, fallbackSource: Quo
 
 export interface QuotaOverviewWindowStatus extends WindowStatus {
   resetCountdown: string;
+}
+
+export interface ProjectedGroupWindow {
+  id: string;
+  period: string;
+  label: string;
+  known: boolean;
+  remaining: number | null;
+  stale: boolean;
+  resetCountdown: string;
+  observedAt: number | null;
+  source: string | null;
+}
+
+export interface ProjectedQuotaGroup {
+  key: string;
+  displayName: string;
+  summaryLabel: string;
+  brands: string[];
+  isStandalone: boolean;
+  availability: Availability;
+  quotaState: QuotaState;
+  windows: ProjectedGroupWindow[];
+  message: string;
 }
 
 export interface QuotaOverview {
@@ -548,6 +772,7 @@ export interface QuotaOverview {
   argonStatus: ArgonStatus;
   carbonStatus: ArgonStatus;
   standaloneModels: StandaloneModelStatus[];
+  projectedQuotaGroups?: ProjectedQuotaGroup[];
   familyWindows: {
     gemini: { fiveHour: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
     claude: { fiveHour: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
@@ -596,6 +821,63 @@ export function fuseQuotaData(fetchAvailableModelsData: any, quotaSummaryData?: 
   };
 }
 
+/**
+ * 根据当前正在使用的账号套餐与可用配额结构，将用户配置的监测范围安全解析为当前账号的等效有效监测范围。
+ * 不改动持久化配置本身，仅避免切到 Ultra / Free 套餐后因独立模型已并入共享池或无权限而导致推荐静默失效。
+ */
+export function resolveEffectiveMonitoredModel(account: Account, monitoredModel = 'all'): string {
+  const trimmed = monitoredModel.trim().toLowerCase();
+  if (!trimmed || trimmed === 'all') return 'all';
+  if (trimmed === 'gemini' || trimmed === 'claude' || trimmed === '3p' || trimmed === 'claude/gpt') {
+    return monitoredModel;
+  }
+  if (!account.quota) return monitoredModel;
+
+  const overview = buildAccountQuotaOverview(account);
+  const hasGeminiCore = overview.models.some(m => m.family === 'gemini' && m.disabled !== true && !m.stale)
+    || overview.familyWindows.gemini.fiveHour !== null
+    || overview.familyWindows.gemini.weekly !== null;
+  if (!hasGeminiCore) return monitoredModel;
+
+  if (
+    trimmed === 'gemini_all'
+    || trimmed === 'gemini 全系模型'
+    || trimmed === 'all gemini models'
+    || trimmed === 'gemini 全系（含 argon）'
+    || trimmed === 'all gemini (incl. argon)'
+  ) {
+    const hasStandaloneGemini =
+      (overview.argonStatus.mode === 'standalone' && overview.argonStatus.availability === 'available')
+      || (overview.carbonStatus.mode === 'standalone' && overview.carbonStatus.availability === 'available')
+      || (overview.standaloneModels ?? []).some(m =>
+        m.availability === 'available'
+        && (m.key.toLowerCase().includes('gemini') || m.displayName.toLowerCase().includes('gemini')));
+    return hasStandaloneGemini ? 'gemini_all' : 'gemini';
+  }
+
+  if (trimmed === 'argon' || trimmed === 'gemini 4 argon' || trimmed === 'gemini-4-argon') {
+    if (overview.argonStatus.mode === 'unified') {
+      return overview.argonStatus.pooledInFamily ?? 'gemini';
+    }
+    if (overview.argonStatus.availability === 'disabled') {
+      return 'gemini';
+    }
+    return monitoredModel;
+  }
+
+  if (trimmed === 'carbon' || trimmed === 'gemini 4 carbon' || trimmed === 'gemini-4-carbon') {
+    if (overview.carbonStatus.mode === 'unified') {
+      return overview.carbonStatus.pooledInFamily ?? 'gemini';
+    }
+    if (overview.carbonStatus.availability === 'disabled') {
+      return 'gemini';
+    }
+    return monitoredModel;
+  }
+
+  return monitoredModel;
+}
+
 export function computeAccountRemaining(account: Account, monitoredModel = 'all'): number | null {
   if (account.disabled || account.validation_blocked || account.quota?.is_forbidden) return null;
   const quota = account.quota;
@@ -627,8 +909,19 @@ export function computeAccountRemaining(account: Account, monitoredModel = 'all'
   const isCarbonTarget = trimmed === 'carbon' || trimmed === 'gemini 4 carbon';
   const isClaudeTarget = trimmed === 'claude' || trimmed === '3p' || trimmed === 'claude/gpt';
   const isGeminiTarget = trimmed === 'gemini';
-  const isGeminiAllTarget = trimmed === 'gemini_all' || trimmed === 'gemini 全系模型';
+  const isGeminiAllTarget = trimmed === 'gemini_all' || trimmed === 'gemini 全系模型' || trimmed === 'all gemini models';
   const isAllTarget = !trimmed || trimmed === 'all';
+
+  const resolveStandaloneRemaining = (status: ArgonStatus): number | null => {
+    if (status.mode === 'unified' && status.pooledInFamily) {
+      const poolValues = familyValues(status.pooledInFamily);
+      if (poolValues.length > 0) return bounded(Math.min(...poolValues));
+    }
+    if (status.availability !== 'available') return null;
+    if (status.quotaState !== 'known' || status.remaining === null) return null;
+    if (typeof status.observedAt === 'number' && nowSec - status.observedAt > FRESH_SECONDS) return null;
+    return bounded(status.remaining);
+  };
 
   // 具体模型或动态新增独立模型：优先匹配 standaloneModels，其次使用规范化后的 effective（= min(own, 相关 family 新鲜窗口)）
   if (!isArgonTarget && !isCarbonTarget && !isClaudeTarget && !isGeminiTarget && !isGeminiAllTarget && !isAllTarget) {
@@ -643,28 +936,41 @@ export function computeAccountRemaining(account: Account, monitoredModel = 'all'
     const model = overview.models.find(item =>
       (item.model_id ?? item.name).toLowerCase() === trimmed
       || (item.display_name ?? '').toLowerCase() === trimmed);
-    if (!model || model.disabled === true || model.stale === true) return null;
-    if (model.effective_known !== true || model.effective_percentage === null) return null;
-    const observed = [model.family_5h, model.family_weekly].filter(status => status?.known && !status.stale).map(status => status!.observedAt).find(value => typeof value === 'number') ?? (!model.own_stale ? model.own_observed_at : null);
-    if (typeof observed === 'number' && nowSec - observed > FRESH_SECONDS) return null;
-    return bounded((model.effective_percentage ?? 0) / 100);
+    if (model) {
+      if (model.disabled === true || model.stale === true) return null;
+      const modelFamily = model.family ?? classifyFamily({ modelId: model.name, displayName: model.display_name });
+      const pooledFamily = (model.is_argon || modelFamily === 'argon') && overview.argonStatus.mode === 'unified'
+        ? overview.argonStatus.pooledInFamily
+        : (model.is_carbon || modelFamily === 'carbon') && overview.carbonStatus.mode === 'unified'
+          ? overview.carbonStatus.pooledInFamily
+          : null;
+      if (pooledFamily) {
+        const poolValues = familyValues(pooledFamily);
+        if (model.effective_known === true && typeof model.effective_percentage === 'number') {
+          const observed = [model.family_5h, model.family_weekly].filter(status => status?.known && !status.stale).map(status => status!.observedAt).find(value => typeof value === 'number') ?? (!model.own_stale ? model.own_observed_at : null);
+          if (typeof observed !== 'number' || nowSec - observed <= FRESH_SECONDS) {
+            poolValues.push(model.effective_percentage / 100);
+          }
+        }
+        return poolValues.length > 0 ? bounded(Math.min(...poolValues)) : null;
+      }
+      if (model.effective_known !== true || typeof model.effective_percentage !== 'number') return null;
+      const observed = [model.family_5h, model.family_weekly].filter(status => status?.known && !status.stale).map(status => status!.observedAt).find(value => typeof value === 'number') ?? (!model.own_stale ? model.own_observed_at : null);
+      if (typeof observed === 'number' && nowSec - observed > FRESH_SECONDS) return null;
+      return bounded((model.effective_percentage ?? 0) / 100);
+    }
+    if (trimmed === 'gemini-4-argon') return resolveStandaloneRemaining(overview.argonStatus);
+    if (trimmed === 'gemini-4-carbon') return resolveStandaloneRemaining(overview.carbonStatus);
+    return null;
   }
 
   if (isArgonTarget) {
-    const status = overview.argonStatus;
-    // 未知/禁用不是“0%”，但也不能作为可切换依据；必须由明确模型记录 + 已知新鲜额度支撑。
-    if (status.availability !== 'available') return null;
-    if (status.quotaState !== 'known' || status.remaining === null) return null;
-    if (typeof status.observedAt === 'number' && nowSec - status.observedAt > FRESH_SECONDS) return null;
-    return bounded(status.remaining);
+    // 未知/禁用不是“0%”，但也不能作为可切换依据；unified 模式解析到其共享池。
+    return resolveStandaloneRemaining(overview.argonStatus);
   }
 
   if (isCarbonTarget) {
-    const status = overview.carbonStatus;
-    if (status.availability !== 'available') return null;
-    if (status.quotaState !== 'known' || status.remaining === null) return null;
-    if (typeof status.observedAt === 'number' && nowSec - status.observedAt > FRESH_SECONDS) return null;
-    return bounded(status.remaining);
+    return resolveStandaloneRemaining(overview.carbonStatus);
   }
 
   if (isGeminiAllTarget) {
@@ -739,10 +1045,142 @@ export function computeAccountRemaining(account: Account, monitoredModel = 'all'
 export function subscriptionTierRank(account: Account | AccountSummary | null | undefined): number {
   if (!account) return 0;
   const raw = String(account.quota?.subscription_tier ?? '').toUpperCase();
-  if (raw.includes('ULTRA')) return 4;
+  if (raw.includes('ULTRA') || raw.includes('ENTERPRISE')) return 5;
+  if (raw.includes('TEAM') || raw.includes('BUSINESS') || raw.includes('WORKSPACE')) return 4;
   if (raw.includes('PRO')) return 3;
-  if (raw.includes('FREE') || raw.includes('STARTER')) return 1;
+  if (raw.includes('PLUS')) return 2.5;
+  if (raw.includes('FREE') || raw.includes('STARTER') || raw.includes('TRIAL')) return 1;
   return 2;
+}
+
+function quotaPeriodLabel(period: string): string {
+  const locale = getActiveLocale();
+  const isEn = locale === 'en';
+  if (period === '5h') return translate(locale, 'common.period.5h', undefined, { namespace: 'app', fallback: isEn ? '5 Hours' : '5 小时' });
+  if (period === 'weekly') return translate(locale, 'common.period.weekly', undefined, { namespace: 'app', fallback: isEn ? 'Weekly' : '每周' });
+  if (period === 'daily') return translate(locale, 'common.period.daily', undefined, { namespace: 'app', fallback: isEn ? 'Daily' : '每日' });
+  return translate(locale, 'quota.model_quota', undefined, { namespace: 'app', fallback: isEn ? 'Model Quota' : '模型配额' });
+}
+
+function toProjectedWindow(
+  id: string,
+  period: string,
+  status: WindowStatus | null | undefined,
+  nowMs: number,
+): ProjectedGroupWindow | null {
+  if (!status) return null;
+  return {
+    id,
+    period,
+    label: quotaPeriodLabel(period),
+    known: status.known === true,
+    remaining: status.known ? status.remaining : null,
+    stale: status.stale === true,
+    resetCountdown: status.resetTime ? formatResetCountdown(status.resetTime, nowMs) : '',
+    observedAt: status.observedAt ?? null,
+    source: status.source ?? null,
+  };
+}
+
+function resolveStandaloneBrands(key: string, displayName: string): string[] {
+  const text = `${key} ${displayName}`.toLowerCase();
+  const brands: string[] = [];
+  if (/\bclaude\b|\banthropic\b/.test(text)) brands.push('claude');
+  if (/\bgpt\b|\bopenai\b/.test(text)) brands.push('openai');
+  if (/\bgemini\b|\bargon\b|\bcarbon\b|\borchestrator\b/.test(text)) brands.push('gemini');
+  return brands.length > 0 ? brands : [key];
+}
+
+function buildProjectedQuotaGroups(
+  applied: NormalizedModel[],
+  groups: NormalizedGroup[],
+  familyWindows: FamilyWindows,
+  modelQuota: Record<'gemini' | 'claude', WindowStatus | null>,
+  standaloneModels: StandaloneModelStatus[],
+  nowMs: number,
+): ProjectedQuotaGroup[] {
+  const out: ProjectedQuotaGroup[] = [];
+  const coreSpecs: Array<{ family: 'gemini' | 'claude'; displayName: string; summaryLabel: string; brands: string[] }> = [
+    { family: 'gemini', displayName: 'Gemini', summaryLabel: 'Gemini', brands: ['gemini'] },
+    { family: 'claude', displayName: 'Claude/GPT', summaryLabel: 'Claude/GPT', brands: ['claude', 'gpt'] },
+  ];
+
+  for (const spec of coreSpecs) {
+    const fw = familyWindows[spec.family];
+    const mq = modelQuota[spec.family];
+    const famModels = applied.filter(m => m.family === spec.family && !m.stale);
+    const hasGroup = groups.some(g => g.family === spec.family);
+    const windows: ProjectedGroupWindow[] = [];
+    const fiveHourWin = toProjectedWindow('5h', '5h', fw.fiveHour, nowMs);
+    if (fiveHourWin) windows.push(fiveHourWin);
+    const weeklyWin = toProjectedWindow('weekly', 'weekly', fw.weekly, nowMs);
+    if (weeklyWin) windows.push(weeklyWin);
+    if (windows.length === 0 && mq) {
+      const modelWin = toProjectedWindow('model', 'unspecified', mq, nowMs);
+      if (modelWin) windows.push(modelWin);
+    }
+    if (windows.length === 0 && famModels.length === 0 && !hasGroup) continue;
+
+    const hasKnownWindow = windows.some(w => w.known);
+    const hasFreshWindow = windows.some(w => w.known && !w.stale);
+    const hasStaleWindow = windows.some(w => w.stale);
+    const allDisabled = famModels.length > 0 && famModels.every(m => m.disabled === true) && !hasKnownWindow;
+    const availability: Availability = allDisabled
+      ? 'disabled'
+      : (hasKnownWindow || hasGroup || famModels.some(m => m.disabled !== true))
+        ? 'available'
+        : 'unknown';
+    const quotaState: QuotaState = hasFreshWindow ? 'known' : hasStaleWindow ? 'stale' : 'not_reported';
+    out.push({
+      key: spec.family,
+      displayName: spec.displayName,
+      summaryLabel: spec.summaryLabel,
+      brands: spec.brands,
+      isStandalone: false,
+      availability,
+      quotaState,
+      windows,
+      message: '',
+    });
+  }
+
+  for (const item of standaloneModels) {
+    const windows: ProjectedGroupWindow[] = [];
+    if (item.key === 'argon' || item.key === 'carbon') {
+      const fw = item.key === 'argon' ? familyWindows.argon : familyWindows.carbon;
+      const w5h = toProjectedWindow('5h', '5h', fw.fiveHour, nowMs);
+      if (w5h) windows.push(w5h);
+      const wWeekly = toProjectedWindow('weekly', 'weekly', fw.weekly, nowMs);
+      if (wWeekly) windows.push(wWeekly);
+    }
+    if (windows.length === 0 && (item.period || item.remaining !== null || item.quotaState !== 'not_reported')) {
+      const period = item.period ?? 'unspecified';
+      windows.push({
+        id: period === 'unspecified' ? 'model' : period,
+        period,
+        label: quotaPeriodLabel(period),
+        known: item.quotaState !== 'not_reported' && item.remaining !== null,
+        remaining: item.remaining,
+        stale: item.quotaState === 'stale',
+        resetCountdown: item.resetCountdown,
+        observedAt: item.observedAt,
+        source: item.source ?? null,
+      });
+    }
+    out.push({
+      key: item.key,
+      displayName: item.displayName,
+      summaryLabel: item.key === 'argon' ? 'Argon' : item.key === 'carbon' ? 'Carbon' : item.displayName,
+      brands: resolveStandaloneBrands(item.key, item.displayName),
+      isStandalone: true,
+      availability: item.availability,
+      quotaState: item.quotaState,
+      windows,
+      message: item.message,
+    });
+  }
+
+  return out;
 }
 
 export function buildAccountQuotaOverview(account: Account | AccountSummary | { quota?: QuotaData | null }, options?: { nowMs?: number }): QuotaOverview {
@@ -754,8 +1192,10 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
     period: null,
     remaining: null,
     resetCountdown: '',
-    message: '尚未取得账号配额数据',
+    message: bt('account_quota.empty'),
     observedAt: null,
+    mode: 'unknown',
+    pooledInFamily: null,
   };
   const emptyRefresh: QuotaRefreshState = {
     complete: false,
@@ -777,39 +1217,41 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
       argonWeeklyRemaining: null, argonWeeklyResetCountdown: '', argonResetCountdown: '',
       carbonWeeklyRemaining: null, carbonWeeklyResetCountdown: '', carbonResetCountdown: '',
       resetTime: null, resetCountdown: '',
-      subscriptionTier: '待确认', quotaGroups: [], staleGroups: [], unknownBuckets: [], models: [],
+      subscriptionTier: bt('quota.tier.pending'), quotaGroups: [], staleGroups: [], unknownBuckets: [], models: [],
       lastUpdated: null, isStale: false, staleHours: 0,
       argonStatus: emptyArgon,
       carbonStatus: emptyArgon,
-      standaloneModels: [
-        { key: 'argon', displayName: 'Gemini 4 Argon', ...emptyArgon },
-        { key: 'carbon', displayName: 'Gemini 4 Carbon', ...emptyArgon },
-      ],
+      standaloneModels: [],
+      projectedQuotaGroups: [],
       familyWindows: {
         gemini: { fiveHour: null, weekly: null }, claude: { fiveHour: null, weekly: null }, argon: { fiveHour: null, weekly: null }, carbon: { fiveHour: null, weekly: null },
       },
       familyModelQuota: { gemini: null, claude: null },
       nextResets: { fiveHour: null, weekly: null },
       refreshState: emptyRefresh,
-      quotaWarnings: ['NO_QUOTA: 尚未取得账号配额数据'],
+      quotaWarnings: [bt('account_quota.warn.no_quota')],
       quotaWarningCodes: ['NO_QUOTA'],
     };
   }
 
   const warnings: string[] = [];
   const codes: string[] = [];
+  const seenCodes = new Set<string>();
+  const addWarning = (code: string, text: string) => {
+    seenCodes.add(code);
+    if (!warnings.includes(text)) warnings.push(text);
+    if (!codes.includes(code)) codes.push(code);
+  };
   const sourceDefault: QuotaSource = quota.source === 'live' ? 'live' : 'cloud';
   const rawGroups = Array.isArray(quota.quota_groups) ? quota.quota_groups : [];
   let groups: NormalizedGroup[] = [];
   try {
     groups = normalizeStoredGroups(rawGroups, quota.last_updated ?? nowSec, sourceDefault);
     if (rawGroups.length > groups.length) {
-      warnings.push(`MALFORMED_GROUPS: ${rawGroups.length - groups.length} 个配额分组结构异常已跳过`);
-      codes.push('MALFORMED_GROUPS');
+      addWarning('MALFORMED_GROUPS', bt('account_quota.warn.malformed_groups', { count: rawGroups.length - groups.length }));
     }
   } catch {
-    warnings.push('GROUPS_PARSE_FAILED: 配额分组无法解析，已按未知处理');
-    codes.push('GROUPS_PARSE_FAILED');
+    addWarning('GROUPS_PARSE_FAILED', bt('account_quota.warn.groups_parse_failed'));
     groups = [];
   }
 
@@ -833,8 +1275,8 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
       }
       models.push(model);
     } catch {
-      warnings.push(`MALFORMED_MODEL:${index}: 模型记录结构异常已跳过`);
-      codes.push('MALFORMED_MODEL');
+      seenCodes.add(`MALFORMED_MODEL:${index}`);
+      addWarning('MALFORMED_MODEL', bt('account_quota.warn.malformed_model', { index }));
     }
   }
 
@@ -854,9 +1296,14 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
 
   const applied = applyFamilyWindows(models, familyWindows);
   const legacy = legacyFromFamilyWindows(familyWindows, nowMs);
-  const argonStatus = buildArgonStatus(applied, groups, familyWindows, nowMs);
+  const argonStatus = buildArgonStatus(applied, groups, familyWindows, nowMs, quota.subscription_tier);
   const carbonStatus = buildCarbonStatus(applied, groups, familyWindows, nowMs, argonStatus, quota.subscription_tier);
   const standaloneModels = buildStandaloneModels(applied, groups, familyWindows, nowMs, argonStatus, carbonStatus, quota.subscription_tier);
+  const argonConverged = argonStatus.mode === 'unified' || argonStatus.mode === 'disabled';
+  const carbonConverged = carbonStatus.mode === 'unified' || carbonStatus.mode === 'disabled';
+  const hasArgonEvidence = applied.some(m => m.is_argon || m.family === 'argon') || groups.some(g => g.family === 'argon');
+  const isFamilyConverged = (family: Family): boolean =>
+    (family === 'argon' && argonConverged) || (family === 'carbon' && carbonConverged);
   const nextFiveHour = pickNextReset(familyWindows, '5h', nowMs);
   const nextWeekly = pickNextReset(familyWindows, 'weekly', nowMs);
   const resetPick = nextFiveHour ?? nextWeekly;
@@ -872,19 +1319,25 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
   const derivedMissingFamilies = (['gemini', 'claude'] as Family[]).filter(family =>
     models.some(model => model.family === family) && !knownFreshGroups.some(group => group.family === family));
   const storedRefresh = quota.refresh_state;
+  const rawMissingFamilies: Family[] = storedRefresh
+    ? (Array.isArray(storedRefresh.missingFamilies) ? storedRefresh.missingFamilies : [])
+    : derivedMissingFamilies;
+  const rawMissingWindows: { family: Family; window: WindowKind }[] = storedRefresh
+    ? (Array.isArray(storedRefresh.missingWindows) ? storedRefresh.missingWindows : [])
+    : [];
   const refreshState: QuotaRefreshState = storedRefresh
     ? {
       complete: storedRefresh.complete === true,
       projectContextRecovered: storedRefresh.projectContextRecovered === true,
       endpointsAttempted: Array.isArray(storedRefresh.endpointsAttempted) ? storedRefresh.endpointsAttempted : [],
       endpointsSucceeded: Array.isArray(storedRefresh.endpointsSucceeded) ? storedRefresh.endpointsSucceeded : [],
-      missingFamilies: Array.isArray(storedRefresh.missingFamilies) ? storedRefresh.missingFamilies : [],
-      missingWindows: Array.isArray(storedRefresh.missingWindows) ? storedRefresh.missingWindows : [],
+      missingFamilies: rawMissingFamilies.filter(family => !isFamilyConverged(family)),
+      missingWindows: rawMissingWindows.filter(item => !isFamilyConverged(item.family)),
       carriedGroups: Number(storedRefresh.carriedGroups) || 0,
       carriedModels: Number(storedRefresh.carriedModels) || 0,
       refreshedAt: Number(storedRefresh.refreshedAt) || 0,
       usedFallbackEndpoint: storedRefresh.usedFallbackEndpoint === true,
-      ...(storedRefresh.error ? { error: String(storedRefresh.error) } : {}),
+      ...(storedRefresh.error ? { error: localizeStoredQuotaError(String(storedRefresh.error)) } : {}),
     }
     : {
       complete: knownFreshGroups.length > 0 && models.length > 0,
@@ -897,34 +1350,38 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
     };
 
   if (argonStatus.availability === 'disabled') {
-    warnings.push('ARGON_DISABLED: 当前账号无 Gemini 4 Argon 权限');
-    codes.push('ARGON_DISABLED');
+    addWarning('ARGON_DISABLED', bt('account_quota.warn.argon_disabled'));
   }
-  if (argonStatus.availability === 'unknown') {
-    warnings.push(argonStatus.message);
-    codes.push('ARGON_UNKNOWN');
+  if (argonStatus.availability === 'unknown' && hasArgonEvidence) {
+    addWarning('ARGON_UNKNOWN', argonStatus.message);
   }
-  if (argonStatus.availability === 'available' && argonStatus.quotaState === 'not_reported') {
-    warnings.push('ARGON_QUOTA_NOT_REPORTED: 存在 Argon 模型记录但本轮未返回配额数值');
-    codes.push('ARGON_QUOTA_NOT_REPORTED');
+  if (argonStatus.availability === 'available' && argonStatus.quotaState === 'not_reported' && !argonConverged) {
+    addWarning('ARGON_QUOTA_NOT_REPORTED', bt('account_quota.warn.argon_not_reported'));
   }
-  if (argonStatus.quotaState === 'stale') {
-    warnings.push('ARGON_STALE: Argon 配额本轮未返回，展示上次真实采样');
-    codes.push('ARGON_STALE');
+  if (argonStatus.quotaState === 'stale' && !argonConverged) {
+    addWarning('ARGON_STALE', bt('account_quota.warn.argon_stale'));
   }
   for (const family of refreshState.missingFamilies) {
-    warnings.push(`MISSING_FAMILY:${family}: ${familyLabel(family)} 配额未取得`);
-    codes.push(`MISSING_FAMILY:${family}`);
+    addWarning(`MISSING_FAMILY:${family}`, bt('account_quota.warn.missing_family', { family, label: familyLabel(family) }));
   }
   for (const item of refreshState.missingWindows) {
-    warnings.push(`MISSING_WINDOW:${item.family}:${item.window}: ${familyLabel(item.family)} ${item.window} 窗口未取得`);
-    codes.push(`MISSING_WINDOW:${item.family}:${item.window}`);
+    addWarning(`MISSING_WINDOW:${item.family}:${item.window}`, bt('account_quota.warn.missing_window', { family: item.family, window: item.window, label: familyLabel(item.family) }));
   }
   if (staleGroups.length > 0) {
-    warnings.push(`CARRIED_GROUPS:${staleGroups.length}: ${staleGroups.map(item => item.name).join('、')} 沿用上次记录`);
-    codes.push('CARRIED_GROUPS');
+    addWarning('CARRIED_GROUPS', bt('account_quota.warn.carried_groups', { count: staleGroups.length, names: staleGroups.map(item => item.name).join(bt('common.list_separator')) }));
   }
-  for (const warning of quota.quota_warnings ?? []) if (!warnings.includes(warning)) warnings.push(warning);
+  for (const warning of quota.quota_warnings ?? []) {
+    const resolved = resolveStoredQuotaWarning(warning);
+    if (resolved) {
+      if (resolved.code === 'ARGON_MODEL_QUOTA' && argonConverged) continue;
+      if (resolved.code === 'MISSING_FAMILY:argon' && argonConverged) continue;
+      if (resolved.code === 'MISSING_FAMILY:carbon' && carbonConverged) continue;
+      if (seenCodes.has(resolved.code)) continue;
+      addWarning(resolved.code, resolved.text);
+    } else if (!warnings.includes(warning)) {
+      warnings.push(warning);
+    }
+  }
 
   const legacySnapshot = legacy;
   let oldestGroup = typeof quota.last_updated === 'number' ? quota.last_updated : null;
@@ -960,6 +1417,15 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
     };
   });
 
+  const projectedQuotaGroups = buildProjectedQuotaGroups(
+    applied,
+    groups,
+    familyWindows,
+    modelQuota,
+    standaloneModels,
+    nowMs,
+  );
+
   return {
     fiveHourRemaining: legacySnapshot.geminiFiveHourRemaining,
     weeklyRemaining: legacySnapshot.geminiWeeklyRemaining,
@@ -981,7 +1447,7 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
     carbonResetCountdown: legacySnapshot.carbonWeeklyResetCountdown,
     resetTime,
     resetCountdown,
-    subscriptionTier: quota.subscription_tier && /starter/i.test(quota.subscription_tier) ? '' : quota.subscription_tier || '待确认',
+    subscriptionTier: quota.subscription_tier && /starter/i.test(quota.subscription_tier) ? 'FREE' : quota.subscription_tier || bt('quota.tier.pending'),
     quotaGroups: outGroups,
     staleGroups,
     unknownBuckets,
@@ -992,6 +1458,7 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
     argonStatus,
     carbonStatus,
     standaloneModels,
+    projectedQuotaGroups,
     familyWindows: {
       gemini: { fiveHour: windowOut(familyWindows.gemini.fiveHour), weekly: windowOut(familyWindows.gemini.weekly) },
       claude: { fiveHour: windowOut(familyWindows.claude.fiveHour), weekly: windowOut(familyWindows.claude.weekly) },
@@ -1014,10 +1481,41 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
  * 所有 account_* / quota_refresh / auto_switch_best 的对外返回统一经过此函数，避免 access/refresh/id token
  * 进入原生内存、桥接日志或 `--command` 标准输出。
  */
+export function localizeStoredQuotaForIpc(quota: QuotaData | null | undefined): QuotaData | null {
+  if (!quota) return null;
+  let next: QuotaData = quota;
+  if (Array.isArray(quota.quota_warnings) && quota.quota_warnings.length > 0) {
+    const seen = new Set<string>();
+    const localizedWarnings: string[] = [];
+    for (const warning of quota.quota_warnings) {
+      const resolved = resolveStoredQuotaWarning(warning);
+      if (resolved) {
+        if (seen.has(resolved.code)) continue;
+        seen.add(resolved.code);
+        if (!localizedWarnings.includes(resolved.text)) localizedWarnings.push(resolved.text);
+      } else if (!localizedWarnings.includes(warning)) {
+        localizedWarnings.push(warning);
+      }
+    }
+    next = { ...next, quota_warnings: localizedWarnings };
+  }
+  if (quota.refresh_state?.error) {
+    next = {
+      ...next,
+      refresh_state: {
+        ...quota.refresh_state,
+        error: localizeStoredQuotaError(String(quota.refresh_state.error)),
+      },
+    };
+  }
+  return next;
+}
+
 export function projectAccountForIpc(account: Account | AccountSummary | null | undefined): Record<string, any> | null {
   if (!account) return null;
   const summary = account as AccountSummary;
-  const quota = summary.quota ?? null;
+  const rawQuota = summary.quota ?? null;
+  const quota = localizeStoredQuotaForIpc(rawQuota);
   return {
     id: summary.id,
     email: summary.email,
@@ -1032,9 +1530,9 @@ export function projectAccountForIpc(account: Account | AccountSummary | null | 
     last_used: summary.last_used ?? null,
     quota,
     credentialReadiness: summary.credentialReadiness ?? accountCredentialReadiness(account as Account),
-    quota_refresh_error: summary.quota_refresh_error ?? null,
-    quota_last_updated: summary.quota_last_updated ?? quota?.last_updated ?? 0,
-    subscription_tier: quota?.subscription_tier ?? null,
+    quota_refresh_error: cleanAndLocalizeRefreshError(summary.quota_refresh_error),
+    quota_last_updated: summary.quota_last_updated ?? rawQuota?.last_updated ?? 0,
+    subscription_tier: rawQuota?.subscription_tier ?? null,
     revision: summary.revision ?? computeAccountRevision(summary),
   };
 }

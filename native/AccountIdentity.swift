@@ -15,6 +15,9 @@ struct AccountIdentity {
     static func normalizeTier(_ raw: String?) -> String {
         let value = (raw ?? "").uppercased()
         if value.contains("ULTRA") { return "ULTRA" }
+        if value.contains("ENTERPRISE") { return "ENTERPRISE" }
+        if value.contains("TEAM") || value.contains("BUSINESS") { return "TEAM" }
+        if value.contains("PLUS") { return "PLUS" }
         if value.contains("PRO") { return "PRO" }
         if value.contains("FREE") || value.contains("STARTER") { return "FREE" }
         return ""

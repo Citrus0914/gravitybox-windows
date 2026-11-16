@@ -42,3 +42,83 @@ test('OAuth client ID and secret are non-empty and support environment override'
   assert.equal(getGoogleClientId(), GOOGLE_CLIENT_ID);
   assert.equal(getGoogleClientSecret(), GOOGLE_CLIENT_SECRET);
 });
+
+test('P1-18: CodedAccountError 保留业务错误语义，中英文凭据就绪度与 403/#3501 保持兼容', async t => {
+  const { CodedAccountError, accountErrorCode, accountCredentialReadiness } = await import('../dist/account-quota.js');
+  const { fetchCloudQuotaForAccount } = await import('../dist/account-cloud.js');
+  const { bt, setActiveLocale, getActiveLocale } = await import('../dist/i18n.js');
+  const prevLocale = getActiveLocale();
+  t.after(() => setActiveLocale(prevLocale));
+
+  const account = {
+    id: 'oauth-p118',
+    email: 'p118@example.invalid',
+    token: {
+      access_token: 'old-token',
+      refresh_token: '1//refresh-p118',
+      expires_in: 3600,
+      expiry_timestamp: 0,
+      token_type: 'Bearer',
+      email: 'p118@example.invalid',
+    },
+    disabled: false,
+    protected_models: [],
+    validation_blocked: false,
+    created_at: 1000,
+    last_used: 1000,
+  };
+
+  setActiveLocale('en');
+  await assert.rejects(
+    fetchCloudQuotaForAccount({
+      account: structuredClone(account),
+      fetchImpl: async url => {
+        assert.equal(url, 'https://oauth2.googleapis.com/token');
+        return Response.json({ access_token: 'fresh-access', expires_in: 3600 });
+      },
+      onTokenRefreshed: async () => {
+        throw new CodedAccountError('removed_stop_refresh', bt('accounts.err.removed_stop_refresh'));
+      },
+    }),
+    err => accountErrorCode(err) === 'removed_stop_refresh' && err.message === bt('accounts.err.removed_stop_refresh')
+  );
+
+  const login = new GoogleAccountLogin(
+    async () => {
+      throw new CodedAccountError('credentials_updated', bt('accounts.err.credentials_updated'));
+    },
+    async () => Response.json({ access_token: 'a1', refresh_token: 'r1', expires_in: 3600 })
+  );
+  t.after(() => login.close());
+  const session = await login.begin();
+  await fetch(callback(session.url, new URL(session.url).searchParams.get('state')));
+  const loginRes = await settled(login, session.id);
+  assert.equal(loginRes.phase, 'failed');
+  assert.equal(loginRes.message, bt('accounts.err.credentials_updated'));
+
+  const now = Math.floor(Date.now() / 1000);
+  const validToken = { ...account.token, access_token: 'valid-access', expiry_timestamp: now + 3600 };
+  for (const locale of ['zh-Hans', 'en']) {
+    setActiveLocale(locale);
+    assert.equal(
+      accountCredentialReadiness({ ...account, token: validToken, quota_refresh_error: bt('account_cloud.err.refresh_failed') }, now).state,
+      'needs_authorization'
+    );
+    assert.equal(
+      accountCredentialReadiness({ ...account, token: validToken, quota_refresh_error: bt('account_cloud.err.missing_refresh_token') }, now).state,
+      'needs_authorization'
+    );
+    assert.equal(
+      accountCredentialReadiness({ ...account, token: validToken, quota_refresh_error: bt('accounts.err.token_invalid') }, now).state,
+      'needs_authorization'
+    );
+    assert.equal(
+      accountCredentialReadiness({ ...account, token: validToken, quota_refresh_error: bt('account_cloud.err.http_3501') }, now).state,
+      'ready'
+    );
+    assert.equal(
+      accountCredentialReadiness({ ...account, token: validToken, quota_refresh_error: bt('account_cloud.err.network') }, now).state,
+      'ready'
+    );
+  }
+});

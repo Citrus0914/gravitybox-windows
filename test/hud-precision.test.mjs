@@ -118,8 +118,8 @@ test('raw TTFT zero survives protobuf parsing and participates in the average', 
   assert.equal(raw.timeToFirstTokenSeconds, 0, 'an empty Duration is an explicit zero');
   const zero = metrics([step({ generation: raw })]);
   assert.equal(zero.session.averageTtftSeconds, 0);
-  assert.equal(zero.session.averageTtftFormatted, '0.00 秒');
-  assert.equal(zero.session.averageTtftFormattedEn, '0.00s');
+  assert.equal(zero.session.averageTtftFormatted, '0 秒');
+  assert.equal(zero.session.averageTtftFormattedEn, '0s');
   const average = metrics([
     step({ generation: raw }),
     step({ idx: 51, firstTokenSeconds: 104 }),
@@ -141,7 +141,7 @@ test('TPS has no 500 tok/s cap or artificial minimum duration', () => {
   assert.equal(result.status, 'calculated');
   assert.equal(result.rawTps, 100000);
   assert.equal(result.outputTps, 100000);
-  assert.equal(result.formatted, '100000.00 tok/s');
+  assert.equal(result.formatted, '100000 tok/s');
   assert.equal(metrics([step({
     outputTokens: 1000, generation: { timeToFirstTokenSeconds: 0, streamingDurationSeconds: 0.25 },
   })]).session.outputTps, 4000);
@@ -172,7 +172,7 @@ test('actual context is independent of generator estimates and output tokens', (
     assert.equal(result.context.breakdown.uncachedContextTokens, 130);
     assert.equal(result.context.breakdown.latestOutputTokens, 99999);
     assert.equal(result.context.usedRatio, 0.33);
-    assert.equal(result.context.usedRatioFormatted, '33.00%');
+    assert.equal(result.context.usedRatioFormatted, '33%');
   }
 });
 
@@ -194,7 +194,7 @@ test('an observed 226412-token context never guesses 256K or clamps the reported
   assert.equal(result.context.isFallbackCapacity, true);
   assert.equal(result.context.hasExplicitDbCapacity, false);
   closeTo(result.context.usedRatio, 1.13206);
-  assert.equal(result.context.usedRatioFormatted, '113.21%');
+  assert.equal(result.context.usedRatioFormatted, '113%');
   for (const overrides of [
     { modelCapacity: 262144 }, { genMetadata: { maxContextTokens: 262144 } },
   ]) {
@@ -881,7 +881,7 @@ test('currentTurnOutputTps 仅统计本轮已完结前台模型步并隔离历�
     `currentTurnOutputTps 应为 2000 / 15，实际 ${res.session.currentTurnOutputTps}`
   );
   assert.equal(res.session.currentTurnOutputTpsFormatted, '133.33 tok/s');
-  assert.equal(res.session.latestStepOutputTpsFormatted, '150.00 tok/s');
+  assert.equal(res.session.latestStepOutputTpsFormatted, '150 tok/s');
   assert.ok((res.session.outputTps || 0) < 100, `全会话均速受上一轮与子智能体拉低，实际 ${res.session.outputTps}`);
 });
 
@@ -1191,3 +1191,94 @@ test('formatHudUsd 与 tokens 估算费用/缓存节省严守零编造规则', (
   assert.equal(unpriced.tokens.cacheSavedUsd, undefined);
   assert.equal(unpriced.tokens.cacheSavedFormatted, undefined);
 });
+
+test('本轮用时按挂钟时间计算：上下文压缩与步骤间空档计入，结束后不回退', () => {
+  const done = metrics([
+    step({ idx: 1, stepType: 14, startTimeSeconds: 100, endTimeSeconds: 100 }),
+    step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: 100, endTimeSeconds: 110, rawInputTokens: 50, outputTokens: 20 }),
+    step({ idx: 3, stepType: 23, status: 3, startTimeSeconds: 112, endTimeSeconds: 112 }),
+    step({ idx: 4, stepType: 15, status: 3, startTimeSeconds: 150, endTimeSeconds: 160, rawInputTokens: 50, outputTokens: 20 }),
+  ]);
+  assert.equal(Number(done.session.currentTurnDurationSeconds.toFixed(1)), 60);
+
+  const nowSec = Date.now() / 1000;
+  const running = metrics(
+    [
+      step({ idx: 1, stepType: 14, startTimeSeconds: nowSec - 300, endTimeSeconds: nowSec - 300 }),
+      step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: nowSec - 300, endTimeSeconds: nowSec - 290, rawInputTokens: 50, outputTokens: 20 }),
+    ],
+    { isStreaming: true }
+  );
+  assert.ok(running.session.currentTurnDurationSeconds >= 299, `实际 ${running.session.currentTurnDurationSeconds}`);
+
+  // 多轮会话隔离回归：第 1 轮数小时前产生子代理，第 2 轮刚起步 (USER_INPUT 无时间戳) 且新子代理活跃时，不得将第 1 轮子代理 startTimeSeconds 混入本轮墙钟起点
+  const turn1Start = nowSec - 7200;
+  const turn2ChildStart = nowSec - 8;
+  const multiTurnMain = [
+    step({ idx: 0, stepType: 14, startTimeSeconds: turn1Start, endTimeSeconds: turn1Start }),
+    step({ idx: 1, stepType: 127, status: 3, isSubagentStep: true, startTimeSeconds: turn1Start + 1, endTimeSeconds: turn1Start + 30 }),
+    step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: turn1Start + 30, endTimeSeconds: turn1Start + 45 }),
+    step({ idx: 3, stepType: 14, startTimeSeconds: null, endTimeSeconds: null, createdAtSeconds: null, hasUsage: false }),
+  ];
+  const turn1OldChild = step({
+    idx: 0,
+    stepType: 15,
+    status: 3,
+    startTimeSeconds: turn1Start + 2,
+    endTimeSeconds: turn1Start + 28,
+    outputTokens: 300,
+  });
+  const turn2NewChild = step({
+    idx: 0,
+    stepType: 15,
+    status: 2,
+    startTimeSeconds: turn2ChildStart,
+    endTimeSeconds: null,
+    outputTokens: 0,
+    hasUsage: false,
+  });
+  const isolatedTurn2 = buildConversationHudMetrics({
+    conversationId: 'multi-turn-subagent-boundary',
+    isStreaming: true,
+    isSubagentRunning: true,
+    runningSubagentCount: 1,
+    contextSteps: multiTurnMain,
+    steps: [...multiTurnMain, turn1OldChild, turn2NewChild],
+  });
+  assert.ok(
+    isolatedTurn2.session.currentTurnDurationSeconds >= 7.5 && isolatedTurn2.session.currentTurnDurationSeconds < 20,
+    `第 2 轮本轮用时应仅围绕新子代理 ~8s 累计，不得被第 1 轮子代理拉至 7200s，实际 ${isolatedTurn2.session.currentTurnDurationSeconds}`
+  );
+});
+
+test('P1-1 & P1-2: 主/子代理并发重叠模型耗时按并集去重且 TPS 不受影响，hasSubagentInTurn 精准隔离历史轮次子代理', () => {
+  const mainTurn1And2 = [
+    step({ idx: 0, stepType: 14, startTimeSeconds: 100, endTimeSeconds: 100 }),
+    step({ idx: 1, stepType: 127, status: 3, isSubagentStep: true, startTimeSeconds: 100, endTimeSeconds: 120, hasUsage: false }),
+    step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: 100, endTimeSeconds: 115, outputTokens: 300 }),
+    step({ idx: 3, stepType: 14, startTimeSeconds: 200, endTimeSeconds: 200 }),
+    step({ idx: 4, stepType: 15, status: 3, startTimeSeconds: 200, endTimeSeconds: 210, outputTokens: 200 }),
+  ];
+  const turn1ChildModel = step({
+    idx: 0,
+    stepType: 15,
+    status: 3,
+    startTimeSeconds: 105,
+    endTimeSeconds: 120,
+    outputTokens: 150,
+  });
+  const res = buildConversationHudMetrics({
+    conversationId: 'p1-overlap-and-turn-subagent',
+    isStreaming: false,
+    isSubagentRunning: false,
+    subagentCount: 1,
+    subagentSteps: 1,
+    contextSteps: mainTurn1And2,
+    steps: [...mainTurn1And2, turn1ChildModel],
+  });
+  assert.equal(res.session.modelDurationSeconds, 30);
+  closeTo(res.session.outputTps, 650 / 40, 'TPS keeps sum of generation durations');
+  assert.equal(res.session.subagentCount, 1);
+  assert.equal(res.session.hasSubagentInTurn, false);
+});
+

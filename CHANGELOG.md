@@ -6,6 +6,21 @@
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-15
+
+### Added
+- **Full App Localization (`简体中文` / `English`)**：新增 GravityBox 自身原生 Swift AppKit 界面（`native/L10n.swift`）、Node 后端（`src/i18n.ts`）与 IDE 会话状态栏（`runtime/hud-i18n.js`）完整中英双语支持，基于外置语言包 `assets/i18n/en.json` 与 `assets/i18n/zh-Hans.json` 实现零重启实时切换。
+- **System Language Following & Packaging**：设置页新增「显示语言 / Display Language」选择器（支持「跟随系统 / Follow System」「简体中文」「English」）；`tools/package-mac.mjs` 依据语言包自动写入 `Info.plist` `CFBundleLocalizations` 并随包同步双端语言资产；新增 `test/i18n-foundation.test.mjs` 与 `test/native-i18n.test.mjs`。
+
+### Changed
+- **Unified Language Lifecycle**：融合 Antigravity 界面汉化开关与全局语言偏好，语言切换实时联动原生窗口、菜单栏面板、后端状态消息与嵌入式 Telemetry HUD，并同步更新版本标识、截图脚本与发布文档至 `1.1.1`。
+- **CI & Release Hardening**：收窄 `.github/workflows/ci.yml` 变更豁免清单以覆盖 `assets/i18n/`、`model-catalog.json`、`pricing-feed.json` 与 `ui-extraction-manifest.json` 门禁；强化 `tools/check-docs.mjs`、`tools/release-integrity.mjs` 与 `tools/package-mac.mjs` 的校验规则与打包产物洁净度。
+
+### Fixed
+- **macOS 15.1 Motion Crash (`#15`)**：修复 `DesignMotion.cancel()` 在 `CADisplayLink.invalidate()` 后冗余调用 `remove(from:forMode:)` 导致 macOS 15.1 主线程 `EXC_BAD_ACCESS` (`SIGSEGV`) 闪退的问题，并为 `CADisplayLink` 引入弱引用 Target 代理与生命周期回归测试。
+- **Cross-End Bilingual & UI Lifecycle**：修复 `controller.ts` `backend.*` 键名前缀双写、`resume`/`reapply` 从英文切回中文未持久写回、英文 HUD 流式测速误显 `0 tok/s`、收起状态菜单栏面板滞留旧语言、活动模态 Sheet 宿主重建失活、`en.json` 删号提示语意倒置、`L10n` 多线程并发读取锁、结构化 `pricing_warning_codes` 过滤与 HUD/术语规范统一问题。
+- **Usage, Pricing & Security Boundaries**：修复 `lockedCost` 与大账本分页 `ledgerEventPage` 零占位锁及 `cacheWrite` 单价校验、`mergePricingEntries` 时序边界继承、`protobuf` 负长度与越界保护，以及切号未提交异常回滚分支 `journal` 脱敏。
+
 ## [1.1.0] - 2026-11-14
 
 ### Added
@@ -136,7 +151,8 @@
 ### Fixed
 - **Native UI**：保持菜单栏状态图标在不同翻译开关状态下的不透明度一致（`b9921e8`，已包含于 1.0.0）。
 
-[Unreleased]: https://github.com/Enzoo404/gravitybox/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/Enzoo404/gravitybox/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/Enzoo404/gravitybox/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Enzoo404/gravitybox/compare/v1.0.5...v1.1.0
 [1.0.5]: https://github.com/Enzoo404/gravitybox/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/Enzoo404/gravitybox/compare/v1.0.3...v1.0.4

@@ -11,8 +11,15 @@
 *.yml text eol=lf
 *.yaml text eol=lf
 *.html text eol=lf
+*.svg text eol=lf
 
 # Binary assets
 *.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.woff2 binary
 *.icns binary
 *.dmg binary

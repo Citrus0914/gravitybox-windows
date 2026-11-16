@@ -1,15 +1,15 @@
 import { lstat, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { SqliteReadSnapshot } from './sqlite-read.js';
 import {
   BROWSER_PROFILE_SAFE_SUBDIRS,
   BROWSER_TOP_SAFE_SUBDIRS,
-  CACHE_METADATA,
   CACHE_NAMES,
   EXTENDED_CACHE_NAMES,
   PARTITION_SAFE_SUBDIRS,
   UUID_REGEX,
+  getCacheMetadata,
   isStrictSubpath,
   type CacheItemMetadata,
   type CacheMaintenanceOptions,
@@ -17,6 +17,7 @@ import {
   type InspectedCacheEntry,
   type SubTargetSpec,
 } from './maintenance-catalog.js';
+import { bt } from './i18n.js';
 
 export interface MaintenanceDiscoveryContext {
   profile: string;
@@ -38,10 +39,10 @@ export async function inspectPathTree(root: string, deadline: number, counter: {
   let lastModifiedAt = 0;
 
   const walk = async (path: string) => {
-    if (++counter.count > 250000 || Date.now() > deadline) throw Error('目录过大，请手动检查');
+    if (++counter.count > 250000 || Date.now() > deadline) throw Error(bt('maintenance.err.dir_too_large'));
     const s = await lstat(path);
-    if (s.isSymbolicLink()) throw Error('缓存含符号链接，已跳过');
-    if (!s.isDirectory() && !s.isFile()) throw Error('缓存含非常规文件，已跳过');
+    if (s.isSymbolicLink()) throw Error(bt('maintenance.err.symlink_skipped'));
+    if (!s.isDirectory() && !s.isFile()) throw Error(bt('maintenance.err.irregular_file_skipped'));
     items.push(JSON.stringify([path.slice(root.length), s.dev, s.ino, s.size, s.mtimeMs, s.ctimeMs]));
     if (s.mtimeMs > lastModifiedAt) lastModifiedAt = s.mtimeMs;
     if (s.isDirectory()) {
@@ -56,9 +57,9 @@ export async function inspectPathTree(root: string, deadline: number, counter: {
 }
 
 export async function inspectSingleProfileItem(ctx: MaintenanceDiscoveryContext, name: string): Promise<InspectedCacheEntry> {
-  const meta: CacheItemMetadata = CACHE_METADATA[name] ?? {
+  const meta: CacheItemMetadata = getCacheMetadata(name) ?? {
     title: name,
-    subtitle: `应用运行缓存目录（${name}）`,
+    subtitle: bt('maintenance.catalog.default.sub', { name }),
     icon: 'folder',
     category: 'safe',
     section: 'runtime',
@@ -68,7 +69,7 @@ export async function inspectSingleProfileItem(ctx: MaintenanceDiscoveryContext,
   const deadline = Date.now() + 8000;
   try {
     const base = await lstat(ctx.profile);
-    if (base.isSymbolicLink() || !base.isDirectory()) throw Error('缓存路径包含链接，已跳过');
+    if (base.isSymbolicLink() || !base.isDirectory()) throw Error(bt('maintenance.err.path_link_skipped'));
     const tree = await inspectPathTree(root, deadline, { count: 0 });
     return {
       name,
@@ -137,7 +138,7 @@ export async function inspectMultiTargetItem(
   candidates: SubTargetSpec[],
   options?: { dynamicSubtitle?: string; itemCount?: number }
 ): Promise<InspectedCacheEntry> {
-  const meta: CacheItemMetadata = CACHE_METADATA[name] ?? {
+  const meta: CacheItemMetadata = getCacheMetadata(name) ?? {
     title: name,
     subtitle: name,
     icon: 'folder',
@@ -180,7 +181,7 @@ export async function inspectMultiTargetItem(
     const sorted = [...candidates].sort((a, b) => a.path.localeCompare(b.path));
     for (const spec of sorted) {
       const rootOwner = ctx.allowedRootDirs().find(r => isStrictSubpath(r, spec.path));
-      if (!rootOwner) throw Error('缓存路径超出受控目录边界，已跳过');
+      if (!rootOwner) throw Error(bt('maintenance.err.out_of_bounds_skipped'));
       await ctx.ensureSafeAncestors(rootOwner, spec.path);
       try {
         const tree = await inspectPathTree(spec.path, deadline, counter);
@@ -190,7 +191,7 @@ export async function inspectMultiTargetItem(
         for (const suffix of ['-journal', '-wal', '-shm']) {
           try {
             const sideStat = await lstat(`${spec.path}${suffix}`);
-            if (sideStat.isSymbolicLink()) throw Error('缓存含符号链接，已跳过');
+            if (sideStat.isSymbolicLink()) throw Error(bt('maintenance.err.symlink_skipped'));
             if (sideStat.isFile()) {
               sidecarBytes += sideStat.size;
               sidecarFiles += 1;
@@ -612,24 +613,24 @@ export async function inspectNamedEntry(
     return await inspectMultiTargetItem(ctx, name, candidates);
   }
   const agentTargets = cachedAgentTargets ?? await collectAgentConversationTargets(ctx, retentionDays);
-  const windowDesc = retentionDays > 0 ? `${retentionDays} 天前` : '非活跃';
+  const windowDesc = retentionDays > 0 ? bt('maintenance.window.days_ago', { days: retentionDays }) : bt('maintenance.window.inactive');
   if (name === 'OrphanAgentData') {
     return await inspectMultiTargetItem(ctx, name, agentTargets.orphanTargets);
   }
   if (name === 'AgentTaskStepLogs') {
     return await inspectMultiTargetItem(ctx, name, agentTargets.taskStepTargets, {
-      dynamicSubtitle: `${windowDesc}对话的终端、步骤日志与草稿`,
+      dynamicSubtitle: bt('maintenance.dynamic.task_step_sub', { windowDesc }),
     });
   }
   if (name === 'AgentVerboseTranscripts') {
     return await inspectMultiTargetItem(ctx, name, agentTargets.verboseTranscriptTargets, {
-      dynamicSubtitle: `${windowDesc}冗余转录（保留精简版记录）`,
+      dynamicSubtitle: bt('maintenance.dynamic.verbose_sub', { windowDesc }),
     });
   }
   if (name === 'AgentSubagentDatabases') {
     const sub = agentTargets.subagentCount > 0
-      ? `${windowDesc} ${agentTargets.subagentCount} 个子智能体库（账单已归档）`
-      : CACHE_METADATA.AgentSubagentDatabases!.subtitle;
+      ? bt('maintenance.dynamic.subagent_sub', { windowDesc, count: agentTargets.subagentCount })
+      : (getCacheMetadata('AgentSubagentDatabases')?.subtitle ?? 'AgentSubagentDatabases');
     return await inspectMultiTargetItem(ctx, name, agentTargets.subagentDbTargets, {
       dynamicSubtitle: sub,
       itemCount: agentTargets.subagentCount,
@@ -641,8 +642,11 @@ export async function inspectNamedEntry(
 export async function inspectReadOnlyPaths(paths: string[], limitCount = 80000, budgetMs = 2800, excludePaths?: ReadonlySet<string>) {
   let bytes = 0, fileCount = 0, count = 0, exists = false, truncated = false;
   const deadline = Date.now() + budgetMs;
+  const normalizedExclude = excludePaths && excludePaths.size > 0
+    ? new Set(Array.from(excludePaths, p => resolve(p)))
+    : undefined;
   const walk = async (path: string) => {
-    if (excludePaths?.has(path)) return;
+    if (normalizedExclude?.has(resolve(path))) return;
     if (++count > limitCount || Date.now() > deadline) {
       truncated = true;
       return;

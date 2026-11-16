@@ -1,9 +1,9 @@
 import { ALLOWED_DATA_DIRECTORY_NAMES, applicationChannel, savedApplicationChannel, applicationTarget, detectInstalledChannels, type ApplicationChannel, type ApplicationTarget } from './application-target.js';
 import { GoogleAccountLogin } from './account-oauth.js';
 import { AccountSwitchService } from './account-switch.js';
-import { AccountsManager, computeAccountRevision, projectAccountForIpc, type QuotaData } from './accounts.js';
+import { AccountsManager, cleanAndLocalizeRefreshError, getGoogleClientId, getGoogleClientSecret, type Account, type QuotaData } from './accounts.js';
 import { UsageStatsManager } from './usage.js';
-import { priceStatus } from './pricing.js';
+import { localizePricingTable, priceStatus } from './pricing.js';
 import {
   normalizeSubscriptionTier,
   projectAccountForIpcNormalized as projectAccountNormalizedWithManager,
@@ -22,7 +22,8 @@ import { StringDecoder } from 'node:string_decoder';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DictionaryStore, loadDictionary, dictionaryFromEntries, validateEntries } from './dictionary.js';
+import { DictionaryStore, loadDictionary, dictionaryFromEntries, validateEntries, resolveDictionaryForLocale } from './dictionary.js';
+import { bt, getActiveLocale, setActiveLocale, resolveInitialRuntimeLanguage, resolveLocale } from './i18n.js';
 import { Controller, type AssistantStatus } from './controller.js';
 import { coverageMetricSnapshot } from './coverage.js';
 import { atomicJson, readOptionalJson, sanitizeError } from './files.js';
@@ -41,10 +42,10 @@ function cliOption(argv: string[], name: string, fallback?: string) {
 }
 
 function sanitizeErrorMessage(err: unknown): string {
-  if (!(err instanceof Error)) return '操作未完成';
+  if (!(err instanceof Error)) return bt('common.action_incomplete');
   const msg = err.message || '';
   const redacted = sanitizeError(msg);
-  const sanitized = redacted.replace(/\/(?:Users|private|var|tmp|Volumes)\/[^\s'"]+/g, '[路径]');
+  const sanitized = redacted.replace(/\/(?:Users|private|var|tmp|Volumes)\/[^\s'"]+/g, bt('common.path_token'));
   return sanitized.slice(0, 200);
 }
 
@@ -118,7 +119,7 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
         let activeEmail = activeAcc?.email ?? '';
         let activeName = activeAcc?.name ?? '';
         let isLiveVerified = false;
-        let quotaRefreshError = (activeAcc as any)?.quota_refresh_error ?? '';
+        let quotaRefreshError = cleanAndLocalizeRefreshError((activeAcc as any)?.quota_refresh_error) ?? '';
 
         if (liveAccountEmail) {
           const matchedSummary = listRes.accounts.find((a: any) => a.email.toLowerCase() === liveAccountEmail.toLowerCase());
@@ -130,7 +131,7 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
             activeEmail = matchedSaved.email;
             activeName = matchedSaved.name || liveLs?.name || '';
             isLiveVerified = true;
-            quotaRefreshError = matchedSaved.quota_refresh_error ?? '';
+            quotaRefreshError = cleanAndLocalizeRefreshError(matchedSaved.quota_refresh_error) ?? '';
           } else {
             // 实机运行账号未保存在本地账号库：严禁混入已存 activeAcc 的姓名、等级或配额
             sourceAcc = {
@@ -151,7 +152,7 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
         const quotaOverview = sourceAcc ? deps.getAccountQuotaOverview(sourceAcc, { nowMs: dashboardNowMs }) : null;
         // 有账号但套餐缺失/空串时回落到“待确认”；完全无账号时才保留 FREE 的既有语义。
         const activeTier = (!isLiveVerified && liveAccountEmail && !currentAccountId)
-          ? normalizeSubscriptionTier((liveLs?.tier && !/starter|free/i.test(liveLs.tier)) ? liveLs.tier : (quotaOverview?.subscriptionTier || '待确认'))
+          ? normalizeSubscriptionTier((liveLs?.tier && !/starter|free/i.test(liveLs.tier)) ? liveLs.tier : (quotaOverview?.subscriptionTier || bt('quota.tier.pending')))
           : (quotaOverview ? normalizeSubscriptionTier(quotaOverview.subscriptionTier) : 'FREE');
 
         const resetTimeStr = formatResetTime(quotaOverview?.resetTime);
@@ -190,7 +191,6 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
           carbonResetCountdown: quotaOverview?.carbonResetCountdown ?? '',
           resetTime: resetTimeStr,
           resetCountdown: quotaOverview?.resetCountdown ?? '',
-          quotaGroups: quotaOverview?.quotaGroups ?? [],
           staleGroups: quotaOverview?.staleGroups ?? [],
           stale_groups: quotaOverview?.staleGroups ?? [],
           models: quotaOverview?.models ?? [],
@@ -198,7 +198,7 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
           isStale: quotaOverview?.isStale ?? false,
           staleHours: quotaOverview?.staleHours ?? 0,
           quotaRefreshError,
-          ...projectQuotaContract(quotaOverview ?? { familyWindows: null, argonStatus: null, carbonStatus: null, standaloneModels: [],
+          ...projectQuotaContract(quotaOverview ?? { familyWindows: null, argonStatus: null, carbonStatus: null, standaloneModels: [], projectedQuotaGroups: [],
             refreshState: { complete: false }, quotaWarnings: [], quotaWarningCodes: [] }),
         };
       } catch (error) { accountsError = sanitizeErrorMessage(error); }
@@ -253,32 +253,34 @@ export async function request(command: string): Promise<any> {
   return new Promise((resolveReply, reject) => {
     const client = createConnection(targetSocketPath); let buffer = ''; let received = 0;
     const decoder = new StringDecoder('utf8');
-    client.setTimeout(['status', 'ping', 'task_list'].includes(command) ? 8000 : 120000, () => { client.destroy(); reject(new Error('等待响应超时，后台结果尚未确认；请查询任务状态，勿直接重试写入操作')); });
+    client.setTimeout(['status', 'ping', 'task_list'].includes(command) ? 8000 : 120000, () => { client.destroy(); reject(new Error(bt('main.request_timeout'))); });
     client.on('connect', () => client.write(JSON.stringify({ command }) + '\n'));
     client.on('data', bytes => {
       // CLI 必须与 socket 服务端一样按 UTF-8 流解码：多字节中文可能跨 chunk 边界，
       // 逐 chunk toString() 会产生 U+FFFD 并损坏 coverage_report/dictionary_export 的 JSON。
       received += bytes.length;
-      if (received > 4_000_000) { client.destroy(); reject(new Error('响应超出限制')); return; }
+      if (received > 4_000_000) { client.destroy(); reject(new Error(bt('main.response_too_large'))); return; }
       buffer += decoder.write(bytes);
-      if (buffer.includes('\n')) { client.end(); try { resolveReply(JSON.parse(buffer.split('\n')[0]!)); } catch { reject(new Error('响应格式错误')); } }
+      if (buffer.includes('\n')) { client.end(); try { resolveReply(JSON.parse(buffer.split('\n')[0]!)); } catch { reject(new Error(bt('main.response_invalid_format'))); } }
     });
-    client.on('error', () => reject(new Error('助手未运行')));
+    client.on('error', () => reject(new Error(bt('main.assistant_not_running'))));
   });
 }
 async function run() {
-  try {
-    process.loadEnvFile?.();
-  } catch (error: any) {
-    if (error?.code !== 'ENOENT') {
-      // ignore
+  if (process.cwd() !== '/') {
+    try {
+      process.loadEnvFile?.();
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        // ignore
+      }
     }
   }
   const args = process.argv.slice(2);
   const option = (name: string, fallback?: string) => cliOption(args, name, fallback);
   const command = option('--command');
   if (command) { console.log(JSON.stringify(await request(command))); return; }
-  if (args.includes('--heal')) throw new Error('当前版本不提供在线补译；可编辑个人词典或使用开发工具生成本地候选');
+  if (args.includes('--heal')) throw new Error(bt('main.heal_unsupported'));
   const stateDir = resolve(option('--state-dir', join(homedir(), 'Library', 'Application Support', 'GravityBox'))!);
   try {
     process.loadEnvFile?.(join(stateDir, '.env'));
@@ -290,12 +292,20 @@ async function run() {
   const socketPath = join(stateDir, 'control.sock');
   let configuredChannel: unknown;
   let configuredHudEnabled: unknown;
+  let configuredAppLanguage: unknown;
   try {
     const parsedCfg = JSON.parse(readFileSync(join(stateDir, 'config.json'), 'utf8'));
     configuredChannel = parsedCfg.applicationChannel;
     configuredHudEnabled = parsedCfg.hudEnabled;
+    configuredAppLanguage = parsedCfg.appLanguage;
   }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('应用版本配置无法读取，原文件已保留'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(bt('main.channel_config_unreadable')); }
+  const explicitLocaleArg = option('--locale');
+  const explicitSystemLocalesArg = option('--system-locales');
+  const initialSystemLocales = explicitSystemLocalesArg
+    ? explicitSystemLocalesArg.split(',').map((s) => s.trim()).filter(Boolean)
+    : undefined;
+  const effectiveInitialSystemLocales = initialSystemLocales?.length ? initialSystemLocales : undefined;
   const explicitChannelArg = option('--channel');
   const explicitAppArg = option('--app');
   const explicitProfileArg = option('--profile');
@@ -396,13 +406,16 @@ async function run() {
   const idempotencyStore = new IdempotencyStore();
   let backendLease: ProcessLease | undefined;
 
-  function projectAccountForIpcNormalized(account: Parameters<typeof projectAccountNormalizedWithManager>[0]): Record<string, unknown> | null {
-    return projectAccountNormalizedWithManager(account, accountsManager);
+  function projectAccountForIpcNormalized(
+    account: Parameters<typeof projectAccountNormalizedWithManager>[0],
+    options?: Parameters<typeof projectAccountNormalizedWithManager>[2],
+  ): Record<string, unknown> | null {
+    return projectAccountNormalizedWithManager(account, accountsManager, options);
   }
 
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const stateInfo = await lstat(stateDir);
-  if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink() || stateInfo.uid !== process.getuid?.()) throw new Error('助手数据目录身份不匹配');
+  if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink() || stateInfo.uid !== process.getuid?.()) throw new Error(bt('main.state_dir_mismatch'));
   await chmod(stateDir, 0o700);
   backendLease = await acquireProcessLease(join(stateDir, 'backend.lock'), 0);
   const earlySignalExit = () => { backendLease?.releaseSync(); process.exit(0); };
@@ -423,40 +436,61 @@ async function run() {
   }
   try {
     const info = await lstat(socketPath);
-    if (!info.isSocket() || info.uid !== process.getuid?.()) throw new Error('控制接口身份不匹配');
+    if (!info.isSocket() || info.uid !== process.getuid?.()) throw new Error(bt('main.socket_mismatch'));
     // Connection acceptance proves a live server even if a long operation delays its reply.
     const live = await new Promise<boolean>((resolveLive, reject) => {
       const client = createConnection(socketPath);
       client.once('connect', () => { client.destroy(); resolveLive(true); });
       client.once('error', (error: NodeJS.ErrnoException) => {
         if (['ECONNREFUSED', 'ENOENT'].includes(error.code ?? '')) resolveLive(false);
-        else reject(new Error('控制接口状态无法确认，已保留现有接口'));
+        else reject(new Error(bt('main.socket_unconfirmed')));
       });
-      client.setTimeout(1500, () => { client.destroy(); reject(new Error('后台繁忙，已保留现有接口')); });
+      client.setTimeout(1500, () => { client.destroy(); reject(new Error(bt('main.socket_busy'))); });
     });
-    if (live) throw new Error('助手已运行');
+    if (live) throw new Error(bt('main.assistant_already_running'));
     const current = await lstat(socketPath);
-    if (current.ino !== info.ino || current.dev !== info.dev) throw new Error('控制接口已变化，请稍后重试');
+    if (current.ino !== info.ino || current.dev !== info.dev) throw new Error(bt('main.socket_changed'));
     await unlink(socketPath);
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   await mkdir(channelStateDir, { recursive: true, mode: 0o700 });
   const userDir = join(stateDir, '词典'); await mkdir(userDir, { recursive: true, mode: 0o700 });
   const userInfo = await lstat(userDir);
-  if (userInfo.isSymbolicLink() || !userInfo.isDirectory() || userInfo.uid !== process.getuid?.()) throw new Error('词典目录身份不匹配');
+  if (userInfo.isSymbolicLink() || !userInfo.isDirectory() || userInfo.uid !== process.getuid?.()) throw new Error(bt('main.dict_dir_mismatch'));
   const personalPath = join(userDir, '个人覆盖.json');
   try { await lstat(personalPath); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') await atomicJson(personalPath, {}); else throw error; }
   const baseDir = fileURLToPath(new URL('../dict/', import.meta.url));
-  const store = new DictionaryStore(baseDir, userDir);
+  const runtimePrefs = await readOptionalJson<{ language?: string; translationEnabled?: boolean; hudEnabled?: boolean }>(join(stateDir, 'runtime-preferences.json'), 'runtime-preferences.json');
+  const preferredConfiguredLanguage =
+    explicitLocaleArg ??
+    (typeof configuredAppLanguage === 'string' && configuredAppLanguage.trim()
+      ? configuredAppLanguage
+      : typeof runtimePrefs?.language === 'string' && runtimePrefs.language.trim()
+      ? runtimePrefs.language
+      : effectiveInitialSystemLocales || process.env.GRAVITYBOX_SYSTEM_LOCALES
+      ? 'system'
+      : undefined);
+  const initialLang =
+    preferredConfiguredLanguage !== undefined || runtimePrefs?.translationEnabled !== undefined
+      ? resolveInitialRuntimeLanguage({
+          configuredLanguage: preferredConfiguredLanguage,
+          legacyTranslationEnabled: explicitLocaleArg ? runtimePrefs?.translationEnabled : runtimePrefs?.translationEnabled,
+          systemLocales: effectiveInitialSystemLocales,
+        })
+      : { configuredLanguage: 'zh-Hans', resolvedLocale: 'zh-Hans' };
+  setActiveLocale(initialLang.resolvedLocale);
+  const initialDictInfo = await resolveDictionaryForLocale(baseDir, initialLang.resolvedLocale);
+  const store = new DictionaryStore(initialDictInfo.baseDir, userDir);
   let fallback;
   try { fallback = dictionaryFromEntries(validateEntries(JSON.parse(await readFile(join(channelStateDir, 'last-valid-dictionary.json'), 'utf8')).entries)); }
-  catch { fallback = await loadDictionary(baseDir); }
+  catch { fallback = await loadDictionary(initialDictInfo.baseDir); }
   await store.start(fallback);
   let writeChain = Promise.resolve();
   let statusTasks:Tasks|undefined;
   let pendingStatus: any, writingStatus=false, lastStatusKey="", lastStatusWrite=0;
   const onStatus = (status: AssistantStatus) => {
     const installState = detectInstalledChannels(channel);
-    const snapshot = { ...status, applicationChannel: channel, applicationLabel: target.label, accountSwitchSupported: target.supportsAccountSwitch, bothApplicationsInstalled: installState.bothInstalled, availableChannels: installState.channels, taskRevision:statusTasks?.revision??0,runningTasks:statusTasks?.list().filter(t=>t.state==='running').length??0 };
+    const oauthClientConfigured = Boolean(getGoogleClientId() && getGoogleClientSecret());
+    const snapshot = { ...status, oauthClientConfigured, applicationChannel: channel, applicationLabel: target.label, accountSwitchSupported: target.supportsAccountSwitch, bothApplicationsInstalled: installState.bothInstalled, availableChannels: installState.channels, taskRevision:statusTasks?.revision??0,runningTasks:statusTasks?.list().filter(t=>t.state==='running').length??0 };
     const {updatedAt,rssMB,...meaningful}=snapshot;const key=JSON.stringify(meaningful);
     if(key===lastStatusKey&&Date.now()-lastStatusWrite<30000)return;
     lastStatusKey=key;lastStatusWrite=Date.now();pendingStatus=snapshot;
@@ -465,42 +499,75 @@ async function run() {
   let fixture: { port: number; origin: string } | undefined;
   if (option('--fixture-port')) {
     const port = Number(option('--fixture-port')), origin = option('--fixture-origin');
-    if (!Number.isInteger(port) || !origin || !/^http:\/\/127\.0\.0\.1:\d+$/.test(origin)) throw new Error('测试参数无效');
+    if (!Number.isInteger(port) || !origin || !/^http:\/\/127\.0\.0\.1:\d+$/.test(origin)) throw new Error(bt('main.fixture_invalid'));
     fixture = { port, origin };
   }
   let applyChain = Promise.resolve();
   const shortcutEnabled = !!fixture;
-  let initiallyPaused = false;
+  let initiallyPaused = initialLang.resolvedLocale === 'en' || !initialDictInfo.hasTargetDictionary;
   let hudEnabled = typeof configuredHudEnabled === 'boolean' ? configuredHudEnabled : true;
-  const runtimePrefs = await readOptionalJson<{ translationEnabled?: boolean; hudEnabled?: boolean }>(join(stateDir, 'runtime-preferences.json'), 'runtime-preferences.json');
-  if (runtimePrefs) {
-    initiallyPaused = runtimePrefs.translationEnabled === false;
-    if (typeof configuredHudEnabled !== 'boolean' && typeof runtimePrefs.hudEnabled === 'boolean') {
-      hudEnabled = runtimePrefs.hudEnabled;
-    }
+  if (runtimePrefs && typeof configuredHudEnabled !== 'boolean' && typeof runtimePrefs.hudEnabled === 'boolean') {
+    hudEnabled = runtimePrefs.hudEnabled;
   }
-  const saveRuntimePreferences = async (patch: { translationEnabled?: boolean; hudEnabled?: boolean }) => {
+  const saveRuntimePreferences = async (patch: { language?: string; translationEnabled?: boolean; hudEnabled?: boolean }) => {
     const currentPrefs = (await readOptionalJson<Record<string, unknown>>(join(stateDir, 'runtime-preferences.json'), 'runtime-preferences.json')) ?? {};
     const nextPrefs = { ...currentPrefs, translationEnabled: controller.snapshot().translationEnabled !== false, hudEnabled, ...patch };
-    if (typeof patch.hudEnabled === 'boolean') {
-      hudEnabled = patch.hudEnabled;
+    if (typeof patch.hudEnabled === 'boolean' || typeof patch.language === 'string') {
+      if (typeof patch.hudEnabled === 'boolean') hudEnabled = patch.hudEnabled;
       const configPath = join(stateDir, 'config.json');
       try {
         const cfg = JSON.parse(await readFile(configPath, 'utf8'));
         if (cfg && typeof cfg === 'object' && !Array.isArray(cfg) && (cfg.schema === undefined || cfg.schema === 2)) {
-          await atomicJson(configPath, { ...cfg, hudEnabled });
+          await atomicJson(configPath, {
+            ...cfg,
+            ...(typeof patch.hudEnabled === 'boolean' ? { hudEnabled } : {}),
+            ...(typeof patch.language === 'string' ? { appLanguage: patch.language } : {}),
+          });
         }
       } catch {}
     }
     await atomicJson(join(stateDir, 'runtime-preferences.json'), nextPrefs);
   };
-  const controller = new Controller({ initiallyPaused, shortcutEnabled, hudEnabled, appPath, profile, fixture, geminiDir, dictionary: store.current!, stateDir: channelStateDir, selectDictionary:async version=>{const dictionary=await store.selectVersion(version);await applyChain;return dictionary;}, reloadDictionary: async () => { await store.reload(); await applyChain; if (store.lastError) throw new Error(store.lastError); }, onStatus });
+  const controller = new Controller({
+    initiallyPaused,
+    locale: initialLang.resolvedLocale,
+    configuredLanguage: initialLang.configuredLanguage,
+    hasTargetDictionary: initialDictInfo.hasTargetDictionary,
+    shortcutEnabled,
+    hudEnabled,
+    appPath,
+    profile,
+    fixture,
+    geminiDir,
+    dictionary: store.current!,
+    stateDir: channelStateDir,
+    selectDictionary:async version=>{const dictionary=await store.selectVersion(version);await applyChain;return dictionary;},
+    reloadDictionary: async () => { await store.reload(); await applyChain; if (store.lastError) throw new Error(store.lastError); },
+    onStatus,
+  });
   const tasks = new Tasks(stateDir, () => onStatus(controller.snapshot()));statusTasks=tasks; await tasks.start();
+  const cancelRunningDeepScan = () => {
+    const deepScan = tasks.list().find(t => t.kind === 'deep-scan' && t.state === 'running');
+    if (deepScan) tasks.cancel(deepScan.id);
+  };
+  const applyLocalePreference = async (requested: string, resolved: ReturnType<typeof resolveLocale>) => {
+    setActiveLocale(resolved);
+    const nextDictInfo = await resolveDictionaryForLocale(baseDir, resolved);
+    await store.setBaseDir(nextDictInfo.baseDir);
+    const shouldTranslate = resolved !== 'en' && nextDictInfo.hasTargetDictionary;
+    await saveRuntimePreferences({ language: requested, translationEnabled: shouldTranslate });
+    if (!shouldTranslate) cancelRunningDeepScan();
+    await controller.setLocale(resolved, requested, {
+      dictionary: store.current,
+      hasTargetDictionary: nextDictInfo.hasTargetDictionary,
+    });
+    return shouldTranslate;
+  };
   let cacheChain = Promise.resolve();
   const cache = () => { const value = store.current; cacheChain = cacheChain.catch(() => {}).then(() => atomicJson(join(channelStateDir, 'last-valid-dictionary.json'), value)); cacheChain.catch(() => {}); };
   cache();
   if (store.lastError) controller.dictionaryError(store.lastError);
-  store.on('updated', dictionary => { cache(); applyChain = controller.update(dictionary); applyChain.catch(() => controller.dictionaryError('部分窗口未完成词典更新')); });
+  store.on('updated', dictionary => { cache(); applyChain = controller.update(dictionary); applyChain.catch(() => controller.dictionaryError(bt('main.dict_partial_update'))); });
   store.on('invalid', message => controller.dictionaryError(String(message)));
   store.on('valid', () => controller.dictionaryError());
   let commandChain = Promise.resolve(); let stopping = false; const ipcMetrics = { statusRequests: 0, taskPayloadReplies: 0 };
@@ -529,17 +596,17 @@ async function run() {
     client.on('data', chunk => {
       if (handled) return;
       received += chunk.length;
-      if (received > 4_000_000) { handled = true; reply({ ok: false, error: '请求过大，已被拒绝' }); return; }
+      if (received > 4_000_000) { handled = true; reply({ ok: false, error: bt('main.request_too_large') }); return; }
       input += decoder.write(chunk);
       if (!input.includes('\n')) return; handled = true;
-      try { parsed = JSON.parse(input.split('\n')[0]!); } catch { reply({ ok: false, error: '请求格式错误' }); return; }
-      if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)){reply({ok:false,error:'请求格式错误'});return;}
+      try { parsed = JSON.parse(input.split('\n')[0]!); } catch { reply({ ok: false, error: bt('main.request_invalid_format') }); return; }
+      if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)){reply({ok:false,error:bt('main.request_invalid_format')});return;}
       if (parsed.idempotencyKey) {
-        if(typeof parsed.idempotencyKey!=='string'||parsed.idempotencyKey.length>256){reply({ok:false,error:'幂等键无效'});return;}
+        if(typeof parsed.idempotencyKey!=='string'||parsed.idempotencyKey.length>256){reply({ok:false,error:bt('main.idempotency_invalid')});return;}
         const fingerprint=createHash('sha256').update(JSON.stringify(canonicalPayload(parsed))).digest('hex');
         const state=idempotencyStore.reserve(parsed.idempotencyKey,fingerprint,reply);
         if(state==='waiting')return;
-        if(state!=='owner'){reply({ok:false,error:state==='conflict'?'幂等键已用于其他请求':'请求过多，请稍后重试'});return;}
+        if(state!=='owner'){reply({ok:false,error:state==='conflict'?bt('main.idempotency_conflict'):bt('main.too_many_requests')});return;}
         ownsIdempotency=true;
       }
       const command = parsed.command;
@@ -589,7 +656,7 @@ async function run() {
                   activeAccountEmail = liveLs.email;
                   const q = accountsManager.getAccountQuotaOverview({ quota: liveLs.quota });
                   activeFiveHourQuota = q.fiveHourRemaining;
-                  activeSubscriptionTier = normalizeSubscriptionTier((liveLs.tier && !/starter|free/i.test(liveLs.tier)) ? liveLs.tier : (q.subscriptionTier !== 'FREE' ? q.subscriptionTier : '待确认'));
+                  activeSubscriptionTier = normalizeSubscriptionTier((liveLs.tier && !/starter|free/i.test(liveLs.tier)) ? liveLs.tier : (q.subscriptionTier !== 'FREE' ? q.subscriptionTier : bt('quota.tier.pending')));
                 }
               } else if (listRes.active_account) {
                 usageManager.setCurrentAccountContext(undefined);
@@ -607,6 +674,7 @@ async function run() {
             ok: true,
             status: {
               ...controller.snapshot(),
+              oauthClientConfigured: Boolean(getGoogleClientId() && getGoogleClientSecret()),
               applicationChannel: channel, applicationLabel: target.label, accountSwitchSupported: target.supportsAccountSwitch,
               bothApplicationsInstalled: installState.bothInstalled, availableChannels: installState.channels,
               ...(parsed.includeAccounts === false ? {} : { activeAccountEmail, activeFiveHourQuota, activeSubscriptionTier, liveAccountEmail, accountsRevision }),
@@ -620,8 +688,9 @@ async function run() {
         return;
       }
       if (command === 'task_list') {ipcMetrics.taskPayloadReplies++; reply({ ok: true, tasks: tasks.list() }); return; }
-      if (command === 'task_cancel') { const cancelled = tasks.cancel(parsed.id); reply(cancelled ? { ok: true } : { ok: false, error: '任务已结束、不存在或已进入保存阶段' }); return; }
-      if (['pause', 'restore', 'stop'].includes(command)) { tasks.cancel(); }
+      if (command === 'task_cancel') { const cancelled = tasks.cancel(parsed.id); reply(cancelled ? { ok: true } : { ok: false, error: bt('main.task_not_cancellable') }); return; }
+      if (command === 'stop') { tasks.cancel(); }
+      else if (['pause', 'restore'].includes(command)) { cancelRunningDeepScan(); }
       if (command === 'dashboard_summary') {
         (async () => {
         const counts = store.layerCounts;
@@ -685,69 +754,27 @@ async function run() {
               const matched = index.accounts.find(a => a.email.toLowerCase() === detectedEmail.toLowerCase());
               effectiveActiveId = matched?.id ?? null;
             }
-            const accountsWithQuota = await Promise.all(index.accounts.map(async summary => {
+            const accountsWithQuota = await Promise.all(index.accounts.map(async (summary): Promise<Record<string, unknown> & { id: string }> => {
               let saved;
               try { saved = await accountsManager.getAccount(summary.id); }
               catch { return { id: summary.id, email: summary.email, name: summary.name, disabled: true,
-                validation_blocked: true, quota: null, quota_refresh_error: '账号文件无法读取，原文件已保留',
-                credentialReadiness: { state: 'needs_authorization', message: '请先核对账号数据文件' } }; }
+                validation_blocked: true, quota: null, quota_refresh_error: bt('main.account_unreadable'),
+                credentialReadiness: { state: 'needs_authorization', message: bt('main.account_check_files') } }; }
               if (!saved) return { id: summary.id, email: summary.email, name: summary.name, disabled: true,
-                quota: null, quota_refresh_error: '账号文件不存在，请重新读取或保存当前账号' };
-              const projectedSaved = projectAccountForIpc(saved ?? summary);
+                quota: null, quota_refresh_error: bt('main.account_missing'),
+                credentialReadiness: { state: 'needs_authorization', message: bt('main.account_check_files') } };
               const isLiveMatched = live?.email?.toLowerCase() === summary.email.toLowerCase() && live.quota;
-              const acc = { ...summary, ...projectedSaved, ...(isLiveMatched ? { quota: mergeLiveQuotaWithSaved(projectedSaved?.quota ?? saved.quota, live.quota) } : {}) };
-              const q = accountsManager.getAccountQuotaOverview(acc, { nowMs: listNowMs });
-              const contract = projectQuotaContract(q);
-              const resetTimeStr = formatResetTime(q.resetTime);
-              const rev = computeAccountRevision(acc);
-              const lastUp = acc.quota_last_updated ?? acc.quota?.last_updated ?? 0;
-              const rawErr = acc.quota_refresh_error;
-              const cleanErr = (rawErr && /双周期/.test(rawErr)) ? null : (rawErr ?? null);
-              return {
-                ...acc,
-                quota_refresh_error: cleanErr,
-                revision: rev,
-                quota_last_updated: lastUp,
-                quotaLastUpdated: lastUp,
-                fiveHourRemaining: q.fiveHourRemaining,
-                weeklyRemaining: q.weeklyRemaining,
-                geminiFiveHourRemaining: q.geminiFiveHourRemaining,
-                geminiWeeklyRemaining: q.geminiWeeklyRemaining,
-                geminiFiveHourResetCountdown: q.geminiFiveHourResetCountdown ?? '',
-                geminiWeeklyResetCountdown: q.geminiWeeklyResetCountdown ?? '',
-                geminiResetCountdown: q.geminiResetCountdown,
-                claudeFiveHourRemaining: q.claudeFiveHourRemaining,
-                claudeWeeklyRemaining: q.claudeWeeklyRemaining,
-                claudeFiveHourResetCountdown: q.claudeFiveHourResetCountdown ?? '',
-                claudeWeeklyResetCountdown: q.claudeWeeklyResetCountdown ?? '',
-                claudeResetCountdown: q.claudeResetCountdown,
-                argonWeeklyRemaining: q.argonWeeklyRemaining,
-                argonWeeklyResetCountdown: q.argonWeeklyResetCountdown ?? '',
-                argonResetCountdown: q.argonResetCountdown,
-                carbonWeeklyRemaining: q.carbonWeeklyRemaining,
-                carbonWeeklyResetCountdown: q.carbonWeeklyResetCountdown ?? '',
-                carbonResetCountdown: q.carbonResetCountdown,
-                staleGroups: q.staleGroups,
-                stale_groups: q.staleGroups,
-                subscription_tier: normalizeSubscriptionTier(q.subscriptionTier),
-                resetTime: resetTimeStr,
-                resetCountdown: q.resetCountdown,
-                quotaGroups: q.quotaGroups,
-                models: q.models,
-                ...contract,
-                quota: {
-                  ...(acc.quota ?? {}),
-                  five_hour_remaining: q.fiveHourRemaining,
-                  weekly_remaining: q.weeklyRemaining,
-                  subscription_tier: normalizeSubscriptionTier(q.subscriptionTier),
-                  reset_time: q.resetTime ?? null,
-                  reset_countdown: q.resetCountdown,
-                  quota_groups: q.quotaGroups,
-                  stale_groups: q.staleGroups,
-                  models: q.models,
-                  ...contract,
-                },
+              const acc: Account = {
+                ...saved,
+                quota: isLiveMatched ? mergeLiveQuotaWithSaved(saved.quota, live.quota) : saved.quota,
               };
+              const projected = projectAccountForIpcNormalized(acc, {
+                nowMs: listNowMs,
+                includeOverviewFields: true,
+                formatResetTime,
+                revisionWithReadiness: true,
+              });
+              return { id: acc.id, ...(projected ?? {}) };
             }));
             accountsWithQuota.sort((a, b) => {
               const aActive = a.id === effectiveActiveId ? 1 : 0;
@@ -783,33 +810,33 @@ async function run() {
           let insidersRunning = false;
           let hasRunningTask = false;
           let taskReason = '';
-          const insidersAppPath = '/Applications/Antigravity - Insiders.app';
-          const candidateTargets = [
-            target,
-            { appPath: insidersAppPath, executable: 'Electron' },
-          ];
+          const insidersPrefix = '/Applications/Antigravity - Insiders.app/Contents/';
+          const stablePrefix = `${target.appPath}/Contents/`;
           try {
             const { stdout: psOut } = await execFileAsync('/bin/ps', ['-ax', '-ww', '-o', 'pid=,pcpu=,args='], { timeout: 3000 });
             for (const line of psOut.split('\n')) {
-              const matched = candidateTargets.find(t => line.includes(`${t.appPath}/Contents/`));
-              if (matched) {
-                if (line.includes(`${matched.appPath}/Contents/MacOS/${matched.executable}`) && !line.includes('Helper')) {
+              const m = line.trim().match(/^(\d+)\s+([\d.]+)\s+(.*)$/);
+              if (!m) continue;
+              const cpu = parseFloat(m[2] || '0');
+              const args = m[3] || '';
+              if (args.startsWith(insidersPrefix)) {
+                // Align with AccountSwitchService.guardStopped(): block any Insiders process sharing official credentials.
+                appRunning = true;
+                insidersRunning = true;
+              } else if (args.startsWith(stablePrefix)) {
+                if (args.startsWith(`${target.appPath}/Contents/MacOS/${target.executable}`) && !args.includes('Helper')) {
                   appRunning = true;
-                  if (matched.appPath === insidersAppPath) {
-                    insidersRunning = true;
-                  } else {
-                    stableRunning = true;
-                  }
+                  stableRunning = true;
                 }
-                const m = line.trim().match(/^(\d+)\s+([\d.]+)\s+/);
-                const cpu = m ? parseFloat(m[2] || '0') : 0;
-                if (/language_server/i.test(line) && cpu >= 3.0) {
-                  hasRunningTask = true;
-                  taskReason = '检测到正在执行的 Agent 或模型推理任务';
-                } else if (/Helper \((?:Plugin|Renderer)\)/i.test(line) && cpu >= 15.0) {
-                  hasRunningTask = true;
-                  taskReason = '检测到正在执行的 Agent 或模型推理任务';
-                }
+              } else {
+                continue;
+              }
+              if (/language_server/i.test(args) && cpu >= 3.0) {
+                hasRunningTask = true;
+                taskReason = bt('main.task.active_inference');
+              } else if (/Helper \((?:Plugin|Renderer)\)/i.test(args) && cpu >= 15.0) {
+                hasRunningTask = true;
+                taskReason = bt('main.task.active_inference');
               }
             }
           } catch {}
@@ -817,7 +844,7 @@ async function run() {
             const cdpState = await controller.hasRunningAgentTask().catch(() => ({ busy: false, reason: '' }));
             if (cdpState.busy) {
               hasRunningTask = true;
-              taskReason = cdpState.reason || '检测到正在执行的 Agent 或模型推理任务';
+              taskReason = cdpState.reason || bt('main.task.active_inference');
             }
           }
           if (appRunning && !hasRunningTask) {
@@ -834,7 +861,7 @@ async function run() {
                     const stats = await Promise.all(files.slice(i, i + 32).map(f => lstat(join(subDir, f)).catch(() => null)));
                     if (stats.some(st => st && nowMs - st.mtimeMs < 15000)) {
                       hasRunningTask = true;
-                      taskReason = '检测到活跃的 Agent 会话任务';
+                      taskReason = bt('main.task.active_session');
                       break;
                     }
                   }
@@ -869,7 +896,7 @@ async function run() {
           if (command === 'auto_switch_get') { reply({ ok: true, config: await accountsManager.getAutoSwitchConfig() }); return; }
           if (isReadOnlyAutoSwitch) {
             const best = await recommendationPreview(parsed.config, true);
-            if (!best) { reply({ ok: true, currentAccount: null, bestCandidate: null, account: null, shouldSwitch: false, executed: false, preview: true, reason: '请先保存当前运行账号' }); return; }
+            if (!best) { reply({ ok: true, currentAccount: null, bestCandidate: null, account: null, shouldSwitch: false, executed: false, preview: true, reason: bt('main.auto_switch.save_current_first') }); return; }
             const projected = {
               currentAccount: projectAccountForIpcNormalized(best.currentAccount),
               bestCandidate: projectAccountForIpcNormalized(best.bestCandidate),
@@ -897,8 +924,9 @@ async function run() {
           }
           if (command === 'api_pricing_get') {
             await syncActiveOfficialModelsToUsageManager();
-            const prices = await usageManager.getActivePricingTable();
-            reply({ ok: true, prices, pricingStatus: Object.fromEntries(Object.entries(prices).map(([k, v]) => [k, priceStatus(v)])) });
+            const rawActivePrices = await usageManager.getActivePricingTable();
+            const prices = localizePricingTable(rawActivePrices);
+            reply({ ok: true, prices, pricingStatus: Object.fromEntries(Object.entries(rawActivePrices).map(([k, v]) => [k, priceStatus(v)])) });
             return;
           }
         })().catch(error => reply({ ok: false, error: sanitizeErrorMessage(error) }));
@@ -906,25 +934,27 @@ async function run() {
       }
       commandChain = commandChain.catch(() => {}).then(async () => {
         try {
-          if(command==='shortcut_set'){if(!fixture)throw new Error('中英对照已移除');await controller.configureShortcut(parsed.enabled===true);reply({ok:true});return;}
+          if(command==='shortcut_set'){if(!fixture)throw new Error(bt('main.shortcut_removed'));await controller.configureShortcut(parsed.enabled===true);reply({ok:true});return;}
           if(command==='api_pricing_revalue_preview'){reply({ok:true,preview:await usageManager.previewRevalueHistory(parsed.mode === 'unpriced_only' ? 'unpriced_only' : 'force_all')});return;}
           if(command==='api_pricing_revalue'){const mode = parsed.mode === 'unpriced_only' ? 'unpriced_only' : 'force_all';reply({ok:true,...await usageManager.revalueHistory(parsed.confirm===true, { mode, previewId: typeof parsed.previewId === 'string' ? parsed.previewId : undefined })});return;}
           if(command==='api_pricing_revalue_rollback'){reply({ok:true,...await usageManager.restoreRevalueHistory(String(parsed.previewId ?? ''),parsed.confirm===true)});return;}
           if(command==='pricing_sync_set'){await atomicJson(join(stateDir, 'pricing-preferences.json'), {enabled:parsed.enabled===true});usageManager.setAutoRemotePricingSync(parsed.enabled===true);reply({ok:true});return;}
           if(command==='pricing_sync_check'){
-            if(parsed.feedUrl!==undefined&&typeof parsed.feedUrl!=='string')throw new Error('价格源地址无效');
+            if(parsed.feedUrl!==undefined&&typeof parsed.feedUrl!=='string')throw new Error(bt('main.pricing_feed_invalid'));
             await syncActiveOfficialModelsToUsageManager();
             const res=await usageManager.syncRemotePricing(parsed.feedUrl,true);
-            const prices=await usageManager.getActivePricingTable();
-            const pricingStatus=Object.fromEntries(Object.entries(prices).map(([k,v])=>[k,priceStatus(v)]));
+            const rawActivePrices=await usageManager.getActivePricingTable();
+            const prices=localizePricingTable(rawActivePrices);
+            const pricingStatus=Object.fromEntries(Object.entries(rawActivePrices).map(([k,v])=>[k,priceStatus(v)]));
             reply({ok:true,...res,prices,pricingStatus,status:await usageManager.getPricingSyncStatus()});
             return;
           }
           if(command==='hud_set'){const nextHud=parsed.enabled!==false;await saveRuntimePreferences({hudEnabled:nextHud});await controller.configureHud(nextHud);await writeChain;reply({ok:true,status:controller.snapshot()});return;}
+          if(command==='maintenance_smart_clear'){reply(await cacheMaintenance.smartClear({scopes:parsed.scopes,retentionDays:parsed.retentionDays,keepLocalSnapshots:parsed.keepLocalSnapshots}));return;}
           if(command==='maintenance_clear'){reply(await cacheMaintenance.clear(parsed.token, parsed.selectedNames));return;}
           if(command==='maintenance_restore'){reply(await cacheMaintenance.restore(parsed.snapshotId ?? parsed.id));return;}
-          if(command==='maintenance_preflight'){if(tasks.list().some(t=>t.state==='running'))throw new Error('请先等待当前任务完成，再执行维护');if(await cacheMaintenance.hasRunningConversation())throw new Error('检测到正在执行的 Agent 会话任务，请先等待任务结束');reply(await controller.maintenancePreflight());return;}
-          if(command==='metadata_scan_start'){const taskId=tasks.begin('deep-scan','读取插件与菜单',async(signal,_progress,commit)=>controller.metadataScan(signal,parsed.nativeMenus,commit));reply({ok:true,taskId});return;}
+          if(command==='maintenance_preflight'){if(tasks.list().some(t=>t.state==='running'))throw new Error(bt('main.preflight_task_running'));if(await cacheMaintenance.hasRunningConversation())throw new Error(bt('main.preflight_agent_running'));reply(await controller.maintenancePreflight());return;}
+          if(command==='metadata_scan_start'){const taskId=tasks.begin('deep-scan',bt('main.task.deep_scan_title'),async(signal,_progress,commit)=>controller.metadataScan(signal,parsed.nativeMenus,commit));reply({ok:true,taskId});return;}
           if (command === 'account_save_current') {
             const acc = await accountsManager.saveCurrentAccount({ homeDir, appSupportDir });
             reply({ ok: true, account: projectAccountForIpcNormalized(acc) });
@@ -946,10 +976,9 @@ async function run() {
           }
           if (command === 'account_reorder') {
             const index = await accountsManager.reorderAccounts(parsed.ids);
-            const reordered = index.accounts.map(account => ({
-              ...account,
-              subscription_tier: normalizeSubscriptionTier((account as any).subscription_tier ?? (account as any).quota?.subscription_tier),
-              quota: account.quota ? { ...account.quota, subscription_tier: normalizeSubscriptionTier((account.quota as any).subscription_tier) } : account.quota,
+            const reordered = await Promise.all(index.accounts.map(async summary => {
+              const saved = await accountsManager.getAccount(summary.id).catch(() => null);
+              return projectAccountForIpcNormalized(saved ?? summary);
             }));
             reply({ ok: true, accounts: reordered });
             return;
@@ -971,7 +1000,7 @@ async function run() {
             usageManager.invalidateCache();
             reply({ ok: true, ...result }); return;
           }
-          if(command==='account_recovery_clear'){if(parsed.confirm!==true)throw new Error('请先确认清除恢复凭据');reply({ok:true,...await switchService.clearRecovery(String(parsed.digest))});return;}
+          if(command==='account_recovery_clear'){if(parsed.confirm!==true)throw new Error(bt('main.recovery_clear_confirm'));reply({ok:true,...await switchService.clearRecovery(String(parsed.digest))});return;}
           if (command === 'account_switch_rollback') {
             const result = await switchService.rollback();
             await syncActiveAccountToUsageManager(true).catch(() => {});
@@ -983,26 +1012,28 @@ async function run() {
           if (command === 'account_oauth_cancel') { reply({ ok: true, ...accountLogin.cancel(String(parsed.id || '')) }); return; }
           if (command === 'account_add_token_start') {
             const refreshToken = String(parsed.refreshToken || '');
-            const taskId = tasks.begin('account-add', '添加 Google 账号', async (_signal, _progress, commit) => {
+            const taskId = tasks.begin('account-add', bt('main.task.account_add_title'), async (_signal, _progress, commit) => {
               commit();
               const acc = await accountsManager.addAccountWithRefreshToken(refreshToken);
-              return { ok: true, message: `已添加账号：${acc.email}` };
+              return { ok: true, message: bt('main.task.account_add_done', { email: acc.email }) };
             });
             reply({ ok: true, taskId }); return;
           }
           if (command === 'quota_refresh_start') {
-            const taskId = tasks.begin('quota-refresh', '刷新账号配额', async (signal, _progress, _commit) => {
+            const taskId = tasks.begin('quota-refresh', bt('main.task.quota_refresh_title'), async (signal, _progress, _commit) => {
               // 取消必须能中止后续账号/端点；token 轮换的中间落盘由 accounts.ts 在 signal 检查后阻止。
               const result = await accountsManager.refreshAllQuotas(globalThis.fetch, { signal });
               const incomplete = result.accounts.filter(a => a.quota?.refresh_state?.complete === false).length;
               const warnings = result.accounts.filter(a => a.quota_refresh_error || a.quota?.refresh_state?.complete === false).length;
               const staleAccounts = result.accounts.filter(a => (a.quota?.stale_groups?.length ?? 0) > 0).length;
               const staleGroups = result.accounts.reduce((total, a) => total + (a.quota?.stale_groups?.length ?? 0), 0);
+              const incompletePart = incomplete ? bt('main.task.quota_refresh_incomplete_part', { count: incomplete }) : '';
+              const stalePart = staleAccounts ? bt('main.task.quota_refresh_stale_part', { accounts: staleAccounts, groups: staleGroups }) : '';
               return { ok: result.failures.length === 0 && incomplete === 0, partial: (result.failures.length > 0 || incomplete > 0) && result.accounts.length > 0,
                 incomplete, updated: result.accounts.length, failed: result.failures.length, warnings, staleAccounts, staleGroups,
                 message: result.failures.length
-                  ? `已读取 ${result.accounts.length} 个账号；${result.failures.length} 个刷新失败。详情见账号卡片。`
-                  : `已读取 ${result.accounts.length} 个账号的配额${incomplete ? `；${incomplete} 个账号部分刷新` : ''}${staleAccounts ? `；${staleAccounts} 个账号的 ${staleGroups} 个分组沿用上次记录` : ''}。` };
+                  ? bt('main.task.quota_refresh_failures', { total: result.accounts.length, failed: result.failures.length })
+                  : bt('main.task.quota_refresh_ok', { total: result.accounts.length, incompletePart, stalePart }) };
             });
             reply({ ok: true, taskId }); return;
           }
@@ -1015,9 +1046,9 @@ async function run() {
             // 只读推荐是默认语义：preview 或不带 execute 时绝不执行切号。
             const wantsExecute = command === 'auto_switch_execute' || parsed.execute === true;
             const confirmed = parsed.confirmed === true;
-            if (wantsExecute && !confirmed) throw new Error('执行切号需要显式确认（execute:true 且 confirmed:true）；本次未执行任何切换');
+            if (wantsExecute && !confirmed) throw new Error(bt('main.auto_switch.confirm_required'));
             const best = await recommendationPreview(parsed.config, false);
-            if (!best) { reply({ ok: true, currentAccount: null, bestCandidate: null, account: null, shouldSwitch: false, executed: false, preview: true, reason: '请先保存当前运行账号' }); return; }
+            if (!best) { reply({ ok: true, currentAccount: null, bestCandidate: null, account: null, shouldSwitch: false, executed: false, preview: true, reason: bt('main.auto_switch.save_current_first') }); return; }
             const projected = {
               currentAccount: projectAccountForIpcNormalized(best.currentAccount),
               bestCandidate: projectAccountForIpcNormalized(best.bestCandidate),
@@ -1034,16 +1065,16 @@ async function run() {
               return;
             }
             reply({ ok: true, ...projected, account: projected.bestCandidate, executed: false, preview: true,
-              message: best.reason, ...(wantsExecute ? { skipReason: '当前无需切换，未执行任何切换' } : {}) });
+              message: best.reason, ...(wantsExecute ? { skipReason: bt('main.auto_switch.no_need') } : {}) });
             return;
           }
           if (command === 'quota_refresh') {
             const acc = await accountsManager.refreshQuota(parsed.id);
-            const projected = projectAccountForIpcNormalized(acc);
-            const normalizedQuota = acc.quota ? { ...acc.quota, ...projectQuotaContract(accountsManager.getAccountQuotaOverview(acc)), subscription_tier: normalizeSubscriptionTier((acc.quota as any).subscription_tier) } : acc.quota;
-            const partial = acc.quota?.refresh_state?.complete === false || !!acc.quota_refresh_error;
-            reply({ ok: true, partial, message: partial ? '已读取本轮可用配额；部分数据未返回，详情见账号卡片。' : '已读取最新配额；各模型未返回的数据会单独标明。',
-              quota: normalizedQuota, account: projected, subscription_tier: normalizeSubscriptionTier(projected?.subscription_tier) });
+            const overview = accountsManager.getAccountQuotaOverview(acc);
+            const projected = projectAccountForIpcNormalized(acc, { overview });
+            const partial = acc.quota?.refresh_state?.complete === false || !!projected?.quota_refresh_error;
+            reply({ ok: true, partial, message: partial ? bt('main.quota.read_partial') : bt('main.quota.read_ok'),
+              quota: acc.quota ? (projected?.quota ?? null) : acc.quota, account: projected, subscription_tier: normalizeSubscriptionTier(projected?.subscription_tier) });
             return;
           }
           if (command === 'quota_refresh_all') {
@@ -1056,12 +1087,27 @@ async function run() {
               staleAccounts: accounts.filter((account: any) => (account?.quota?.stale_groups?.length ?? 0) > 0).length });
             return;
           }
-          if (command === 'pause' || command === 'restore') { await saveRuntimePreferences({translationEnabled:false});await tasks.stop();await controller.pause(); }
-          else if (command === 'resume' || command === 'reapply') {await saveRuntimePreferences({translationEnabled:true});await controller.resume();}
-          else if (command === 'toggle') {if(!fixture)throw new Error('中英对照已移除');await controller.toggleLanguage();}
+          if (command === 'language_set') {
+            const requested = typeof parsed.language === 'string' && parsed.language.trim() ? parsed.language.trim() : 'system';
+            const systemLocales = Array.isArray(parsed.systemLocales)
+              ? parsed.systemLocales.filter((v: unknown): v is string => typeof v === 'string' && v.trim().length > 0)
+              : undefined;
+            const resolved = resolveLocale(requested, systemLocales?.length ? systemLocales : undefined);
+            await applyLocalePreference(requested, resolved);
+          }
+          else if (command === 'pause' || command === 'restore') { await saveRuntimePreferences({ translationEnabled: false }); cancelRunningDeepScan(); await controller.pause(); }
+          else if (command === 'resume' || command === 'reapply') {
+            if (getActiveLocale() === 'en') {
+              await applyLocalePreference('zh-Hans', 'zh-Hans');
+            } else {
+              await saveRuntimePreferences({ translationEnabled: true });
+              await controller.resume();
+            }
+          }
+          else if (command === 'toggle') {if(!fixture)throw new Error(bt('main.shortcut_removed'));await controller.toggleLanguage();}
           else if (command === 'reload') await store.reload();
           else if (command === 'stop') { await accountLogin.close(); await tasks.stop();store.close(); await controller.stop(); stopping = true; }
-          else throw new Error('未知操作');
+          else throw new Error(bt('main.unknown_command'));
           await writeChain; await cacheChain.catch(() => {});
           reply({ ok: true, status: controller.snapshot() });
           if (stopping) { server.close(); await unlink(socketPath).catch(() => {}); await backendLease?.release(); setTimeout(() => process.exit(0), 100); }
@@ -1077,8 +1123,8 @@ async function run() {
   process.off('SIGTERM', earlySignalExit); process.off('SIGINT', earlySignalExit);
   process.on('SIGTERM', () => void stop()); process.on('SIGINT', () => void stop());
   // A single bad payload must not take the whole localisation helper down; log it and keep serving.
-  process.on('uncaughtException', error => { console.error(`[GravityBox] ${sanitizeError(error?.stack ?? error?.message ?? '未捕获异常')}`); if (stopping) void stop(1); });
-  process.on('unhandledRejection', reason => { console.error(`[GravityBox] ${reason instanceof Error ? sanitizeError(reason.message) : '后台任务异常'}`); });
+  process.on('uncaughtException', error => { console.error(`[GravityBox] ${sanitizeError(error?.stack ?? error?.message ?? bt('main.uncaught_exception'))}`); if (stopping) void stop(1); });
+  process.on('unhandledRejection', reason => { console.error(`[GravityBox] ${reason instanceof Error ? sanitizeError(reason.message) : bt('main.unhandled_rejection')}`); });
   await controller.start();
   void syncActiveAccountToUsageManager(true).catch(() => {});
   } catch (error) {
@@ -1096,5 +1142,5 @@ function isDirectEntry(): boolean {
   try { return realpathSync(entry) === realpathSync(modulePath); } catch { return false; }
 }
 if (process.env.GRAVITYBOX_IMPORT_ONLY !== '1' && isDirectEntry()) {
-  run().catch(error => { console.error(`[GravityBox] ${sanitizeError((error as Error)?.message ?? '启动失败')}`); process.exitCode = 1; });
+  run().catch(error => { console.error(`[GravityBox] ${sanitizeError((error as Error)?.message ?? bt('main.startup_failed'))}`); process.exitCode = 1; });
 }

@@ -1,4 +1,5 @@
 import { applicationTarget, type ApplicationTarget } from './application-target.js';
+import { bt } from './i18n.js';
 import { inspectBundle } from './discovery.js';
 import { lstat, mkdir, readFile, readdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -38,8 +39,11 @@ import {
   normalizeStoredGroups,
 } from './quota.js';
 import {
+  CodedAccountError,
   accountCredentialReadiness,
+  accountErrorCode,
   buildAccountQuotaOverview,
+  cleanAndLocalizeRefreshError,
   computeAccountRemaining,
   computeAccountRevision,
   endpointHost,
@@ -49,15 +53,18 @@ import {
   fuseQuotaData,
   generateDeviceProfile,
   groupToQuotaGroup,
+  localizeStoredQuotaError,
   modelQuotaFromNormalized,
   normalizedModelFromStored,
   pickNextReset,
   projectAccountForIpc,
   quotaSnapshotForRevision,
   refreshResetDescription,
+  resolveEffectiveMonitoredModel,
   sanitizeJsonString,
   subscriptionTierRank,
   type Account,
+  type AccountErrorCode,
   type AccountIndex,
   type AccountSummary,
   type AutoSwitchConfig,
@@ -96,12 +103,17 @@ export {
   validCachedCloudProviderContext,
   type CloudProviderContext,
   accountCredentialReadiness,
+  accountErrorCode,
+  cleanAndLocalizeRefreshError,
+  CodedAccountError,
   computeAccountRevision,
   endpointHost,
   endpointPriority,
   familyLabel,
   formatResetCountdown,
   generateDeviceProfile,
+  localizeStoredQuotaError,
+  type AccountErrorCode,
   groupToQuotaGroup,
   modelQuotaFromNormalized,
   normalizedModelFromStored,
@@ -109,6 +121,7 @@ export {
   projectAccountForIpc,
   quotaSnapshotForRevision,
   refreshResetDescription,
+  resolveEffectiveMonitoredModel,
   sanitizeJsonString,
   type Account,
   type AccountIndex,
@@ -151,7 +164,7 @@ export class AccountsManager {
   private providerContextCache: { value: CloudProviderContext; expiresAt: number } | null = null;
   private inFlightProviderContext: Promise<CloudProviderContext | null> | null = null;
   private indexCache: { mtimeMs: number; size: number; index: AccountIndex } | null = null;
-  private accountCache = new Map<string, { mtimeMs: number; size: number; account: Account; digest: string }>();
+  private accountCache = new Map<string, { mtimeMs: number; size: number; account: Account; digest: string; revision: string }>();
   private accountFileDigests = new WeakMap<Account, string>();
   private refreshSaveMeta = new WeakMap<Account, { expectedRefreshToken: string; isRefreshUpdate: boolean }>();
 
@@ -222,7 +235,7 @@ export class AccountsManager {
           return cached;
         }
       } catch {}
-      throw new CloudQuotaAuthorityError('无法确认 Antigravity 实际配额服务，请先运行官方应用；未采用其他环境的默认配额');
+      throw new CloudQuotaAuthorityError(bt('accounts.err.provider_unverified'));
     })();
     this.inFlightProviderContext=task;
     try{return await task;}finally{this.inFlightProviderContext=null;}
@@ -303,12 +316,13 @@ export class AccountsManager {
     }
     if (!dirty) {
       for (const summary of index.accounts) {
-        const acc = await this.getAccount(summary.id);
-        if (!acc) {
+        const entry = await this.peekAccountEntry(summary.id);
+        if (!entry) {
           dirty = true;
           break;
         }
-        if (summary.revision && computeAccountRevision(acc) !== summary.revision) {
+        const acc = entry.account;
+        if (summary.revision && entry.revision !== summary.revision) {
           dirty = true;
           break;
         }
@@ -345,7 +359,7 @@ export class AccountsManager {
         if (parsed && Array.isArray(parsed.accounts)) {
           const cleanAccounts = parsed.accounts.map((acc: AccountSummary) => ({
             ...acc,
-            quota_refresh_error: acc.quota_refresh_error && /双周期/.test(acc.quota_refresh_error) ? null : acc.quota_refresh_error,
+            quota_refresh_error: acc.quota_refresh_error && /双周期|dual window/i.test(acc.quota_refresh_error) ? null : acc.quota_refresh_error,
             quota: acc.quota ? {
               ...acc.quota,
               subscription_tier: acc.quota.subscription_tier,
@@ -432,45 +446,52 @@ export class AccountsManager {
         current_account_id: summaries.some(a => a.id === previous.current_account_id) ? previous.current_account_id! : summaries[0]?.id ?? null,
       };
       await atomicJson(this.indexPath, index);
+      this.indexCache = null;
       return index;
     });
   }
 
-  async getAccount(id: string): Promise<Account | null> {
+  private async peekAccountEntry(id: string): Promise<{ account: Account; digest: string; revision: string } | null> {
     await this.init();
-    if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error('账号 ID 无效');
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(bt('accounts.err.invalid_id'));
     const filePath = join(this.accountsDir, `${id}.json`);
     try {
       const st = await lstat(filePath);
       const cached = this.accountCache.get(id);
       if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
-        const clone = structuredClone(cached.account);
-        this.accountFileDigests.set(clone, cached.digest);
-        return clone;
+        return cached;
       }
       const raw = await readFile(filePath);
       const acc = JSON.parse(sanitizeJsonString(raw)) as Account;
-      if (acc) {
-        if (acc.quota_refresh_error && /双周期/.test(acc.quota_refresh_error)) {
-          acc.quota_refresh_error = null;
-        }
-        const digest = createHash('sha256').update(raw).digest('hex');
-        this.accountCache.set(id, { mtimeMs: st.mtimeMs, size: st.size, account: structuredClone(acc), digest });
-        this.accountFileDigests.set(acc, digest);
+      if (!acc) return null;
+      if (acc.quota_refresh_error && /双周期|dual window/i.test(acc.quota_refresh_error)) {
+        acc.quota_refresh_error = null;
       }
-      return acc;
+      const digest = createHash('sha256').update(raw).digest('hex');
+      const revision = computeAccountRevision(acc);
+      const entry = { mtimeMs: st.mtimeMs, size: st.size, account: acc, digest, revision };
+      this.accountCache.set(id, entry);
+      return entry;
     } catch (error) {
       this.accountCache.delete(id);
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      throw new Error('账号文件无法读取或格式损坏，原文件已保留');
+      throw new Error(bt('accounts.err.corrupt_file'));
     }
+  }
+
+  async getAccount(id: string): Promise<Account | null> {
+    const entry = await this.peekAccountEntry(id);
+    if (!entry) return null;
+    const clone = structuredClone(entry.account);
+    this.accountFileDigests.set(clone, entry.digest);
+    return clone;
   }
 
   async saveAccount(
     account: Account,
     options?: { expectedRefreshToken?: string; expectedFileDigest?: string; isRefreshUpdate?: boolean }
   ): Promise<void> {
-    if (!/^[a-zA-Z0-9_-]+$/.test(account.id)) throw new Error('账号 ID 无效');
+    if (!/^[a-zA-Z0-9_-]+$/.test(account.id)) throw new CodedAccountError('invalid_id', bt('accounts.err.invalid_id'));
     await this.init();
 
     return this.withWriteLock(async () => {
@@ -482,16 +503,16 @@ export class AccountsManager {
       const diskAccount = await this.getAccount(account.id);
       const expectedFileDigest = options?.expectedFileDigest ?? this.accountFileDigests.get(account);
       const diskDigest = diskAccount ? this.accountFileDigests.get(diskAccount) : undefined;
-      if (!isRefreshUpdate && expectedFileDigest && (!diskAccount || expectedFileDigest !== diskDigest)) throw new Error('账号记录已在其他操作中更新，请重新读取后保存');
+      if (!isRefreshUpdate && expectedFileDigest && (!diskAccount || expectedFileDigest !== diskDigest)) throw new CodedAccountError('conflict_modified', bt('accounts.err.conflict_modified'));
 
       if (expectedRefresh !== undefined && diskAccount) {
         if (diskAccount.token.refresh_token !== expectedRefresh) {
-          throw new Error('账号凭据已更新，停止覆盖新的登录记录');
+          throw new CodedAccountError('credentials_updated', bt('accounts.err.credentials_updated'));
         }
       }
 
       if (isRefreshUpdate && !diskAccount) {
-        throw new Error(`账号 ${account.id} 已被删除，停止刷新写入`);
+        throw new CodedAccountError('deleted_stop_refresh', bt('accounts.err.deleted_stop_refresh', { id: account.id }));
       }
 
       let toSave: Account = account;
@@ -569,7 +590,7 @@ export class AccountsManager {
     await this.init();
     return this.withWriteLock(async () => {
       const current = await this.getAccount(id);
-      if (!current) throw new Error(`找不到 ID 为 ${id} 的账号`);
+      if (!current) throw new Error(bt('accounts.err.not_found_by_id', { id }));
       const result = await mutate(current);
       await this.saveAccount(current);
       return { account: current, result };
@@ -577,7 +598,7 @@ export class AccountsManager {
   }
 
   async renameAccount(id: string, name: string): Promise<Account> {
-    if (typeof name !== "string" || name.trim().length > 80) throw new Error("账号名称最多 80 个字符");
+    if (typeof name !== "string" || name.trim().length > 80) throw new Error(bt('accounts.err.name_too_long'));
     return (await this.updateAccount(id, current => { current.name = name.trim() || current.email.split('@')[0] || current.email; })).account;
   }
 
@@ -591,7 +612,7 @@ export class AccountsManager {
       );
 
       let account: Account;
-      if (data.id && !/^[a-zA-Z0-9_-]+$/.test(String(data.id))) throw new Error('账号 ID 无效');
+      if (data.id && !/^[a-zA-Z0-9_-]+$/.test(String(data.id))) throw new Error(bt('accounts.err.invalid_id'));
       const now = Math.floor(Date.now() / 1000);
       const refreshToken = data.refreshToken ?? data.refresh_token ?? data.token?.refresh_token ?? data.token?.refreshToken;
       const accessToken = data.accessToken ?? data.access_token ?? data.token?.access_token ?? data.token?.accessToken;
@@ -625,8 +646,8 @@ export class AccountsManager {
           },
         };
       } else {
-        if (!refreshToken) throw new Error('新增账号缺少 refreshToken');
-        if (!email) throw new Error('新增账号缺少 email');
+        if (!refreshToken) throw new CodedAccountError('missing_refresh_token', bt('accounts.err.missing_refresh_token'));
+        if (!email) throw new CodedAccountError('missing_email', bt('accounts.err.missing_email'));
         const id = data.id || randomUUID();
         const exp = expiresIn ?? 3600;
         account = {
@@ -663,24 +684,24 @@ export class AccountsManager {
 
   async addAccountWithRefreshToken(raw: string, fetchImpl: typeof fetch = globalThis.fetch): Promise<Account> {
     const refreshToken = String(raw).trim();
-    if (!refreshToken || refreshToken.length > 8192 || /[\r\n\x00]/.test(refreshToken)) throw new Error('请填写有效的 Refresh Token');
+    if (!refreshToken || refreshToken.length > 8192 || /[\r\n\x00]/.test(refreshToken)) throw new CodedAccountError('invalid_refresh_token', bt('accounts.err.invalid_refresh_token'));
     const clientId = getGoogleClientId(), clientSecret = getGoogleClientSecret();
     if (fetchImpl === globalThis.fetch && (!clientId || !clientSecret)) {
-      throw new Error('未配置 Google OAuth 凭据，请在 .env 中配置 GRAVITYBOX_GOOGLE_CLIENT_ID 与 GRAVITYBOX_GOOGLE_CLIENT_SECRET');
+      throw new CodedAccountError('missing_oauth_client', bt('oauth.err.missing_client'));
     }
     const tokenReply = await fetchImpl('https://oauth2.googleapis.com/token', {
       method: 'POST', signal: AbortSignal.timeout(6000), headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken, grant_type: 'refresh_token' }).toString(),
-    }).catch(() => { throw new Error('无法连接登录服务，请检查网络后重试'); });
-    if (!tokenReply.ok) throw new Error('登录凭据无效或已失效，请重新获取');
+    }).catch(() => { throw new CodedAccountError('token_network', bt('accounts.err.token_network')); });
+    if (!tokenReply.ok) throw new CodedAccountError('token_invalid', bt('accounts.err.token_invalid'));
     const token: any = await tokenReply.json();
-    if (typeof token.access_token !== 'string' || !token.access_token) throw new Error('登录服务未返回有效凭据');
+    if (typeof token.access_token !== 'string' || !token.access_token) throw new CodedAccountError('token_no_access', bt('accounts.err.token_no_access'));
     const identityReply = await fetchImpl('https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: { Authorization: `Bearer ${token.access_token}` }, signal: AbortSignal.timeout(6000),
-    }).catch(() => { throw new Error('未能核实账号身份，尚未添加'); });
-    if (!identityReply.ok) throw new Error('未能核实账号身份，尚未添加');
+    }).catch(() => { throw new CodedAccountError('identity_verify_failed', bt('accounts.err.identity_verify_failed')); });
+    if (!identityReply.ok) throw new CodedAccountError('identity_verify_failed', bt('accounts.err.identity_verify_failed'));
     const identity: any = await identityReply.json();
-    if (typeof identity.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(identity.email) || identity.verified_email === false) throw new Error('未取得已验证的账号邮箱，尚未添加');
+    if (typeof identity.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(identity.email) || identity.verified_email === false) throw new CodedAccountError('email_unverified', bt('accounts.err.email_unverified'));
     return this.upsertAccount({ email: identity.email, name: identity.name, accessToken: token.access_token,
       refreshToken: token.refresh_token || refreshToken, expiresIn: Number(token.expires_in) || 3600, idToken: token.id_token });
   }
@@ -689,16 +710,16 @@ export class AccountsManager {
     const reply = await fetchImpl('https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: { Authorization: `Bearer ${token.access_token}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
     });
-    if (!reply.ok) throw new Error('未能核实 Google 账号，尚未添加');
+    if (!reply.ok) throw new CodedAccountError('oauth_verify_failed', bt('accounts.err.oauth_verify_failed'));
     const identity: any = await reply.json();
-    if (typeof identity.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(identity.email) || identity.verified_email !== true) throw new Error('未取得已验证的 Google 邮箱，尚未添加');
+    if (typeof identity.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(identity.email) || identity.verified_email !== true) throw new CodedAccountError('oauth_unverified_email', bt('accounts.err.oauth_unverified_email'));
     signal.throwIfAborted();
     await this.upsertAccount({ email: identity.email, name: identity.name, accessToken: token.access_token,
       refreshToken: token.refresh_token, expiresIn: Number(token.expires_in) || 3600, idToken: token.id_token });
   }
 
   async deleteAccount(id: string): Promise<boolean> {
-    if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error('账号 ID 无效');
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error(bt('accounts.err.invalid_id'));
     await this.init();
     return this.withWriteLock(async () => {
       const index = await this.loadIndex();
@@ -786,7 +807,7 @@ export class AccountsManager {
     return this.withWriteLock(async () => {
       const index = await this.loadIndex();
       if (!index.accounts.some(a => a.id === id)) {
-        throw new Error(`找不到账号: ${id}`);
+        throw new Error(bt('accounts.err.not_found_simple', { id }));
       }
 
       const now = Math.floor(Date.now() / 1000);
@@ -836,7 +857,7 @@ export class AccountsManager {
       validateAccountPolicy(parsed);
       const reserve = Math.min(98, Math.max(1, Number(parsed.reserve_percentage ?? parsed.reservePercentage) || 10));
       const candidateMin = Math.min(100, Math.max(2, Number(parsed.candidate_min_percentage ?? parsed.candidateMinPercentage) || 30));
-      if (reserve >= candidateMin) throw Error('推荐门槛关系无效');
+      if (reserve >= candidateMin) throw Error(bt('accounts.err.threshold_relation'));
       return {
         enabled: parsed.enabled ?? false,
         strategy: parsed.strategy === 'round_robin' ? 'round_robin' : 'priority',
@@ -849,7 +870,7 @@ export class AccountsManager {
         last_switched_id: parsed.last_switched_id ?? undefined,
       };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw Error('账号推荐配置损坏或类型无效，原文件已保留');
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw Error(bt('accounts.err.policy_corrupted'));
       return {
         enabled: false,
         strategy: 'priority',
@@ -872,20 +893,20 @@ export class AccountsManager {
     if (reserveRaw !== undefined) {
       const num = Number(reserveRaw);
       if (isNaN(num) || num < 1 || num > 98) {
-        throw new Error('当前账号配额门槛必须在 1% 到 98% 之间');
+        throw new Error(bt('accounts.err.reserve_range'));
       }
     }
     const candidateMinRaw = config.candidate_min_percentage ?? config.candidateMinPercentage;
     if (candidateMinRaw !== undefined) {
       const num = Number(candidateMinRaw);
       if (isNaN(num) || num < 2 || num > 100) {
-        throw new Error('候选账号配额门槛必须在 2% 到 100% 之间');
+        throw new Error(bt('accounts.err.candidate_range'));
       }
     }
     const reserve = reserveRaw !== undefined ? Number(reserveRaw) : current.reserve_percentage;
     const candidateMin = candidateMinRaw !== undefined ? Number(candidateMinRaw) : current.candidate_min_percentage;
     if (reserve >= candidateMin) {
-      throw new Error('候选账号配额门槛必须大于当前账号配额门槛');
+      throw new Error(bt('accounts.err.threshold_gt'));
     }
     return {
       enabled: config.enabled !== undefined ? Boolean(config.enabled) : current.enabled,
@@ -949,15 +970,16 @@ export class AccountsManager {
         currentAccount,
         bestCandidate: null,
         shouldSwitch: false,
-        reason: '智能备用账号推荐策略未启用',
+        reason: bt('accounts.recommend.disabled'),
       };
     }
 
     if (!currentAccount) {
-      return { currentAccount: null, bestCandidate: null, shouldSwitch: false, reason: '没有当前激活账号' };
+      return { currentAccount: null, bestCandidate: null, shouldSwitch: false, reason: bt('accounts.recommend.no_current') };
     }
 
-    const currentRem = this.getAccountRemaining(currentAccount, cfg.monitored_model);
+    const effectiveModel = resolveEffectiveMonitoredModel(currentAccount, cfg.monitored_model);
+    const currentRem = this.getAccountRemaining(currentAccount, effectiveModel);
     const isLow = currentRem !== null && currentRem <= cfg.reserve_percentage;
 
     const candidateIds = cfg.candidate_account_ids.length > 0
@@ -973,7 +995,7 @@ export class AccountsManager {
     // Filter valid & precompute remaining/tierRank once per candidate (避免排序中重复构建配额视图)
     const allValidScored: Array<{ acc: Account; rem: number; tierRank: number }> = [];
     for (const acc of candidates) {
-      const rem = this.getAccountRemaining(acc, cfg.monitored_model);
+      const rem = this.getAccountRemaining(acc, effectiveModel);
       if (rem === null || rem < cfg.candidate_min_percentage || rem <= 0) continue;
       if (accountCredentialReadiness(acc).state === 'needs_authorization') continue;
       allValidScored.push({ acc, rem, tierRank: this.subscriptionTierRank(acc) });
@@ -984,7 +1006,7 @@ export class AccountsManager {
         currentAccount,
         bestCandidate: null,
         shouldSwitch: false,
-        reason: '备选池中没有额度充足且可用的账号',
+        reason: bt('accounts.recommend.no_candidates'),
       };
     }
 
@@ -1039,12 +1061,12 @@ export class AccountsManager {
       bestCandidate: best,
       shouldSwitch: effectiveShouldSwitch,
       reason: effectiveShouldSwitch
-        ? `当前账号额度偏低（剩余 ${currentRem}%），建议切换至备用账号 ${bestDisplay}（额度充足，剩余 ${bestRem}%）`
+        ? bt('accounts.recommend.should_switch', { currentRem, bestDisplay, bestRem })
         : isLow && isDowngradeToFree
-        ? '当前配额偏低，但仅有免费候选；为避免降级暂不建议切换'
+        ? bt('accounts.recommend.only_free')
         : currentRem === null
-        ? '当前账号配额未知或已过期，请先刷新'
-        : `当前账号额度充足（剩余 ${currentRem}%）`,
+        ? bt('accounts.recommend.unknown')
+        : bt('accounts.recommend.sufficient', { currentRem }),
     };
   }
 
@@ -1229,7 +1251,7 @@ export class AccountsManager {
     }
 
     if (!extractedToken || !extractedToken.refresh_token) {
-      throw new Error('未在系统 Keychain、会话凭据或应用数据库中找到有效登录态');
+      throw new Error(bt('accounts.err.no_active_login'));
     }
 
     if (extractedEmail && !extractedToken.email) {
@@ -1237,7 +1259,7 @@ export class AccountsManager {
     }
 
     const email = extractedEmail || extractedToken.email;
-    if (!email || !/^[^\s@]+@[^\s@]+$/.test(email) || email.endsWith('@antigravity.user')) throw new Error('无法核实此凭据的账号邮箱，请通过登录凭据添加并核实身份');
+    if (!email || !/^[^\s@]+@[^\s@]+$/.test(email) || email.endsWith('@antigravity.user')) throw new Error(bt('accounts.err.cannot_verify_email'));
 
     const account = await this.upsertAccount({
       email,
@@ -1271,8 +1293,8 @@ export class AccountsManager {
   private async saveRefreshedAccount(account: Account, expectedRefresh = account.token.refresh_token, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     const latest = await this.getAccount(account.id);
-    if (!latest) throw new Error('此账号已移除，停止保存刷新结果');
-    if (latest.token.refresh_token !== expectedRefresh) throw new Error('账号凭据已更新，停止覆盖新的登录记录');
+    if (!latest) throw new CodedAccountError('removed_stop_refresh', bt('accounts.err.removed_stop_refresh'));
+    if (latest.token.refresh_token !== expectedRefresh) throw new CodedAccountError('credentials_updated', bt('accounts.err.credentials_updated'));
     // Refresh work runs in the background; keep remarks, order, flags and usage edited meanwhile.
     const toSave: Account = {
       ...latest,
@@ -1295,7 +1317,7 @@ export class AccountsManager {
     const index = await this.loadIndex();
     const targetId = id || index.current_account_id;
     if (!targetId) {
-      throw new Error('未指定账号 ID 且当前没有激活账号');
+      throw new Error(bt('accounts.err.no_target_id'));
     }
 
     const inFlight = this.inFlightRefreshes.get(targetId);
@@ -1329,7 +1351,7 @@ export class AccountsManager {
             }
             account.quota={models:[],quota_groups:[],last_updated:0,is_forbidden:false,subscription_tier:account.quota?.subscription_tier,model_forwarding_rules:{},source:'cloud',quota_warnings:['UNVERIFIED_CLOUD_SCOPE: '+error.message]};
           }
-          account.quota_refresh_error = error instanceof Error ? error.message : '刷新失败，请稍后重试';
+          account.quota_refresh_error = error instanceof Error ? error.message : bt('accounts.err.refresh_failed_retry');
           await this.saveRefreshedAccount(account);
         }
         throw error;
@@ -1348,9 +1370,9 @@ export class AccountsManager {
     signal?.throwIfAborted();
     const index = await this.loadIndex();
     const targetId = id || index.current_account_id;
-    if (!targetId) throw new Error('未指定账号 ID 且当前没有激活账号');
+    if (!targetId) throw new Error(bt('accounts.err.no_target_id'));
     const account = await this.getAccount(targetId);
-    if (!account) throw new Error(`找不到 ID 为 ${targetId} 的账号`);
+    if (!account) throw new Error(bt('accounts.err.not_found_by_id', { id: targetId }));
 
     // 1) 本机 live 优先：仅当邮箱严格匹配且返回模型记录时采用（不跨账号借数据）。
     // 若 RetrieveUserQuotaSummary 超时/失败导致 quota_groups 为空，且账号具备 refresh_token，则回退云端接口补全分组。
@@ -1363,8 +1385,12 @@ export class AccountsManager {
     const canFallbackToCloud = liveSummaryFailed && Boolean(account.token?.refresh_token);
     if (lsStatus && account.email && lsStatus.email && lsStatus.email.trim().toLowerCase() === account.email.trim().toLowerCase() && (lsStatus.quota.models?.length ?? 0) > 0 && !canFallbackToCloud) {
       const fresh = lsStatus.quota;
-      const freshState = this.getAccountQuotaOverview({ quota: fresh }).refreshState;
       const old = account.quota;
+      const resolvedTier = (fresh.subscription_tier && fresh.subscription_tier !== 'FREE')
+        ? fresh.subscription_tier
+        : (old?.subscription_tier || fresh.subscription_tier);
+      const freshWithTier: QuotaData = { ...fresh, subscription_tier: resolvedTier };
+      const freshState = this.getAccountQuotaOverview({ quota: freshWithTier }).refreshState;
       const { groups, staleGroups } = mergeGroupsWithPrevious(
         normalizeStoredGroups(fresh.quota_groups, fresh.last_updated, 'live'),
         normalizeStoredGroups(old?.quota_groups, old?.last_updated ?? fresh.last_updated), Date.now());
@@ -1373,7 +1399,7 @@ export class AccountsManager {
         (old?.models ?? []).map(model => normalizedModelFromStored(model)));
       const missingWindows = groups.flatMap(group => group.buckets.filter(bucket => bucket.stale)
         .map(bucket => ({ family: group.family, window: bucket.window })));
-      account.quota = { ...fresh, source: 'live',
+      account.quota = { ...freshWithTier, source: 'live',
         models: applyFamilyWindows(models, familyWindowsFromGroups(groups, Date.now())).map(modelQuotaFromNormalized),
         quota_groups: groups.map(groupToQuotaGroup),
         ...(staleGroups.length ? { stale_groups: staleGroups } : {}),
@@ -1425,7 +1451,7 @@ export class AccountsManager {
           results.push(updated);
         } catch (error) {
           if (options?.signal?.aborted) throw error;
-          failures.push({ id: accMeta.id, message: error instanceof Error ? error.message : '刷新失败' });
+          failures.push({ id: accMeta.id, message: error instanceof Error ? error.message : bt('accounts.err.refresh_failed') });
         }
       }
     }));
@@ -1508,11 +1534,21 @@ export class AccountsManager {
       const matched = index.accounts.find(a => a.email.toLowerCase() === detectedEmail.toLowerCase());
       effectiveActiveId = matched?.id ?? null;
     }
-    const activeAccount = effectiveActiveId ? await this.getAccount(effectiveActiveId) : null;
+    const activeEntry = effectiveActiveId ? await this.peekAccountEntry(effectiveActiveId) : null;
+    const activeAccount = activeEntry ? structuredClone(activeEntry.account) : null;
     const accountsWithRevision = await Promise.all(index.accounts.map(async acc => {
-      const saved = await this.getAccount(acc.id);
+      const entry = await this.peekAccountEntry(acc.id);
+      const saved = entry?.account ?? null;
       const readiness = accountCredentialReadiness(saved ?? acc as Account);
-      return { ...acc, quota: saved?.quota ?? null, quota_refresh_error: saved?.quota_refresh_error ?? null, revision: computeAccountRevision(saved ?? acc) + ':' + readiness.state, credentialReadiness: readiness, quota_last_updated: saved?.quota?.last_updated ?? 0 };
+      const baseRevision = entry ? entry.revision : computeAccountRevision(acc);
+      return {
+        ...acc,
+        quota: saved?.quota ?? null,
+        quota_refresh_error: cleanAndLocalizeRefreshError(saved?.quota_refresh_error),
+        revision: baseRevision + ':' + readiness.state,
+        credentialReadiness: readiness,
+        quota_last_updated: saved?.quota?.last_updated ?? 0,
+      };
     }));
     // 确保当前激活账号始终排在第一位
     accountsWithRevision.sort((a, b) => {
@@ -1520,7 +1556,7 @@ export class AccountsManager {
       const bActive = b.id === effectiveActiveId ? 1 : 0;
       return bActive - aActive;
     });
-    const activeRevision = activeAccount ? computeAccountRevision(activeAccount) : '';
+    const activeRevision = activeEntry ? activeEntry.revision : '';
     const poolRevision = accountsWithRevision.map(a => a.revision).join(':');
     return {
       active_account_id: effectiveActiveId,

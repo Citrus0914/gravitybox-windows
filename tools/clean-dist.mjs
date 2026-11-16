@@ -4,11 +4,16 @@ import { join } from 'node:path';
 import { GENERATED_DIST_FILES } from './copy-runtime.mjs';
 
 /**
- * dist 孤儿清理：只删除 `dist/**\/*.js` 中「没有同名 src/**\/*.ts 对应」且不在白名单里的文件。
- * - 白名单只放构建期生成物（engine.js 由 tools/copy-runtime.mjs 生成），资源/运行时文件不是 .js，不会被触碰。
+ * dist 孤儿清理：删除 `dist/**` 中「没有同名 src/**\/*.ts 对应」且不在白名单里的 TypeScript 编译产物（.js / .js.map / .d.ts / .d.ts.map）。
+ * - 白名单只放构建期生成物（engine.js 由 tools/copy-runtime.mjs 生成），非编译期资源文件不会被触碰。
  * - 默认 dry-run 之外的行为只有删除孤儿；缺失 src/dist 目录时视为无孤儿，不报错。
  */
 const defaultRoot = fileURLToPath(new URL('../', import.meta.url));
+const DIST_ARTIFACT_RE = /\.(?:js|d\.ts)(?:\.map)?$/;
+
+function toJsStem(file) {
+  return file.replace(/\.(?:js\.map|d\.ts\.map|d\.ts)$/, '.js');
+}
 
 async function listFiles(dir) {
   const result = [];
@@ -30,8 +35,11 @@ export async function planDistCleanup({ projectRoot = defaultRoot, srcDir = 'src
   const srcFiles = (await listFiles(join(projectRoot, srcDir))).filter(file => file.endsWith('.ts'));
   const expected = new Set(srcFiles.map(file => file.replace(/\.ts$/, '.js')));
   const keep = new Set(whitelist);
-  const distFiles = (await listFiles(join(projectRoot, distDir))).filter(file => file.endsWith('.js'));
-  const orphans = distFiles.filter(file => !expected.has(file) && !keep.has(file)).sort();
+  const distFiles = (await listFiles(join(projectRoot, distDir))).filter(file => DIST_ARTIFACT_RE.test(file));
+  const orphans = distFiles.filter(file => {
+    const stemJs = toJsStem(file);
+    return !expected.has(stemJs) && !keep.has(file) && !keep.has(stemJs);
+  }).sort();
   return { expected: [...expected].sort(), whitelist: [...keep], orphans };
 }
 

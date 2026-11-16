@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { bt } from './i18n.js';
 
 /**
  * ReentrantMutex:
@@ -43,7 +44,7 @@ export class ReentrantMutex {
           current.catch(() => {}),
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
-              const err = new Error(`${label} 排队超时`);
+              const err = new Error(bt('mutex.timeout', { label }));
               (err as any).code = 'ELOCKTIMEOUT';
               reject(err);
             }, timeoutMs);

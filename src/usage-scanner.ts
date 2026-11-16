@@ -11,6 +11,7 @@ import {
   type GenerationEvent,
   type TokenUsageSummary,
 } from './usage-types.js';
+import { bt } from './i18n.js';
 
 export interface DiscoveredDbStat {
   mtimeMs: number;
@@ -56,7 +57,7 @@ export async function discoverDatabaseFiles(
   const issue = (path: string, error: unknown) => errors.push({
     id: createHash('sha256').update(path).digest('hex').slice(0, 10),
     state: 'discovery_failed',
-    category: (error as NodeJS.ErrnoException).code === 'EACCES' ? '目录访问受限' : '数据库发现失败',
+    category: (error as NodeJS.ErrnoException).code === 'EACCES' ? bt('scanner.err.access_denied') : bt('scanner.err.discovery_failed'),
   });
   const list: { path: string; mtime: number }[] = [];
   const now = Date.now();
@@ -125,7 +126,7 @@ export async function blobRows(
     signal?.throwIfAborted();
     if (!batch.length) return;
     const ids = batch.map(row => Number(row.idx)).filter(Number.isSafeInteger);
-    if (ids.length !== batch.length) throw new Error('数据库记录索引格式不支持');
+    if (ids.length !== batch.length) throw new Error(bt('scanner.err.unsupported_row_index'));
     const reply = await querySqlite(dbPath, `SELECT idx, length(${column}) as size, ${column} as data_blob FROM ${table} WHERE idx IN (${ids.join(',')}) ORDER BY idx;`, signal, reader);
     if (!reply.ok) throw new Error(reply.error);
     if (onRows) onRows(reply.rows); else result.push(...reply.rows);
@@ -149,7 +150,7 @@ export async function blobRows(
 }
 
 export function isTransientSqliteReadError(message = ''): boolean {
-  return /跨批读取期间变化|busy|locked|no such table|连接已关闭|超出单批预算|unable to open/i.test(message);
+  return /跨批读取期间变化|changed across batches|busy|locked|no such table|连接已关闭|connection closed|超出单批预算|exceeded batch budget|unable to open/i.test(message);
 }
 
 export async function isInitializingOrRemovedDb(dbPath: string, errorMessage = ''): Promise<boolean> {
@@ -259,7 +260,7 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
   if (genRows.length > 50_000) {
     const cached = ctx.fileCache.get(dbPath);
     return { events: cached?.events ?? [], generationsScanned: 0, skippedLargeRecords: genRows.length,
-      hasError: true, usedCached: !!cached, error: '单库生成记录超过有界读取预算；已保留已有账本，请分批归档后重试' };
+      hasError: true, usedCached: !!cached, error: bt('scanner.err.batch_budget_exceeded') };
   }
   const events: GenerationEvent[] = [];
   let generationsScanned = 0;
@@ -324,7 +325,7 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
     if(!validTimestamp(timestamp))timestamp=0;
 
     const modelEnum = ProtobufReader.findVarint(wrapped, 3) ?? ProtobufReader.findVarint(usage, 1) ?? null;
-    const assignedModel = resolveDatabaseModelFullName(modelId, label, modelEnum);
+    const assignedModel = resolveDatabaseModelFullName(modelId, label, modelEnum, { canonicalUnknown: true });
     const lockModelKey = modelId || label || '未知模型';
 
     // Only requests first observed after a positively observed identity can be attributed.
@@ -376,8 +377,12 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
     const stepTimes=new Map<number,{timestamp:number;usage:Buffer|null;execution:Buffer|null}>();
     const stepSchema=await reader.query('PRAGMA table_info(steps);');
     const stepColumns=new Set(stepSchema.rows.map(row=>row.name));
-    const stepRes = !stepSchema.ok || !['idx','metadata','step_type'].every(column=>stepColumns.has(column)) ? {ok:false,error:'时间表结构缺失或不支持',rows:[]} : await blobRows(dbPath, 'steps', 'metadata', 'step_type = 15', rows => {
+    const stepRes = !stepSchema.ok || !['idx','metadata','step_type'].every(column=>stepColumns.has(column)) ? {ok:false,error:bt('scanner.err.missing_timestamp_schema'),rows:[]} : await blobRows(dbPath, 'steps', 'metadata', 'step_type = 15', rows => {
       for (const row of rows) {
+        if (row.size > 16 * 1024 * 1024 && !row.projected) {
+          skippedLargeRecords++;
+          continue;
+        }
         const metaBuf = row.data_blob instanceof Uint8Array ? Buffer.from(row.data_blob.buffer, row.data_blob.byteOffset, row.data_blob.byteLength) : Buffer.from(row.data_hex || '', 'hex');
         const tsBuf = ProtobufReader.findField(metaBuf, 1);
         const rawTime=tsBuf?ProtobufReader.findVarint(tsBuf,1)??0:0;
@@ -407,7 +412,7 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
   if (!await reader.verifyUnchanged() || !after || after.dev !== fileStat?.dev || after.ino !== fileStat?.ino) {
     const previous = ctx.fileCache.get(dbPath);
     return { events: previous?.events ?? events, generationsScanned, skippedLargeRecords,
-      hasError: true, usedCached: !!previous, error: '数据库在跨批读取期间变化，请重试' };
+      hasError: true, usedCached: !!previous, error: bt('scanner.err.changed_across_batches') };
   }
   const observedAt = performance.timeOrigin + performance.now();
   for (const event of events) event.source_observed_at = observedAt;
@@ -418,7 +423,7 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
   }
   const unknownTime = events.some(event => event.timestamp_seconds <= 0);
   const hasError = !stepOk && unknownTime;
-  const timeError = hasError ? '时间信息读取失败，部分记录时间未知' : undefined;
+  const timeError = hasError ? bt('scanner.err.timestamp_read_failed') : undefined;
   if (fileStat) {
     ctx.setFileCacheEntry(dbPath, {
       mtimeMs: fileStat.mtimeMs,

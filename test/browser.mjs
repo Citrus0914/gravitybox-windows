@@ -780,6 +780,54 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
       await cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.dispose()');
     }finally{cdp?.close();if(target?.targetId)await browserCommand('Target.closeTarget',{targetId:target.targetId}).catch(error => { chromeErrors += '\nTarget cleanup: ' + error.message; });}
   });
+  await check('引导条款弹窗多文本节点、弯引号与升级套餐说明均可正确汉化并无损恢复', async () => {
+    let target, cdp;
+    try {
+      ({ target, cdp } = await openIsolatedPage('/'));
+      await cdp.evaluate(`(() => {
+        document.body.innerHTML = '<div role="dialog" aria-modal="true"><h2 id="terms-h2">One last thing before getting started\\u2026</h2><p id="terms-sub">A few things to know, and a couple settings to review.</p><ul><li><span id="terms-opt-title">Optimized for you</span><span id="terms-opt-body"></span></li><li><span id="terms-safe-title">Built to help, not hurt</span><span id="terms-safe-body">Automated safeguards help to protect your conversations from insecure or unsafe content. That being said, users should be aware of potential agentic risks, including data exfiltration.</span></li><li><span id="terms-ctrl-title">You are in control</span><span id="terms-ctrl-body"></span></li></ul><label><input type="checkbox"><span id="terms-improve"><span>Help us improve Antigravity.</span> Allow Google to collect and use your Interactions data, subject to the <a href="https://antigravity.google/terms">Google Antigravity Terms of Service</a> and <a href="https://policies.google.com/privacy">Google Privacy Policy</a>. You can control this from your settings at any point.</span></label><label><input type="checkbox"><span id="terms-stay"></span></label><button id="terms-btn">Continue</button></div><div role="dialog" aria-label="Settings"><aside><h1>Settings</h1><button>General</button><button>Models</button><button>Appearance</button></aside><main><h2>Models</h2><div id="plan-upgrade-desc">You can upgrade to a higher Google AI Ultra plan to receive the highest rate limits.</div></main></div>';
+        const opt = document.querySelector('#terms-opt-body');
+        opt.append(
+          document.createTextNode('Customize your experience across the agent, plugins, and product from the settings and marketplace. We won\\u2019t show you ads or let advertisers influence what '),
+          document.createTextNode('Antigravity'),
+          document.createTextNode(' says.')
+        );
+        const ctrl = document.querySelector('#terms-ctrl-body');
+        ctrl.append(
+          document.createTextNode('Antigravity'),
+          document.createTextNode('\\u2019s agents are powerful and will help you get a lot done better and faster than before, but still make sure to verify the actions taken by the agent.')
+        );
+        const stay = document.querySelector('#terms-stay');
+        const stayTitle = document.createElement('span');
+        stayTitle.textContent = 'Stay up to date.';
+        stay.append(
+          stayTitle,
+          document.createTextNode(' '),
+          document.createTextNode('Sign up for newsletters, tips and tricks, and other notifications about '),
+          document.createTextNode('Antigravity'),
+          document.createTextNode('.')
+        );
+      })()`);
+      const entries = JSON.parse(await readFile(join(root, 'dict/base.json'), 'utf8'));
+      const engine = await readFile(join(root, 'dist/engine.js'), 'utf8');
+      await cdp.evaluate('globalThis.__GRAVITYBOX_BOOT__=' + JSON.stringify({ origin, path: '/', dictionary: { schema: 1, version: 'terms-modal-regression', entries } }) + ';' + engine);
+      await until(async () => await text(cdp, '#terms-stay') === '获取最新动态。 订阅 Antigravity 的产品动态、实用技巧及其他通知。');
+      assert.equal(await text(cdp, '#terms-h2'), '开始前，还有最后几项确认…');
+      assert.equal(await text(cdp, '#terms-sub'), '请先了解以下要点，并核对相关设置。');
+      assert.equal(await text(cdp, '#terms-opt-title'), '为您优化体验');
+      assert.equal(await text(cdp, '#terms-opt-body'), '您可在设置和市场中自定义智能体、插件及产品的整体体验。我们绝不向您展示广告，也不会让广告商左右 Antigravity 的回复。');
+      assert.equal(await text(cdp, '#terms-safe-title'), '助力开发，安全护航');
+      assert.equal(await text(cdp, '#terms-safe-body'), '自动安全防护机制有助于保护您的对话免受不安全或危险内容的影响。尽管如此，仍请留意智能体可能带来的潜在风险（包括数据外泄）。');
+      assert.equal(await text(cdp, '#terms-ctrl-title'), '操作由您掌控');
+      assert.equal(await text(cdp, '#terms-ctrl-body'), 'Antigravity 的智能体功能强大，能助您更高效、更出色地完成更多工作，但仍请务必核实其执行的每项操作。');
+      assert.equal(await text(cdp, '#terms-improve'), '帮助我们改进 Antigravity。 允许 Google 收集并使用您的交互数据，并遵循 Google Antigravity 服务条款与 Google 隐私政策。您可随时在设置中更改此项。');
+      assert.equal(await text(cdp, '#terms-btn'), '继续');
+      assert.equal(await text(cdp, '#plan-upgrade-desc'), '您可以升级到更高阶的 Google AI Ultra 套餐以获得最高速率限额。');
+      await cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.dispose()');
+      assert.equal(await text(cdp, '#terms-stay'), 'Stay up to date. Sign up for newsletters, tips and tricks, and other notifications about Antigravity.');
+      assert.equal(await text(cdp, '#terms-opt-body'), 'Customize your experience across the agent, plugins, and product from the settings and marketplace. We won\u2019t show you ads or let advertisers influence what Antigravity says.');
+    } finally { cdp?.close(); if (target?.targetId) await browserCommand('Target.closeTarget', { targetId: target.targetId }).catch(error => { chromeErrors += '\nTarget cleanup: ' + error.message; }); }
+  });
   await check('设置首帧、同词典刷新、热更新和退出动画保持译文，不跨帧回写英文', async () => {
     let target,cdp;
     try {
@@ -951,7 +999,7 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
       };
     })()`);
     assert.equal(rendered.c1, '1 轮 · 本轮 18s · 90 tok/s');
-    assert.equal(rendered.c2, '59M tok · 缓存命中 97%');
+    assert.equal(rendered.c2, '58.6M tok · 缓存命中 97%');
     assert.equal(rendered.c3, '64%');
     assert.equal(rendered.sameRow, true);
     const precision = await main.evaluate(`(() => {
@@ -984,7 +1032,7 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     assert.equal(precision.turnDuration, '18秒');
     assert.equal(precision.duration, '1小时5分59秒');
     assert.equal(precision.toolDuration, '12分31秒');
-    assert.equal(precision.ttft, '19.70 秒');
+    assert.equal(precision.ttft, '19.7 秒');
     assert.equal(precision.cache, '96.7%');
     assert.equal(precision.tokensBadge, '58.6M tok');
     assert.equal(precision.cachedRead, '56.5M tok');
@@ -1158,7 +1206,7 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     assert.equal(ultraCompactInfo.cacheDisplay, 'none');
     assert.equal(ultraCompactInfo.sameRow, true);
 
-    // 5. 验证单色渐深蓝进度条与 1 轻蓝 / 2 实心琥珀 / 3+ 实心正红压缩徽章渲染
+    // 5. 验证单色渐深蓝进度条与 1 实心品牌蓝 / 2 实心琥珀 / 3+ 实心正红压缩徽章渲染（含深/浅色统一纯白数字）
     const pushTier = async (compactionCount, usedRatio) => {
       await main.evaluate(`(() => {
         const mgr = globalThis.__GRAVITYBOX_HUD_V1__?.manager;
@@ -1202,17 +1250,151 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     const tier3 = await pushTier(3, 0.92);
     assert.equal(tier1.hidden, false);
     assert.equal(tier1.tier, 'low');
-    assert.equal(tier1.bgImage, 'none', '1 次压缩应使用轻蓝半透明胶囊而非实心高饱和渐变');
+    assert.equal(tier1.bgImage, 'none');
+    assert.equal(tier1.bgColor, 'rgb(49, 134, 255)', '浅色模式下 1 次压缩徽章蓝色必须与会话统计小蓝点一致');
+    assert.equal(tier1.fgColor, 'rgb(255, 255, 255)', '浅色模式下 1 次压缩徽章数字必须为纯白');
     assert.equal(tier2.tier, 'warn');
     assert.ok(tier2.bgImage.includes('linear-gradient'), '2 次压缩应使用实心琥珀渐变');
+    assert.equal(tier2.fgColor, 'rgb(255, 255, 255)', '浅色模式下 2 次压缩徽章数字必须为纯白');
     assert.equal(tier3.tier, 'danger');
     assert.ok(tier3.bgImage.includes('linear-gradient'), '3+ 次压缩应使用实心正红渐变');
+    assert.equal(tier3.fgColor, 'rgb(255, 255, 255)', '浅色模式下 3+ 次压缩徽章数字必须为纯白');
     assert.notEqual(tier2.bgImage, tier3.bgImage, '2 次琥珀与 3+ 次正红渐变样式必须清晰区分');
     assert.notEqual(tier1.meterFill, tier3.meterFill, '进度条颜色应随占比加深');
     assert.match(tier3.meterFill, /^rgb\(/, '92% 仍保持单色渐深蓝 rgb() 而非跳变红/黄');
     const [rLow] = tier1.meterFill.match(/\d+/g).map(Number);
     const [rHigh, , bHigh] = tier3.meterFill.match(/\d+/g).map(Number);
     assert.ok(rLow > rHigh && bHigh > rHigh, '92% 时蓝色分量占优且比 15% 更深沉');
+
+    await main.evaluate(`(() => {
+      document.documentElement.setAttribute('data-theme', 'dark');
+      document.querySelector('#__gravitybox_hud_host__')?.setAttribute('data-theme', 'dark');
+    })()`);
+    try {
+      await pushTier(1, 0.15);
+      await until(async () => {
+        const cur = await main.evaluate(`(() => {
+          const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
+          const bStyle = getComputedStyle(sr.querySelector('#hud-compaction-badge'));
+          return { bgColor: bStyle.backgroundColor, fgColor: bStyle.color };
+        })()`);
+        return cur.bgColor === 'rgb(88, 155, 255)' && cur.fgColor === 'rgb(255, 255, 255)';
+      }, 2000, 'dark tier 1 badge transition');
+      await pushTier(2, 0.55);
+      await until(async () => {
+        const cur = await main.evaluate(`(() => {
+          const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
+          const bStyle = getComputedStyle(sr.querySelector('#hud-compaction-badge'));
+          return { bgImage: bStyle.backgroundImage, fgColor: bStyle.color };
+        })()`);
+        return cur.bgImage.includes('linear-gradient') && cur.fgColor === 'rgb(255, 255, 255)';
+      }, 2000, 'dark tier 2 badge transition');
+      await pushTier(3, 0.92);
+      await until(async () => {
+        const cur = await main.evaluate(`(() => {
+          const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
+          const bStyle = getComputedStyle(sr.querySelector('#hud-compaction-badge'));
+          return { bgImage: bStyle.backgroundImage, fgColor: bStyle.color };
+        })()`);
+        return cur.bgImage.includes('linear-gradient') && cur.fgColor === 'rgb(255, 255, 255)';
+      }, 2000, 'dark tier 3 badge transition');
+    } finally {
+      await main.evaluate(`(() => {
+        document.documentElement.removeAttribute('data-theme');
+        document.querySelector('#__gravitybox_hud_host__')?.removeAttribute('data-theme');
+      })()`).catch(() => {});
+    }
+
+    // 6. 恢复 640px 宽分栏并验证 Orchestrator 双模型常驻短标、紧凑 7px 留白与真实 DOM 阶段对照渲染
+    await main.evaluate(`document.querySelector('#hud-e2e-fixture').style.width = '640px'`);
+    await until(async () => await main.evaluate(`!document.querySelector('#__gravitybox_hud_host__').shadowRoot.querySelector('.hud-container').classList.contains('is-ultra-compact')`));
+    await main.evaluate(`(() => {
+      const mgr = globalThis.__GRAVITYBOX_HUD_V1__?.manager;
+      const inst = mgr ? [...mgr.instances.values()][0] : null;
+      if (!inst) return;
+      mgr.dispatchMetrics({
+        conversationId: inst.getCurrentConvId(),
+        sessionRevision: inst.getSessionRevision(),
+        metricsSequence: (inst.lastMetricsSequence || 0) + 1,
+        updatedAt: Date.now(),
+        availability: 'ready',
+        isStreaming: false,
+        session: { turns: 3, steps: 20, compactionCount: 0, modelDurationSeconds: 10, toolDurationSeconds: 5, averageTtftSeconds: 1.2, outputTps: 80, outputTpsFormatted: '80 tok/s', currentTurnDurationSeconds: 5, currentTurnDurationCompactZh: '本轮 5s' },
+        tokens: { totalTokens: 1000000, totalTokensCompact: '1M tok', cacheHitRate: 0.9, cacheHitRateFormatted: '90%' },
+        context: {
+          hasUsageData: true,
+          modelId: 'gemini-4-hydrogen',
+          modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+          modelShortLabel: 'Hydrogen',
+          modelCompactLabel: 'H',
+          isMultiModel: true,
+          isOrchestrator: true,
+          usedTokens: 468000,
+          usedTokensCompact: '468K',
+          peakContextTokens: 468000,
+          capacityTokens: 512000,
+          capacityTokensCompact: '512K',
+          isFallbackCapacity: false,
+          usedRatio: 468000 / 512000,
+          usedRatioFormatted: '91.4%',
+          breakdown: { cachedContextTokens: 465000, cachedContextRatio: 90.8, uncachedContextTokens: 3000, uncachedContextRatio: 0.6, latestOutputTokens: 3730 },
+          modelStages: [
+            { slotKey: 'orchestrator:carbon', role: 'planner', modelId: 'gemini-4-carbon', modelDisplayName: 'Orchestrator (Carbon)', shortLabel: 'Carbon', compactLabel: 'C', hasUsageData: true, isActive: false, usedTokens: 462000, peakContextTokens: 462000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 462000 / 512000, usedRatioFormatted: '90.2%' },
+            { slotKey: 'orchestrator:hydrogen', role: 'executor', modelId: 'gemini-4-hydrogen', modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)', shortLabel: 'Hydrogen', compactLabel: 'H', hasUsageData: true, isActive: true, usedTokens: 468000, peakContextTokens: 468000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 468000 / 512000, usedRatioFormatted: '91.4%' }
+          ]
+        }
+      });
+    })()`, ctx.executionContextId);
+    const dualBrowserCheck = await main.evaluate(`(() => {
+      const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
+      const capCtx = sr.querySelector('.capsule-context');
+      const caps = [...sr.querySelectorAll('.capsule')];
+      const cs = getComputedStyle(capCtx);
+      const stageItems = [...sr.querySelectorAll('#hud-ctx-stages-list .hud-stage-item')];
+      return {
+        sameRow: caps.every(c => c.offsetTop === caps[0].offsetTop),
+        paddingLeft: cs.paddingLeft,
+        paddingRight: cs.paddingRight,
+        tagVisible: !sr.querySelector('#hud-ctx-model-tag').hasAttribute('hidden'),
+        fullDisplay: getComputedStyle(sr.querySelector('#hud-ctx-model-full')).display,
+        shortDisplay: getComputedStyle(sr.querySelector('#hud-ctx-model-short')).display,
+        fullTag: sr.querySelector('#hud-ctx-model-full').textContent.trim(),
+        ctxPct: sr.querySelector('#hud-txt-context').textContent.trim(),
+        popPrefix: sr.querySelector('#pop-ctx-prefix').textContent,
+        stageCount: stageItems.length,
+        stageTexts: stageItems.map(el => el.textContent.replace(/\\s+/g, ' ').trim()),
+      };
+    })()`);
+    assert.equal(dualBrowserCheck.sameRow, true, '双模型短标加入后三胶囊仍应严格保持同一行');
+    assert.equal(dualBrowserCheck.paddingLeft, '7px');
+    assert.equal(dualBrowserCheck.paddingRight, '7px');
+    assert.equal(dualBrowserCheck.tagVisible, true);
+    assert.notEqual(dualBrowserCheck.fullDisplay, 'none');
+    assert.equal(dualBrowserCheck.shortDisplay, 'none');
+    assert.equal(dualBrowserCheck.fullTag, 'Hydrogen');
+    assert.equal(dualBrowserCheck.ctxPct, '91%');
+    assert.equal(dualBrowserCheck.popPrefix, '当前上下文 · Hydrogen ');
+    assert.equal(dualBrowserCheck.stageCount, 2);
+    assert.match(dualBrowserCheck.stageTexts[0], /规划 · Carbon.*90\.2% · 462K \/ 512K/);
+    assert.match(dualBrowserCheck.stageTexts[1], /执行 · Hydrogen.*当前.*91\.4% · 468K \/ 512K/);
+
+    // 7. 缩窄至 400px（<= 440px 紧凑态）：验证模型标签自动切换为单字母徽标 H 且不折行
+    await main.evaluate(`document.querySelector('#hud-e2e-fixture').style.width = '400px'`);
+    await until(async () => await main.evaluate(`document.querySelector('#__gravitybox_hud_host__').shadowRoot.querySelector('.hud-container').classList.contains('is-compact')`));
+    const compactTagCheck = await main.evaluate(`(() => {
+      const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
+      const caps = [...sr.querySelectorAll('.capsule')];
+      return {
+        sameRow: caps.every(c => c.offsetTop === caps[0].offsetTop),
+        fullDisplay: getComputedStyle(sr.querySelector('#hud-ctx-model-full')).display,
+        shortDisplay: getComputedStyle(sr.querySelector('#hud-ctx-model-short')).display,
+        shortText: sr.querySelector('#hud-ctx-model-short').textContent.trim(),
+      };
+    })()`);
+    assert.equal(compactTagCheck.sameRow, true, '紧凑分栏下缩为单字母徽标后三胶囊仍应保持同行');
+    assert.equal(compactTagCheck.fullDisplay, 'none');
+    assert.notEqual(compactTagCheck.shortDisplay, 'none');
+    assert.equal(compactTagCheck.shortText, 'H');
 
     await main.evaluate('document.querySelector("#hud-e2e-fixture").remove()');
     await main.evaluate('globalThis.__GRAVITYBOX_HUD_V1__?.reconcileMounts()', ctx.executionContextId);
@@ -1253,6 +1435,35 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     await until(async()=>{const rows=await values();return rows.length===2&&rows[0].tokens===151;});
     assert.equal(await text(main,'#settings'),'Settings');
     assert.equal(await main.evaluate(`globalThis.__GRAVITYBOX_HUD_V1__.manager.languageMode`,ctx.executionContextId),'en');
+    const enHudAudit = await main.evaluate(`(() => {
+      const hosts = [...document.querySelectorAll('#__gravitybox_hud_host__')];
+      const texts = [];
+      for (const h of hosts) {
+        const sr = h.shadowRoot;
+        if (!sr) continue;
+        for (const el of sr.querySelectorAll('.capsule, .hud-popover')) {
+          if (el.getAttribute('aria-label')) texts.push(el.getAttribute('aria-label'));
+          if (el.textContent) texts.push(el.textContent);
+        }
+      }
+      return { hostCount: hosts.length, texts };
+    })()`);
+    assert.ok(enHudAudit.hostCount >= 1);
+    assert.equal(enHudAudit.texts.some((t) => /[\u3400-\u9fff]/.test(t)), false, JSON.stringify(enHudAudit));
+
+    await main.evaluate(`(() => {
+      const pane0 = document.querySelector('#binding-pane-0');
+      if (pane0) pane0.style.width = '480px';
+    })()`);
+    await main.evaluate(`globalThis.__GRAVITYBOX_HUD_V1__?.reconcileMounts?.()`, ctx.executionContextId);
+    await until(async () => await main.evaluate(`(() => {
+      const host = document.querySelector('#binding-pane-0 #__gravitybox_hud_host__') || document.querySelector('#__gravitybox_hud_host__');
+      const root = host?.shadowRoot?.querySelector('#hud-toolbar');
+      const cacheVal = host?.shadowRoot?.querySelector('#hud-txt-tokens .hud-cache-val');
+      if (!root?.classList.contains('is-mid-compact') || !cacheVal) return false;
+      const cs = getComputedStyle(cacheVal);
+      return cs.display !== 'none' && cacheVal.offsetWidth > 0 && cacheVal.textContent.trim().length > 0;
+    })()`));
     await main.evaluate(`document.querySelector('#binding-pane-0').remove();document.querySelector('#binding-pane-1').remove()`);await command('resume');
     await until(async()=>await text(main,'#settings')==='设置');
   });

@@ -81,15 +81,15 @@ extension Assistant {
 
     func refreshSingleAccountQuota(id: String, completion: ((Result<[String: Any], Error>) -> Void)? = nil) {
         guard !id.isEmpty else {
-            completion?(.failure(BackendFailure(message: "账号标识无效")))
+            completion?(.failure(BackendFailure(message: L10n.t("assistant_account.invalid_id"))))
             return
         }
         guard reachable else {
-            completion?(.failure(BackendFailure(message: "本机服务尚未就绪")))
+            completion?(.failure(BackendFailure(message: L10n.t("assistant_account.service_not_ready"))))
             return
         }
         guard !refreshingAccountIds.contains(id) else {
-            completion?(.failure(BackendFailure(message: "该账号配额正在刷新中")))
+            completion?(.failure(BackendFailure(message: L10n.t("assistant_account.refresh_in_progress"))))
             return
         }
         singleAccountRefreshErrors[id] = nil
@@ -117,10 +117,10 @@ extension Assistant {
     }
 
     func buildAccountSwitchMenu() -> NSMenu {
-        let switchSubmenu = NSMenu(title: "切换账号")
+        let switchSubmenu = NSMenu(title: L10n.t("assistant_account.switch_submenu"))
         switchSubmenu.showsStateColumn = true
         if cachedAccounts.isEmpty {
-            let emptyItem = NSMenuItem(title: "暂无可用账号快照", action: nil, keyEquivalent: "")
+            let emptyItem = NSMenuItem(title: L10n.t("assistant_account.no_snapshots"), action: nil, keyEquivalent: "")
             emptyItem.isEnabled = false
             switchSubmenu.addItem(emptyItem)
         } else {
@@ -131,7 +131,7 @@ extension Assistant {
             }.map(\.element)
             for acc in ordered {
                 let id = acc["id"] as? String ?? ""
-                let accEmail = acc["email"] as? String ?? "未知账号"
+                let accEmail = acc["email"] as? String ?? L10n.t("assistant_account.unknown_account")
                 let label = acc["name"] as? String ?? ""
                 let displayName = label.isEmpty ? accEmail : "\(label) · \(accEmail)"
                 let accTier = AccountIdentity.normalizeTier(acc["subscription_tier"] as? String)
@@ -145,7 +145,7 @@ extension Assistant {
             }
         }
         switchSubmenu.addItem(.separator())
-        let manageItem = NSMenuItem(title: "管理账号…", action: #selector(showAccountsFromMenuCard), keyEquivalent: "")
+        let manageItem = NSMenuItem(title: L10n.t("assistant_account.manage_accounts"), action: #selector(showAccountsFromMenuCard), keyEquivalent: "")
         manageItem.target = self
         switchSubmenu.addItem(manageItem)
         return switchSubmenu
@@ -177,6 +177,8 @@ extension Assistant {
             usagePage?.fetch()
         }
         if menuTracking || menuPopover?.isShown == true {
+            let periodKey = menuPanelController.map { MenuPanelController.periods[$0.selectedPeriod] } ?? "today"
+            fetchUsageSummary(period: periodKey, force: true, allowCached: false)
             menuPanelController?.syncFromAssistant()
         }
     }
@@ -193,7 +195,7 @@ extension Assistant {
             guard case .success(let payload) = result else {
                 self.accountSwitchInFlight = false
                 if case .failure(let error) = result {
-                    self.showMessage("无法确认切换前置条件：" + error.localizedDescription, error: true)
+                    self.showMessage(L10n.t("assistant_account.preflight_failed", ["error": error.localizedDescription]), error: true)
                 }
                 return
             }
@@ -204,13 +206,13 @@ extension Assistant {
             let hasRunningTask = (payload["hasRunningTask"] as? Bool == true) || (payload["safe"] as? Bool == false)
             let display: String
             if !name.isEmpty && name.caseInsensitiveCompare(email) != .orderedSame && !email.isEmpty {
-                display = "\(name)（\(email)）"
+                display = L10n.shared.isEnglish ? "\(name) (\(email))" : "\(name)（\(email)）"
             } else {
-                display = email.isEmpty ? (name.isEmpty ? "目标账号" : name) : email
+                display = email.isEmpty ? (name.isEmpty ? L10n.t("assistant_account.target_fallback") : name) : email
             }
             if insidersRunning {
                 self.accountSwitchInFlight = false
-                self.showMessage("检测到 Antigravity Insiders 正在运行，请先保存工作并手动退出后再切换账号", error: true)
+                self.showMessage(L10n.t("assistant_account.insiders_running"), error: true)
                 return
             }
             let performSwitch = { [weak self] in
@@ -221,9 +223,9 @@ extension Assistant {
                     switch response {
                     case .failure(let error):
                         if shouldQuitAndRelaunch { self.relaunchAntigravityAfterSwitch() }
-                        self.showMessage("切换账号失败：" + error.localizedDescription, error: true)
+                        self.showMessage(L10n.t("assistant_account.switch_failed", ["error": error.localizedDescription]), error: true)
                     case .success(let value):
-                        self.showMessage(value["message"] as? String ?? "已切换至账号：\(email)")
+                        self.showMessage(value["message"] as? String ?? L10n.t("assistant_account.switched_to", ["email": email]))
                         if shouldQuitAndRelaunch { self.relaunchAntigravityAfterSwitch() }
                         self.invalidateUsageReportCache()
                         self.refresh(); self.accountsPage?.fetch(); self.overview?.fetch(); completion?()
@@ -238,7 +240,7 @@ extension Assistant {
                     self.bridge.send(["command": "account_switch", "id": id, "target": "all", "autoRefreshToken": true]) { [weak self] response in
                         guard let self else { return }; self.accountSwitchInFlight = false
                         if case .success(let value) = response {
-                            self.showMessage(value["message"] as? String ?? "已切换至账号：\(email)")
+                            self.showMessage(value["message"] as? String ?? L10n.t("assistant_account.switched_to", ["email": email]))
                             if shouldQuitAndRelaunch { self.relaunchAntigravityAfterSwitch() }
                             self.invalidateUsageReportCache()
                             self.refresh(); self.accountsPage?.fetch(); self.overview?.fetch(); completion?()
@@ -252,7 +254,7 @@ extension Assistant {
                         guard let self else { return }
                         guard exited else {
                             self.accountSwitchInFlight = false
-                            self.showMessage("请先在 Antigravity 中保存工作并退出应用，再切换账号", error: true)
+                            self.showMessage(L10n.t("assistant_account.quit_first"), error: true)
                             return
                         }
                         performSwitch()
@@ -270,10 +272,10 @@ extension Assistant {
                 #endif
                 let busyAlert = NSAlert()
                 busyAlert.alertStyle = .warning
-                busyAlert.messageText = "切换至 \(display)？"
-                busyAlert.informativeText = "检测到 Antigravity 有正在运行的任务，现在切换会中断当前任务并重启应用。"
-                busyAlert.addButton(withTitle: "仍要切换")
-                busyAlert.addButton(withTitle: "取消")
+                busyAlert.messageText = L10n.t("assistant_account.switch_prompt_title", ["display": display])
+                busyAlert.informativeText = L10n.t("assistant_account.switch_busy_body")
+                busyAlert.addButton(withTitle: L10n.t("assistant_account.switch_busy_confirm"))
+                busyAlert.addButton(withTitle: L10n.t("common.cancel"))
                 self.presentSheetAlert(busyAlert) { execute($0 == .alertFirstButtonReturn) }
                 return
             }
@@ -282,12 +284,12 @@ extension Assistant {
             #endif
             let alert = NSAlert()
             alert.alertStyle = .informational
-            alert.messageText = "切换至 \(display)？"
+            alert.messageText = L10n.t("assistant_account.switch_prompt_title", ["display": display])
             alert.informativeText = appRunning
-                ? "当前无正在运行的任务，确认后将自动重启 Antigravity 生效。"
-                : "Antigravity 当前未运行，确认后将直接切换账号。"
-            alert.addButton(withTitle: "确认切换")
-            alert.addButton(withTitle: "取消")
+                ? L10n.t("assistant_account.switch_ready_body")
+                : L10n.t("assistant_account.switch_stopped_body")
+            alert.addButton(withTitle: L10n.t("assistant_account.switch_confirm"))
+            alert.addButton(withTitle: L10n.t("common.cancel"))
             self.presentSheetAlert(alert) { execute($0 == .alertFirstButtonReturn) }
         }
     }
@@ -302,7 +304,7 @@ extension Assistant {
             switch response {
             case .failure(let error): self.finishQuotaRefresh(error: error.localizedDescription)
             case .success(let value):
-                guard let id = value["taskId"] as? String, !id.isEmpty else { self.finishQuotaRefresh(error: "未取得刷新任务，请重试"); return }
+                guard let id = value["taskId"] as? String, !id.isEmpty else { self.finishQuotaRefresh(error: L10n.t("assistant_account.refresh_task_missing")); return }
                 self.pendingAccountTaskId = id; self.refresh(taskPollOnly: true)
             }
         }
@@ -356,11 +358,15 @@ extension Assistant {
                     let r = rhs.element["id"] as? String == resolvedActiveId
                     return l == r ? lhs.offset < rhs.offset : l
                 }.map(\.element)
+                if let cachedRec = self.cachedRecommendedAccountId,
+                   cachedRec == resolvedActiveId || !self.cachedAccounts.contains(where: { ($0["id"] as? String) == cachedRec }) {
+                    self.cachedRecommendedAccountId = nil
+                }
                 if let globalErr = self.quotaRefreshError, InterfaceText.isMultiAccountSummary(globalErr) {
                     let anyAccountHasIssue = self.cachedAccounts.contains { acc in
                         if acc["disabled"] as? Bool == true { return false }
                         let err = (acc["quota_refresh_error"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !err.isEmpty && !err.contains("双周期") { return true }
+                        if !err.isEmpty && !InterfaceText.isInternalDualWindowError(err) { return true }
                         if let quota = acc["quota"] as? [String: Any],
                            let stale = quota["stale_groups"] as? [[String: Any]], !stale.isEmpty {
                             return true

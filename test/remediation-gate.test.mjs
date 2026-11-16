@@ -360,9 +360,14 @@ test('Release-Audit-P1: 大账本模型归一化搜索、starter 套餐映射、
  assert.equal(flashPage.total,1);
  assert.equal(flashPage.rows[0].model,'gemini-3.8-flash');
 
- // 2) Carbon 模型配额在未显式标记 is_carbon 的旧快照上自动对齐 family === 'carbon'
+ // 2) Carbon 模型配额在未显式标记 is_carbon 的旧快照上自动对齐 family === 'carbon'，且新套餐枚举精确归一化
  const carbonOverview=buildAccountQuotaOverview({quota:{models:[{name:'gemini-4-carbon',percentage:80,reset_time:''}],quota_groups:[],is_forbidden:false,subscription_tier:'PRO',last_updated:nowSec,model_forwarding_rules:{}}});
  assert.equal(carbonOverview.models[0].is_carbon,true);
+ assert.equal(normalizeSubscriptionTier('starter'),'FREE');
+ assert.equal(normalizeSubscriptionTier('Google One AI Plus'),'PLUS');
+ assert.equal(normalizeSubscriptionTier('Workspace Team'),'TEAM');
+ assert.equal(normalizeSubscriptionTier('Cloud Enterprise'),'ENTERPRISE');
+ assert.equal(normalizeSubscriptionTier('unknown-plan'),'待确认');
 
  // 3) 小账本单账号快照在 getUsageEvents 中继承账号范围并拒绝越权混读；gemini-4-carbon-trial 优惠期边界受 priceStatus 识别
  const convDir=join(dir,'antigravity','conversations');
@@ -416,4 +421,145 @@ test('Release-Audit-P1: 大账本模型归一化搜索、starter 套餐映射、
  const scan=await maint.scan();
  const convProtected=scan.protectedEntries.find(e=>e.id==='conversations');
  assert.ok(convProtected && convProtected.bytes>=22,'受保护对话与站点 Cookies 体积不得被浏览器缓存抵扣归零');
+});
+
+test('Release-1.1.1-Final-Audit: P0→P1→P2 全量审计修复项端到端回归核验',async t=>{
+ const {mkdtemp,mkdir,rm}=await import('node:fs/promises');
+ const {tmpdir}=await import('node:os');
+ const {join}=await import('node:path');
+ const {DatabaseSync}=await import('node:sqlite');
+ const {UsageStatsManager,resolveDatabaseModelFullName}=await import('../dist/usage.js');
+ const {AccountsManager}=await import('../dist/accounts.js');
+ const {classifyFamily,normalizeLiveModels}=await import('../dist/quota.js');
+ const {DEFAULT_API_PRICES,calculateEstimatedUsd,matchPricingKeys,resolvePricingForTimestamp}=await import('../dist/pricing.js');
+ const {registerRemoteModelMetadata,FEED_MODEL_KEYS}=await import('../dist/model-catalog.js');
+ const {ProtobufWriter:W}=await import('../dist/protobuf.js');
+ const {ConversationMetricsEngine,buildConversationHudMetrics,resolveModelCapacity}=await import('../dist/hud.js');
+ const dir=await mkdtemp(join(tmpdir(),'gb-final-audit-'));
+ t.after(()=>rm(dir,{recursive:true,force:true}));
+
+ // 1) P1-1 & P1-3: 公开价格源覆盖 18 款活跃商业模型、远端动态别名/容量注册与长上下文阶梯计费
+ assert.ok(FEED_MODEL_KEYS.length>=18,'公开价格源应覆盖全部主流活跃商业模型');
+ assert.equal(resolvePricingForTimestamp(DEFAULT_API_PRICES['gemini-4-carbon-trial'],Math.floor(Date.parse('2026-11-30T23:59:59Z')/1000))?.input,2);
+ assert.equal(resolvePricingForTimestamp(DEFAULT_API_PRICES['gemini-4-carbon-trial'],Math.floor(Date.parse('2026-12-01T00:00:00Z')/1000))?.input,4);
+ const g31=DEFAULT_API_PRICES['gemini-3.1-pro'];
+ assert.equal(calculateEstimatedUsd(200_000,0,0,g31),0.4);
+ assert.equal(calculateEstimatedUsd(250_000,0,0,g31),1.0,'Gemini 3.1 Pro >200k 上下文应自动切换至 $4/1M 阶梯费率');
+
+ registerRemoteModelMetadata({
+  aliases:{'MODEL_PLACEHOLDER_M699':'gemini-4-xenon-test','__proto__':'evil'},
+  models:{'gemini-4-xenon-test':{displayName:'Gemini 4 Xenon',capacityTokens:256_000},'bad-cap':{capacityTokens:99_999_999}},
+ });
+ assert.equal(matchPricingKeys('MODEL_PLACEHOLDER_M699',['gemini-4-xenon-test']),'gemini-4-xenon-test');
+ assert.equal(resolveDatabaseModelFullName('MODEL_PLACEHOLDER_M699',null),'gemini-4-xenon-test');
+ const xenonCap=resolveModelCapacity('MODEL_PLACEHOLDER_M699');
+ assert.equal(xenonCap.modelId,'gemini-4-xenon-test');
+ assert.equal(xenonCap.displayName,'Gemini 4 Xenon');
+ assert.equal(xenonCap.capacityTokens,256_000);
+ assert.equal(xenonCap.isFallback,false);
+ assert.equal(resolveModelCapacity('bad-cap').isFallback,true,'越界容量必须被安全过滤');
+
+ // 2) P1-2: 此前未落锁的未定价历史事件在获取新价格后由 autoHealUnpricedHistory 自动补齐并刷新快照
+ const convDir=join(dir,'antigravity','conversations');
+ await mkdir(convDir,{recursive:true});
+ const nowSec=Math.floor(Date.now()/1000)-30;
+ const healDb=new DatabaseSync(join(convDir,'heal-unlocked.db'));
+ healDb.exec('CREATE TABLE gen_metadata(idx INTEGER PRIMARY KEY,data BLOB);');
+ healDb.prepare('INSERT INTO gen_metadata VALUES(0,?)').run(W.encodeLengthDelimited(1,Buffer.concat([
+  W.encodeString(19,'future-official-model-v9'),
+  W.encodeLengthDelimited(4,Buffer.concat([W.encodeVarintField(2,1_000_000),W.encodeVarintField(3,0)])),
+  W.encodeLengthDelimited(9,W.encodeLengthDelimited(4,W.encodeVarintField(1,nowSec))),
+ ])));
+ healDb.close();
+ const healState=join(dir,'heal-state');
+ const healMgr=new UsageStatsManager({geminiDir:dir,stateDir:healState});
+ const beforeHeal=await healMgr.getUsageSummary(true);
+ assert.equal(beforeHeal.all_time.estimated_usd,0);
+ assert.equal(beforeHeal.all_time.unpriced_models,1);
+ await healMgr.savePricingTable({'future-official-model-v9':{model:'future-official-model-v9',input:3.5,output:14,cached:0.35}});
+ const healedCount=await healMgr.autoHealUnpricedHistory();
+ assert.equal(healedCount,1,'未落锁历史未定价事件在新价格到达后必须被自愈落锁');
+ const afterHeal=await healMgr.getUsageSummary(false);
+ assert.equal(afterHeal.all_time.estimated_usd,3.5);
+ assert.equal(afterHeal.all_time.unpriced_models,0);
+
+ // 3) P0-3 & P1-5: 六档套餐权重 (TEAM > PRO > PLUS > 待确认) 与推理模型归属及实时窗口字段透传
+ assert.equal(classifyFamily({modelId:'o3-mini'}),'claude');
+ assert.equal(classifyFamily({modelId:'o4-mini'}),'claude');
+ const liveNormalized=normalizeLiveModels([{modelId:'claude-sonnet-5-5',maxTokens:200_000,maxOutputTokens:16_384,quotaInfo:{remainingFraction:0.8}}],nowSec);
+ assert.equal(liveNormalized[0].max_tokens,200_000);
+ assert.equal(liveNormalized[0].max_output_tokens,16_384);
+
+ const tierMgr=new AccountsManager(join(dir,'tier-state'));
+ const mkQ=(rem,tier)=>({...tierMgr.fuseQuota(
+  {models:{'gemini-3.8-flash':{quotaInfo:{remainingFraction:rem}}}},
+  {groups:[{displayName:'Gemini Models',buckets:[{window:'5h',remainingFraction:rem}]}]}
+ ),subscription_tier:tier});
+ const aTeam=await tierMgr.upsertAccount({email:'team@example.invalid',refreshToken:'rt-t',accessToken:'at-t',expiresIn:3600});
+ const aPro=await tierMgr.upsertAccount({email:'pro@example.invalid',refreshToken:'rt-p',accessToken:'at-p',expiresIn:3600});
+ const aPlus=await tierMgr.upsertAccount({email:'plus@example.invalid',refreshToken:'rt-pl',accessToken:'at-pl',expiresIn:3600});
+ const aCur=await tierMgr.upsertAccount({email:'cur@example.invalid',refreshToken:'rt-c',accessToken:'at-c',expiresIn:3600});
+ aTeam.quota=mkQ(0.7,'TEAM');aPro.quota=mkQ(0.9,'PRO');aPlus.quota=mkQ(0.95,'PLUS');aCur.quota=mkQ(0.05,'PRO');
+ await tierMgr.saveAccount(aTeam);await tierMgr.saveAccount(aPro);await tierMgr.saveAccount(aPlus);await tierMgr.saveAccount(aCur);
+ const bestTeam=await tierMgr.selectBestAccount(
+  {enabled:true,strategy:'priority',reserve_percentage:20,candidate_min_percentage:30,monitored_model:'gemini',candidate_account_ids:[aPlus.id,aPro.id,aTeam.id]},
+  {currentId:aCur.id,currentEmail:aCur.email,currentQuota:aCur.quota}
+ );
+ assert.equal(bestTeam.bestCandidate?.id,aTeam.id,'TEAM 套餐权重应高于 PRO 与 PLUS');
+
+ // 4) P0-4, P0-5 & P1-4: 子智能体轨迹标记、轮初等待落盘状态与 2.5s 内并发多子代理即刻嗅探 + 计费继承
+ const subMetrics=buildConversationHudMetrics({
+  conversationId:'sub-traj',
+  isSubagentTrajectory:true,
+  steps:[{idx:0,stepType:15,status:3,hasUsage:true,startTimeSeconds:nowSec,endTimeSeconds:nowSec+2,rawInputTokens:1000,outputTokens:100}],
+ });
+ assert.equal(subMetrics.session.isSubagentTrajectory,true);
+ assert.equal(subMetrics.session.turns,0);
+
+ const turn2Boot=buildConversationHudMetrics({
+  conversationId:'turn2-boot',
+  isStreaming:true,
+  steps:[
+   {idx:0,stepType:14,status:3,startTimeSeconds:nowSec-20,endTimeSeconds:nowSec-20},
+   {idx:1,stepType:15,status:3,hasUsage:true,startTimeSeconds:nowSec-19,endTimeSeconds:nowSec-15,rawInputTokens:1000,outputTokens:100},
+   {idx:2,stepType:14,status:3,startTimeSeconds:nowSec-1,endTimeSeconds:nowSec-1},
+  ],
+ });
+ assert.equal(turn2Boot.session.awaitingFirstTurnStep,true);
+
+ const multiConvDir=join(dir,'multi-sub-convs');
+ await mkdir(multiConvDir,{recursive:true});
+ const parentId='11111111-1111-4111-8111-111111111111';
+ const child1Id='22222222-2222-4222-8222-222222222222';
+ const child2Id='33333333-3333-4333-8333-333333333333';
+ const parentDb=new DatabaseSync(join(multiConvDir,`${parentId}.db`));
+ parentDb.exec('CREATE TABLE steps(idx INTEGER PRIMARY KEY,step_type INTEGER,status INTEGER,metadata BLOB); CREATE TABLE trajectory_meta(trajectory_id TEXT);');
+ parentDb.prepare('INSERT INTO trajectory_meta VALUES(?)').run(parentId);
+ parentDb.prepare('INSERT INTO steps VALUES(0,14,3,?)').run(W.encodeLengthDelimited(1,W.encodeVarintField(1,nowSec)));
+ parentDb.prepare('INSERT INTO steps VALUES(1,127,1,?)').run(W.encodeLengthDelimited(1,W.encodeVarintField(1,nowSec+1)));
+ parentDb.close();
+
+ const makeChildDb=(cid)=>{
+  const cdb=new DatabaseSync(join(multiConvDir,`${cid}.db`));
+  cdb.exec('CREATE TABLE steps(idx INTEGER PRIMARY KEY,step_type INTEGER,status INTEGER,metadata BLOB); CREATE TABLE gen_metadata(idx INTEGER PRIMARY KEY,data BLOB); CREATE TABLE trajectory_meta(trajectory_id TEXT); CREATE TABLE trajectory_metadata_blob(id TEXT PRIMARY KEY,data BLOB);');
+  cdb.prepare('INSERT INTO trajectory_meta VALUES(?)').run(cid);
+  cdb.prepare('INSERT INTO trajectory_metadata_blob VALUES(?,?)').run('meta',W.encodeString(5,parentId));
+  cdb.prepare('INSERT INTO steps VALUES(0,15,1,?)').run(Buffer.concat([
+   W.encodeLengthDelimited(1,W.encodeVarintField(1,nowSec+1)),
+   W.encodeLengthDelimited(9,Buffer.concat([W.encodeVarintField(2,1_000_000),W.encodeVarintField(3,0)])),
+  ]));
+  cdb.prepare('INSERT INTO gen_metadata VALUES(0,?)').run(W.encodeLengthDelimited(1,W.encodeString(19,'gemini-3.8-pro')));
+  cdb.close();
+ };
+ makeChildDb(child1Id);
+ const engine=new ConversationMetricsEngine({conversationsDir:multiConvDir});
+ const mSub1=await engine.getConversationMetrics({conversationId:parentId,isSubagentRunning:true});
+ assert.equal(mSub1.session.subagentCount,1);
+ assert.equal(mSub1.tokens.estimatedCostUsd,4.0,'子智能体未内嵌 step ModelInfo 时应从 child genMetadata 继承模型单价');
+
+ // 2.5s 缓存窗口内立即创建第 2 个并发子代理 .db，目录 mtime 变化必须立即触发重扫而非盲等 2.5s
+ makeChildDb(child2Id);
+ const mSub2=await engine.getConversationMetrics({conversationId:parentId,isSubagentRunning:true});
+ assert.equal(mSub2.session.subagentCount,2,'2.5s 窗口内新增第 2 个子代理库必须被即刻嗅探纳入');
+ assert.equal(mSub2.tokens.estimatedCostUsd,8.0);
 });

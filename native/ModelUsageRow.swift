@@ -6,17 +6,17 @@ final class ModelUsageRow: NSView {
     let costLabel: NSTextField
     let tokensLabel: NSTextField
 
-    init(name: String, tokens: String, input: String, output: String, requests: Int, cost: String, share: Int, shareText: String? = nil) {
-        let isUnpriced = cost == "未计价"
+    init(name: String, tokens: String, input: String, output: String, requests: Int, cost: String, share: Int, shareText: String? = nil, isUnpriced explicitUnpriced: Bool? = nil) {
+        let isUnpriced = explicitUnpriced ?? (cost == L10n.t("menu_panel.usage.unpriced") || cost == "未计价" || cost == "Unpriced")
         nameLabel = text(Self.displayName(name), size: 13, weight: .semibold)
         costLabel = text(cost, size: 14, weight: .semibold, color: isUnpriced ? Design.secondary : .labelColor)
-        tokensLabel = text("\(tokens) Token", size: 12, weight: .medium)
+        tokensLabel = text(L10n.t("usage.model_row.tokens", ["tokens": tokens]), size: 12, weight: .medium)
         super.init(frame: .zero)
-        enableTextCopy(nameLabel, value: name, title: "复制模型 ID")
+        enableTextCopy(nameLabel, value: name, title: L10n.t("overview.copy_model_id"))
         identifier = NSUserInterfaceItemIdentifier("model-usage-row")
         nameLabel.lineBreakMode = .byTruncatingMiddle
         nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        nameLabel.setAccessibilityLabel(Self.displayName(name) + "，模型 ID：" + name)
+        nameLabel.setAccessibilityLabel(L10n.t("usage.model_row.a11y", ["display": Self.displayName(name), "id": name]))
         tokensLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         costLabel.font = .monospacedDigitSystemFont(ofSize: isUnpriced ? 12.5 : 14, weight: .semibold)
         costLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -45,9 +45,9 @@ final class ModelUsageRow: NSView {
         let heading = horizontal([iconBox, nameLabel, flexibleSpace(), costLabel], spacing: 9)
         heading.alignment = .centerY
         let resolvedShare = shareText ?? "\(share)%"
-        let reqLabel = text("\(requests.formatted()) 次请求", size: 11, color: Design.secondary)
+        let reqLabel = text(L10n.t("usage.model_row.requests", ["count": InterfaceText.formatInteger(requests)]), size: 11, color: Design.secondary)
         reqLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        let shareLabel = text("Token 占比 \(resolvedShare)", size: 11, color: Design.secondary)
+        let shareLabel = text(L10n.t("usage.model_row.share", ["share": resolvedShare]), size: 11, color: Design.secondary)
         shareLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         let metrics = horizontal([
             tokensLabel,
@@ -55,7 +55,7 @@ final class ModelUsageRow: NSView {
             flexibleSpace(),
             shareLabel
         ], spacing: 16)
-        tokensLabel.setAccessibilityHelp("输入 \(input) Token，输出 \(output) Token")
+        tokensLabel.setAccessibilityHelp(L10n.t("usage.model_row.tokens_help", ["input": input, "output": output]))
         let body = vertical([heading, metrics], spacing: 6)
         addSubview(body)
         pin(body, to: self, inset: 2)

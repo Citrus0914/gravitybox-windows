@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { bt } from './i18n.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,7 +24,7 @@ export class SystemKeychainAdapter implements KeychainAdapter {
       return stdout.trim() || null;
     } catch (error) {
       if ((error as { code?: number }).code === 44) return null;
-      throw new Error('无法读取账号钥匙串，请检查本机访问权限');
+      throw new Error(bt('keychain.err.read'));
     }
   }
 
@@ -42,7 +43,7 @@ export class SystemKeychainAdapter implements KeychainAdapter {
       };
       const timer = setTimeout(() => {
         try { child.kill(); } catch {}
-        finish(new Error('无法保存账号钥匙串，访问超时'));
+        finish(new Error(bt('keychain.err.write_timeout')));
       }, 5000);
 
       child.stdin.on('error', () => {});
@@ -51,10 +52,10 @@ export class SystemKeychainAdapter implements KeychainAdapter {
       child.stderr.on('data', () => {});
       child.on('close', code => {
         if (code === 0) finish();
-        else finish(new Error('无法保存账号钥匙串，原凭据访问权限可能受限'));
+        else finish(new Error(bt('keychain.err.write')));
       });
       child.on('error', () => {
-        finish(new Error('无法保存账号钥匙串，原凭据访问权限可能受限'));
+        finish(new Error(bt('keychain.err.write')));
       });
     });
   }
@@ -62,7 +63,7 @@ export class SystemKeychainAdapter implements KeychainAdapter {
   async deletePassword(service: string, account: string): Promise<void> {
     try {
       await execFileAsync('/usr/bin/security', ['delete-generic-password', '-s', service, '-a', account], { timeout: 5000 });
-    } catch (error) { if ((error as { code?: number }).code !== 44) throw new Error('无法恢复账号钥匙串'); }
+    } catch (error) { if ((error as { code?: number }).code !== 44) throw new Error(bt('keychain.err.delete')); }
   }
 }
 

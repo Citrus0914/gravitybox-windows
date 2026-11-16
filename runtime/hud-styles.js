@@ -38,9 +38,10 @@ export const HUD_STYLES_CSS = `
   /* 与原生 App / 菜单栏 accessibleWarningColor (#B45309) / accessibleDangerColor (#B91C1C) 同色系 */
   --hud-warn-color: #B45309;
   --hud-danger-color: #B91C1C;
-  --hud-compaction-low-bg: rgba(49, 134, 255, 0.14);
-  --hud-compaction-low-fg: #1D63D6;
-  --hud-compaction-low-border: rgba(49, 134, 255, 0.28);
+  --hud-compaction-low-bg: var(--hud-accent-blue);
+  --hud-compaction-low-fg: #FFFFFF;
+  --hud-compaction-low-border: transparent;
+  --hud-compaction-low-shadow: 0 1px 2px rgba(49, 134, 255, 0.28), inset 0 0.5px 0 rgba(255, 255, 255, 0.24);
   --hud-compaction-warn-bg: linear-gradient(180deg, #D97706 0%, #B45309 100%);
   --hud-compaction-warn-fg: #FFFFFF;
   --hud-compaction-warn-shadow: 0 1px 2px rgba(180, 83, 9, 0.28), inset 0 0.5px 0 rgba(255, 255, 255, 0.24);
@@ -96,11 +97,12 @@ export const HUD_STYLES_CSS = `
   /* 与原生 App / 菜单栏 Dark systemOrange (#FF9F0A) / systemRed (#FF453A) 同色系 */
   --hud-warn-color: #FF9F0A;
   --hud-danger-color: #FF453A;
-  --hud-compaction-low-bg: rgba(88, 155, 255, 0.18);
-  --hud-compaction-low-fg: #93C5FD;
-  --hud-compaction-low-border: rgba(88, 155, 255, 0.34);
+  --hud-compaction-low-bg: var(--hud-accent-blue);
+  --hud-compaction-low-fg: #FFFFFF;
+  --hud-compaction-low-border: transparent;
+  --hud-compaction-low-shadow: 0 1px 2px rgba(37, 99, 235, 0.32), inset 0 0.5px 0 rgba(255, 255, 255, 0.24);
   --hud-compaction-warn-bg: linear-gradient(180deg, #FF9F0A 0%, #D97706 100%);
-  --hud-compaction-warn-fg: #1C1917;
+  --hud-compaction-warn-fg: #FFFFFF;
   --hud-compaction-warn-shadow: 0 1px 2px rgba(217, 119, 6, 0.34), inset 0 0.5px 0 rgba(255, 255, 255, 0.28);
   --hud-compaction-danger-bg: linear-gradient(180deg, #FF453A 0%, #DC2626 100%);
   --hud-compaction-danger-fg: #FFFFFF;
@@ -231,7 +233,8 @@ export const HUD_STYLES_CSS = `
 .capsule.is-skeleton .capsule-icon,
 .capsule.is-skeleton .capsule-donut,
 .capsule.is-skeleton .hud-status-dot,
-.capsule.is-skeleton .hud-compaction-badge {
+.capsule.is-skeleton .hud-compaction-badge,
+.capsule.is-skeleton .hud-ctx-model-tag {
   opacity: 0.35;
 }
 
@@ -270,7 +273,7 @@ export const HUD_STYLES_CSS = `
   opacity: 0.85;
 }
 
-/* 上下文常驻胶囊左侧压缩次数徽章 (0 次隐藏，1 轻蓝 / 2 实心琥珀 / 3+ 实心正红) */
+/* 上下文常驻胶囊左侧压缩次数徽章 (0 次隐藏，1 实心品牌蓝 / 2 实心琥珀 / 3+ 实心正红，数字统一纯白) */
 .hud-compaction-badge {
   display: inline-flex;
   align-items: center;
@@ -278,7 +281,7 @@ export const HUD_STYLES_CSS = `
   min-width: 12px;
   height: 12px;
   padding: 0 3px;
-  margin-right: 8px;
+  margin-right: 5.5px;
   border-radius: 9999px;
   border: 1px solid var(--hud-compaction-low-border);
   background: var(--hud-compaction-low-bg);
@@ -290,7 +293,7 @@ export const HUD_STYLES_CSS = `
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
   box-sizing: border-box;
-  box-shadow: none;
+  box-shadow: var(--hud-compaction-low-shadow);
   transition: background 180ms ease, color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
 }
 
@@ -298,7 +301,7 @@ export const HUD_STYLES_CSS = `
   border-color: var(--hud-compaction-low-border);
   background: var(--hud-compaction-low-bg);
   color: var(--hud-compaction-low-fg);
-  box-shadow: none;
+  box-shadow: var(--hud-compaction-low-shadow);
 }
 
 .hud-compaction-badge.is-compaction-warn {
@@ -319,12 +322,37 @@ export const HUD_STYLES_CSS = `
   display: none !important;
 }
 
+/* 常驻上下文胶囊模型归属短标 (仅 Orchestrator 双阶段或多模型切换时显示) */
+.hud-ctx-model-tag {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 5.5px;
+  color: var(--hud-text-primary);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.hud-ctx-model-tag[hidden] {
+  display: none !important;
+}
+
+.hud-ctx-model-full {
+  display: inline;
+}
+
+.hud-ctx-model-short {
+  display: none;
+}
+
 /* Antigravity 原生横向微缩计量条 (单色渐深蓝平滑填充) */
 .capsule-donut {
-  width: 56px;
+  width: 46px;
   height: 8px;
   flex-shrink: 0;
-  margin-right: 6px;
+  margin-right: 5.5px;
   transition: width 150ms ease, margin-right 150ms ease;
 }
 
@@ -332,13 +360,15 @@ export const HUD_STYLES_CSS = `
   transition: width 350ms cubic-bezier(0.22, 1, 0.36, 1), fill 220ms ease;
 }
 
-.capsule-context.has-compaction {
-  padding-inline: 9px;
+.capsule-context.has-compaction .capsule-donut,
+.capsule-context.has-model-tag .capsule-donut {
+  width: 40px;
+  margin-right: 5.5px;
 }
 
-.capsule-context.has-compaction .capsule-donut {
-  width: 46px;
-  margin-right: 6px;
+.capsule-context.has-compaction.has-model-tag .capsule-donut {
+  width: 36px;
+  margin-right: 5px;
 }
 
 .capsule-text {
@@ -349,12 +379,45 @@ export const HUD_STYLES_CSS = `
   font-variant-numeric: tabular-nums;
 }
 
+#hud-txt-tokens {
+  display: inline-flex;
+  align-items: baseline;
+  max-width: 100%;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.hud-tok-total {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hud-tok-cache {
+  display: inline-flex;
+  align-items: baseline;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.hud-cache-dot,
+.hud-cache-space {
+  white-space: pre;
+  flex-shrink: 0;
+}
+
+.hud-cache-prefix,
+.hud-cache-val {
+  flex-shrink: 0;
+}
+
 /* ==================== 弹性收缩权重阶梯与保底尺寸 ==================== */
 .capsule-context {
   flex-shrink: 0;
-  min-width: 124px;
-  justify-content: center;
-  padding-inline: 11px;
+  min-width: 0;
+  justify-content: flex-start;
+  padding: 0 7px;
 }
 
 .capsule-session {
@@ -380,67 +443,146 @@ export const HUD_STYLES_CSS = `
   max-width: 260px;
 }
 
-/* 状态 1：标准紧凑 (360px ~ 440px) - 隐藏 "命中" 冗余词汇，按比例收窄上下文胶囊 */
+/* 状态 0：中窄过渡 (441px ~ 510px) - 优先折叠 "命中"/"Hit" 冗余词，保住总量与缓存百分比 */
+.hud-container.is-mid-compact .hud-cache-label {
+  display: none;
+}
+
+@container hud (max-width: 510px) {
+  .hud-cache-label {
+    display: none;
+  }
+}
+
+/* 状态 1：标准紧凑 (360px ~ 440px) - 隐藏 "命中" 冗余词汇，模型短标缩为单字母徽标，按比例收窄上下文胶囊 */
 .hud-container.is-compact .hud-cache-label {
   display: none;
 }
 
+.hud-container.is-compact .hud-ctx-model-tag {
+  margin-right: 4.5px;
+}
+
+.hud-container.is-compact .hud-ctx-model-full {
+  display: none;
+}
+
+.hud-container.is-compact .hud-ctx-model-short {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 13px;
+  padding: 0 3.5px;
+  border-radius: 3.5px;
+  background-color: var(--hud-badge-bg);
+  font-size: 9.5px;
+  font-weight: 600;
+}
+
 .hud-container.is-compact .capsule-context {
   min-width: 0;
-  padding-inline: 8px;
+  padding-inline: 6.5px;
 }
 
 .hud-container.is-compact .capsule-donut {
-  width: 42px;
+  width: 38px;
   margin-right: 5px;
 }
 
 .hud-container.is-compact .capsule-context.has-compaction {
-  padding-inline: 7px;
+  padding-inline: 6.5px;
 }
 
-.hud-container.is-compact .capsule-context.has-compaction .capsule-donut {
-  width: 34px;
+.hud-container.is-compact .capsule-context.has-compaction .capsule-donut,
+.hud-container.is-compact .capsule-context.has-model-tag .capsule-donut {
+  width: 32px;
   margin-right: 5px;
 }
 
+.hud-container.is-compact .capsule-context.has-compaction.has-model-tag .capsule-donut {
+  width: 28px;
+  margin-right: 4.5px;
+}
+
 .hud-container.is-compact .hud-compaction-badge {
-  margin-right: 6px;
+  margin-right: 5px;
 }
 
 @container hud (max-width: 440px) {
   .hud-cache-label {
     display: none;
   }
+  .hud-ctx-model-tag {
+    margin-right: 4.5px;
+  }
+  .hud-ctx-model-full {
+    display: none;
+  }
+  .hud-ctx-model-short {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 13px;
+    padding: 0 3.5px;
+    border-radius: 3.5px;
+    background-color: var(--hud-badge-bg);
+    font-size: 9.5px;
+    font-weight: 600;
+  }
   .capsule-context {
     min-width: 0;
-    padding-inline: 8px;
+    padding-inline: 6.5px;
   }
   .capsule-donut {
-    width: 42px;
+    width: 38px;
     margin-right: 5px;
   }
   .capsule-context.has-compaction {
-    padding-inline: 7px;
+    padding-inline: 6.5px;
   }
-  .capsule-context.has-compaction .capsule-donut {
-    width: 34px;
+  .capsule-context.has-compaction .capsule-donut,
+  .capsule-context.has-model-tag .capsule-donut {
+    width: 32px;
     margin-right: 5px;
   }
+  .capsule-context.has-compaction.has-model-tag .capsule-donut {
+    width: 28px;
+    margin-right: 4.5px;
+  }
   .hud-compaction-badge {
-    margin-right: 6px;
+    margin-right: 5px;
   }
 }
 
 /* 状态 2：极限紧凑 (< 360px) - 仅保留核心步数、总量与上下文读数，收窄上下文胶囊与进度条 */
+.hud-container.is-ultra-compact .hud-ctx-model-tag {
+  margin-right: 4px;
+}
+
+.hud-container.is-ultra-compact .hud-ctx-model-full {
+  display: none;
+}
+
+.hud-container.is-ultra-compact .hud-ctx-model-short {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 12.5px;
+  padding: 0 3px;
+  border-radius: 3.5px;
+  background-color: var(--hud-badge-bg);
+  font-size: 9px;
+  font-weight: 600;
+}
+
 .hud-container.is-ultra-compact .capsule-context {
   min-width: 0;
-  padding-inline: 6.5px;
+  padding-inline: 6px;
 }
 
 .hud-container.is-ultra-compact .capsule-donut {
-  width: 32px;
-  margin-right: 4.5px;
+  width: 30px;
+  margin-right: 4px;
 }
 
 .hud-container.is-ultra-compact .capsule-context.has-compaction {
@@ -452,12 +594,18 @@ export const HUD_STYLES_CSS = `
   height: 11.5px;
   padding: 0 2.5px;
   font-size: 8.5px;
-  margin-right: 5px;
+  margin-right: 4.5px;
 }
 
-.hud-container.is-ultra-compact .capsule-context.has-compaction .capsule-donut {
-  width: 26px;
+.hud-container.is-ultra-compact .capsule-context.has-compaction .capsule-donut,
+.hud-container.is-ultra-compact .capsule-context.has-model-tag .capsule-donut {
+  width: 24px;
   margin-right: 4px;
+}
+
+.hud-container.is-ultra-compact .capsule-context.has-compaction.has-model-tag .capsule-donut {
+  width: 22px;
+  margin-right: 3.5px;
 }
 
 .hud-container.is-ultra-compact .hud-turns,
@@ -469,13 +617,21 @@ export const HUD_STYLES_CSS = `
 }
 
 @container hud (max-width: 360px) {
+  .hud-ctx-model-tag {
+    margin-right: 4px;
+  }
+  .hud-ctx-model-short {
+    height: 12.5px;
+    padding: 0 3px;
+    font-size: 9px;
+  }
   .capsule-context {
     min-width: 0;
-    padding-inline: 6.5px;
+    padding-inline: 6px;
   }
   .capsule-donut {
-    width: 32px;
-    margin-right: 4.5px;
+    width: 30px;
+    margin-right: 4px;
   }
   .capsule-context.has-compaction {
     padding-inline: 6px;
@@ -485,11 +641,16 @@ export const HUD_STYLES_CSS = `
     height: 11.5px;
     padding: 0 2.5px;
     font-size: 8.5px;
-    margin-right: 5px;
+    margin-right: 4.5px;
   }
-  .capsule-context.has-compaction .capsule-donut {
-    width: 26px;
+  .capsule-context.has-compaction .capsule-donut,
+  .capsule-context.has-model-tag .capsule-donut {
+    width: 24px;
     margin-right: 4px;
+  }
+  .capsule-context.has-compaction.has-model-tag .capsule-donut {
+    width: 22px;
+    margin-right: 3.5px;
   }
   .hud-turns,
   .hud-turn-dot,
@@ -732,6 +893,7 @@ export const HUD_STYLES_CSS = `
   .hud-status-dot,
   .hud-popover,
   .hud-progress-seg,
+  .hud-stage-bar-fill,
   #hud-meter-fill {
     transition: none !important;
   }
@@ -792,6 +954,128 @@ export const HUD_STYLES_CSS = `
 
 .hud-popover-status-note[hidden] {
   display: none !important;
+}
+
+/* Popover 3: Orchestrator 双阶段 / 多模型独立上下文对照区 */
+.hud-ctx-stages-wrap[hidden] {
+  display: none !important;
+}
+
+.hud-ctx-stages-divider {
+  height: 0;
+  width: 100%;
+  border-top: 1px dashed var(--hud-divider);
+  margin: 8px 0 7px 0;
+}
+
+.hud-ctx-stages-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--hud-text-muted);
+  margin-bottom: 6px;
+  line-height: 1.2;
+}
+
+.hud-ctx-stages-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.hud-stage-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3.5px;
+}
+
+.hud-stage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  line-height: 1.25;
+}
+
+.hud-stage-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--hud-text-secondary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hud-stage-item.is-active .hud-stage-name {
+  color: var(--hud-text-primary);
+  font-weight: 600;
+}
+
+.hud-stage-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+  border: 1.25px solid var(--hud-text-muted);
+  background: transparent;
+  box-sizing: border-box;
+}
+
+.hud-stage-item.is-active .hud-stage-dot {
+  border-color: transparent;
+  background-color: var(--hud-accent-blue);
+}
+
+.hud-stage-item.is-pending .hud-stage-dot {
+  border-color: transparent;
+  background-color: var(--hud-divider);
+}
+
+.hud-stage-badge {
+  padding: 1px 4.5px;
+  border-radius: 4px;
+  background-color: var(--hud-badge-bg);
+  color: var(--hud-accent-blue);
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  flex-shrink: 0;
+}
+
+.hud-stage-val {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--hud-text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.hud-stage-item.is-pending .hud-stage-val {
+  color: var(--hud-text-muted);
+  font-weight: 400;
+}
+
+.hud-stage-bar-track {
+  width: 100%;
+  height: 3.5px;
+  border-radius: 9999px;
+  background-color: var(--hud-progress-track);
+  overflow: hidden;
+}
+
+.hud-stage-bar-fill {
+  height: 100%;
+  border-radius: 9999px;
+  transition: width 220ms ease, background-color 220ms ease;
+  opacity: 0.72;
+}
+
+.hud-stage-item.is-active .hud-stage-bar-fill {
+  opacity: 1;
 }
 `;
 

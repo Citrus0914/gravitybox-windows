@@ -6,6 +6,7 @@ import { join, dirname } from 'node:path';
 import type { LedgerEvent } from './usage-ledger.js';
 import { aggregateLedger, ledgerEventPage } from './usage-aggregate.js';
 import { revalueLedger } from './usage-revalue.js';
+import { bt, setActiveLocale } from './i18n.js';
 export function validLedgerEvent(event: unknown): event is LedgerEvent {
     if (!event || typeof event !== 'object')
         return false;
@@ -29,7 +30,7 @@ function compactUnitPrice(price: any) {
 function regular(path: string) {
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.())
-        throw Error('用量总账文件身份不匹配，已停止写入');
+        throw Error(bt('ledger.err.file_identity_mismatch'));
 }
 interface LegacyBaselineCache {
     path: string;
@@ -48,9 +49,9 @@ function readValidatedLegacyEvents(legacyPath: string): LedgerEvent[] {
     }
     const stat = lstatSync(legacyPath);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.())
-        throw Error('用量总账文件身份不匹配，已停止写入');
+        throw Error(bt('ledger.err.file_identity_mismatch'));
     if (stat.size > 64 * 1024 * 1024)
-        throw Error('旧JSON总账超过自动读取预算，原文件保留，请先预览迁移');
+        throw Error(bt('ledger.err.legacy_json_budget'));
     if (
         cachedLegacyBaseline &&
         cachedLegacyBaseline.path === legacyPath &&
@@ -63,7 +64,7 @@ function readValidatedLegacyEvents(legacyPath: string): LedgerEvent[] {
     }
     const legacy = JSON.parse(readFileSync(legacyPath, 'utf8'));
     if (![1, 2].includes(legacy?.version) || !Array.isArray(legacy.events) || !legacy.events.every(validLedgerEvent)) {
-        throw Error('旧用量总账损坏或版本不支持；原文件已保留，停止写回');
+        throw Error(bt('ledger.err.legacy_corrupt'));
     }
     cachedLegacyBaseline = {
         path: legacyPath,
@@ -77,12 +78,16 @@ function readValidatedLegacyEvents(legacyPath: string): LedgerEvent[] {
 }
 
 function runRequest(payload: {
+    locale?: string;
     path: string;
     legacyPath: string;
     operation: string;
     events?: LedgerEvent[];
     options?: any;
 }): unknown {
+    if (typeof payload.locale === 'string' && payload.locale) {
+        setActiveLocale(payload.locale);
+    }
     const { path, legacyPath, operation, events, options } = payload;
     const result = new Map<string, LedgerEvent>();
     // Validate before opening a writable database. Never overwrite or "repair" a damaged baseline.
@@ -101,16 +106,16 @@ function runRequest(payload: {
             originalEventCount: legacyEvents.length, syntheticCount: synthetic.length, identityReviewCount: suspicious.length - synthetic.length,
             proposedExcludedTokens: synthetic.reduce((sum, event) => sum + event.total_tokens, 0),
             proposedExcludedRequests: synthetic.length,
-            samples: suspicious.slice(0, 50).map(event => ({ eventKey: event.event_key, reason: isSyntheticRecoveredDb(event.db_file) ? '缺少原始用量，旧版本从金额反推' : '旧记录缺少稳定身份/归属证据，需核对',
-                before: { model: event.model, tokens: event.total_tokens, timestamp: event.timestamp_seconds, account: event.account_email ?? event.account_id ?? null }, after: isSyntheticRecoveredDb(event.db_file) ? '仅保留金额凭据，Token/请求不计入可核验统计' : '保留原件，等待源数据核对' })),
-            message: '旧JSON只读保留；当前预览不覆盖、删除或提交任何历史修订。新记录使用独立索引，可恢复原件核对。' };
+            samples: suspicious.slice(0, 50).map(event => ({ eventKey: event.event_key, reason: isSyntheticRecoveredDb(event.db_file) ? bt('ledger.review.reason_synthetic') : bt('ledger.review.reason_missing_attribution'),
+                before: { model: event.model, tokens: event.total_tokens, timestamp: event.timestamp_seconds, account: event.account_email ?? event.account_id ?? null }, after: isSyntheticRecoveredDb(event.db_file) ? bt('ledger.review.after_synthetic') : bt('ledger.review.after_unverified') })),
+            message: bt('ledger.review.message') };
     }
     if (!existsSync(path) && operation === 'count')
         return legacyEvents.length;
     if (!existsSync(path) && operation === 'locks')
         return {};
     if (!existsSync(path) && operation === 'events')
-        throw Error('统计快照的总账已不可用，请重新读取');
+        throw Error(bt('ledger.err.snapshot_unavailable'));
     if (!existsSync(path) && operation === 'load')
         return [...result.values()];
     if (existsSync(path))
@@ -122,11 +127,11 @@ function runRequest(payload: {
     try {
         if (operation === 'load') {
             if (Number(db.prepare('PRAGMA user_version').get()?.user_version) !== 2)
-                throw Error('用量总账版本不支持');
+                throw Error(bt('ledger.err.unsupported_version'));
             for (const row of db.prepare('SELECT payload,observed_at FROM events ORDER BY timestamp, event_key').iterate()) {
                 const event = JSON.parse(String(row.payload));
                 if (!validLedgerEvent(event))
-                    throw Error('用量总账事件损坏，停止写回');
+                    throw Error(bt('ledger.err.corrupt_event_stop'));
                 if (Number(row.observed_at) > 0) event.source_observed_at = Number(row.observed_at);
                 result.set(event.event_key!, event);
             }
@@ -134,16 +139,16 @@ function runRequest(payload: {
         }
         const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
         if (version !== 0 && version !== 2 || version === 0 && Number(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").get()?.n) > 0)
-            throw Error('用量总账版本或结构不支持，原件已保留');
+            throw Error(bt('ledger.err.unsupported_structure'));
         if (operation === 'version')
             return JSON.stringify([db.prepare('SELECT COALESCE(MAX(seq),0) AS n FROM event_revisions').get()?.n, db.prepare('SELECT COALESCE(MAX(version),0) AS n FROM rate_changes').get()?.n]);
         if (operation === 'locks') {
             if (version !== 2)
-                throw Error('费率索引版本不支持');
+                throw Error(bt('ledger.err.rate_index_unsupported'));
             return Object.fromEntries(db.prepare('SELECT event_key,usd,unit_price FROM rate_locks LIMIT 50001').all().map(row => {
                 const price = JSON.parse(String(row.unit_price));
                 if (!Number.isFinite(row.usd) || Number(row.usd) < 0 || !['input', 'output', 'cached'].every(key => Number.isFinite(price[key]) && price[key] >= 0))
-                    throw Error('费率索引损坏，停止重估');
+                    throw Error(bt('ledger.err.rate_index_corrupt'));
                 return [String(row.event_key), { usd: Number(row.usd), price }];
             }));
         }
@@ -197,22 +202,34 @@ function runRequest(payload: {
         if (operation === 'revalue')
             return revalueLedger(db, path, options);
         if (operation === 'save-locks') {
-            const previous = db.prepare('SELECT unit_price FROM rate_locks WHERE event_key=?');
             const sequence = db.prepare('SELECT MIN(seq) AS seq FROM event_revisions WHERE event_key=?');
             const put = db.prepare('INSERT INTO rate_locks VALUES(?,?,?) ON CONFLICT(event_key) DO UPDATE SET unit_price=excluded.unit_price,usd=excluded.usd');
+            const remove = db.prepare('DELETE FROM rate_locks WHERE event_key=?');
             let minSeq = Number.POSITIVE_INFINITY;
             db.exec('BEGIN IMMEDIATE');
             try {
+                const existing = new Map<string, string>();
+                for (const row of db.prepare('SELECT event_key,unit_price FROM rate_locks').iterate() as Iterable<any>) {
+                    existing.set(String(row.event_key), String(row.unit_price));
+                }
                 for (const [key, entry] of Object.entries<any>(options.entries)) {
                     if (!Number.isFinite(entry.usd) || entry.usd < 0 || !entry.price)
-                        throw Error('拒绝写入无效费率锁');
+                        throw Error(bt('ledger.err.invalid_rate_lock'));
                     const price = JSON.stringify(compactUnitPrice(entry.price));
-                    if (previous.get(key)?.unit_price !== price) {
+                    if (existing.get(key) !== price) {
                         const seq = sequence.get(key)?.seq;
                         if (typeof seq === 'number')
                             minSeq = Math.min(minSeq, seq);
                     }
                     put.run(key, price, entry.usd);
+                }
+                for (const key of existing.keys()) {
+                    if (!Object.hasOwn(options.entries, key)) {
+                        remove.run(key);
+                        const seq = sequence.get(key)?.seq;
+                        if (typeof seq === 'number')
+                            minSeq = Math.min(minSeq, seq);
+                    }
                 }
                 if (Number.isFinite(minSeq))
                     db.prepare('INSERT INTO rate_changes VALUES((SELECT COALESCE(MAX(version),0)+1 FROM rate_changes),?)').run(minSeq);
@@ -229,17 +246,17 @@ function runRequest(payload: {
             if (existsSync(ratesPath)) {
                 regular(ratesPath);
                 if (lstatSync(ratesPath).size > 16 * 1024 * 1024)
-                    throw Error('旧费率JSON超过自动迁移预算，原件保留，请先预览迁移');
+                    throw Error(bt('ledger.err.legacy_rates_budget'));
                 const rates = JSON.parse(readFileSync(ratesPath, 'utf8'));
                 if (rates.version !== 1 || !rates.entries || typeof rates.entries !== 'object')
-                    throw Error('旧费率账本无效，原件已保留');
+                    throw Error(bt('ledger.err.legacy_rates_invalid'));
                 const insertRate = db.prepare('INSERT OR IGNORE INTO rate_locks VALUES(?,?,?)');
                 db.exec('BEGIN IMMEDIATE');
                 try {
                     for (const [key, item] of Object.entries<any>(rates.entries)) {
                         const price = compactUnitPrice(item.price ?? rates.profiles?.[item.p]);
                         if (!price || !Number.isFinite(item.usd) || item.usd < 0)
-                            throw Error('旧费率记录无效');
+                            throw Error(bt('ledger.err.legacy_rate_entry_invalid'));
                         insertRate.run(key, JSON.stringify(price), item.usd);
                     }
                     db.exec('COMMIT');
@@ -268,7 +285,7 @@ function runRequest(payload: {
             return { ...aggregateLedger(db, options), ledger_review_records: legacyEvents.filter(event => !event.source_id || isSyntheticRecoveredDb(event.db_file)).length };
         }
         if (!Array.isArray(events) || !events.every(validLedgerEvent))
-            throw Error('拒绝写入无效用量事件');
+            throw Error(bt('ledger.err.invalid_usage_event'));
         const upsert = db.prepare('INSERT INTO events(event_key,timestamp,account_id,model,payload,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp,account_id=excluded.account_id,model=excluded.model,payload=excluded.payload,observed_at=excluded.observed_at WHERE payload<>excluded.payload');
         const updateObserved = db.prepare('UPDATE events SET observed_at=MAX(observed_at,?) WHERE event_key=?');
         const revision = db.prepare('INSERT INTO event_revisions(event_key,timestamp,payload) VALUES(?,?,?)');

@@ -64,7 +64,12 @@
     globalThis[KEY] = {
       state, getLanguageMode: () => 'en', refresh() {},
       update(next) { dictionary = next; }, setShortcutEnabled() {},
-      dispose() { delete globalThis[KEY]; delete globalThis.__GRAVITYBOX_BOOT__; },
+      dispose() {
+        try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {}
+        delete globalThis[KEY];
+        if (globalThis.__GRAVITYBOX_BOOT__ === options) delete globalThis.__GRAVITYBOX_BOOT__;
+        return { restored: 0, skipped: 0, active: false };
+      },
     };
     globalThis.__GRAVITYBOX_ATTACH_HUD__?.();
     return;
@@ -120,7 +125,7 @@
   /* J03: third-party/product names are not interface copy. Entity links/cards are protected
      structurally (J01); this allowlist covers brand-only labels rendered as plain text/buttons so a
      dictionary hit can never turn "Gemini"/"GitHub" into Chinese. */
-  const BRAND_NAMES = new Set(['antigravity', 'gemini', 'claude', 'gpt', 'chatgpt', 'google', 'google chat', 'github', 'github copilot', 'copilot', 'chrome', 'chromium', 'firefox', 'safari', 'webkit', 'node.js', 'nodejs', 'npm', 'pnpm', 'yarn', 'deno', 'bun', 'electron', 'typescript', 'javascript', 'python', 'rust', 'golang', 'java', 'kotlin', 'swift', 'xcode', 'vscode', 'vs code', 'visual studio code', 'intellij idea', 'pycharm', 'webstorm', 'jetbrains', 'docker', 'kubernetes', 'postgresql', 'postgres', 'mysql', 'sqlite', 'redis', 'mongodb', 'react', 'vue', 'svelte', 'angular', 'next.js', 'vite', 'webpack', 'esbuild', 'tailwind', 'tailwind css', 'openai', 'anthropic', 'deepseek', 'mistral', 'llama', 'perplexity', 'notion', 'slack', 'linear', 'jira', 'figma', 'gitlab', 'bitbucket', 'vercel', 'cloudflare', 'firebase', 'supabase', 'prisma', 'playwright', 'xterm', 'monaco', 'markdown', 'inter', 'google sans', 'google sans code', 'google sans text', 'jetbrains mono', 'fira code', 'fira mono', 'cascadia code', 'cascadia mono', 'sf mono', 'roboto mono', 'source code pro', 'consolas', 'menlo', 'courier new', 'ubuntu mono', 'inconsolata', 'hack', 'catppuccin', 'catppuccin frappe', 'catppuccin latte', 'catppuccin macchiato', 'catppuccin mocha', 'gruvbox', 'gruvbox material', 'gruvbox dark', 'gruvbox light', 'solarized', 'solarized light', 'solarized dark', 'one light', 'one dark', 'one dark pro', 'dracula', 'nord', 'monokai', 'monokai pro', 'monokai dimmed', 'tokyo night', 'ayu', 'ayu dark', 'ayu light', 'ayu mirage', 'quiet light', 'aoede', 'arlo', 'charon', 'cleo', 'fenrir', 'finn', 'fola', 'gero', 'kore', 'leda', 'lora', 'neno', 'olin', 'orus', 'puck', 'tari', 'zephyr', 'project 4k', 'workspace_1', 'workspace_2', 'workspace_3']);
+  const BRAND_NAMES = new Set(['antigravity', 'gravitybox', 'gemini', 'claude', 'gpt', 'chatgpt', 'google', 'google chat', 'github', 'github copilot', 'copilot', 'chrome', 'chromium', 'firefox', 'safari', 'webkit', 'node.js', 'nodejs', 'npm', 'pnpm', 'yarn', 'deno', 'bun', 'electron', 'typescript', 'javascript', 'python', 'rust', 'golang', 'java', 'kotlin', 'swift', 'xcode', 'vscode', 'vs code', 'visual studio code', 'intellij idea', 'pycharm', 'webstorm', 'jetbrains', 'docker', 'kubernetes', 'postgresql', 'postgres', 'mysql', 'sqlite', 'redis', 'mongodb', 'react', 'vue', 'svelte', 'angular', 'next.js', 'vite', 'webpack', 'esbuild', 'tailwind', 'tailwind css', 'openai', 'anthropic', 'deepseek', 'mistral', 'llama', 'perplexity', 'notion', 'slack', 'linear', 'jira', 'figma', 'gitlab', 'bitbucket', 'vercel', 'cloudflare', 'firebase', 'supabase', 'prisma', 'playwright', 'puppeteer', 'xterm', 'monaco', 'markdown', 'latex', 'mermaid', 'git', 'mcp', 'oauth', 'jetski', 'sidecar', 'flutter', 'dart', 'agy', 'inter', 'google sans', 'google sans code', 'google sans text', 'jetbrains mono', 'fira code', 'fira mono', 'cascadia code', 'cascadia mono', 'sf mono', 'roboto mono', 'source code pro', 'consolas', 'menlo', 'courier new', 'ubuntu mono', 'inconsolata', 'hack', 'catppuccin', 'catppuccin frappe', 'catppuccin latte', 'catppuccin macchiato', 'catppuccin mocha', 'gruvbox', 'gruvbox material', 'gruvbox dark', 'gruvbox light', 'solarized', 'solarized light', 'solarized dark', 'one light', 'one dark', 'one dark pro', 'dracula', 'nord', 'monokai', 'monokai pro', 'monokai dimmed', 'tokyo night', 'ayu', 'ayu dark', 'ayu light', 'ayu mirage', 'quiet light', 'aoede', 'arlo', 'charon', 'cleo', 'fenrir', 'finn', 'fola', 'gero', 'kore', 'leda', 'lora', 'neno', 'olin', 'orus', 'puck', 'tari', 'zephyr', 'project 4k', 'workspace_1', 'workspace_2', 'workspace_3']);
   function isBrandName(value) { return BRAND_NAMES.has(lower(normalize(value))); }
   /* J04 disclosure: templates only understand {0}/{1}… placeholders. printf-style (%s/%d/…) and
      ICU plural/select messages are not recognised (the runtime substitutes the number before the
@@ -156,6 +161,7 @@
   const INLINE_LAYOUT_WARNING = '内联占位符无法安全映射（语序重排/缺少对应文本槽/占位符集合不一致）：已保留完整英文，请在词典中按原占位顺序提供译文';
   const normalize = s => s.replace(/\s+/g, ' ').trim();
   const lower = s => s.toLowerCase();
+  const foldKey = s => lower(s).replace(/[\u2018\u2019]/g, "'");
   let auditKeys = null, auditExpires = 0;
   const auditTrail = new Map();
   function visibleUi(el) {
@@ -318,7 +324,7 @@
     if (!dict?.entries) return;
     for (const [k, v] of Object.entries(dict.entries)) {
       if(k.startsWith('@ui:'))continue;
-      const f = lower(k);
+      const f = foldKey(k);
       if (!foldedMap.has(f)) foldedMap.set(f, v);
     }
   }
@@ -490,7 +496,8 @@
     if (!p) return false;
     const dialog = p.closest('[role="dialog"],[role="alertdialog"]');
     if (!dialog) return false;
-    if (dialog.getAttribute('aria-label') === 'Settings' || dialog.querySelector('aside,[data-testid*="settings"]')) return false;
+    const dialogLabel = dialog.getAttribute('aria-label');
+    if (dialogLabel === 'Settings' || dialogLabel === '设置' || dialog.querySelector('aside,[data-testid*="settings"]')) return false;
     return Boolean(dialog.querySelector('[data-testid*="confirm"],button'));
   }
   function eligible(element, scan = 0) {
@@ -509,7 +516,10 @@
   function entryFor(key) {
     const entries = dictionary.entries;
     if (Object.hasOwn(entries, key)) return entries[key];
-    return foldedMap.get(lower(key));
+    return foldedMap.get(foldKey(key));
+  }
+  function nestedLabel(name) {
+    return isBrandName(name) ? name : (entryFor(name) || name);
   }
 
   const RE_DUR_H = /(\d+)\s*h\b/gi;
@@ -1095,27 +1105,27 @@
     },
     {
       key: "{name} [Remote]", pattern: /^(.+?)\s+\[Remote\]$/i,
-      replace: (_, name) => `${name} [远程]`
+      replace: (_, name) => `${nestedLabel(name)} [远程]`
     },
     {
       key: "{name}, setup required", pattern: /^(.+?),\s*setup\s+required$/i,
-      replace: (_, name) => `${name}（需要配置）`
+      replace: (_, name) => `${nestedLabel(name)}（需要配置）`
     },
     {
       key: "{name} · Context window", pattern: /^(.+?)\s*·\s*Context\s+window$/i,
-      replace: (_, name) => `${name} · 上下文窗口`
+      replace: (_, name) => `${nestedLabel(name)} · 上下文窗口`
     },
     {
       key: "{name}: Expired", pattern: /^(.+?):\s+Expired$/i,
-      replace: (_, name) => `${name}：已过期`
+      replace: (_, name) => `${nestedLabel(name)}：已过期`
     },
     {
       key: "{name}: Invalid", pattern: /^(.+?):\s+Invalid$/i,
-      replace: (_, name) => `${name}：无效`
+      replace: (_, name) => `${nestedLabel(name)}：无效`
     },
     {
       key: "{name}: Unknown", pattern: /^(.+?):\s+Unknown$/i,
-      replace: (_, name) => `${name}：未知`
+      replace: (_, name) => `${nestedLabel(name)}：未知`
     },
     {
       key: "Viewed {file}:{start}-{end}", pattern: /^Viewed\s+(.+?):(\d+)-(\d+)$/i,
@@ -1491,6 +1501,231 @@
       key: "Stop {count} selected",
       pattern: /^Stop\s+(\d+)\s+selected$/i,
       replace: (_, n) => `停止已选中的 ${n} 项`
+    },
+    {
+      key: "⚠️ Failed to render LaTeX: {reason}",
+      pattern: /^⚠️\s*Failed\s+to\s+render\s+LaTeX:\s*(.+)$/i,
+      replace: (_, r) => `⚠️ LaTeX 渲染失败：${r}`
+    },
+    {
+      key: "⚠️ Failed to render Mermaid diagram: {reason}",
+      pattern: /^⚠️\s*Failed\s+to\s+render\s+Mermaid\s+diagram:\s*(.+)$/i,
+      replace: (_, r) => `⚠️ Mermaid 图表渲染失败：${r}`
+    },
+    {
+      key: "Agent: {name}",
+      pattern: /^Agent:\s*(.+)$/i,
+      replace: (_, n) => `智能体：${n}`
+    },
+    {
+      key: "Agent ID: {id}",
+      pattern: /^Agent\s+ID:\s*(.+)$/i,
+      replace: (_, id) => `智能体 ID：${id}`
+    },
+    {
+      key: "Error: {message}",
+      pattern: /^Error:\s*(.+)$/i,
+      replace: (_, m) => `错误：${m}`
+    },
+    {
+      key: "Error ID: {id}",
+      pattern: /^Error\s+ID:\s*(.+)$/i,
+      replace: (_, id) => `错误 ID：${id}`
+    },
+    {
+      key: "Working directory: {path}",
+      pattern: /^Working\s+directory:\s*(.+)$/i,
+      replace: (_, p) => `工作目录：${p}`
+    },
+    {
+      key: "Side Question: {title}",
+      pattern: /^Side\s+Question:\s*(.+)$/i,
+      replace: (_, t) => `旁路追问：${t}`
+    },
+    {
+      key: "Delete side question: {title}",
+      pattern: /^Delete\s+side\s+question:\s*(.+)$/i,
+      replace: (_, t) => `删除旁路追问：${t}`
+    },
+    {
+      key: "Edit side question title: {title}",
+      pattern: /^Edit\s+side\s+question\s+title:\s*(.+)$/i,
+      replace: (_, t) => `编辑旁路追问标题：${t}`
+    },
+    {
+      key: "Couldn't connect to {target}",
+      pattern: /^Couldn['’]t\s+connect\s+to\s+(.+)$/i,
+      replace: (_, t) => `无法连接到 ${t}`
+    },
+    {
+      key: "Couldn't switch accounts: {reason}",
+      pattern: /^Couldn['’]t\s+switch\s+accounts:\s*(.+)$/i,
+      replace: (_, r) => `无法切换账号：${r}`
+    },
+    {
+      key: "Unable to load PDF: {reason}",
+      pattern: /^Unable\s+to\s+load\s+PDF:\s*(.+)$/i,
+      replace: (_, r) => `无法加载 PDF：${r}`
+    },
+    {
+      key: "List resources: {server}",
+      pattern: /^List\s+resources:\s*(.+)$/i,
+      replace: (_, s) => `列出资源：${s}`
+    },
+    {
+      key: "Read resource: {uri}",
+      pattern: /^Read\s+resource:\s*(.+)$/i,
+      replace: (_, u) => `读取资源：${u}`
+    },
+    {
+      key: "Commented on: {target}",
+      pattern: /^Commented\s+on:\s*(.+)$/i,
+      replace: (_, t) => `已评论：${t}`
+    },
+    {
+      key: "SSH config: {path}",
+      pattern: /^SSH\s+config:\s*(.+)$/i,
+      replace: (_, p) => `SSH 配置：${p}`
+    },
+    {
+      key: "Domains: {domains}",
+      pattern: /^Domains:\s*(.+)$/i,
+      replace: (_, d) => `域名：${d}`
+    },
+    {
+      key: "Location: {location}",
+      pattern: /^Location:\s*(.+)$/i,
+      replace: (_, l) => `位置：${l}`
+    },
+    {
+      key: "Payload: {payload}",
+      pattern: /^Payload:\s*(.+)$/i,
+      replace: (_, p) => `载荷：${p}`
+    },
+    {
+      key: "Project ID: {id}",
+      pattern: /^Project\s+ID:\s*(.+)$/i,
+      replace: (_, id) => `项目 ID：${id}`
+    },
+    {
+      key: "Used for: {purpose}",
+      pattern: /^Used\s+for:\s*(.+)$/i,
+      replace: (_, p) => `用途：${p}`
+    },
+    {
+      key: "Invalid embed: {url}",
+      pattern: /^Invalid\s+embed:\s*(.+)$/i,
+      replace: (_, u) => `无效的嵌入内容：${u}`
+    },
+    {
+      key: "Blocked: {reason}",
+      pattern: /^Blocked:\s*(.+)$/i,
+      replace: (_, r) => `已阻止：${r}`
+    },
+    {
+      key: "Your Plan: {plan}",
+      pattern: /^Your\s+Plan:\s*(.+)$/i,
+      replace: (_, p) => `当前套餐：${nestedLabel(p)}`
+    },
+    {
+      key: "Switch environment ({env})",
+      pattern: /^Switch\s+environment\s*\((.+)\)$/i,
+      replace: (_, e) => `切换环境 (${e})`
+    },
+    {
+      key: "System default ({name})",
+      pattern: /^System\s+default\s*\((.+)\)$/i,
+      replace: (_, n) => `系统默认 (${nestedLabel(n)})`
+    },
+    {
+      key: "Cost summary: {summary}",
+      pattern: /^Cost\s+summary:\s*(.+)$/i,
+      replace: (_, s) => `费用摘要：${s}`
+    },
+    {
+      key: "Sort and filter conversations ({count} active)",
+      pattern: /^Sort\s+and\s+filter\s+conversations\s*\((\d+)\s+active\)$/i,
+      replace: (_, n) => `排序与筛选对话（${n} 个活跃）`
+    },
+    {
+      key: "Worker sandbox initialization failed: {reason}",
+      pattern: /^Worker\s+sandbox\s+initialization\s+failed:\s*(.+)$/i,
+      replace: (_, r) => `工作区沙箱初始化失败：${r}`
+    },
+    {
+      key: "Authorization code for {target}",
+      pattern: /^Authorization\s+code\s+for\s+(.+)$/i,
+      replace: (_, t) => `${t} 的授权码`
+    },
+    {
+      key: "Auth code for {target}",
+      pattern: /^Auth\s+code\s+for\s+(.+)$/i,
+      replace: (_, t) => `${t} 的授权码`
+    },
+    {
+      key: "Welcome to {name}!",
+      pattern: /^Welcome\s+to\s+(.+?)!$/i,
+      replace: (_, n) => `欢迎使用 ${n}！`
+    },
+    {
+      key: "Loading {name}...",
+      pattern: /^Loading\s+(.+?)(?:\.\.\.|…)$/i,
+      replace: (_, n) => `正在加载 ${nestedLabel(n)}...`
+    },
+    {
+      key: 'Restarted "{name}".',
+      pattern: /^Restarted\s+"(.+)"\.$/i,
+      replace: (_, n) => `已重启“${n}”。`
+    },
+    {
+      key: 'Started "{name}".',
+      pattern: /^Started\s+"(.+)"\.$/i,
+      replace: (_, n) => `已启动“${n}”。`
+    },
+    {
+      key: 'Enabled "{name}".',
+      pattern: /^Enabled\s+"(.+)"\.$/i,
+      replace: (_, n) => `已启用“${n}”。`
+    },
+    {
+      key: 'Deleted "{name}".',
+      pattern: /^Deleted\s+"(.+)"\.$/i,
+      replace: (_, n) => `已删除“${n}”。`
+    },
+    {
+      key: "Using browser · {detail}",
+      pattern: /^Using\s+browser\s*·\s*(.+)$/i,
+      replace: (_, d) => `使用浏览器 · ${nestedLabel(d)}`
+    },
+    {
+      key: "Running for {duration}",
+      pattern: /^Running\s+for\s+(\d+\s*[hms](?:\s+\d+\s*[hms])*|<1s)$/i,
+      replace: (_, d) => `已运行 ${formatDuration(d)}`
+    },
+    {
+      key: "Up {duration}",
+      pattern: /^Up\s+(\d+\s*[hms](?:\s+\d+\s*[hms])*)$/i,
+      replace: (_, d) => `已运行 ${formatDuration(d)}`
+    },
+    {
+      key: "You have {count} conversations in progress. Updating will cancel them and you'll need to manually restart them.",
+      pattern: /^You\s+have\s+(\d+)\s+conversations?\s+in\s+progress\.\s*Updating\s+will\s+cancel\s+them\s+and\s+you'll\s+need\s+to\s+manually\s+restart\s+them\.?$/i,
+      replace: (_, n) => `您当前有 ${n} 个对话正在进行。更新将取消这些对话，更新后需要手动重新启动。`
+    },
+    {
+      key: "You have {count} conversations in progress. Updating will interrupt them, and they will automatically resume once the update completes.",
+      pattern: /^You\s+have\s+(\d+)\s+conversations?\s+in\s+progress\.\s*Updating\s+will\s+interrupt\s+them,\s+and\s+they\s+will\s+automatically\s+resume\s+once\s+the\s+update\s+completes\.?$/i,
+      replace: (_, n) => `您当前有 ${n} 个对话正在进行。更新将暂时中断它们，并在更新完成后自动恢复。`
+    },
+    {
+      key: "Hide {host} from this list",
+      pattern: /^Hide\s+(.+?)\s+from\s+this\s+list$/i,
+      replace: (_, h) => `从列表中隐藏 ${h}`
+    },
+    {
+      key: "Show {host} in the list again",
+      pattern: /^Show\s+(.+?)\s+in\s+the\s+list\s+again$/i,
+      replace: (_, h) => `在列表中重新显示 ${h}`
     }
   ];
 
@@ -1561,6 +1796,25 @@
     if (attr) return attributeAllowed(node, attr);
     return eligible(node.parentElement, scan);
   }
+  function elementHasActiveTranslation(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    if (inlineGroups.has(el)) return true;
+    for (const attr of TRANSLATABLE_ATTRS) {
+      if (nodeSlots.get(el)?.has(attr)) return true;
+    }
+    for (let child = el.firstChild; child; child = child.nextSibling) {
+      if (child.nodeType === Node.TEXT_NODE && nodeSlots.get(child)?.has('')) return true;
+    }
+    return false;
+  }
+  function syncElementLocFlag(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return;
+    if (languageMode === 'zh' && elementHasActiveTranslation(el)) {
+      el.dataset.gravityboxLoc = '1';
+    } else {
+      delete el.dataset.gravityboxLoc;
+    }
+  }
   function updateValue(node, attr = '', scan = 0) {
     let slots = nodeSlots.get(node);
     const old = slots?.get(attr);
@@ -1568,7 +1822,7 @@
     const el = attr ? node : node.parentElement;
     if (current === null) {
       if (slots) { slots.delete(attr); if (!slots.size) activeNodes.delete(node); }
-      if (el && el.nodeType === Node.ELEMENT_NODE && !slots?.size) delete el.dataset.gravityboxLoc;
+      syncElementLocFlag(el);
       return;
     }
     if (!translatable(node, attr, scan)) {
@@ -1576,7 +1830,7 @@
          drop the slot so a later re-entry starts from the real text instead of a stale value. */
       if (old && current === old.last) setValue(node, attr, old.original);
       if (slots) { slots.delete(attr); if (!slots.size) activeNodes.delete(node); }
-      if (el && el.nodeType === Node.ELEMENT_NODE && !slots?.size) delete el.dataset.gravityboxLoc;
+      syncElementLocFlag(el);
       return;
     }
     if (old?.group) {
@@ -1604,13 +1858,7 @@
     if (current !== targetVal) setValue(node, attr, targetVal);
     auditRecord(original,targetVal,el,attr ? 'attribute' : inferKind(el),nodeSlots.get(node)?.get(attr)?.matchedKeys??[]);
 
-    if (el && el.nodeType === Node.ELEMENT_NODE) {
-      if (languageMode === 'zh' && next !== original) {
-        el.dataset.gravityboxLoc = '1';
-      } else if (languageMode === 'en' || next === original) {
-        delete el.dataset.gravityboxLoc;
-      }
-    }
+    syncElementLocFlag(el);
   }
   /* `input` / `textarea` are PROTECTED so their typed value is never touched, but their
      translated metadata (placeholder / title / aria-label / data-tooltip) is not user content:
@@ -1683,7 +1931,7 @@
       slots.delete('');
       if (!slots.size) activeNodes.delete(node);
     }
-    delete el.dataset.gravityboxLoc;
+    syncElementLocFlag(el);
   }
 
   /* J04 (conservative): the template is the element's direct children rendered as text runs plus
@@ -1752,8 +2000,7 @@
       for (let k = 0; k < items.length; k++) writeGroupSlot(items[k].node, el, k === 0 ? part : '', items[k].original, groupKeys);
     }
     auditRecord(norm, zh, el, 'template', groupKeys);
-    if (languageMode === 'zh') el.dataset.gravityboxLoc = '1';
-    else delete el.dataset.gravityboxLoc;
+    syncElementLocFlag(el);
     for (let i = inlineElements.length - 1; i >= 0; i--) queue.add(inlineElements[i]);
     return true;
   }
@@ -1797,8 +2044,7 @@
       inlineGroupContainers.add(el);
       for (let k = 0; k < items.length; k++) writeGroupSlot(items[k].node, el, k === 0 ? zh : '', items[k].original, groupKeys);
       auditRecord(norm, zh, el, 'template', groupKeys);
-      if (languageMode === 'zh') el.dataset.gravityboxLoc = '1';
-      else delete el.dataset.gravityboxLoc;
+      syncElementLocFlag(el);
       return true;
     }
     const normPlaceholders = placeholderTokens(norm), zhPlaceholders = placeholderTokens(zh);
@@ -2051,16 +2297,12 @@
         for (const [attr, slot] of slots) {
           const targetVal = languageMode === 'en' ? slot.original : slot.last;
           setValue(node, attr, targetVal);
-          const el = attr ? node : node.parentElement;
-          if (el && el.nodeType === Node.ELEMENT_NODE) {
-            if (languageMode === 'en') delete el.dataset.gravityboxLoc;
-            else el.dataset.gravityboxLoc = '1';
-          }
+          syncElementLocFlag(attr ? node : node.parentElement);
         }
       }
       try{globalThis.__gravityboxLanguageChanged?.(languageMode);}catch{}
       try{globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(languageMode);}catch{}
-      return { mode: languageMode, activeNodes: activeNodes.size, groups: 0 };
+      return { mode: languageMode, activeNodes: activeNodes.size, groups: inlineGroupContainers.size };
     },
     getLanguageMode() { return languageMode; },
     setShortcutEnabled(enabled){shortcutEnabled=options.path==='/fixture'&&enabled===true;return{enabled:shortcutEnabled};},
@@ -2189,7 +2431,7 @@
     state() {
       return {
         active, version: dictionary.version, translatedNodes: activeNodes.size,
-        groups: 0,
+        groups: inlineGroupContainers.size,
         observedRoots: observed.size, pending: waiting.size + settingsWaiting.size + pending.size,
         scanCount, maxSliceMs, lastCollectionTruncated, languageMode,routeExcluded,runtimeId:options.runtimeId,
         reconcileChecks, reconcilePasses, reconcilePending: reconcileQueue ? reconcileQueue.nodes.length - reconcileQueue.index : 0,

@@ -5,12 +5,14 @@ import { createHash } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { atomicJson, atomicText } from './files.js';
-import { formatLocalDate, type LedgerSnapshot } from './usage-aggregate.js';
+import { bt } from './i18n.js';
+import { formatLocalDate, isUnpricedZeroSentinel, type LedgerSnapshot } from './usage-aggregate.js';
 import { UsageLedger, type LedgerEvent } from './usage-ledger.js';
 import {
   DEFAULT_PRICING_FEED_URLS,
   calculateEstimatedUsd,
   canonicalActivePricingKeys,
+  resolveContextTierPricing,
   resolvePricingFromTable,
   type ApiPricing,
   type ApiPricingEntry,
@@ -45,7 +47,7 @@ import {
   type DiscoveredDbStat,
   type UsageScanContext,
 } from './usage-scanner.js';
-import { buildUsageSummaryReport } from './usage-report.js';
+import { buildPricingWarningCodes, buildUsageSummaryReport } from './usage-report.js';
 
 export {
   resolveDatabaseModelFullName,
@@ -141,7 +143,7 @@ export class UsageStatsManager {
     const defaultGeminiDir = join(homedir(), '.gemini');
     const defaultStateDir = join(homedir(), 'Library', 'Application Support', 'GravityBox');
     this.geminiDir = options?.geminiDir ?? defaultGeminiDir;
-    if (options?.dataDirectoryName && !ALLOWED_DATA_DIRECTORY_NAMES.includes(options.dataDirectoryName)) throw new Error('仅统计 Antigravity 正式版用量');
+    if (options?.dataDirectoryName && !ALLOWED_DATA_DIRECTORY_NAMES.includes(options.dataDirectoryName)) throw new Error(bt('usage.err.official_only'));
     this.dataDirectoryNames = options?.dataDirectoryName ? [options.dataDirectoryName] : ALLOWED_DATA_DIRECTORY_NAMES;
     const stateDir = options?.stateDir ?? (options?.geminiDir && options.geminiDir !== defaultGeminiDir ? join(options.geminiDir, '.gravitybox_state') : defaultStateDir);
     this.observationsPath = join(stateDir, 'usage-account-observations.json');
@@ -163,7 +165,7 @@ export class UsageStatsManager {
 
   async ledgerReview(): Promise<Record<string, unknown>> {
     try { return await this.ledger.review(); }
-    catch { return { readOnly: true, unavailable: true, message: '旧账本损坏、版本不支持或超出读取预算；原件已保留，未生成修订候选或覆盖数据。' }; }
+    catch { return { readOnly: true, unavailable: true, message: bt('usage.review.unavailable') }; }
   }
 
   setAutoRemotePricingSync(enabled: boolean) { this.autoRemotePricingSync = enabled; }
@@ -190,18 +192,13 @@ export class UsageStatsManager {
 
   private isUnpricedRateLock(value: { usd: number; price?: ApiPricing } | undefined): boolean {
     if (!value || !value.price) return true;
-    return (
-      value.usd === 0 &&
-      value.price.input === 0 &&
-      value.price.output === 0 &&
-      value.price.cached === 0 &&
-      (value.price.cacheWrite ?? 0) === 0
-    );
+    return value.usd === 0 && isUnpricedZeroSentinel(value.price);
   }
 
   async previewRevalueHistory(mode: 'force_all' | 'unpriced_only' = 'force_all') {
     await this.getUsageSummary(true);
-    return this.ledger.revalue({ action: 'preview', mode, prices: await this.getRawPricingTable(), accounts: [], now: Math.floor(Date.now() / 1000) });
+    const liveFiles = (await this.discoverDatabaseFiles()).map(path => basename(path));
+    return this.ledger.revalue({ action: 'preview', mode, prices: await this.getRawPricingTable(), accounts: [], liveFiles, now: Math.floor(Date.now() / 1000) });
   }
 
   private async mutateHistoricalPricing<T>(operation: () => Promise<T>): Promise<T> {
@@ -214,8 +211,8 @@ export class UsageStatsManager {
   }
 
   async revalueHistory(confirmed = false, options?: { mode?: 'force_all' | 'unpriced_only'; previewId?: string }): Promise<{ before: number; after: number; message: string }> {
-    if (!confirmed) throw Error('重新估算历史费用需要明确确认');
-    if (!options?.previewId) throw Error('请先查看历史重估预览，再确认该预览；历史金额未改变');
+    if (!confirmed) throw Error(bt('usage.err.revalue_confirm'));
+    if (!options?.previewId) throw Error(bt('usage.err.revalue_preview_required'));
     return this.mutateHistoricalPricing(async () => {
       const result = await this.ledger.revalue({ action: 'apply', confirmed, previewId: options.previewId,
         prices: await this.getRawPricingTable(), accounts: [], now: Math.floor(Date.now() / 1000) });
@@ -252,17 +249,17 @@ export class UsageStatsManager {
     }
     try {
       const data = JSON.parse(await readFile(this.rateLocksPath, 'utf8'));
-      if (data.version !== 1 || !data.entries || typeof data.entries !== 'object') throw Error('费率账本格式无效');
+      if (data.version !== 1 || !data.entries || typeof data.entries !== 'object') throw Error(bt('usage.err.rate_ledger_invalid_format'));
       const profiles: ApiPricing[] = Array.isArray(data.profiles) ? data.profiles : [];
       const cachedProfiles = profiles.map(p => (p ? this.cachedPriceRef(p) : undefined));
       let hasLegacyInlinePrice = false;
       for (const [key, value] of Object.entries<any>(data.entries)) {
-        if (!/^[a-f0-9]{64}$/.test(key) || !Number.isFinite(value?.usd) || value.usd < 0) throw Error('费率账本条目无效');
+        if (!/^[a-f0-9]{64}$/.test(key) || !Number.isFinite(value?.usd) || value.usd < 0) throw Error(bt('usage.err.rate_ledger_invalid_entry'));
         let price: ApiPricing | undefined = value.price ? this.cachedPriceRef(value.price) : undefined;
         if (!price && typeof value.p === 'number') {
           price = cachedProfiles[value.p];
         }
-        if (!price) throw Error('费率账本条目无效');
+        if (!price) throw Error(bt('usage.err.rate_ledger_invalid_entry'));
         if (value.price) hasLegacyInlinePrice = true;
         this.rateLocks[key] = { usd: value.usd, price };
       }
@@ -272,7 +269,7 @@ export class UsageStatsManager {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         this.rateLocksUnavailable = true;
-        this.pricingWarnings.push('历史费率账本不可读，停止重新计价；请保留原文件供恢复');
+        this.pricingWarnings.push(bt('usage.warn.rate_ledger_unreadable_stop'));
       }
     }
 
@@ -306,17 +303,21 @@ export class UsageStatsManager {
 
   private lockedCost(event: GenerationEvent, price: ApiPricing | null): number | null {
     if (this.rateLocksUnavailable || this.ledgerUnavailable || this.archivedUnavailable || event.timestamp_seconds <= 0) return null;
+    const cw = event.cache_write_tokens ?? 0;
     const existing = event.event_key ? this.rateLocks[event.event_key] ?? (event.legacy_event_key && this.usageLedgerEvents.get(event.legacy_event_key)?.timestamp_seconds === event.timestamp_seconds ? this.rateLocks[event.legacy_event_key] : undefined) : undefined;
-    if (existing) {
+    if (existing && !this.isUnpricedRateLock(existing)) {
+      const effectiveExisting = resolveContextTierPricing(existing.price, event.input_tokens + event.cached_tokens + cw);
+      if (cw > 0 && (!Number.isFinite(effectiveExisting.cacheWrite) || effectiveExisting.cacheWrite! < 0)) return null;
       if (!event.source_id) return existing.usd;
-      const usd = calculateEstimatedUsd(event.input_tokens, event.output_tokens, event.cached_tokens, existing.price, event.cache_write_tokens ?? 0);
+      const usd = calculateEstimatedUsd(event.input_tokens, event.output_tokens, event.cached_tokens, existing.price, cw);
       if (!this.rateLocks[event.event_key!] || this.rateLocks[event.event_key!]!.usd !== usd) {
         this.rateLocks[event.event_key!] = { usd, price: existing.price }; this.rateLocksDirty = true;
       }
       return usd;
     }
-    if (!price || ((event.cache_write_tokens ?? 0) > 0 && !Number.isFinite(price.cacheWrite))) return null;
-    const usd = calculateEstimatedUsd(event.input_tokens, event.output_tokens, event.cached_tokens, price, event.cache_write_tokens ?? 0);
+    const effectivePrice = price ? resolveContextTierPricing(price, event.input_tokens + event.cached_tokens + cw) : null;
+    if (!price || !effectivePrice || (cw > 0 && (!Number.isFinite(effectivePrice.cacheWrite) || effectivePrice.cacheWrite! < 0))) return null;
+    const usd = calculateEstimatedUsd(event.input_tokens, event.output_tokens, event.cached_tokens, price, cw);
     if (event.event_key) {
       this.rateLocks[event.event_key] = { usd, price: this.cachedPriceRef(price) };
       this.rateLocksDirty = true;
@@ -325,7 +326,7 @@ export class UsageStatsManager {
   }
 
   setDataDirectoryName(name?: DataDirectoryName): void {
-    if (name && !ALLOWED_DATA_DIRECTORY_NAMES.includes(name)) throw new Error('仅统计 Antigravity 正式版用量');
+    if (name && !ALLOWED_DATA_DIRECTORY_NAMES.includes(name)) throw new Error(bt('usage.err.official_only'));
     const nextNames = name ? [name] : ALLOWED_DATA_DIRECTORY_NAMES;
     if (this.dataDirectoryNames.join(',') === nextNames.join(',')) return;
     this.cancelRead();
@@ -421,9 +422,9 @@ export class UsageStatsManager {
     this.archivedEventsLoaded = true;
     try {
       const raw = JSON.parse(await readFile(this.archivedEventsPath, 'utf8'));
-      if (!raw || raw.version !== 1 || typeof raw.databases !== 'object' || raw.databases === null) throw Error('归档账本版本或结构无效');
+      if (!raw || raw.version !== 1 || typeof raw.databases !== 'object' || raw.databases === null) throw Error(bt('usage.err.archive_invalid_format'));
       for (const [key, entry] of Object.entries<any>(raw.databases)) {
-        if (!entry || !Array.isArray(entry.events)) throw Error('归档账本事件列表无效');
+        if (!entry || !Array.isArray(entry.events)) throw Error(bt('usage.err.archive_invalid_events'));
         const validEvents = entry.events.filter((e: any): e is GenerationEvent =>
           Boolean(
             e &&
@@ -435,7 +436,7 @@ export class UsageStatsManager {
             Number.isFinite(e.timestamp_seconds)
           )
         );
-        if (validEvents.length !== entry.events.length) throw Error('归档账本含无效事件');
+        if (validEvents.length !== entry.events.length) throw Error(bt('usage.err.archive_corrupt_event'));
         for (const e of validEvents) {
           e.model = resolveDatabaseModelFullName(e.model, null);
         }
@@ -449,7 +450,7 @@ export class UsageStatsManager {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         this.archivedUnavailable = true;
-        this.storageWarnings.add('归档用量账本读取异常，原件已保留，停止写回');
+        this.storageWarnings.add(bt('usage.warn.archive_unreadable'));
       }
     }
   }
@@ -558,17 +559,17 @@ export class UsageStatsManager {
       this.largeLedgerBaselinePresent = totalCount > 0;
       for (const event of this.largeLedger ? [] : await this.ledger.load()) {
         if (event.db_file === 'recovered_session.db' || event.db_file === 'recovered_enterprise_session.db') {
-          this.storageWarnings.add('旧账本含费用反推的合成事件，原记录已保留，未计入可核验用量；请核对恢复材料');
+          this.storageWarnings.add(bt('usage.warn.legacy_synthetic'));
           continue;
         }
-        if (event.account_confidence === 'legacy') this.storageWarnings.add('旧JSON的账号归属缺少确证，已保留原件，仅计入全部账号；可在账本预览中核对');
+        if (event.account_confidence === 'legacy') this.storageWarnings.add(bt('usage.warn.legacy_account_confidence'));
         event.model = resolveDatabaseModelFullName(event.model, null);
         this.usageLedgerEvents.set(event.event_key!, event);
       }
     } catch {
       this.ledgerUnavailable = true;
       this.ledgerCorrupt = true;
-      this.storageWarnings.add('持久化用量总账无法读取或版本不支持，原件已保留，停止写回；当前只展示可读取的源数据');
+      this.storageWarnings.add(bt('usage.warn.ledger_unreadable'));
     }
     await this.loadArchivedEvents();
     for (const [key, archive] of this.archivedByDb) {
@@ -613,7 +614,7 @@ export class UsageStatsManager {
       }
       this.usageLedgerDirty = this.pendingLedgerEvents.size > 0;
     } catch {
-      this.storageWarnings.add('用量总账未能保存，原始数据已保留；统计尚未持久化，请检查磁盘与权限');
+      this.storageWarnings.add(bt('usage.warn.ledger_save_failed'));
       this.ledgerUnavailable = true;
     }
   }
@@ -673,7 +674,7 @@ export class UsageStatsManager {
     await this.loadPersistentFileCache();
     await this.loadUsageLedger();
     await this.loadRateLocks();
-    if (this.archivedUnavailable || this.ledgerUnavailable || this.rateLocksUnavailable) throw Error('账本不可读，已中止清理以保护历史记录');
+    if (this.archivedUnavailable || this.ledgerUnavailable || this.rateLocksUnavailable) throw Error(bt('usage.err.clear_aborted_ledger_unreadable'));
     const rawPricing = await this.getRawPricingTable();
 
     let archivedCount = 0;
@@ -684,7 +685,7 @@ export class UsageStatsManager {
       if (!st || !st.isFile() || st.isSymbolicLink()) continue;
       const res = await this.scanDatabaseEvents(dbPath, true);
       if (res.hasError || res.usedCached || res.skippedLargeRecords > 0) {
-        throw new Error(`归档会话数据库用量失败（${basename(dbPath)}）：${res.error || '无法读取'}；已中止清理以保护历史账单`);
+        throw new Error(bt('usage.err.archive_db_failed', { name: basename(dbPath), error: res.error || bt('usage.err.cannot_read') }));
       }
       for (const ev of res.events) {
         const price = this.resolvePricing(rawPricing, ev.model, ev.timestamp_seconds);
@@ -708,7 +709,7 @@ export class UsageStatsManager {
       }
       await this.saveUsageLedger();
       if (this.largeLedger) await this.ledger.aggregate({ prices: rawPricing, accounts: this.knownAccounts, now: Math.floor(Date.now() / 1000) });
-      if (this.ledgerUnavailable) throw Error('归档总账未能持久化，已中止清理');
+      if (this.ledgerUnavailable) throw Error(bt('usage.err.archive_not_persisted'));
       await this.savePersistentFileCache();
       await atomicJson(this.archivedEventsPath, {
         version: 1,
@@ -716,7 +717,7 @@ export class UsageStatsManager {
         databases: Object.fromEntries(this.archivedByDb.entries()),
       });
       const persisted = JSON.parse(await readFile(this.archivedEventsPath, 'utf8'));
-      if (JSON.stringify(persisted.databases) !== JSON.stringify(Object.fromEntries(this.archivedByDb))) throw Error('归档回读校验失败，已中止清理');
+      if (JSON.stringify(persisted.databases) !== JSON.stringify(Object.fromEntries(this.archivedByDb))) throw Error(bt('usage.err.archive_verify_failed'));
       this.invalidateCache();
     }
     return { archivedCount, eventCount };
@@ -751,8 +752,8 @@ export class UsageStatsManager {
     return this.resolvePricingTableFromRaw(raw, timestampSeconds);
   }
 
-  private canonicalActivePricingKeys(modelIds?: Iterable<string> | null): Set<string> {
-    return canonicalActivePricingKeys(modelIds !== undefined && modelIds !== null ? modelIds : this.activeOfficialModels);
+  private canonicalActivePricingKeys(modelIds?: Iterable<string> | null, extraKeys?: Iterable<string>): Set<string> {
+    return canonicalActivePricingKeys(modelIds !== undefined && modelIds !== null ? modelIds : this.activeOfficialModels, extraKeys);
   }
 
   /**
@@ -764,7 +765,7 @@ export class UsageStatsManager {
     activeModelIds?: Iterable<string> | null
   ): Promise<Record<string, ApiPricing>> {
     const raw = await this.getRawPricingTable();
-    return this.resolvePricingTableFromRaw(raw, timestampSeconds, this.canonicalActivePricingKeys(activeModelIds));
+    return this.resolvePricingTableFromRaw(raw, timestampSeconds, this.canonicalActivePricingKeys(activeModelIds, Object.keys(raw)));
   }
 
   private pricingSyncStateSnapshot(): PricingSyncMutableState {
@@ -816,7 +817,7 @@ export class UsageStatsManager {
     });
     const now = Date.now();
     if (!force && now < this.nextAutoSyncAt) {
-      return { synced: false, error: '检查频率限制（24小时）' };
+      return { synced: false, error: bt('usage.err.sync_rate_limited') };
     }
     const snapshot = this.pricingSyncStateSnapshot();
     const result = await executeRemotePricingSync({
@@ -865,35 +866,69 @@ export class UsageStatsManager {
     await saveCustomPricingCache(this.pricingCachePath, table);
     this.cachedSummariesByAccount.clear();
     this.lastAggregationKeysByAccount.clear();
+    this.snapshots.clear();
   }
 
   /**
    * 自动智能补齐未计价历史记录（零按钮、用户无感）：
-   * 仅针对历史账本中由于此前模型未定价而记录为 $0.00 的条目，
+   * 仅针对历史账本中由于此前模型未定价而记录为 $0.00 或尚未落锁的条目，
    * 在获取到官方最新定价后，按真实发生物理时间戳匹配当时费率，
    * 自动补齐并锁定；已锁定且有正常费率的记录绝对不动。
    */
   async autoHealUnpricedHistory(): Promise<number> {
+    await this.loadUsageLedger();
+    if (this.largeLedger) {
+      if (this.ledgerUnavailable || this.archivedUnavailable || this.rateLocksUnavailable) return 0;
+      if (this.usageLedgerDirty) await this.saveUsageLedger();
+      const rawPricing = await this.getRawPricingTable();
+      const dbPaths = await this.discoverDatabaseFiles();
+      const aggregated = await this.ledger.aggregate({
+        prices: rawPricing,
+        accountId: 'all',
+        accounts: this.knownAccounts,
+        liveFiles: dbPaths.map(path => basename(path)),
+        now: Math.floor(Date.now() / 1000),
+      });
+      const healed = (aggregated as typeof aggregated & { healed_unpriced_count?: number }).healed_unpriced_count ?? 0;
+      this.cachedSummariesByAccount.clear();
+      this.lastAggregationKeysByAccount.clear();
+      this.snapshots.clear();
+      if (healed > 0) {
+        await this.getUsageSummary(true);
+      }
+      return healed;
+    }
+
     await this.loadRateLocks();
     if (this.rateLocksUnavailable) return 0;
     const unpricedKeys: string[] = [];
+    const beforeValidLockedKeys = new Set<string>();
     for (const [key, value] of Object.entries(this.rateLocks)) {
       if (this.isUnpricedRateLock(value)) {
         unpricedKeys.push(key);
+      } else {
+        beforeValidLockedKeys.add(key);
       }
     }
-    if (unpricedKeys.length === 0) return 0;
-
+    const unpricedSet = new Set(unpricedKeys);
     for (const key of unpricedKeys) {
       delete this.rateLocks[key];
     }
-    this.rateLocksDirty = true;
+    if (unpricedKeys.length > 0) {
+      this.rateLocksDirty = true;
+    }
     this.cachedSummariesByAccount.clear();
     this.lastAggregationKeysByAccount.clear();
     this.snapshots.clear();
 
     await this.getUsageSummary(true);
-    return unpricedKeys.length;
+    let newlyLockedFromUnlocked = 0;
+    for (const [key, value] of Object.entries(this.rateLocks)) {
+      if (!beforeValidLockedKeys.has(key) && !unpricedSet.has(key) && !this.isUnpricedRateLock(value)) {
+        newlyLockedFromUnlocked++;
+      }
+    }
+    return unpricedSet.size + newlyLockedFromUnlocked;
   }
 
   private discoveredStats = new Map<string, DiscoveredDbStat>();
@@ -941,19 +976,26 @@ export class UsageStatsManager {
     const accKey = accountId || 'all';
     if (!snapshotId || force) await this.getUsageSummary(force, accountId);
     const snapshot=(!force && snapshotId)?this.snapshots.get(snapshotId):this.snapshots.get(this.cachedSummariesByAccount.get(accKey)?.data.snapshot_id??'');
-    if (!snapshot || snapshot.expires<Date.now()) throw Error('统计快照已过期，请重新读取');
+    if (!snapshot || snapshot.expires<Date.now()) throw Error(bt('usage.err.snapshot_expired'));
     if (pin) snapshot.pins++;
     if (snapshot.pins > 0) snapshot.expires = Date.now()+600000;
     if (snapshot.ledger) {
-      if (accountId && accountId !== snapshot.ledger.accountId) throw Error('统计快照账号范围不匹配，请重新读取');
-      const targetEmail = this.knownAccounts.find(account => account.id === snapshot.ledger!.accountId)?.email;
-      const page = await this.ledger.events({ snapshot: snapshot.ledger, period, query: query.slice(0, 200), offset: Math.max(0, Math.floor(offset) || 0), limit: Math.min(500, Math.max(1, Math.floor(limit) || 200)), targetEmail });
+      const snapshotAccountId = snapshot.ledger.accountId ?? 'all';
+      if (accountId && snapshotAccountId !== 'all' && accountId !== snapshotAccountId) {
+        throw Error(bt('usage.err.snapshot_account_mismatch'));
+      }
+      const effectiveAccountId = accountId || snapshotAccountId;
+      const targetEmail = this.knownAccounts.find(account => account.id === effectiveAccountId)?.email;
+      const effectiveSnapshot = effectiveAccountId === snapshotAccountId
+        ? snapshot.ledger
+        : { ...snapshot.ledger, accountId: effectiveAccountId };
+      const page = await this.ledger.events({ snapshot: effectiveSnapshot, period, query: query.slice(0, 200), offset: Math.max(0, Math.floor(offset) || 0), limit: Math.min(500, Math.max(1, Math.floor(limit) || 200)), targetEmail });
       return { ...page, generated_at: snapshot.summary.generated_at, snapshot_id: snapshot.summary.snapshot_id, availability: snapshot.summary.availability, scope: snapshot.summary.scan_scope_description };
     }
     const {summary,prices,rawPricing}=snapshot as any;
     const snapshotAccountId: string = summary.selected_account_id ?? 'all';
     if (accountId && snapshotAccountId !== 'all' && accountId !== snapshotAccountId) {
-      throw Error('统计快照账号范围不匹配，请重新读取');
+      throw Error(bt('usage.err.snapshot_account_mismatch'));
     }
     const effectiveAccountId = accountId ?? snapshotAccountId;
     const start = new Date(summary.generated_at*1000); start.setHours(0, 0, 0, 0);
@@ -1003,7 +1045,7 @@ export class UsageStatsManager {
   /**
    * 收集并聚合全量 Token 统计与 API 账单报告（带 30 秒内存 TTL 缓存）
    */
-  cancelRead() { this.scanAbort?.abort(new Error('读取已取消')); return !!this.scanAbort; }
+  cancelRead() { this.scanAbort?.abort(new Error(bt('usage.err.read_cancelled'))); return !!this.scanAbort; }
   async getUsageSummary(forceRefresh = false, accountId?: string): Promise<TokenUsageSummary> {
     if (this.pricingMutation) await this.pricingMutation;
     const accKey = accountId || 'all';
@@ -1015,7 +1057,7 @@ export class UsageStatsManager {
       if(!this.pendingForced)this.pendingForced=this.inFlight.catch(()=>{}).then(()=>this.getUsageSummary(true, accountId)).finally(()=>{this.pendingForced=undefined;});
       return this.pendingForced;
     }
-    const abort=this.scanAbort=new AbortController(), timer=setTimeout(()=>abort.abort(new Error('读取超出 30 秒整体预算')),30000);timer.unref();
+    const abort=this.scanAbort=new AbortController(), timer=setTimeout(()=>abort.abort(new Error(bt('usage.err.read_timeout_budget'))),30000);timer.unref();
     this.inFlightForced=forceRefresh;
     this.inFlightAccountKey=accKey;
     const work=this.collectUsage(forceRefresh,abort.signal,accountId);this.inFlight=work;
@@ -1032,7 +1074,11 @@ export class UsageStatsManager {
     await this.loadPersistentFileCache();
     if (forceRefresh && this.ledgerUnavailable && !this.ledgerCorrupt) {
       this.ledgerUnavailable = false;
-      this.storageWarnings.delete('用量总账未能保存，原始数据已保留；统计尚未持久化，请检查磁盘与权限');
+      for (const warning of this.storageWarnings) {
+        if (/用量总账未能保存|Failed to save usage ledger/i.test(warning)) {
+          this.storageWarnings.delete(warning);
+        }
+      }
     }
     const dbPaths = await this.discoverDatabaseFiles();
     const allEvents: GenerationEvent[] = [];
@@ -1040,7 +1086,7 @@ export class UsageStatsManager {
     let skippedLargeRecords = 0;
     let failedDatabasesCount = this.discoveryErrors.length, cachedDatabasesCount = 0;
     const diagnostics: NonNullable<TokenUsageSummary['database_diagnostics']> = [...this.discoveryErrors];
-    const category = (message = '') => /取消|预算|timeout|aborted/i.test(message) ? '读取已取消或超过预算' : /时间/.test(message) ? '时间信息不完整' : /unable to open|permission|denied|not permitted/i.test(message) ? '无法打开数据库或关联文件' : /no such table|no such column/i.test(message) ? '数据库结构暂不支持' : /locked|busy/i.test(message) ? '数据库繁忙' : /maxBuffer|stdout.*length|超出/i.test(message) ? '超过单批读取预算' : /malformed|not a database/i.test(message) ? '格式无法读取' : '读取未完成';
+    const category = (message = '') => /取消|超过预算|整体预算|总账操作超时|bounded read budget|30-second total budget|cancel|timeout|aborted/i.test(message) ? bt('usage.diag.cancelled_or_budget') : /时间|timestamp/i.test(message) ? bt('usage.diag.incomplete_time') : /unable to open|permission|denied|not permitted/i.test(message) ? bt('usage.diag.cannot_open') : /no such table|no such column/i.test(message) ? bt('usage.diag.unsupported_schema') : /locked|busy/i.test(message) ? bt('usage.diag.db_busy') : /maxBuffer|stdout.*length|单批|batch budget|超出/i.test(message) ? bt('usage.diag.batch_budget') : /malformed|not a database/i.test(message) ? bt('usage.diag.corrupt_format') : bt('usage.diag.incomplete');
 
     let nextDatabase=0;
     let allCacheHits = dbPaths.length > 0;
@@ -1066,14 +1112,17 @@ export class UsageStatsManager {
       } else {
         for (const ev of res.events) allEvents.push(ev);
         if (allEvents.length > 50_000 && !this.ledgerUnavailable) {
-          this.largeLedger = true;
-          const batch = allEvents.splice(0, allEvents.length);
-          for (const event of batch) this.upsertLedger(event);
-          await this.saveUsageLedger();
-          if (this.ledgerUnavailable) {
-            for (const ev of batch) allEvents.push(ev);
-          } else {
-            this.usageLedgerEvents.clear();
+          await this.loadUsageLedger();
+          if (!this.ledgerUnavailable) {
+            this.largeLedger = true;
+            const batch = allEvents.splice(0, allEvents.length);
+            for (const event of batch) this.upsertLedger(event);
+            await this.saveUsageLedger();
+            if (this.ledgerUnavailable) {
+              for (const ev of batch) allEvents.push(ev);
+            } else {
+              this.usageLedgerEvents.clear();
+            }
           }
         }
       }
@@ -1084,7 +1133,7 @@ export class UsageStatsManager {
       const cached = this.fileCache.get(p);
       diagnostics.push({ id: createHash('sha256').update(p).digest('hex').slice(0,10),
         state: res.hasError ? (res.events.length ? 'cached_or_partial' : 'failed') : 'read',
-        category: res.hasError ? category(res.error) : '已读取', lastSuccessAt: cached?.lastSuccessAt });
+        category: res.hasError ? category(res.error) : bt('usage.diag.read'), lastSuccessAt: cached?.lastSuccessAt });
     }
     }));
 
@@ -1092,7 +1141,7 @@ export class UsageStatsManager {
       allCacheHits = false;
       const cached=this.fileCache.get(path);failedDatabasesCount++;
       if(cached){for (const ev of cached.events) allEvents.push(ev);cachedDatabasesCount++;generationsScanned+=cached.generationsScanned;skippedLargeRecords+=cached.skippedLargeRecords;}
-      diagnostics.push({id:createHash('sha256').update(path).digest('hex').slice(0,10),state:cached?'cached_or_partial':'failed',category:'读取已取消或超过预算',lastSuccessAt:cached?.lastSuccessAt});
+      diagnostics.push({id:createHash('sha256').update(path).digest('hex').slice(0,10),state:cached?'cached_or_partial':'failed',category:bt('usage.diag.cancelled_or_budget'),lastSuccessAt:cached?.lastSuccessAt});
     }
 
     await this.loadArchivedEvents();
@@ -1127,34 +1176,47 @@ export class UsageStatsManager {
     }
 
     await this.loadUsageLedger();
+    if (this.autoRemotePricingSync) {
+      void this.syncRemotePricing().catch(() => {});
+    }
     if (this.largeLedger && !this.ledgerUnavailable) {
       for (const event of allEvents) this.upsertLedger(event);
       await this.saveUsageLedger();
       const rawPricing = await this.getRawPricingTable();
-      if (this.rateLocksUnavailable && !this.pricingWarnings.some(w => w.includes('费率账本'))) this.pricingWarnings.push('历史费率账本不可读，未重新计价');
+      if (this.rateLocksUnavailable && !this.pricingWarnings.some(w => /费率账本|rate ledger/i.test(w))) this.pricingWarnings.push(bt('usage.warn.rate_ledger_unreadable_no_reprice'));
       const revision = await this.ledger.version();
       const aggregateKey = JSON.stringify([revision, this.calendarKey(), rawPricing, accountId ?? 'all', this.knownAccounts]);
       const prior = this.cachedSummariesByAccount.get(accKey)?.data;
       const existingSnapshot = prior?.snapshot_id ? this.snapshots.get(prior.snapshot_id) : undefined;
+      const totalScanned = dbPaths.length + archivedDbCount;
+      const totalDiscovered = (this.lastDiscoveredDatabaseCount || dbPaths.length) + archivedDbCount;
       if (prior && existingSnapshot?.ledger && this.lastAggregationKeysByAccount.get(accKey) === aggregateKey && await this.ledger.renew(existingSnapshot.ledger)) {
+        const reusedWarnings = [...this.pricingWarnings, ...this.storageWarnings];
         const availability = failedDatabasesCount > 0 || skippedLargeRecords > 0 || this.storageWarnings.size > 0 || prior.unknown_time_records || prior.historical_amount_receipts?.unmatchedCount ? 'partial' : 'complete';
         const hasReadError = this.ledgerCorrupt || this.archivedUnavailable || failedDatabasesCount > 0 || skippedLargeRecords > 0 || (prior.unknown_time_records ?? 0) > 0;
         const reused: TokenUsageSummary = { ...prior, availability, has_error: hasReadError, hasError: hasReadError,
-          failed_databases_count: failedDatabasesCount, database_diagnostics: diagnostics, last_attempt_at: Math.floor(Date.now() / 1000), pricing_warnings: [...this.pricingWarnings, ...this.storageWarnings] };
+          databases_scanned: totalScanned, databases_discovered: totalDiscovered,
+          failed_databases_count: failedDatabasesCount, database_diagnostics: diagnostics, last_attempt_at: Math.floor(Date.now() / 1000),
+          pricing_warnings: reusedWarnings, pricing_warning_codes: buildPricingWarningCodes(reusedWarnings) };
         existingSnapshot.expires = Date.now() + 600000;
         existingSnapshot.summary = reused;
         this.cachedSummariesByAccount.set(accKey, { data: reused, expiresAt: Date.now() + (failedDatabasesCount > 0 ? 2000 : 30000) });
         return reused;
       }
       const aggregated = await this.ledger.aggregate({ prices: rawPricing, accountId, accounts: this.knownAccounts, liveFiles: dbPaths.map(path => basename(path)), now: Math.floor(Date.now() / 1000) });
-      if (aggregated.ledger_review_records) this.storageWarnings.add('旧JSON含缺少来源或归属证据的记录，原件已保留；请查看只读账本预览');
-      const availability = failedDatabasesCount > 0 || skippedLargeRecords > 0 || this.storageWarnings.size > 0 || aggregated.unknown_time_records || aggregated.historical_amount_receipts?.unmatchedCount ? 'partial' : 'complete';
+      const largeStorageWarnings = new Set(this.storageWarnings);
+      if (aggregated.ledger_review_records) largeStorageWarnings.add(bt('usage.warn.ledger_review_needed'));
+      const largeWarnings = [...this.pricingWarnings, ...largeStorageWarnings];
+      const availability = failedDatabasesCount > 0 || skippedLargeRecords > 0 || largeStorageWarnings.size > 0 || aggregated.unknown_time_records || aggregated.historical_amount_receipts?.unmatchedCount ? 'partial' : 'complete';
       const hasReadError = this.ledgerCorrupt || this.archivedUnavailable || failedDatabasesCount > 0 || skippedLargeRecords > 0 || (aggregated.unknown_time_records ?? 0) > 0;
-      const result: TokenUsageSummary = { ...aggregated, availability, has_error: hasReadError, hasError: hasReadError,
+      const aggPublic: typeof aggregated & { healed_unpriced_count?: number } = { ...aggregated };
+      delete aggPublic.healed_unpriced_count;
+      const result: TokenUsageSummary = { ...aggPublic, availability, has_error: hasReadError, hasError: hasReadError,
         priced_models: aggregated.all_time.priced_models, unpriced_models: aggregated.all_time.unpriced_models,
-        databases_scanned: dbPaths.length, databases_discovered: this.lastDiscoveredDatabaseCount || dbPaths.length,
+        databases_scanned: totalScanned, databases_discovered: totalDiscovered,
         generations_scanned: generationsScanned, skipped_large_records: skippedLargeRecords, failed_databases_count: failedDatabasesCount,
-        database_diagnostics: diagnostics, scan_scope_description: '本机索引用量总账（含已离线记录）', pricing_warnings: [...this.pricingWarnings, ...this.storageWarnings] };
+        database_diagnostics: diagnostics, scan_scope_description: bt('usage.scope.indexed_ledger'),
+        pricing_warnings: largeWarnings, pricing_warning_codes: buildPricingWarningCodes(largeWarnings) };
       const id = result.snapshot_id!;
       const previous = this.snapshots.get(id);
       if (previous) result.generated_at = previous.summary.generated_at;
@@ -1170,8 +1232,6 @@ export class UsageStatsManager {
     }
 
     const liveEventsCount = allEvents.length;
-
-    await this.loadUsageLedger();
 
     for (const event of allEvents) this.upsertLedger(event);
 
@@ -1190,7 +1250,7 @@ export class UsageStatsManager {
     for (const [evKey, ledgerEv] of this.usageLedgerEvents.entries()) {
       if (currentLegacyKeys.has(evKey)) continue;
       if (!ledgerEv.source_id && ledgerEv.db_file && liveSourceFiles.has(ledgerEv.db_file)) {
-        this.storageWarnings.add('旧账本缺少稳定请求身份，相关历史记录待核对；原JSON保留，未与当前源数据重复累计');
+        this.storageWarnings.add(bt('usage.warn.ledger_missing_source_id'));
         continue;
       }
       if (!seenEventKeys.has(evKey)) {
@@ -1202,15 +1262,19 @@ export class UsageStatsManager {
     archivedDbCount += mergedLedgerDbs.size;
 
     const existingAccCache = this.cachedSummariesByAccount.get(accKey);
-    if ((allEvents.length === 0 || (dbPaths.length > 0 && cachedDatabasesCount === dbPaths.length)) && failedDatabasesCount > 0 && existingAccCache?.data) {
+    const calNowKey = this.calendarKey();
+    if ((allEvents.length === 0 || (dbPaths.length > 0 && cachedDatabasesCount === dbPaths.length)) && failedDatabasesCount > 0 && existingAccCache?.data && this.periodKey === calNowKey) {
       if (existingAccCache.data.snapshot_id && this.snapshots.has(existingAccCache.data.snapshot_id)) {
         this.snapshots.get(existingAccCache.data.snapshot_id)!.expires = Date.now() + 600000;
       }
+      const fallbackWarnings = existingAccCache.data.pricing_warnings ?? [...this.pricingWarnings, ...this.storageWarnings];
       return {
         ...existingAccCache.data,
         failed_databases_count: failedDatabasesCount,
         has_error: true,
         hasError: true, availability: 'cached', database_diagnostics: diagnostics, last_attempt_at: Math.floor(Date.now()/1000),
+        pricing_warnings: fallbackWarnings,
+        pricing_warning_codes: existingAccCache.data.pricing_warning_codes ?? buildPricingWarningCodes(fallbackWarnings),
       };
     }
 
@@ -1220,23 +1284,22 @@ export class UsageStatsManager {
     }
     const rawPricing = await this.getRawPricingTable();
     await this.loadRateLocks();
-    if (this.rateLocksUnavailable && !this.pricingWarnings.some(w => w.includes('费率账本'))) this.pricingWarnings.push('历史费率账本不可读，未重新计价');
+    if (this.rateLocksUnavailable && !this.pricingWarnings.some(w => /费率账本|rate ledger/i.test(w))) this.pricingWarnings.push(bt('usage.warn.rate_ledger_unreadable_no_reprice'));
     const now = Math.floor(Date.now() / 1000);
     const pricing = this.resolvePricingTableFromRaw(rawPricing, now);
-    if (this.autoRemotePricingSync) {
-      void this.syncRemotePricing().catch(() => {});
-    }
     const calKey = this.calendarKey();
     const aggKey = allCacheHits && failedDatabasesCount === 0
       ? `${accKey}|${calKey}|${this.lastDiscoveredDatabaseCount}|${dbPaths.map(p => { const c = this.fileCache.get(p); return c ? `${p}:${c.mtimeMs}:${c.size}:${c.walMtimeMs}:${c.walSize}:${c.hasError ? 1 : 0}` : p; }).join(';')}|arch:${archivedStampParts.join(';')}|${JSON.stringify(rawPricing)}|${this.pricingWarnings.join(',')}`
       : '';
     const cachedByAccEntry = this.cachedSummariesByAccount.get(accKey);
     if (aggKey && aggKey === this.lastAggregationKeysByAccount.get(accKey) && cachedByAccEntry?.data && this.periodKey === calKey) {
+      const reusedWarnings = [...this.pricingWarnings, ...this.storageWarnings];
       const reused: TokenUsageSummary = {
         ...cachedByAccEntry.data,
         database_diagnostics: diagnostics,
         last_attempt_at: now,
-        pricing_warnings: [...this.pricingWarnings, ...this.storageWarnings],
+        pricing_warnings: reusedWarnings,
+        pricing_warning_codes: buildPricingWarningCodes(reusedWarnings),
       };
       this.cachedSummariesByAccount.set(accKey, { data: reused, expiresAt: Date.now() + 30_000 });
       if (reused.snapshot_id && this.snapshots.has(reused.snapshot_id)) {
@@ -1249,7 +1312,7 @@ export class UsageStatsManager {
     // 汇总可用的账号列表 (available_accounts)
     // 规则：首项恒为“全部账号”，后续依次排列所有真实登录/保存过的具体账号（以邮箱呈现），杜绝“个人账号”或“企业 Vertex AI”等虚构分类
     const accountMap = new Map<string, AvailableAccountUsageOption>();
-    accountMap.set('all', { id: 'all', label: '全部账号', type: 'all', total_tokens: 0, request_count: 0 });
+    accountMap.set('all', { id: 'all', label: bt('usage.all_accounts'), type: 'all', total_tokens: 0, request_count: 0 });
 
     // 1. 先用 knownAccounts 预填充真实账号（保持用户在账号面板中看到的一致顺序）
     for (const acc of this.knownAccounts) {

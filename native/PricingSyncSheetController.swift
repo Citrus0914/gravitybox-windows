@@ -5,25 +5,29 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
     let sheet = SheetWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 492), styleMask: [.titled], backing: .buffered, defer: false)
     private let statusIconBox = NSBox()
     private let statusIconView = NSImageView()
-    private let titleLabel = text("价格基准", size: 16, weight: .semibold, color: .labelColor)
+    private let titleLabel = text(L10n.t("pricing_sheet.title"), size: 16, weight: .semibold, color: .labelColor)
     let subtitleLabel = text("", size: 11, color: Design.secondary, wrap: true)
     let summaryPill = pillBadge("", color: Design.blue)
-    let historicalNoteLabel = text("仅展示在用模型；已下架模型按历史费率核算", size: 11, color: Design.secondary, wrap: true)
+    let historicalNoteLabel = text(L10n.t("pricing_sheet.note"), size: 11, color: Design.secondary, wrap: true)
     private let listStack = NSStackView()
     private let listScroll = NSScrollView()
-    let recheckBtn = InlineRefreshButton("重新检查", width: 88, target: nil, action: #selector(recheck))
-    let closeBtn = button("完成", target: nil, action: #selector(closeSheet))
+    let recheckBtn = InlineRefreshButton(L10n.t("pricing_sheet.recheck"), width: 96, target: nil, action: #selector(recheck))
+    let closeBtn = button(L10n.t("pricing_sheet.done"), target: nil, action: #selector(closeSheet))
     private var checking = false
+    var onDismiss: (() -> Void)?
     var renderedSummaryLines: [String] = []
 
     private static let checkTimeFormatter: DateFormatter = {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
         f.dateFormat = "MM-dd HH:mm"
         return f
     }()
 
     private static let priceFormatter: NumberFormatter = {
         let f = NumberFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.numberStyle = .decimal
         f.minimumFractionDigits = 2
         f.maximumFractionDigits = 4
@@ -34,7 +38,7 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
     init(app: Assistant) {
         self.app = app
         super.init()
-        sheet.title = "价格基准"
+        sheet.title = L10n.t("pricing_sheet.title")
         sheet.isReleasedWhenClosed = false
         sheet.backgroundColor = .clear
         sheet.isOpaque = false
@@ -116,7 +120,7 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
     }
 
     private static func fmtRate(_ val: Double) -> String {
-        let s = priceFormatter.string(from: NSNumber(value: val)) ?? String(format: "%.2f", val)
+        let s = priceFormatter.string(from: NSNumber(value: val)) ?? String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), val)
         return "$\(s)"
     }
 
@@ -145,9 +149,9 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
         if synced {
             statusIconView.image = NSImage(systemSymbolName: "checkmark.seal.fill", accessibilityDescription: nil)
             statusIconView.contentTintColor = .systemGreen
-            titleLabel.stringValue = healedCount > 0 ? "价格基准已同步并补齐历史记录" : "价格基准已同步"
+            titleLabel.stringValue = healedCount > 0 ? L10n.t("pricing_sheet.synced_healed") : L10n.t("pricing_sheet.synced")
             if healedCount > 0 {
-                subtitleLabel.stringValue = "已自动补齐 \(healedCount) 条历史未计价记录"
+                subtitleLabel.stringValue = L10n.t("pricing_sheet.healed_sub", ["count": healedCount])
                 subtitleLabel.isHidden = false
             } else {
                 subtitleLabel.stringValue = ""
@@ -157,22 +161,22 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
         } else {
             statusIconView.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
             statusIconView.contentTintColor = accessibleWarningColor()
-            titleLabel.stringValue = "同步未完成，展示当前生效基准"
-            subtitleLabel.stringValue = (err?.isEmpty == false) ? "检查提示：\(err!)" : "无法连接远端价格源"
+            titleLabel.stringValue = L10n.t("pricing_sheet.sync_incomplete")
+            subtitleLabel.stringValue = (err?.isEmpty == false) ? L10n.t("pricing_sheet.check_hint", ["error": err!]) : L10n.t("pricing_sheet.remote_unreachable")
             subtitleLabel.isHidden = false
             summaryPill.tint = accessibleWarningColor()
         }
 
         if lastCheckMs > 0 {
             let formatted = Self.checkTimeFormatter.string(from: Date(timeIntervalSince1970: lastCheckMs / 1000.0))
-            let stateText = synced ? "已同步 \(formatted)" : "已检查 \(formatted)"
-            summaryPill.title = "\(stateText) · \(totalModels) 款"
+            let stateText = synced ? L10n.t("pricing_sheet.pill.synced_at", ["time": formatted]) : L10n.t("pricing_sheet.pill.checked_at", ["time": formatted])
+            summaryPill.title = L10n.t("pricing_sheet.pill.count", ["state": stateText, "count": totalModels])
             summaryPill.isHidden = false
         } else if !feedVersion.isEmpty && feedVersion != "unknown" {
-            summaryPill.title = "v\(feedVersion) · \(totalModels) 款"
+            summaryPill.title = L10n.t("pricing_sheet.pill.version_count", ["version": feedVersion, "count": totalModels])
             summaryPill.isHidden = false
         } else {
-            summaryPill.title = "\(totalModels) 款生效"
+            summaryPill.title = L10n.t("pricing_sheet.pill.active_count", ["count": totalModels])
             summaryPill.isHidden = totalModels == 0
         }
 
@@ -191,10 +195,10 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
             let cacheWriteRate = entry["cacheWrite"] != nil ? doubleVal(entry, "cacheWrite") : nil
             let rawState = pricingStatus[key] ?? "historical"
             let (stateTitle, stateTint): (String, NSColor) = switch rawState {
-            case "confirmed": ("已核对", Design.blue)
-            case "user": ("自定义", .systemPurple)
-            case "expired": ("已过期", accessibleWarningColor())
-            default: ("历史基准", Design.inactivePill)
+            case "confirmed": (L10n.t("pricing_sheet.state.confirmed"), Design.blue)
+            case "user": (L10n.t("pricing_sheet.state.user"), .systemPurple)
+            case "expired": (L10n.t("pricing_sheet.state.expired"), accessibleWarningColor())
+            default: (L10n.t("pricing_sheet.state.historical"), Design.inactivePill)
             }
 
             let prov = entry["provenance"] as? [String: Any] ?? [:]
@@ -203,10 +207,10 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
             let sourceUrl = (prov["sourceUrl"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
             var dateParts: [String] = []
-            if !checkedAt.isEmpty { dateParts.append("官方定价 \(checkedAt)") }
+            if !checkedAt.isEmpty { dateParts.append(L10n.t("pricing_sheet.date.checked_at", ["date": checkedAt])) }
             if !validUntil.isEmpty {
                 let shortDate = validUntil.count >= 10 ? String(validUntil.prefix(10)) : validUntil
-                dateParts.append("优惠至 \(shortDate)")
+                dateParts.append(L10n.t("pricing_sheet.date.valid_until", ["date": shortDate]))
             }
             let dateText = dateParts.joined(separator: " · ")
 
@@ -220,20 +224,20 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
             topRow.alignment = .centerY
 
             var rateParts = [
-                "输入 \(Self.fmtRate(inputRate))",
-                "缓存读 \(Self.fmtRate(cachedRate))",
+                L10n.t("pricing_sheet.rate.input", ["rate": Self.fmtRate(inputRate)]),
+                L10n.t("pricing_sheet.rate.cache_read", ["rate": Self.fmtRate(cachedRate)]),
             ]
             if let cacheWriteRate, cacheWriteRate > 0 {
-                rateParts.append("缓存写 \(Self.fmtRate(cacheWriteRate))")
+                rateParts.append(L10n.t("pricing_sheet.rate.cache_write", ["rate": Self.fmtRate(cacheWriteRate)]))
             }
-            rateParts.append("输出 \(Self.fmtRate(outputRate))")
+            rateParts.append(L10n.t("pricing_sheet.rate.output", ["rate": Self.fmtRate(outputRate)]))
             let rateLabel = text(rateParts.joined(separator: " · "), size: 11.5, weight: .medium, color: .labelColor)
             rateLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
             rateLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
             let bottomRow: NSView
             if let url = URL(string: sourceUrl), ["http", "https"].contains(url.scheme ?? "") {
-                let linkBtn = NSButton(title: "官方来源 ↗", target: self, action: #selector(openSourceURL(_:)))
+                let linkBtn = NSButton(title: L10n.t("pricing_sheet.source_link"), target: self, action: #selector(openSourceURL(_:)))
                 linkBtn.isBordered = false
                 linkBtn.font = .systemFont(ofSize: 10.5, weight: .medium)
                 linkBtn.contentTintColor = Design.blue
@@ -275,7 +279,7 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
         }
 
         if sortedKeys.isEmpty {
-            let emptyLabel = text("暂无可用的模型价格基准记录", size: 12, color: Design.secondary)
+            let emptyLabel = text(L10n.t("pricing_sheet.empty"), size: 12, color: Design.secondary)
             listStack.addArrangedSubview(emptyLabel)
         }
         renderedSummaryLines = summaryLines
@@ -300,19 +304,23 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
             if case .success(let payload) = result {
                 self.apply(payload: payload)
                 if payload["synced"] as? Bool == true {
+                    self.app.invalidateUsageReportCache()
                     self.app.overview?.fetch()
                     self.app.usagePage?.fetch(force: true)
                 }
             } else if case .failure(let err) = result {
-                self.app.showMessage("检查失败：\(err.localizedDescription)", error: true)
+                self.app.showMessage(L10n.t("pricing_sheet.check_failed", ["error": err.localizedDescription]), error: true)
             }
         }
     }
 
-    func show(in parent: NSWindow, payload: [String: Any]) {
+    func show(in parent: NSWindow, payload: [String: Any], onDismiss: (() -> Void)? = nil) {
+        self.onDismiss = onDismiss
         apply(payload: payload)
         if sheet.sheetParent == nil {
-            parent.beginSheet(sheet)
+            app.presentRetainedSheet(controller: self, sheet: sheet, in: parent) { [weak self] _ in
+                self?.onDismiss?()
+            }
         }
         sheet.makeFirstResponder(nil)
     }

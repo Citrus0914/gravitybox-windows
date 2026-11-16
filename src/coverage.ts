@@ -5,6 +5,7 @@ import { extractUiStrings, extractedKind, fetchBuffer, isEnglishSource, normaliz
 import { decodeScopedKey } from './candidates.js';
 import type { Dictionary } from './dictionary.js';
 import type { DeepReport } from './deep-scan.js';
+import { bt } from './i18n.js';
 
 export type CoverageSource = { id: string; scope: 'renderer' | 'native'; source: string };
 export type CoverageEntry = { key: string; translation?: string; status: string; sources: string[]; confidence: 'ui' | 'literal'; kind?: string; observed?: 'verified' | 'untranslated'; observations?: number; scoped?: boolean };
@@ -238,13 +239,13 @@ export async function rendererSources(origin: string, main: string, signal: Abor
     signal.throwIfAborted(); const raw = queue.shift()!; const url = new URL(raw, origin + '/');
     if (url.origin !== origin || url.search || url.hash || seen.has(url.pathname)) continue;
     seen.add(url.pathname);
-    if (seen.size > 64 || bytes > 50_000_000) { skipped.push({ id: url.pathname, reason: '资源数量或总大小达到扫描上限' }); continue; }
+    if (seen.size > 64 || bytes > 50_000_000) { skipped.push({ id: url.pathname, reason: bt('coverage.skip.scan_limit') }); continue; }
     try {
       const buffer = await fetchBuffer(url.href, 5000); signal.throwIfAborted();
       const source = buffer.toString('utf8'); bytes += buffer.length;
       resources.push({ id: url.pathname, scope: 'renderer', source });
       for (const ref of staticReferences(source)) queue.push(new URL(ref, url).pathname);
-    } catch (error) { signal.throwIfAborted(); skipped.push({ id: url.pathname, reason: '静态资源读取失败' }); }
+    } catch (error) { signal.throwIfAborted(); skipped.push({ id: url.pathname, reason: bt('coverage.skip.read_failed') }); }
     progress(resources.length, resources.length + queue.length);
   }
   return { resources, skipped };
@@ -275,7 +276,7 @@ function collectNativeAsarEntries(
 // Read only this application's first-party ASAR files; do not execute or unpack into its bundle.
 export function asarSources(buffer: Buffer): CoverageSource[] {
   const { jsonSize, dataOffset } = parseAsarHeaderPrefix(buffer, 8_000_000);
-  if (jsonSize + 16 > buffer.length || dataOffset > buffer.length) throw new Error('应用资源索引无效');
+  if (jsonSize + 16 > buffer.length || dataOffset > buffer.length) throw new Error(bt('coverage.err.invalid_resource_index'));
   const header = JSON.parse(buffer.subarray(16, 16 + jsonSize).toString()) as { files?: Record<string, AsarFileEntry> };
   const result: CoverageSource[] = [];
   for (const { path, entry } of collectNativeAsarEntries(header.files)) {
@@ -322,7 +323,7 @@ export function createCoverage(sources: CoverageSource[], dictionary: Dictionary
       found.set('catalog:' + key,{ key, translation: resolved.translation, status: resolved.ambiguous?'review':classifyCoverage(key,resolved.translation), sources: ['reviewed-ui-catalog'], confidence: 'ui', ...(resolved.scoped?{scoped:true}:{}) });
     }
   }
-  const report: CoverageReport = { schema: 1, appVersion, bundleSha256, dictionaryVersion: dictionary.version, generatedAt: new Date().toISOString(), resources: sources.map(r => ({ id:r.id, scope:r.scope, bytes:Buffer.byteLength(r.source),sha256:createHash('sha256').update(r.source).digest('hex') })), skipped, entries:[...found.values()].sort((a,b)=>a.key.localeCompare(b.key)), counts:{},statusCounts:{},observedCounts:{},visits:[],limits:['扫描受时间、节点和采样上限约束；跨域 iframe、关闭的 Shadow DOM、%s/ICU 以及重排的内联占位暂不支持。','资源扫描不等于实际页面验收；低置信度文字需人工核对。','未知页面文本只计数，不保存正文，不用于在线补译。','原生菜单、账号条件、插件自定义文字和危险操作后的界面需单独验收。'] };
+  const report: CoverageReport = { schema: 1, appVersion, bundleSha256, dictionaryVersion: dictionary.version, generatedAt: new Date().toISOString(), resources: sources.map(r => ({ id:r.id, scope:r.scope, bytes:Buffer.byteLength(r.source),sha256:createHash('sha256').update(r.source).digest('hex') })), skipped, entries:[...found.values()].sort((a,b)=>a.key.localeCompare(b.key)), counts:{},statusCounts:{},observedCounts:{},visits:[],limits:[bt('coverage.limit.1'),bt('coverage.limit.2'),bt('coverage.limit.3'),bt('coverage.limit.4')] };
   recountCoverage(report);return report;
 }
 
@@ -411,13 +412,14 @@ export function recordCoverageVisit(report: CoverageReport, route: string, audit
   report.visits.push({ at:new Date().toISOString(),route: /^\/(?:settings(?:\/[a-z-]+)?|history|customizations(?:\/[a-z-]+)?|automations)?$/.test(route)?route:'/other',observations:report.entries.filter(e=>e.status!=='native'&&observations.has(normalize(e.key))).length,unknownUiCount:Math.max(0,Number(audit?.unmatchedCount)||0),protectedCount:Math.max(0,Number(audit?.protectedCount)||0),truncated:!!audit?.truncated });
   report.visits=report.visits.slice(-100);recountCoverage(report);
 }
-export const coverageStatusNames: Record<string,string> = { translated:'词典已覆盖', missing:'缺少译文', unchanged:'原样译文待确认', preserved:'保留名称',review:'候选需人工分类',dynamic:'动态片段待分类',native:'原生界面单独处理',verified:'实机已验证',untranslated:'实机仍为英文' };
+const coverageStatusNames: Record<string,string> = { translated:'词典已覆盖', missing:'缺少译文', unchanged:'原样译文待确认', preserved:'保留名称',review:'候选需人工分类',dynamic:'动态片段待分类',native:'原生界面单独处理',verified:'实机已验证',untranslated:'实机仍为英文' };
 export function coverageMarkdown(report: CoverageReport) {
   const metric = coverageMetricSnapshot(report);
   const sum = Object.values(report.counts).reduce((total, count) => total + count, 0);
-  const lines=['# 界面汉化覆盖清单','',`应用 ${report.appVersion} · ${report.generatedAt}`,`词典版本 ${report.dictionaryVersion}；界面包 ${report.bundleSha256}`,'','资源扫描与实机验收分别记录，不以词典命中率宣称全部界面已汉化。','',`已抽取词条 ${metric.extracted} 条；分类合计 ${sum} 条（每词条一个终态，实机观察优先，不重复计数）。`,'','## 分类（互斥终态）','',...Object.entries(report.counts).map(([key,count])=>`- ${coverageStatusNames[key]??key}：${count}`),'','## 实机观察（另计，不重复计入分类）','',...(Object.entries(report.observedCounts ?? {}).length?Object.entries(report.observedCounts!).map(([key,count])=>`- ${coverageStatusNames[key]??key}：${count}`):['- 尚无实机观察']),'',`已读资源 ${report.resources.length} 个；记录页面采样 ${report.visits.length} 次；未读资源 ${report.skipped.length} 个。`,'',...report.limits.map(s=>'- '+s),'','| 原文 | 分类 | 实机结果 | 来源 |','| --- | --- | --- | --- |'];
+  const statusLabel = (key: string) => bt(`coverage.status.${key}`, undefined, coverageStatusNames[key] ?? key);
+  const lines=[bt('coverage.md.title'),'',bt('coverage.md.app_line',{version:report.appVersion,generatedAt:report.generatedAt}),bt('coverage.md.dict_line',{dictVersion:report.dictionaryVersion,bundleSha256:report.bundleSha256}),'',bt('coverage.md.disclaimer'),'',bt('coverage.md.extracted_summary',{extracted:metric.extracted,sum}),'',bt('coverage.md.section_counts'),'',...Object.entries(report.counts).map(([key,count])=>`- ${statusLabel(key)}：${count}`),'',bt('coverage.md.section_observed'),'',...(Object.entries(report.observedCounts ?? {}).length?Object.entries(report.observedCounts!).map(([key,count])=>`- ${statusLabel(key)}：${count}`):[bt('coverage.md.no_observed')]),'',bt('coverage.md.resources_summary',{resources:report.resources.length,visits:report.visits.length,skipped:report.skipped.length}),'',...report.limits.map(s=>'- '+s),'',bt('coverage.md.table_header'),'| --- | --- | --- | --- |'];
   const esc=(s:string)=>s.replace(/\|/g,'\\|').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,' ');
-  for(const e of report.entries)lines.push(`| ${esc(e.key)} | ${coverageStatusNames[e.status]??e.status}${e.confidence==='literal'?'（需核对）':''} | ${e.observed?coverageStatusNames[e.observed]:'未检查'} | ${e.sources.map(esc).join(', ')} |`);
+  for(const e of report.entries)lines.push(`| ${esc(e.key)} | ${statusLabel(e.status)}${e.confidence==='literal'?bt('coverage.md.needs_review_suffix'):''} | ${e.observed?statusLabel(e.observed):bt('coverage.md.unchecked')} | ${e.sources.map(esc).join(', ')} |`);
   return lines.join('\n')+'\n';
 }
 

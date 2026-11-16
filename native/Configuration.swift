@@ -50,9 +50,10 @@ struct AppConfiguration: Codable {
     var menuUsagePeriod = 0
     var menuTrendMetric = "tokens"
     var applicationChannel = "stable"
+    var appLanguage: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case autoPricingSyncEnabled, hudEnabled, quotaRefreshMinutes, schema, lastPage, navigationVersion, syncAntigravityLifecycle, autoUpdateEnabled, lastCleanedVersion, accountsCollapsed, menuSelectedTab, menuUsagePeriod, menuTrendMetric, applicationChannel
+        case autoPricingSyncEnabled, hudEnabled, quotaRefreshMinutes, schema, lastPage, navigationVersion, syncAntigravityLifecycle, autoUpdateEnabled, lastCleanedVersion, accountsCollapsed, menuSelectedTab, menuUsagePeriod, menuTrendMetric, applicationChannel, appLanguage
     }
 
     init() {}
@@ -70,7 +71,7 @@ struct AppConfiguration: Codable {
         lastCleanedVersion = (try? container.decode(String.self, forKey: .lastCleanedVersion)) ?? ""
         accountsCollapsed = (try? container.decode(Bool.self, forKey: .accountsCollapsed)) ?? false
         if let channel = try container.decodeIfPresent(String.self, forKey: .applicationChannel) {
-            guard ["stable", "insiders"].contains(channel) else { throw BackendFailure(message: "应用版本选择无效，原配置已保留。") }
+            guard ["stable", "insiders"].contains(channel) else { throw BackendFailure(message: L10n.t("config.error.invalid_channel")) }
             applicationChannel = "stable"
         }
         menuSelectedTab = max(0, min(2, (try? container.decode(Int.self, forKey: .menuSelectedTab)) ?? 0))
@@ -79,6 +80,10 @@ struct AppConfiguration: Codable {
             menuTrendMetric = rawMetric
         } else {
             menuTrendMetric = "tokens"
+        }
+        if let rawLang = try? container.decodeIfPresent(String.self, forKey: .appLanguage) {
+            let trimmed = rawLang.trimmingCharacters(in: .whitespacesAndNewlines)
+            appLanguage = trimmed.isEmpty ? nil : trimmed
         }
     }
 
@@ -111,13 +116,13 @@ final class ConfigurationStore {
         let data: Data
         do { data = try Data(contentsOf: file) }
         catch let error as NSError {
-            guard error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError else { throw BackendFailure(message: "配置无法读取，原文件已保留。") }
+            guard error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError else { throw BackendFailure(message: L10n.t("config.error.unreadable")) }
             value = AppConfiguration(); return
         }
         if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if raw["schema"] != nil && (raw["schema"] as? Int) != 2 { throw BackendFailure(message: "配置版本暂不支持，原文件已保留。") }
+            if raw["schema"] != nil && (raw["schema"] as? Int) != 2 { throw BackendFailure(message: L10n.t("config.error.unsupported_version")) }
             if let channel = raw["applicationChannel"], !(channel is String && ["stable", "insiders"].contains(channel as! String)) {
-                throw BackendFailure(message: "应用版本选择无效，原配置已保留。")
+                throw BackendFailure(message: L10n.t("config.error.invalid_channel"))
             }
             retainedDocument = raw
             if let current = try? JSONDecoder().decode(AppConfiguration.self, from: data) {
@@ -126,7 +131,7 @@ final class ConfigurationStore {
                     let backup = state.appendingPathComponent("config-before-stable-only.json")
                     if !fm.fileExists(atPath: backup.path) {
                         guard fm.createFile(atPath: backup.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
-                            throw BackendFailure(message: "旧配置备份失败，原文件已保留。")
+                            throw BackendFailure(message: L10n.t("config.error.backup_failed"))
                         }
                     }
                     try save()
@@ -135,7 +140,7 @@ final class ConfigurationStore {
             }
             value = AppConfiguration()
             return
-        } else { throw BackendFailure(message: "配置文件格式损坏，已保留原文件。") }
+        } else { throw BackendFailure(message: L10n.t("config.error.corrupted")) }
     }
     func save() throws {
         value.applicationChannel = "stable"
@@ -146,7 +151,7 @@ final class ConfigurationStore {
         if let data = try? Data(contentsOf: file) {
             guard let latest = try JSONSerialization.jsonObject(with: data) as? [String:Any],
                   latest["schema"] == nil || latest["schema"] as? Int == 2 else {
-                throw BackendFailure(message: "配置已变化或损坏，原文件已保留。")
+                throw BackendFailure(message: L10n.t("config.error.changed_or_corrupted"))
             }
             document = latest
         }
@@ -154,8 +159,8 @@ final class ConfigurationStore {
         for (key, value) in known { document[key] = value }
         let data = try JSONSerialization.data(withJSONObject:document,options:[.prettyPrinted,.sortedKeys])
         let temp = file.deletingLastPathComponent().appendingPathComponent("config-\(UUID().uuidString).tmp")
-        guard FileManager.default.createFile(atPath: temp.path, contents: data, attributes: [.posixPermissions: 0o600]) else { throw BackendFailure(message: "配置无法写入，请检查磁盘空间和权限。") }
+        guard FileManager.default.createFile(atPath: temp.path, contents: data, attributes: [.posixPermissions: 0o600]) else { throw BackendFailure(message: L10n.t("config.error.unwritable")) }
         defer { try? FileManager.default.removeItem(at: temp) }
-        if rename(temp.path, file.path) != 0 { throw BackendFailure(message: "配置未能保存 · \(errno)，请重试。") }
+        if rename(temp.path, file.path) != 0 { throw BackendFailure(message: L10n.t("config.error.save_failed", ["errno": errno])) }
     }
 }

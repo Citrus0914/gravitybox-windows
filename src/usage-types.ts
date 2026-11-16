@@ -1,6 +1,8 @@
 import type { ApiPricing } from './pricing.js';
 import { stripModelProviderPrefix } from './model-identity.js';
+import { getEffectiveModelPriceAlias } from './model-catalog.js';
 import type { LedgerEvent } from './usage-ledger.js';
+import { bt } from './i18n.js';
 
 export interface TokenUsageTotals {
   input_tokens: number;
@@ -79,6 +81,7 @@ export interface TokenUsageSummary {
   snapshot_id?: string;
   last_attempt_at?: number;
   pricing_warnings?: string[];
+  pricing_warning_codes?: string[];
   unattributed_requests?: number;
   unattributed_tokens?: number;
   ledger_review_records?: number;
@@ -122,14 +125,24 @@ export interface GenerationEvent {
  * 针对 Vertex AI / GCP 路径前缀（如 publishers/google/models/gemini-4-carbon）自动解耦并清洗为规范模型名称。
  * 同时对 Orchestrator 双阶段模式（Plan Mode: Argon / Carbon；Execution Mode: gemini-flash-worker-agy / 1669）执行方案 B 归一化合并。
  */
+export const CANONICAL_UNKNOWN_MODEL = '未知模型';
+
+export function isUnknownModelName(name: string | null | undefined): boolean {
+  const clean = typeof name === 'string' ? name.trim() : '';
+  return clean === CANONICAL_UNKNOWN_MODEL || clean.toLowerCase() === 'unknown model';
+}
+
 export function resolveDatabaseModelFullName(
   modelId: string | null | undefined,
   label: string | null | undefined,
-  modelEnum?: number | null
+  modelEnum?: number | null,
+  options?: { canonicalUnknown?: boolean }
 ): string {
-  const cleanId = typeof modelId === 'string' ? modelId.trim() : '';
+  const rawId = typeof modelId === 'string' ? modelId.trim() : '';
+  const cleanId = isUnknownModelName(rawId) ? '' : rawId;
   const strippedId = cleanId ? (stripModelProviderPrefix(cleanId) || cleanId) : '';
-  const cleanLabel = typeof label === 'string' ? label.trim() : '';
+  const rawLabel = typeof label === 'string' ? label.trim() : '';
+  const cleanLabel = isUnknownModelName(rawLabel) ? '' : rawLabel;
 
   // Antigravity Orchestrator 双阶段模型归一化（方案 B）：
   // 1. 规划阶段 (Plan Mode)：response_model 恒为 "gemini-pro-orchestrator-g1-pro"，由 label ("Orchestrator (Argon)" / "Orchestrator (Carbon)") 或 model_enum (1668 / 1667) 区分底层规划模型；
@@ -143,7 +156,14 @@ export function resolveDatabaseModelFullName(
     if (/\bhydrogen\b/i.test(cleanLabel) || /\bhydrogen\b/i.test(strippedId)) {
       return 'gemini-4-hydrogen';
     }
-    if (/\bargon\b/i.test(cleanLabel) || /\bargon\b/i.test(strippedId) || modelEnum === 1668 || /M668$/i.test(strippedId) || /^gemini-pro-orchestrator/i.test(strippedId)) {
+    if (/\bargon\b/i.test(cleanLabel) || /\bargon\b/i.test(strippedId) || modelEnum === 1668 || /M668$/i.test(strippedId)) {
+      return 'gemini-4-argon';
+    }
+    const dynamicCodename = cleanLabel.match(/Orchestrator\s*\(\s*([A-Za-z][A-Za-z0-9._-]{1,31})\s*\)/i)?.[1];
+    if (dynamicCodename) {
+      return `gemini-4-${dynamicCodename.toLowerCase()}`;
+    }
+    if (/^gemini-pro-orchestrator/i.test(strippedId)) {
       return 'gemini-4-argon';
     }
   }
@@ -159,17 +179,27 @@ export function resolveDatabaseModelFullName(
     return 'gemini-3.8-flash';
   }
 
+  const normalizeDisplayLabel = (lbl: string): string =>
+    lbl
+      .replace(/\s*[（(]\s*(?:extra[\s-]*high|extra[\s-]*low|xhigh|high|medium|low|thinking|max)\s*[）)]\s*$/i, '')
+      .replace(/\s+(?:extra[\s-]*high|extra[\s-]*low|xhigh|high|medium|low|thinking|max)\s*$/i, '')
+      .trim() || lbl;
+
   if (cleanId) {
+    const dynamicIdAlias = getEffectiveModelPriceAlias(strippedId) ?? getEffectiveModelPriceAlias(cleanId);
+    if (dynamicIdAlias) return dynamicIdAlias;
+    if (/^MODEL_PLACEHOLDER_M\d+$/i.test(strippedId) && cleanLabel) {
+      const normalizedLabel = normalizeDisplayLabel(cleanLabel);
+      return getEffectiveModelPriceAlias(normalizedLabel) ?? normalizedLabel;
+    }
     if (strippedId) return strippedId;
     return cleanId;
   }
   if (cleanLabel) {
-    return cleanLabel
-      .replace(/\s*[（(]\s*(?:extra[\s-]*low|high|medium|low|thinking|max)\s*[）)]\s*$/i, '')
-      .replace(/\s+(?:extra[\s-]*low|high|medium|low|thinking|max)\s*$/i, '')
-      .trim() || cleanLabel;
+    const normalizedLabel = normalizeDisplayLabel(cleanLabel);
+    return getEffectiveModelPriceAlias(normalizedLabel) ?? normalizedLabel;
   }
-  return '未知模型';
+  return options?.canonicalUnknown ? CANONICAL_UNKNOWN_MODEL : bt('usage.unknown_model');
 }
 
 export interface FileCacheEntry {

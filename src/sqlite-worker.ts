@@ -1,11 +1,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, type Hash } from 'node:crypto';
 import { parentPort, workerData } from 'node:worker_threads';
+import { bt, setActiveLocale } from './i18n.js';
 import {
   projectProtobuf,
   GENERATION_PROJECTION,
   STEP_PROJECTION,
   HUD_STEP_METADATA_PROJECTION,
+  HUD_STEP_METADATA_MINIMAL_PROJECTION,
   HUD_GEN_METADATA_PROJECTION,
 } from './protobuf-projection.js';
 
@@ -211,24 +213,37 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
     let projectStepMetaStmt: ReturnType<DatabaseSync['prepare']> | undefined;
     const canIncludeStepInPrefix = (row: any): boolean => {
       const st = Number(row.status);
-      const metaLen = Number(row.metadata_len ?? 0);
-      return TERMINAL_STEP_STATUSES.has(st) && metaLen <= inlineLimit;
+      return TERMINAL_STEP_STATUSES.has(st);
     };
     const normalizeRawStep = (row: any): HudWorkerRawStepRow => {
       const idx = Number(row.idx);
       const metadataLen = Number(row.metadata_len ?? 0);
       let effectiveMeta: Uint8Array | null = row.metadata && row.metadata.byteLength > 0 ? detachBuf(row.metadata) : null;
       if (!effectiveMeta && Number.isSafeInteger(metadataLen) && metadataLen > inlineLimit) {
+        projectStepMetaStmt ??= db.prepare('SELECT substr(metadata, ?, ?) AS chunk FROM steps WHERE idx = ?');
+        const readMetaChunk = (offset: number, length: number) =>
+          (projectStepMetaStmt!.get(offset + 1, length, idx) as { chunk?: Uint8Array } | undefined)?.chunk ?? new Uint8Array(0);
         try {
-          projectStepMetaStmt ??= db.prepare('SELECT substr(metadata, ?, ?) AS chunk FROM steps WHERE idx = ?');
           const projected = projectProtobuf(
             metadataLen,
-            (offset, length) => (projectStepMetaStmt!.get(offset + 1, length, idx) as { chunk?: Uint8Array } | undefined)?.chunk ?? new Uint8Array(0),
-            HUD_STEP_METADATA_PROJECTION
+            readMetaChunk,
+            HUD_STEP_METADATA_PROJECTION,
+            { skipOversizedLeafFields: true }
           );
           effectiveMeta = detachBuf(projected.data);
         } catch {
-          throw Error("HUD 步骤元数据投影失败");
+          try {
+            const minimal = projectProtobuf(
+              metadataLen,
+              readMetaChunk,
+              HUD_STEP_METADATA_MINIMAL_PROJECTION,
+              { skipOversizedLeafFields: true }
+            );
+            effectiveMeta = detachBuf(minimal.data);
+          } catch {
+            // 单步超大/损坏元数据就地降级，保留 idx/step_type/status 避免整库扫描回退
+            effectiveMeta = null;
+          }
         }
       }
       return {
@@ -312,9 +327,12 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
         stepPrefixCutoffIdx = Number(rows[prefixEnd]!.idx);
         stepPrefixDigest = prefixHasher.digest('hex');
       }
-      for (const r of rows) {
-        appendedSteps.push(normalizeRawStep(r));
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        rows[i] = null;
+        if (r) appendedSteps.push(normalizeRawStep(r));
       }
+      rows.length = 0;
     }
 
     let genMode: 'full' | 'append' | 'unchanged' = 'full';
@@ -336,11 +354,13 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
           const projected = projectProtobuf(
             dataLen,
             (offset, length) => (chunkStmt!.get(offset + 1, length, idx) as { chunk?: Uint8Array } | undefined)?.chunk ?? new Uint8Array(0),
-            HUD_GEN_METADATA_PROJECTION
+            HUD_GEN_METADATA_PROJECTION,
+            { skipOversizedLeafFields: true }
           );
           return projected.data;
         } catch {
-          throw Error("HUD 请求元数据投影失败");
+          // 单行生成元数据投影异常就地降级，避免阻断整库读取
+          return null;
         }
       };
 
@@ -381,13 +401,17 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
           lastGenIdx = tailGenRows.length > 0 ? Number(tailGenRows[tailGenRows.length - 1]!.idx) : prefixMaxGenIdx;
           const fullGenHasher = genPrefixHasher.copy();
           const resolvedTail: Array<{ idx: number; dataLen: number; rawBlob: Uint8Array | null }> = [];
-          for (const r of tailGenRows) {
+          for (let i = 0; i < tailGenRows.length; i++) {
+            const r = tailGenRows[i];
+            tailGenRows[i] = null;
+            if (!r) continue;
             const idx = Number(r.idx);
             const dataLen = Number(r.dataLen ?? 0);
             const rawBlob = resolveRawGenBlob(idx, dataLen, r.inlineData);
             hashRawGenRow(fullGenHasher, idx, dataLen, rawBlob);
             resolvedTail.push({ idx, dataLen, rawBlob });
           }
+          tailGenRows.length = 0;
           genDigest = fullGenHasher.digest('hex');
           let advanceGen = 0;
           while (advanceGen < resolvedTail.length - 1 && resolvedTail[advanceGen]!.dataLen <= inlineLimit) {
@@ -408,9 +432,11 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
             genMode = 'append';
             for (const item of resolvedTail) {
               const detached = detachBuf(item.rawBlob);
+              item.rawBlob = null;
               if (detached) genBlobs.push({ idx: item.idx, data: detached });
             }
           }
+          resolvedTail.length = 0;
         }
       }
 
@@ -422,13 +448,17 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
         const fullGenHasher = createHash('sha256');
         const prefixGenHasher = createHash('sha256');
         const resolvedAll: Array<{ idx: number; dataLen: number; rawBlob: Uint8Array | null }> = [];
-        for (const r of allGenRows) {
+        for (let i = 0; i < allGenRows.length; i++) {
+          const r = allGenRows[i];
+          allGenRows[i] = null;
+          if (!r) continue;
           const idx = Number(r.idx);
           const dataLen = Number(r.dataLen ?? 0);
           const rawBlob = resolveRawGenBlob(idx, dataLen, r.inlineData);
           hashRawGenRow(fullGenHasher, idx, dataLen, rawBlob);
           resolvedAll.push({ idx, dataLen, rawBlob });
         }
+        allGenRows.length = 0;
         genDigest = fullGenHasher.digest('hex');
         let prefixEnd = 0;
         while (prefixEnd < resolvedAll.length - 1 && resolvedAll[prefixEnd]!.dataLen <= inlineLimit) {
@@ -446,9 +476,11 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
           genMode = 'full';
           for (const item of resolvedAll) {
             const detached = detachBuf(item.rawBlob);
+            item.rawBlob = null;
             if (detached) genBlobs.push({ idx: item.idx, data: detached });
           }
         }
+        resolvedAll.length = 0;
       }
     }
 
@@ -509,11 +541,17 @@ function closeSession() {
   sessionError = undefined;
 }
 
+if (typeof workerData?.locale === 'string' && workerData.locale) {
+  setActiveLocale(workerData.locale);
+}
 if (typeof workerData?.path === 'string' && workerData.path.length > 0) {
   openSession(workerData.path);
 }
 
-parentPort?.on('message', (request: { id: string; open?: string; sql?: string; verify?: boolean; close?: boolean; reusable?: boolean; projection?: {table:string;column:string;idx:number}; hudScan?: HudWorkerScanRequest }) => {
+parentPort?.on('message', (request: { id: string; locale?: string; open?: string; sql?: string; verify?: boolean; close?: boolean; reusable?: boolean; projection?: {table:string;column:string;idx:number}; hudScan?: HudWorkerScanRequest }) => {
+  if (typeof request.locale === 'string' && request.locale) {
+    setActiveLocale(request.locale);
+  }
   if (request.hudScan) {
     try {
       const { result, transfers } = executeHudScan(request.hudScan);
@@ -537,23 +575,23 @@ parentPort?.on('message', (request: { id: string; open?: string; sql?: string; v
     return;
   }
   if (sessionError || !database) {
-    parentPort?.postMessage({ id: request.id, ok: false, rows: [], error: sessionError || 'SQLite 读取连接已关闭' });
+    parentPort?.postMessage({ id: request.id, ok: false, rows: [], error: sessionError || bt('sqlite.err.connection_closed') });
     return;
   }
   try {
     let rows: Record<string,any>[];
     if (request.verify) {
       const unchanged = sessionDataVersion === Number(database.prepare('PRAGMA data_version').get()?.data_version);
-      parentPort?.postMessage({ id: request.id, ok: unchanged, rows: [], ...(unchanged ? {} : { error: '数据库在读取期间变化，请重试' }) });
+      parentPort?.postMessage({ id: request.id, ok: unchanged, rows: [], ...(unchanged ? {} : { error: bt('sqlite.err.changed_during_read') }) });
       return;
     }
     if(request.projection){
       database.exec('BEGIN;');
       try {
       const {table,column,idx}=request.projection;
-      if(!Number.isSafeInteger(idx)||!((table==='gen_metadata'&&column==='data')||(table==='steps'&&column==='metadata')))throw Error('元数据投影请求无效');
+      if(!Number.isSafeInteger(idx)||!((table==='gen_metadata'&&column==='data')||(table==='steps'&&column==='metadata')))throw Error(bt('sqlite.err.invalid_projection'));
       const sizes=database.prepare(`SELECT length(${column}) AS size FROM ${table} WHERE idx=?`).all(idx);
-      if(sizes.length!==1)throw Error('元数据索引不存在或不唯一');
+      if(sizes.length!==1)throw Error(bt('sqlite.err.projection_index_missing'));
       const statement=database.prepare(`SELECT substr(${column},?,?) AS chunk FROM ${table} WHERE idx=?`);
       const projected=projectProtobuf(Number(sizes[0]!.size),(offset,length)=>statement.get(offset+1,length,idx)!.chunk as Uint8Array,table==='gen_metadata'?GENERATION_PROJECTION:STEP_PROJECTION);
       // Small Buffers may share Node's non-transferable slab. Give IPC its own ArrayBuffer.

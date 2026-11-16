@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '已存在的版本标签（如 v1.0.1）；仅构建草稿，不公开发布'
+        description: '已存在的版本标签（如 v1.1.1）；仅构建草稿，不公开发布'
         required: true
         type: string
       inspect_only:
@@ -81,7 +81,7 @@ jobs:
         run: node tools/release-control.mjs preflight
 
       - name: Install Dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Check Development Environment
         run: npm run doctor

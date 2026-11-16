@@ -1,27 +1,28 @@
 import { ProtobufReader as Reader, ProtobufWriter as Writer } from './protobuf.js';
+import { bt } from './i18n.js';
 
 export function replaceTopicRow(value: string | undefined, sentinel: string, payload: Buffer): string {
   let wrapper: Record<string, unknown> | undefined;
   let encoded = value || '';
-  if (encoded.startsWith('{')) { wrapper = JSON.parse(encoded); if (typeof wrapper?.data !== 'string') throw new Error('登录数据格式无法识别'); encoded = wrapper.data; }
-  if (encoded && !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error('登录数据格式无法识别');
+  if (encoded.startsWith('{')) { wrapper = JSON.parse(encoded); if (typeof wrapper?.data !== 'string') throw new Error(bt('account_state.err.invalid_format')); encoded = wrapper.data; }
+  if (encoded && !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error(bt('account_state.err.invalid_format'));
   const data = Buffer.from(encoded, 'base64'), keep: Buffer[] = [];
   let offset = 0;
   while (offset < data.length) {
     const start = offset, tag = Reader.readVarint(data, offset);
-    if (!tag) throw new Error('登录数据不完整');
+    if (!tag) throw new Error(bt('account_state.err.incomplete'));
     const [field, pos] = tag;
     let content: Buffer | undefined;
     if ((field & 7) === 2) {
       const size = Reader.readVarint(data, pos);
-      if (!size || size[1] + size[0] > data.length) throw new Error('登录数据不完整');
+      if (!size || size[1] + size[0] > data.length) throw new Error(bt('account_state.err.incomplete'));
       offset = size[1] + size[0]; content = data.subarray(size[1], offset);
     } else if ((field & 7) === 0) {
-      const v = Reader.readVarint(data, pos); if (!v) throw new Error('登录数据不完整'); offset = v[1];
+      const v = Reader.readVarint(data, pos); if (!v) throw new Error(bt('account_state.err.incomplete')); offset = v[1];
     } else if ((field & 7) === 1) offset = pos + 8;
     else if ((field & 7) === 5) offset = pos + 4;
-    else throw new Error('登录数据格式无法识别');
-    if (offset > data.length) throw new Error('登录数据不完整');
+    else throw new Error(bt('account_state.err.invalid_format'));
+    if (offset > data.length) throw new Error(bt('account_state.err.incomplete'));
     if (!(field === 10 && content && Reader.findString(content, 1) === sentinel)) keep.push(data.subarray(start, offset));
   }
   const row = Writer.encodeString(1, payload.toString('base64'));
@@ -34,7 +35,7 @@ export function replaceTopicRow(value: string | undefined, sentinel: string, pay
 export function decodeTopicRow(value: string, sentinel: string): Buffer | null {
   let encoded = value;
   if (value.startsWith('{')) encoded = JSON.parse(value).data;
-  if (typeof encoded !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error('登录数据格式无法识别');
+  if (typeof encoded !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error(bt('account_state.err.invalid_format'));
   const data = Buffer.from(encoded, 'base64');
   let offset = 0;
   while (offset < data.length) {

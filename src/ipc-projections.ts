@@ -1,19 +1,28 @@
-import { type AccountsManager, projectAccountForIpc } from './accounts.js';
+import { computeAccountRevision, type AccountsManager, type Account, type AccountSummary, type QuotaOverview, projectAccountForIpc } from './accounts.js';
 import type { ModelTokenUsage, TokenUsagePeriod, TokenUsageSummary } from './usage.js';
+import { localizePricingProvenance } from './pricing.js';
+import { bt } from './i18n.js';
 
 /** 套餐枚举统一收口；空值/未知值一律回落到“待确认”，空串不得穿透 IPC。 */
-export function normalizeSubscriptionTier(value: unknown): 'FREE' | 'PRO' | 'ULTRA' | '待确认' {
-  if (typeof value !== 'string') return '待确认';
+export function normalizeSubscriptionTier(value: unknown): string {
+  const pending = bt('quota.tier.pending');
+  if (typeof value !== 'string') return pending;
   const raw = value.trim();
-  if (!raw) return '待确认';
+  if (!raw) return pending;
   const upper = raw.toUpperCase();
   if (upper === 'FREE') return 'FREE';
   if (upper === 'PRO') return 'PRO';
   if (upper === 'ULTRA') return 'ULTRA';
+  if (upper === 'ENTERPRISE') return 'ENTERPRISE';
+  if (upper === 'TEAM' || upper === 'TEAMS' || upper === 'BUSINESS') return 'TEAM';
+  if (upper === 'PLUS') return 'PLUS';
   if (/\bULTRA\b/i.test(raw)) return 'ULTRA';
+  if (/\bENTERPRISE\b/i.test(raw)) return 'ENTERPRISE';
+  if (/\b(?:TEAM|TEAMS|BUSINESS)\b/i.test(raw)) return 'TEAM';
+  if (/\bPLUS\b/i.test(raw)) return 'PLUS';
   if (/\bPRO\b/i.test(raw)) return 'PRO';
   if (/\bFREE\b/i.test(raw) || /starter/i.test(raw)) return 'FREE';
-  return '待确认';
+  return pending;
 }
 
 /** Single contract for dashboard, account cards, menu and refresh replies. No credentials. */
@@ -23,44 +32,120 @@ export function projectQuotaContract(overview: {
   argonStatus?: unknown;
   carbonStatus?: unknown;
   standaloneModels?: unknown[];
+  projectedQuotaGroups?: unknown[];
+  quotaGroups?: unknown[];
   refreshState?: unknown;
   quotaWarnings?: unknown;
   quotaWarningCodes?: unknown;
 }): Record<string, unknown> {
+  const projectedGroups = Array.isArray(overview.projectedQuotaGroups)
+    ? overview.projectedQuotaGroups
+    : (Array.isArray(overview.quotaGroups)
+      && overview.quotaGroups.every(item => item && typeof item === 'object' && Array.isArray((item as { windows?: unknown }).windows)))
+      ? overview.quotaGroups
+      : [];
   return {
     familyWindows: overview.familyWindows,
     familyModelQuota: overview.familyModelQuota,
     argonStatus: overview.argonStatus,
     carbonStatus: overview.carbonStatus ?? null,
     standaloneModels: overview.standaloneModels ?? [],
+    quotaGroups: projectedGroups,
     refreshState: overview.refreshState,
     quotaWarnings: overview.quotaWarnings,
     quotaWarningCodes: overview.quotaWarningCodes,
   };
 }
 
+export interface ProjectAccountIpcOptions {
+  overview?: QuotaOverview;
+  nowMs?: number;
+  includeOverviewFields?: boolean;
+  formatResetTime?: (resetTime: number | null | undefined) => string;
+  revisionWithReadiness?: boolean;
+}
+
 export function projectAccountForIpcNormalized(
   account: Parameters<typeof projectAccountForIpc>[0],
-  accountsManager: Pick<AccountsManager, 'getAccountQuotaOverview'>
+  accountsManager: Pick<AccountsManager, 'getAccountQuotaOverview'>,
+  options?: ProjectAccountIpcOptions,
 ): Record<string, unknown> | null {
   if (!account) return null;
   const projected = projectAccountForIpc(account) as Record<string, unknown> | null;
   if (!projected) return projected;
+  const overview = options?.overview ?? accountsManager.getAccountQuotaOverview(
+    account,
+    options?.nowMs !== undefined ? { nowMs: options.nowMs } : undefined,
+  );
+  const normalizedTier = normalizeSubscriptionTier(
+    options?.includeOverviewFields ? overview.subscriptionTier : projected.subscription_tier,
+  );
+  const contract = projectQuotaContract(overview);
   const normalized: Record<string, unknown> = {
     ...projected,
-    subscription_tier: normalizeSubscriptionTier(projected.subscription_tier),
+    subscription_tier: normalizedTier,
+    ...contract,
   };
+  if (options?.revisionWithReadiness) {
+    const revBase = computeAccountRevision(account as Account | AccountSummary);
+    const readinessState = (projected.credentialReadiness as { state?: string } | undefined)?.state ?? 'ready';
+    normalized.revision = `${revBase}:${readinessState}`;
+  }
   if (projected.quota && typeof projected.quota === 'object') {
     const quotaObj = projected.quota as Record<string, unknown>;
     normalized.quota = {
       ...quotaObj,
-      subscription_tier: normalizeSubscriptionTier(quotaObj.subscription_tier),
+      subscription_tier: normalizeSubscriptionTier(quotaObj.subscription_tier ?? normalizedTier),
+      ...contract,
     };
   }
-  const contract = projectQuotaContract(accountsManager.getAccountQuotaOverview(account));
-  Object.assign(normalized, contract);
-  if (normalized.quota && typeof normalized.quota === 'object') {
-    Object.assign(normalized.quota as Record<string, unknown>, contract);
+  if (options?.includeOverviewFields) {
+    const lastUp = Number(projected.quota_last_updated ?? (projected.quota as { last_updated?: unknown } | null)?.last_updated ?? 0);
+    const resetTimeStr = options.formatResetTime
+      ? options.formatResetTime(overview.resetTime)
+      : (overview.resetTime !== null && overview.resetTime !== undefined ? String(overview.resetTime) : '');
+    Object.assign(normalized, {
+      quota_last_updated: lastUp,
+      quotaLastUpdated: lastUp,
+      fiveHourRemaining: overview.fiveHourRemaining,
+      weeklyRemaining: overview.weeklyRemaining,
+      geminiFiveHourRemaining: overview.geminiFiveHourRemaining,
+      geminiWeeklyRemaining: overview.geminiWeeklyRemaining,
+      geminiFiveHourResetCountdown: overview.geminiFiveHourResetCountdown ?? '',
+      geminiWeeklyResetCountdown: overview.geminiWeeklyResetCountdown ?? '',
+      geminiResetCountdown: overview.geminiResetCountdown,
+      claudeFiveHourRemaining: overview.claudeFiveHourRemaining,
+      claudeWeeklyRemaining: overview.claudeWeeklyRemaining,
+      claudeFiveHourResetCountdown: overview.claudeFiveHourResetCountdown ?? '',
+      claudeWeeklyResetCountdown: overview.claudeWeeklyResetCountdown ?? '',
+      claudeResetCountdown: overview.claudeResetCountdown,
+      argonWeeklyRemaining: overview.argonWeeklyRemaining,
+      argonWeeklyResetCountdown: overview.argonWeeklyResetCountdown ?? '',
+      argonResetCountdown: overview.argonResetCountdown,
+      carbonWeeklyRemaining: overview.carbonWeeklyRemaining,
+      carbonWeeklyResetCountdown: overview.carbonWeeklyResetCountdown ?? '',
+      carbonResetCountdown: overview.carbonResetCountdown,
+      staleGroups: overview.staleGroups,
+      stale_groups: overview.staleGroups,
+      resetTime: resetTimeStr,
+      resetCountdown: overview.resetCountdown,
+      models: overview.models,
+    });
+    const baseQuota = (normalized.quota && typeof normalized.quota === 'object')
+      ? (normalized.quota as Record<string, unknown>)
+      : {};
+    normalized.quota = {
+      ...baseQuota,
+      five_hour_remaining: overview.fiveHourRemaining,
+      weekly_remaining: overview.weeklyRemaining,
+      subscription_tier: normalizedTier,
+      reset_time: overview.resetTime ?? null,
+      reset_countdown: overview.resetCountdown,
+      quota_groups: overview.quotaGroups,
+      stale_groups: overview.staleGroups,
+      models: overview.models,
+      ...contract,
+    };
   }
   return normalized;
 }
@@ -83,7 +168,7 @@ export function projectUsagePeriodSummary(usage: TokenUsageSummary, periodInput:
     unpricedTokens: m.unpriced_tokens ?? 0,
     pricingKey: m.pricingKey,
     pricingStatus: m.pricingStatus,
-    pricingProvenance: m.pricingProvenance,
+    pricingProvenance: localizePricingProvenance(m.pricingProvenance) ?? null,
     input_tokens: m.input_tokens,
     output_tokens: m.output_tokens,
     cached_tokens: m.cached_tokens,

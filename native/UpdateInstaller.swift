@@ -12,12 +12,12 @@ enum UpdatePackageIntegrity {
         let pattern = #"^([0-9a-fA-F]{64})[ \t]+\*?(.+?)$"#
         guard lines.count == 1,
               let match = lines[0].range(of: pattern, options: .regularExpression) else {
-            throw failure("SHA-256 校验文件格式无效，已停止更新；当前版本仍可继续使用。")
+            throw failure(L10n.t("update.error.sha_format_invalid", fallback: "SHA-256 校验文件格式无效，已停止更新；当前版本仍可继续使用。"))
         }
         let line = String(lines[0][match]), hash = String(line.prefix(64)).lowercased()
         var name = String(line.dropFirst(64)).trimmingCharacters(in: .whitespaces)
         if name.hasPrefix("*") { name.removeFirst() }
-        guard name == fileName else { throw failure("SHA-256 校验文件与安装包名称不匹配，已停止更新。") }
+        guard name == fileName else { throw failure(L10n.t("update.error.sha_name_mismatch", fallback: "SHA-256 校验文件与安装包名称不匹配，已停止更新。")) }
         return hash
     }
 
@@ -38,7 +38,7 @@ enum UpdatePackageIntegrity {
     }
 
     static func verify(_ file: URL, expected: String) throws {
-        guard try fileHash(file) == expected else { throw failure("安装包 SHA-256 校验不一致，已停止更新；当前版本仍可继续使用。") }
+        guard try fileHash(file) == expected else { throw failure(L10n.t("update.error.sha_mismatch", fallback: "安装包 SHA-256 校验不一致，已停止更新；当前版本仍可继续使用。")) }
     }
 }
 
@@ -70,13 +70,59 @@ enum UpdateInstaller {
     static func version(_ app: URL) throws -> String {
         let data = try Data(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
         guard let info = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              let version = info["CFBundleShortVersionString"] as? String else { throw UpdatePackageIntegrity.failure("应用版本信息无效。") }
+              let version = info["CFBundleShortVersionString"] as? String else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.app_version_invalid", fallback: "应用版本信息无效。")) }
         return version
     }
 
     static func swap(_ first: URL, _ second: URL) throws {
         guard renameatx_np(AT_FDCWD, first.path, AT_FDCWD, second.path, UInt32(RENAME_SWAP)) == 0 else {
-            throw UpdatePackageIntegrity.failure("无法原子替换应用，旧版本已保留（错误 \(errno)）。")
+            throw UpdatePackageIntegrity.failure(L10n.t("update.error.atomic_swap_failed", ["errno": errno], fallback: "无法原子替换应用，旧版本已保留（错误 \(errno)）。"))
+        }
+    }
+
+    static func configuredExpectedTeamID() -> String? {
+        if let envTeam = ProcessInfo.processInfo.environment["GRAVITYBOX_EXPECTED_TEAM_ID"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envTeam.isEmpty {
+            return envTeam
+        }
+        if let plistTeam = (Bundle.main.object(forInfoDictionaryKey: "GravityBoxExpectedTeamID") as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !plistTeam.isEmpty {
+            return plistTeam
+        }
+        return nil
+    }
+
+    static func verifyCodeSignature(_ app: URL, expectedTeamID: String? = configuredExpectedTeamID(), failureMessage: String? = nil) throws {
+        let msg = failureMessage ?? L10n.t("update.error.installer_codesign_failed", fallback: "新版本应用签名完整性校验失败。")
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        check.arguments = ["--verify", "--deep", "--strict", app.path]
+        check.standardInput = FileHandle.nullDevice
+        check.standardOutput = FileHandle.nullDevice
+        check.standardError = FileHandle.nullDevice
+        try check.run(); check.waitUntilExit()
+        guard check.terminationStatus == 0 else {
+            throw UpdatePackageIntegrity.failure(msg)
+        }
+        if let expected = expectedTeamID?.trimmingCharacters(in: .whitespacesAndNewlines), !expected.isEmpty {
+            let inspect = Process()
+            let errPipe = Pipe()
+            inspect.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+            inspect.arguments = ["-dv", "--verbose=2", app.path]
+            inspect.standardInput = FileHandle.nullDevice
+            inspect.standardOutput = FileHandle.nullDevice
+            inspect.standardError = errPipe
+            try inspect.run()
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            inspect.waitUntilExit()
+            let details = String(data: errData, encoding: .utf8) ?? ""
+            let actualTeam = details
+                .components(separatedBy: .newlines)
+                .first(where: { $0.hasPrefix("TeamIdentifier=") })
+                .map { String($0.dropFirst("TeamIdentifier=".count)).trimmingCharacters(in: .whitespacesAndNewlines) }
+            guard inspect.terminationStatus == 0, actualTeam == expected else {
+                throw UpdatePackageIntegrity.failure(msg)
+            }
         }
     }
 
@@ -86,14 +132,9 @@ enum UpdateInstaller {
               plist["CFBundleIdentifier"] as? String == "local.gravitybox.app",
               plist["CFBundleShortVersionString"] as? String == version,
               try UpdatePackageIntegrity.appHash(app) == appHash else {
-            throw UpdatePackageIntegrity.failure("新版本应用身份、版本或内容不匹配，旧版本未被替换。")
+            throw UpdatePackageIntegrity.failure(L10n.t("update.error.app_mismatch", fallback: "新版本应用身份、版本或内容不匹配，旧版本未被替换。"))
         }
-        let check = Process()
-        check.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        check.arguments = ["--verify", "--deep", "--strict", app.path]
-        check.standardOutput = FileHandle.nullDevice; check.standardError = FileHandle.nullDevice
-        try check.run(); check.waitUntilExit()
-        guard check.terminationStatus == 0 else { throw UpdatePackageIntegrity.failure("新版本应用签名完整性校验失败。") }
+        try verifyCodeSignature(app)
     }
 
     /// Copy onto the target volume before quitting; the existing app is untouched on any error.
@@ -125,7 +166,7 @@ enum UpdateInstaller {
         if let receipt { process.arguments! += ["--update-receipt", receipt.path, "--update-token", token] }
         process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
         try process.run(); process.waitUntilExit()
-        guard process.terminationStatus == 0 else { throw UpdatePackageIntegrity.failure("新版本未能启动。") }
+        guard process.terminationStatus == 0 else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.launch_failed", fallback: "新版本未能启动。")) }
     }
 
     static func waitForReady(_ receipt: URL, token: String, timeout: TimeInterval = 40) -> Bool {
@@ -146,7 +187,7 @@ enum UpdateInstaller {
         for app in running where !app.isTerminated { _ = app.forceTerminate() }
         let forcedEnd = Date().addingTimeInterval(2)
         while running.contains(where: { !$0.isTerminated }) && Date() < forcedEnd { Thread.sleep(forTimeInterval: 0.1) }
-        guard running.allSatisfy({ $0.isTerminated }) else { throw UpdatePackageIntegrity.failure("新版本仍在运行，恢复副本已保留。") }
+        guard running.allSatisfy({ $0.isTerminated }) else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.still_running", fallback: "新版本仍在运行，恢复副本已保留。")) }
     }
 
     static func run(receiptURL: URL,
@@ -157,10 +198,10 @@ enum UpdateInstaller {
                     stopApp: (URL) throws -> Void = stopNewApp) throws {
         let fm = FileManager.default
         var receipt = try JSONDecoder().decode(UpdateInstallReceipt.self, from: Data(contentsOf: receiptURL))
-        guard receipt.schema == 1 else { throw UpdatePackageIntegrity.failure("更新恢复记录版本不受支持。") }
+        guard receipt.schema == 1 else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.receipt_unsupported", fallback: "更新恢复记录版本不受支持。")) }
         let target = URL(fileURLWithPath: receipt.targetPath), backup = URL(fileURLWithPath: receipt.backupPath)
         guard target != backup, target.deletingLastPathComponent() == backup.deletingLastPathComponent(),
-              backup.lastPathComponent.hasPrefix(".GravityBox-backup-") else { throw UpdatePackageIntegrity.failure("更新恢复路径无效。") }
+              backup.lastPathComponent.hasPrefix(".GravityBox-backup-") else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.backup_path_invalid", fallback: "更新恢复路径无效。")) }
         func currentHash(_ app: URL) -> String? { try? UpdatePackageIntegrity.appHash(app) }
         if receipt.phase == "confirmed" || receipt.phase == "rolled-back" { return }
         if receipt.oldAppHash != nil, currentHash(target) == receipt.oldAppHash,
@@ -172,7 +213,7 @@ enum UpdateInstaller {
             (receipt.oldAppHash == nil || currentHash(backup) == receipt.oldAppHash)
         do {
             if !exchanged {
-                guard currentHash(target) == receipt.oldAppHash else { throw UpdatePackageIntegrity.failure("目标应用已由其他程序改变，已保留恢复材料。") }
+                guard currentHash(target) == receipt.oldAppHash else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.target_changed_before_install", fallback: "目标应用已由其他程序改变，已保留恢复材料。")) }
                 try validate(backup, receipt.expectedVersion, receipt.newAppHash)
                 if receipt.oldAppHash != nil { try exchange(backup, target) }
                 else { try fm.moveItem(at: backup, to: target) }
@@ -181,17 +222,17 @@ enum UpdateInstaller {
             receipt.phase = "installed"; try receipt.save(to: receiptURL)
             try validate(target, receipt.expectedVersion, receipt.newAppHash)
             try openApp(target, receiptURL, receipt.token)
-            guard awaitReady(receiptURL, receipt.token) else { throw UpdatePackageIntegrity.failure("新版本后台未能就绪。") }
+            guard awaitReady(receiptURL, receipt.token) else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.backend_not_ready", fallback: "新版本后台未能就绪。")) }
             receipt.phase = "confirmed"; try receipt.save(to: receiptURL)
             // Keep the old app and receipt as a recovery point. Startup cleanup must not remove them.
         } catch {
             if exchanged {
                 do {
-                    guard currentHash(target) == receipt.newAppHash else { throw UpdatePackageIntegrity.failure("目标应用已变化，停止覆盖。") }
+                    guard currentHash(target) == receipt.newAppHash else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.target_changed_abort", fallback: "目标应用已变化，停止覆盖。")) }
                     try stopApp(target)
-                    guard currentHash(target) == receipt.newAppHash else { throw UpdatePackageIntegrity.failure("目标应用已变化，停止覆盖。") }
+                    guard currentHash(target) == receipt.newAppHash else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.target_changed_abort", fallback: "目标应用已变化，停止覆盖。")) }
                     if let oldHash = receipt.oldAppHash {
-                        guard currentHash(backup) == oldHash else { throw UpdatePackageIntegrity.failure("旧版本恢复副本已变化。") }
+                        guard currentHash(backup) == oldHash else { throw UpdatePackageIntegrity.failure(L10n.t("update.error.backup_changed", fallback: "旧版本恢复副本已变化。")) }
                         try validate(backup, version(backup), oldHash)
                         try exchange(backup, target)
                     } else { try fm.moveItem(at: target, to: backup) }
@@ -199,7 +240,7 @@ enum UpdateInstaller {
                     if receipt.oldAppHash != nil { try? openApp(target, nil, "") }
                 } catch {
                     receipt.phase = "recovery-required"; try? receipt.save(to: receiptURL)
-                    throw UpdatePackageIntegrity.failure("更新未完成，自动恢复受阻；旧版本及恢复记录已保留在 \(receiptURL.deletingLastPathComponent().path)。")
+                    throw UpdatePackageIntegrity.failure(L10n.t("update.error.rollback_blocked", ["dir": receiptURL.deletingLastPathComponent().path], fallback: "更新未完成，自动恢复受阻；旧版本及恢复记录已保留在 \(receiptURL.deletingLastPathComponent().path)。"))
                 }
             }
             throw error

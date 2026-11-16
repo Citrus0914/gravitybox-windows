@@ -1,6 +1,7 @@
 import { lstat, mkdir, rename, readFile, open } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { atomicJson } from './files.js';
+import { bt } from './i18n.js';
 export interface JournalMove {
     from: string;
     to: string;
@@ -18,7 +19,7 @@ async function identity(path: string): Promise<string | null> {
     try {
         const stat = await lstat(path);
         if (stat.isSymbolicLink())
-            throw Error('恢复路径为符号链接，已停止');
+            throw Error(bt('maintenance.journal.err.symlink'));
         return `${stat.dev}:${stat.ino}`;
     }
     catch (error) {
@@ -28,17 +29,19 @@ async function identity(path: string): Promise<string | null> {
     }
 }
 async function persistDirectories(...paths: string[]) {
+    const ignoredCodes = new Set(['EINVAL', 'ENOTSUP', 'EPERM', 'EACCES', 'EISDIR', 'EBADF', 'ENOENT']);
     for (const path of new Set(paths.map(dirname))) {
-        const handle = await open(path, 'r');
+        let handle;
         try {
+            handle = await open(path, 'r');
             await handle.sync();
         }
         catch (error) {
-            if (!['EINVAL', 'ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? ''))
+            if (!ignoredCodes.has((error as NodeJS.ErrnoException).code ?? ''))
                 throw error;
         }
         finally {
-            await handle.close();
+            await handle?.close().catch(() => {});
         }
     }
 }
@@ -69,7 +72,7 @@ export async function reconcileMoves(path: string, manifest: MaintenanceManifest
     transaction.phase = complete ? 'rolled-back' : 'recovery-required';
     await atomicJson(path, manifest);
     if (!complete)
-        throw Error('部分路径已变化，自动恢复受阻；完整移动计划已保留，请勿清空废纸篓');
+        throw Error(bt('maintenance.journal.err.reconcile_blocked'));
 }
 export async function executeMoves(path: string, manifest: MaintenanceManifest, moves: JournalMove[], guard: (move: JournalMove) => Promise<void>, committedPatch: Record<string, unknown> = {}, persist = atomicJson): Promise<void> {
     const simulated = new Map<string, string | null>();
@@ -82,7 +85,7 @@ export async function executeMoves(path: string, manifest: MaintenanceManifest, 
         await guard(move);
         const source = simulated.get(move.from);
         if (!source || simulated.get(move.to) !== null)
-            throw Error('维护路径已变化，未开始移动');
+            throw Error(bt('maintenance.journal.err.path_changed_before'));
         move.identity = source;
         simulated.set(move.from, null);
         simulated.set(move.to, source);
@@ -94,7 +97,7 @@ export async function executeMoves(path: string, manifest: MaintenanceManifest, 
         for (const move of moves) {
             await guard(move);
             if (await identity(move.from) !== move.identity || await identity(move.to) !== null)
-                throw Error('维护路径正在变化，停止移动');
+                throw Error(bt('maintenance.journal.err.path_changed_during'));
             await mkdir(dirname(move.to), { recursive: true, mode: 0o700 });
             await rename(move.from, move.to);
             await persistDirectories(move.from, move.to);
@@ -106,7 +109,7 @@ export async function executeMoves(path: string, manifest: MaintenanceManifest, 
             await reconcileMoves(path, manifest, guard);
         }
         catch {
-            throw Error('维护未完成，部分恢复待处理；移动计划及数据已保留');
+            throw Error(bt('maintenance.journal.err.incomplete_recovery'));
         }
         throw error;
     }
@@ -114,10 +117,10 @@ export async function executeMoves(path: string, manifest: MaintenanceManifest, 
 export async function readMaintenanceManifest(path: string): Promise<MaintenanceManifest> {
     const stat = await lstat(path);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.())
-        throw Error('维护事务清单身份不匹配');
+        throw Error(bt('maintenance.journal.err.manifest_identity'));
     const manifest = JSON.parse(await readFile(path, 'utf8')) as MaintenanceManifest;
     if (manifest.transaction && (!Array.isArray(manifest.transaction.moves) || !['prepared', 'committed', 'rolled-back', 'recovery-required'].includes(manifest.transaction.phase)
         || manifest.transaction.moves.some(move => typeof move.from !== 'string' || typeof move.to !== 'string' || !/^\d+:\d+$/.test(move.identity ?? ''))))
-        throw Error('维护事务记录格式无效，原件已保留');
+        throw Error(bt('maintenance.journal.err.manifest_invalid'));
     return manifest;
 }

@@ -8,6 +8,8 @@ import { resolveVerifiedLanguageServerPorts } from './discovery.js';
 import { SqliteReadSnapshot } from './sqlite-read.js';
 import {
   applyFamilyWindows,
+  buildArgonStatus,
+  buildCarbonStatus,
   familyWindowsFromGroups,
   mergeGroupSets,
   mergeModelCatalogues,
@@ -15,6 +17,7 @@ import {
   normalizeLiveModels,
 } from './quota.js';
 import type { LiveLanguageServerStatus, ModelQuota, QuotaData, QuotaGroup } from './accounts.js';
+import { bt } from './i18n.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -107,7 +110,7 @@ export async function localRpcFetch(
     req.on('error', rejectReply);
     req.on('timeout', () => {
       req.destroy();
-      rejectReply(new Error('本地 RPC 超时'));
+      rejectReply(new Error(bt('account_probe.err.rpc_timeout')));
     });
     req.write(body);
     req.end();
@@ -263,10 +266,14 @@ export async function probeLiveLanguageServerOnce(
         const tierRaw = isEnterpriseVertex
           ? (userStatus.planStatus?.planInfo?.planName || userStatus.planStatus?.planInfo?.teamsTier || userStatus.paidTier?.name || '')
           : (userStatus.userTier?.name || userStatus.userTier?.id || userStatus.planStatus?.planInfo?.planName || userStatus.paidTier?.name || '');
-        let tier = isEnterpriseVertex ? '' : 'FREE';
+        let tier = '';
         if (/ultra/i.test(tierRaw)) tier = 'ULTRA';
+        else if (/enterprise/i.test(tierRaw)) tier = 'ENTERPRISE';
+        else if (/\b(?:business|team|teams|workspace)\b/i.test(tierRaw)) tier = 'TEAM';
+        else if (/\bplus\b/i.test(tierRaw)) tier = 'PLUS';
         else if (/pro/i.test(tierRaw)) tier = 'PRO';
-        else if (!isEnterpriseVertex && tierRaw) tier = 'FREE';
+        else if (/\b(?:free|starter|trial)\b/i.test(tierRaw)) tier = 'FREE';
+        else if (tierRaw.trim()) tier = '';
 
         const observedAt = Math.floor(Date.now() / 1000);
         const clientConfigs = userStatus.cascadeModelConfigData?.clientModelConfigs || [];
@@ -274,8 +281,14 @@ export async function probeLiveLanguageServerOnce(
         const groups = mergeGroupSets([normalizeLiveGroups(quotaSummaryData, observedAt)]);
         const windows = familyWindowsFromGroups(groups, Date.now());
         const applied = applyFamilyWindows(models, windows);
+        const liveArgon = buildArgonStatus(applied, groups, windows, Date.now(), tier);
+        const liveCarbon = buildCarbonStatus(applied, groups, windows, Date.now(), liveArgon, tier);
+        const isIgnoredStandalone = (family: 'gemini' | 'claude' | 'argon' | 'carbon'): boolean =>
+          (family === 'argon' && (liveArgon.mode === 'unified' || liveArgon.mode === 'disabled'))
+          || (family === 'carbon' && (liveCarbon.mode === 'unified' || liveCarbon.mode === 'disabled'));
         const missingFamilies = (['gemini', 'claude', 'argon', 'carbon'] as const).filter(family =>
-          models.some(model => model.family === family && model.disabled !== true)
+          !isIgnoredStandalone(family)
+          && models.some(model => model.family === family && model.disabled !== true)
           && !groups.some(group => group.family === family && group.buckets.some(bucket => bucket.remaining_fraction_known))
           && !((family === 'argon' || family === 'carbon') && models.some(m => m.family === family && m.own_percentage_known && !m.own_stale)));
         const quotaData: QuotaData = {
@@ -295,7 +308,7 @@ export async function probeLiveLanguageServerOnce(
             carriedGroups: 0,
             refreshedAt: observedAt,
           },
-          quota_warnings: models.length === 0 ? ['NO_MODEL_RECORDS: live 未返回模型列表'] : undefined,
+          quota_warnings: models.length === 0 ? [bt('account_probe.warn.no_model_records')] : undefined,
         };
 
         return {

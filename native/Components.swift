@@ -14,9 +14,20 @@ private final class CopyTextMenuItem: NSMenuItem {
         NSPasteboard.general.setString(rawValue ?? label?.stringValue ?? "", forType: .string)
     }
 }
-func enableTextCopy(_ label: NSTextField, value: String? = nil, title: String = "复制完整内容") {
+func enableTextCopy(_ label: NSTextField, value: String? = nil, title: String? = nil) {
+    let resolvedTitle = title ?? L10n.t("common.copy_full_content", fallback: "复制完整内容")
+    if let existingMenu = label.menu,
+       existingMenu.items.count == 1,
+       let existingItem = existingMenu.items.first as? CopyTextMenuItem {
+        existingItem.label = label
+        existingItem.rawValue = value
+        if existingItem.title != resolvedTitle {
+            existingItem.title = resolvedTitle
+        }
+        return
+    }
     let menu = NSMenu()
-    menu.addItem(CopyTextMenuItem(label: label, value: value, title: title))
+    menu.addItem(CopyTextMenuItem(label: label, value: value, title: resolvedTitle))
     label.menu = menu
 }
 
@@ -66,6 +77,10 @@ class DesignCardBox: NSBox {
     private var hoverTrackingArea: NSTrackingArea?
     private let hoverMotion = DesignMotion()
     private var hoverProgress: CGFloat = 0
+
+    deinit {
+        hoverMotion.cancel()
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -161,6 +176,17 @@ final class PillSelectionView: NSView {
         layer?.cornerRadius = 9
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        motion.cancel()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            motion.cancel()
+        }
+    }
 
     func slide(to targetRect: NSRect, in view: NSView?) {
         guard targetRect != currentTargetRect else { return }
@@ -265,6 +291,8 @@ final class TopAlignedDocument: NSView { override var isFlipped: Bool { true } }
 final class StickyHeaderScrollView: NSScrollView {
     let headerHost = NSVisualEffectView()
     let headerDivider = DesignDividerView()
+    var onViewportHeightChanged: ((CGFloat) -> Void)?
+    private var lastReportedViewportHeight: CGFloat = -1
     private var boundsObserver: NSObjectProtocol?
 
     init(headerView: NSView) {
@@ -318,6 +346,22 @@ final class StickyHeaderScrollView: NSScrollView {
         }
     }
 
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        tile()
+    }
+
+    override func layout() {
+        let headerH: CGFloat = 52
+        let expectedH = max(0, bounds.height - headerH)
+        if abs(headerHost.frame.width - bounds.width) > 0.5
+            || abs(contentView.frame.origin.y - headerH) > 0.5
+            || abs(contentView.frame.height - expectedH) > 0.5 {
+            tile()
+        }
+        super.layout()
+    }
+
     override func tile() {
         super.tile()
         let headerH: CGFloat = 52
@@ -331,6 +375,10 @@ final class StickyHeaderScrollView: NSScrollView {
             sFrame.origin.y = headerH
             sFrame.size.height = max(0, bounds.height - headerH)
             vScroller.frame = sFrame
+        }
+        if abs(clipFrame.size.height - lastReportedViewportHeight) > 0.5 {
+            lastReportedViewportHeight = clipFrame.size.height
+            onViewportHeightChanged?(clipFrame.size.height)
         }
     }
 }
@@ -378,12 +426,31 @@ func scrollPage(_ stack: NSStackView) -> NSView {
     for view in stack.arrangedSubviews { fillWidth(view, in: stack) }
     return scroll
 }
-/// Overview stretches the account quota card to fill the minimum window cleanly while keeping KPI cards balanced.
-func dashboardScrollPage(_ stack: NSStackView, hero: NSView, metrics: [NSView]) -> NSView {
+/// Overview adaptively expands across Ultra / Pro / Free quota row counts to fill the scroll viewport cleanly while keeping middle KPI cards poised and steady across tiers.
+func dashboardScrollPage(_ stack: NSStackView, hero: NSView, metrics: [NSView], bento: NSView) -> NSView {
+    stack.distribution = .fill
+    stack.detachesHiddenViews = true
     let scroll = scrollPage(stack) as! NSScrollView
-    for metric in metrics {
-        metric.heightAnchor.constraint(greaterThanOrEqualToConstant: 88).isActive = true
+    if let document = scroll.documentView {
+        let minViewport = document.heightAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.heightAnchor)
+        minViewport.priority = .required
+        let fitViewport = document.heightAnchor.constraint(equalTo: scroll.contentView.heightAnchor)
+        fitViewport.priority = NSLayoutConstraint.Priority(490)
+        NSLayoutConstraint.activate([minViewport, fitViewport])
     }
+    for metric in metrics {
+        metric.heightAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
+        let maxMetricH = metric.heightAnchor.constraint(lessThanOrEqualToConstant: 148)
+        maxMetricH.priority = NSLayoutConstraint.Priority(485)
+        maxMetricH.isActive = true
+        metric.setContentHuggingPriority(NSLayoutConstraint.Priority(230), for: .vertical)
+    }
+    if let firstMetric = metrics.first {
+        let viewportMetricRatio = firstMetric.heightAnchor.constraint(equalTo: scroll.contentView.heightAnchor, multiplier: 0.21)
+        viewportMetricRatio.priority = NSLayoutConstraint.Priority(470)
+        viewportMetricRatio.isActive = true
+    }
+    let _ = (hero, bento)
     return scroll
 }
 
@@ -413,6 +480,19 @@ final class SidebarRowView: NSTableRowView {
     private var hoverTracking: NSTrackingArea?
     private let hoverMotion = DesignMotion()
     private var hoverProgress: CGFloat = 0
+
+    deinit {
+        hoverMotion.cancel()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            hoverMotion.cancel()
+            hovered = false
+            hoverProgress = 0
+        }
+    }
     var hovered = false {
         didSet {
             guard oldValue != hovered else { return }
@@ -476,6 +556,18 @@ final class SidebarLaunchButton: NSButton {
         }
     }
     deinit { hoverMotion.cancel(); pressMotion.cancel() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            hoverMotion.cancel()
+            pressMotion.cancel()
+            hovered = false
+            hoverProgress = 0
+            pressProgress = 0
+        }
+    }
+
     let iconView = NSImageView()
     let titleField: NSTextField
     let badgeLabel = text("", size: 11, weight: .semibold, color: Design.blue)
@@ -490,15 +582,22 @@ final class SidebarLaunchButton: NSButton {
         }
     }
 
+    func setDisplayTitle(_ title: String) {
+        self.title = title
+        titleField.stringValue = title
+        setAccessibilityLabel(title)
+    }
+
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: 36)
     }
 
-    init(title: String = "打开 Antigravity", symbolName: String = "arrow.up.forward.app", isUpdatePrompt: Bool = false, target: AnyObject?, action: Selector) {
+    init(title: String? = nil, symbolName: String = "arrow.up.forward.app", isUpdatePrompt: Bool = false, target: AnyObject?, action: Selector) {
+        let resolvedTitle = title ?? L10n.t("sidebar.open_antigravity", fallback: "打开 Antigravity")
         self.isUpdatePrompt = isUpdatePrompt
-        self.titleField = text(title, size: 13, weight: isUpdatePrompt ? .semibold : .medium, color: Design.primary.withAlphaComponent(0.86))
+        self.titleField = text(resolvedTitle, size: 13, weight: isUpdatePrompt ? .semibold : .medium, color: Design.dynamicAlpha(Design.primary, 0.86))
         super.init(frame: .zero)
-        self.title = title
+        self.title = resolvedTitle
         self.target = target
         self.action = action
         bezelStyle = .inline
@@ -507,7 +606,7 @@ final class SidebarLaunchButton: NSButton {
         setButtonType(.momentaryChange)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 36).isActive = true
-        setAccessibilityLabel(title)
+        setAccessibilityLabel(resolvedTitle)
 
         iconView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
         iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14.5, weight: isUpdatePrompt ? .semibold : .medium)
@@ -620,13 +719,15 @@ struct LiveStatus {
     var working = false
     var taskRevision = 0
     var languageMode = "zh"
+    var locale = "zh-Hans"
+    var configuredLanguage = "zh-Hans"
     var mode = "starting"
     var translationEnabled: Bool? = nil
     var hudEnabled: Bool? = nil
     var appVersion = ""
     var entries = 0
     var windows = 0
-    var message = "正在连接本机服务…"
+    var message = L10n.t("assistant.starting_service", fallback: "正在连接本机服务…")
     var dictionaryVersion = ""
     var dictionaryError = ""
     var baseVersion = "2.23.0"
@@ -638,19 +739,22 @@ struct LiveStatus {
     var activeSubscriptionTier = "FREE"
     var accountsRevision = ""
     var liveAccountEmail = ""
+    var oauthClientConfigured = true
 
     init(_ raw: [String: Any] = [:]) {
         working = (raw["healing"] as? Bool == true) || (raw["runningTasks"] as? Int ?? 0) > 0
         taskRevision = raw["taskRevision"] as? Int ?? 0
         bundleCacheHit = raw["bundleCacheHit"] as? Bool ?? false
         languageMode = raw["languageMode"] as? String ?? "zh"
+        locale = raw["locale"] as? String ?? (languageMode == "en" ? "en" : "zh-Hans")
+        configuredLanguage = raw["configuredLanguage"] as? String ?? locale
         mode = raw["mode"] as? String ?? "starting"
         translationEnabled = raw["translationEnabled"] as? Bool
         hudEnabled = raw["hudEnabled"] as? Bool
         appVersion = raw["appVersion"] as? String ?? ""
         entries = raw["entries"] as? Int ?? 0
         windows = raw["windows"] as? Int ?? 0
-        message = raw["message"] as? String ?? "正在连接本机服务…"
+        message = raw["message"] as? String ?? L10n.t("assistant.starting_service", fallback: "正在连接本机服务…")
         dictionaryVersion = raw["dictionaryVersion"] as? String ?? ""
         dictionaryError = raw["dictionaryError"] as? String ?? ""
         baseVersion = raw["dictionaryBaseVersion"] as? String ?? "2.23.0"
@@ -662,8 +766,9 @@ struct LiveStatus {
         activeSubscriptionTier = raw["activeSubscriptionTier"] as? String ?? "FREE"
         accountsRevision = (raw["accountsRevision"] as? String) ?? "\(raw["accountsRevision"] ?? "")"
         liveAccountEmail = raw["liveAccountEmail"] as? String ?? ""
+        oauthClientConfigured = raw["oauthClientConfigured"] as? Bool ?? true
         if let errors = raw["errors"] as? [String], !errors.isEmpty {
-            connectionError = errors.joined(separator: "；")
+            connectionError = errors.joined(separator: L10n.shared.isEnglish ? "; " : "；")
         }
     }
 
@@ -679,19 +784,23 @@ struct LiveStatus {
     }
 
     var title: String {
-        if !dictionaryError.isEmpty { return "需要检查词典" }
-        if !connectionError.isEmpty { return "部分界面需要检查" }
-        if working && enabled { return "正在处理任务" }
+        if !dictionaryError.isEmpty { return L10n.t("status.check_dictionary", fallback: "需要检查词典") }
+        if !connectionError.isEmpty { return L10n.t("status.check_partial", fallback: "部分界面需要检查") }
+        if working && enabled { return L10n.t("status.running_tasks", fallback: "正在处理任务") }
         switch mode {
-        case "connected", "adaptive": return "已连接"
-        case "paused": return "汉化已暂停"
-        case "unsupported": return "等待版本适配"
-        case "legacy-blocked": return "检测到旧版汉化"
-        case "error": return "连接需要处理"
-        case "stopped": return "服务已停止"
-        case "waiting-window": return "等待可连接窗口"
-        case "waiting": return "等待目标界面"
-        default: return "等待 Antigravity"
+        case "connected", "adaptive": return L10n.t("status.connected", fallback: "已连接")
+        case "paused":
+            if L10n.shared.currentLocale == "en" || locale == "en" {
+                return windows > 0 ? L10n.t("status.connected_english", fallback: "已连接 · 英文") : L10n.t("status.english_mode", fallback: "英文模式")
+            }
+            return L10n.t("status.paused", fallback: "汉化已暂停")
+        case "unsupported": return L10n.t("status.unsupported", fallback: "等待版本适配")
+        case "legacy-blocked": return L10n.t("status.legacy_blocked", fallback: "检测到旧版汉化")
+        case "error": return L10n.t("status.error", fallback: "连接需要处理")
+        case "stopped": return L10n.t("status.stopped", fallback: "服务已停止")
+        case "waiting-window": return L10n.t("status.waiting_window", fallback: "等待可连接窗口")
+        case "waiting": return L10n.t("status.waiting", fallback: "等待目标界面")
+        default: return L10n.t("status.waiting_app", fallback: "等待 Antigravity")
         }
     }
 
@@ -821,6 +930,321 @@ final class PillBadge: NSView {
     }
 }
 func pillBadge(_ title: String, color: NSColor) -> PillBadge { PillBadge(title, color: color) }
+
+/// 订阅等级专属徽章（方案 A · 光学晶釉）：区别于普通状态 PillBadge 的精致圆角铭牌，按昵称字号提供 regular / compact 两档比例。
+final class TierBadge: NSView {
+    enum Scale {
+        case regular
+        case compact
+
+        var height: CGFloat { self == .regular ? 18.0 : 16.0 }
+        var cornerRadius: CGFloat { self == .regular ? 5.5 : 4.8 }
+        var fontSize: CGFloat { self == .regular ? 9.5 : 8.5 }
+        var kern: CGFloat { self == .regular ? 0.45 : 0.35 }
+        var leadingPad: CGFloat { self == .regular ? 5.5 : 4.5 }
+        var trailingPad: CGFloat { self == .regular ? 6.0 : 5.0 }
+        var iconGap: CGFloat { self == .regular ? 3.5 : 3.0 }
+        func iconSize(for kind: Kind) -> CGFloat {
+            switch kind {
+            case .ultra: return self == .regular ? 9.5 : 8.5
+            case .pro, .free: return self == .regular ? 8.5 : 7.5
+            case .neutral: return 0
+            }
+        }
+    }
+
+    enum Kind: Equatable {
+        case free
+        case pro
+        case ultra
+        case neutral
+
+        static func resolve(_ raw: String) -> Kind {
+            switch AccountIdentity.normalizeTier(raw) {
+            case "ULTRA", "ENTERPRISE": return .ultra
+            case "PRO", "TEAM", "PLUS": return .pro
+            case "FREE": return .free
+            default: return .neutral
+            }
+        }
+    }
+
+    private struct Palette {
+        let fillColors: [CGColor]
+        let fillLocations: [CGFloat]
+        let borderColors: [CGColor]
+        let borderLocations: [CGFloat]
+        let textColor: NSColor
+        let topBevelAlpha: CGFloat
+        let diagonalGradient: Bool
+    }
+
+    override var allowsVibrancy: Bool { false }
+    let scale: Scale
+    private let label = text("", size: 9.5, weight: .semibold)
+    private var labelLeadingConstraint: NSLayoutConstraint!
+    private var kind: Kind = .neutral
+
+    var title: String = "" {
+        didSet {
+            kind = Kind.resolve(title)
+            updateContent()
+        }
+    }
+
+    init(_ title: String, scale: Scale = .regular) {
+        self.scale = scale
+        super.init(frame: .zero)
+        label.setAccessibilityElement(false)
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.allowsDefaultTighteningForTruncation = false
+        addSubview(label)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        labelLeadingConstraint = label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: scale.leadingPad)
+        NSLayoutConstraint.activate([
+            labelLeadingConstraint,
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -scale.trailingPad),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            heightAnchor.constraint(equalToConstant: scale.height)
+        ])
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setContentHuggingPriority(.required, for: .vertical)
+        setContentCompressionResistancePriority(.required, for: .vertical)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        self.title = title
+        self.kind = Kind.resolve(title)
+        updateContent()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func palette(for kind: Kind, isDark: Bool) -> Palette {
+        func cg(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ a: CGFloat) -> CGColor {
+            NSColor(srgbRed: r / 255.0, green: g / 255.0, blue: b / 255.0, alpha: a).cgColor
+        }
+        switch kind {
+        case .ultra:
+            if isDark {
+                return Palette(
+                    fillColors: [cg(255, 179, 64, 0.16), cg(168, 85, 247, 0.25), cg(56, 189, 248, 0.19)],
+                    fillLocations: [0.0, 0.52, 1.0],
+                    borderColors: [cg(251, 191, 36, 0.58), cg(192, 132, 252, 0.56), cg(56, 189, 248, 0.54)],
+                    borderLocations: [0.0, 0.5, 1.0],
+                    textColor: NSColor(srgbRed: 226/255, green: 198/255, blue: 1.0, alpha: 1.0),
+                    topBevelAlpha: 0.22,
+                    diagonalGradient: true
+                )
+            }
+            return Palette(
+                fillColors: [cg(255, 159, 10, 0.09), cg(139, 92, 246, 0.14), cg(10, 132, 255, 0.13)],
+                fillLocations: [0.0, 0.50, 1.0],
+                borderColors: [cg(245, 158, 11, 0.52), cg(139, 92, 246, 0.50), cg(14, 165, 233, 0.46)],
+                borderLocations: [0.0, 0.52, 1.0],
+                textColor: NSColor(srgbRed: 93/255, green: 40/255, blue: 184/255, alpha: 1.0),
+                topBevelAlpha: 0.85,
+                diagonalGradient: true
+            )
+        case .pro:
+            if isDark {
+                return Palette(
+                    fillColors: [cg(10, 132, 255, 0.24), cg(72, 152, 255, 0.13)],
+                    fillLocations: [0.0, 1.0],
+                    borderColors: [cg(105, 182, 255, 0.46), cg(10, 132, 255, 0.22)],
+                    borderLocations: [0.0, 1.0],
+                    textColor: NSColor(srgbRed: 109/255, green: 183/255, blue: 1.0, alpha: 1.0),
+                    topBevelAlpha: 0.20,
+                    diagonalGradient: true
+                )
+            }
+            return Palette(
+                fillColors: [cg(0, 100, 220, 0.09), cg(52, 120, 246, 0.17)],
+                fillLocations: [0.0, 1.0],
+                borderColors: [cg(0, 100, 220, 0.34), cg(75, 148, 255, 0.22)],
+                borderLocations: [0.0, 1.0],
+                textColor: NSColor(srgbRed: 0.0, green: 78/255, blue: 179/255, alpha: 1.0),
+                topBevelAlpha: 0.78,
+                diagonalGradient: true
+            )
+        case .free, .neutral:
+            if isDark {
+                return Palette(
+                    fillColors: [cg(255, 255, 255, 0.095), cg(255, 255, 255, 0.045)],
+                    fillLocations: [0.0, 1.0],
+                    borderColors: [cg(255, 255, 255, 0.18), cg(255, 255, 255, 0.07)],
+                    borderLocations: [0.0, 1.0],
+                    textColor: NSColor(srgbRed: 162/255, green: 167/255, blue: 180/255, alpha: 1.0),
+                    topBevelAlpha: 0.10,
+                    diagonalGradient: false
+                )
+            }
+            return Palette(
+                fillColors: [cg(246, 247, 250, 1.0), cg(236, 238, 243, 1.0)],
+                fillLocations: [0.0, 1.0],
+                borderColors: [cg(29, 29, 31, 0.14), cg(29, 29, 31, 0.08)],
+                borderLocations: [0.0, 1.0],
+                textColor: NSColor(srgbRed: 86/255, green: 92/255, blue: 104/255, alpha: 1.0),
+                topBevelAlpha: 0.90,
+                diagonalGradient: false
+            )
+        }
+    }
+
+    private func updateContent() {
+        let iconSize = scale.iconSize(for: kind)
+        labelLeadingConstraint.constant = scale.leadingPad + (iconSize > 0 ? iconSize + scale.iconGap : 0)
+        let currentKind = kind
+        let textColor = NSColor(name: nil) { [weak self] appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return self?.palette(for: currentKind, isDark: isDark).textColor ?? .labelColor
+        }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: scale.fontSize, weight: .semibold),
+            .kern: scale.kern,
+            .foregroundColor: textColor
+        ]
+        label.attributedStringValue = NSAttributedString(string: title, attributes: attrs)
+        setAccessibilityLabel(title)
+        invalidateIntrinsicContentSize()
+        needsDisplay = true
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let iconSize = scale.iconSize(for: kind)
+        let iconBlock = iconSize > 0 ? (iconSize + scale.iconGap) : 0
+        let width = scale.leadingPad + iconBlock + ceil(label.intrinsicContentSize.width) + scale.trailingPad
+        return NSSize(width: width, height: scale.height)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateContent()
+    }
+
+    private static func addSparkle(to path: CGMutablePath, center: CGPoint, radius: CGFloat) {
+        let waist = radius * 0.08
+        path.move(to: CGPoint(x: center.x, y: center.y + radius))
+        path.addQuadCurve(to: CGPoint(x: center.x + radius, y: center.y), control: CGPoint(x: center.x + waist, y: center.y + waist))
+        path.addQuadCurve(to: CGPoint(x: center.x, y: center.y - radius), control: CGPoint(x: center.x + waist, y: center.y - waist))
+        path.addQuadCurve(to: CGPoint(x: center.x - radius, y: center.y), control: CGPoint(x: center.x - waist, y: center.y - waist))
+        path.addQuadCurve(to: CGPoint(x: center.x, y: center.y + radius), control: CGPoint(x: center.x - waist, y: center.y + waist))
+        path.closeSubpath()
+    }
+
+    override func draw(_ rect: NSRect) {
+        guard bounds.width > 2 && bounds.height > 2,
+              let gctx = NSGraphicsContext.current else { return }
+        let ctx = gctx.cgContext
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let pal = palette(for: kind, isDark: isDark)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+        let outerRect = bounds.insetBy(dx: 0.45, dy: 0.45)
+        let r = max(1.0, scale.cornerRadius - 0.45)
+        let outerPath = CGPath(roundedRect: outerRect, cornerWidth: r, cornerHeight: r, transform: nil)
+        let startPt = pal.diagonalGradient ? CGPoint(x: outerRect.minX, y: outerRect.maxY) : CGPoint(x: outerRect.midX, y: outerRect.maxY)
+        let endPt = pal.diagonalGradient ? CGPoint(x: outerRect.maxX, y: outerRect.minY) : CGPoint(x: outerRect.midX, y: outerRect.minY)
+
+        // 1. 光学晶釉底色渐变
+        ctx.saveGState()
+        ctx.addPath(outerPath)
+        ctx.clip()
+        if let fillGrad = CGGradient(colorsSpace: colorSpace, colors: pal.fillColors as CFArray, locations: pal.fillLocations) {
+            ctx.drawLinearGradient(fillGrad, start: startPt, end: endPt, options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+        }
+
+        // 2. 顶部 Specular Bevel 高光倒角（呼应 GravityBox 卡片倒角语言）
+        let bevelRect = bounds.insetBy(dx: 0.9, dy: 0.9)
+        let bevelR = max(1.0, scale.cornerRadius - 0.9)
+        let bevelPath = CGPath(roundedRect: bevelRect, cornerWidth: bevelR, cornerHeight: bevelR, transform: nil)
+        ctx.addPath(bevelPath)
+        ctx.setLineWidth(0.75)
+        ctx.replacePathWithStrokedPath()
+        ctx.clip()
+        let bevelColors = [
+            NSColor.white.withAlphaComponent(pal.topBevelAlpha).cgColor,
+            NSColor.white.withAlphaComponent(0.0).cgColor
+        ] as CFArray
+        if let bevelGrad = CGGradient(colorsSpace: colorSpace, colors: bevelColors, locations: [0.0, 0.55]) {
+            ctx.drawLinearGradient(bevelGrad, start: CGPoint(x: bevelRect.midX, y: bevelRect.maxY), end: CGPoint(x: bevelRect.midX, y: bevelRect.minY), options: [])
+        }
+        ctx.restoreGState()
+
+        // 3. 渐变描边
+        ctx.saveGState()
+        ctx.addPath(outerPath)
+        ctx.setLineWidth(0.9)
+        ctx.replacePathWithStrokedPath()
+        ctx.clip()
+        if let borderGrad = CGGradient(colorsSpace: colorSpace, colors: pal.borderColors as CFArray, locations: pal.borderLocations) {
+            ctx.drawLinearGradient(borderGrad, start: startPt, end: endPt, options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+        }
+        ctx.restoreGState()
+
+        // 4. 等级微徽记
+        let iconSize = scale.iconSize(for: kind)
+        guard iconSize > 0 else { return }
+        let iconRect = CGRect(x: scale.leadingPad, y: (bounds.height - iconSize) / 2.0, width: iconSize, height: iconSize)
+
+        ctx.saveGState()
+        switch kind {
+        case .free:
+            let ringColor = pal.textColor.withAlphaComponent(0.85).cgColor
+            ctx.setStrokeColor(ringColor)
+            ctx.setFillColor(ringColor)
+            let ringInset = iconSize * 0.14
+            ctx.setLineWidth(max(1.0, iconSize * 0.14))
+            ctx.strokeEllipse(in: iconRect.insetBy(dx: ringInset, dy: ringInset))
+            let dotR = iconSize * 0.14
+            ctx.fillEllipse(in: CGRect(x: iconRect.midX - dotR, y: iconRect.midY - dotR, width: dotR * 2, height: dotR * 2))
+        case .pro:
+            let starPath = CGMutablePath()
+            Self.addSparkle(to: starPath, center: CGPoint(x: iconRect.midX, y: iconRect.midY), radius: iconSize * 0.48)
+            ctx.addPath(starPath)
+            ctx.setFillColor(pal.textColor.cgColor)
+            ctx.fillPath()
+        case .ultra:
+            let twinPath = CGMutablePath()
+            Self.addSparkle(
+                to: twinPath,
+                center: CGPoint(x: iconRect.minX + iconSize * 0.43, y: iconRect.minY + iconSize * 0.43),
+                radius: iconSize * 0.41
+            )
+            Self.addSparkle(
+                to: twinPath,
+                center: CGPoint(x: iconRect.minX + iconSize * 0.81, y: iconRect.minY + iconSize * 0.78),
+                radius: iconSize * 0.18
+            )
+            ctx.addPath(twinPath)
+            ctx.clip()
+            let prismColors: [CGColor] = isDark
+                ? [
+                    NSColor(srgbRed: 251/255, green: 191/255, blue: 36/255, alpha: 1).cgColor,
+                    NSColor(srgbRed: 192/255, green: 132/255, blue: 252/255, alpha: 1).cgColor,
+                    NSColor(srgbRed: 56/255, green: 189/255, blue: 248/255, alpha: 1).cgColor
+                ]
+                : [
+                    NSColor(srgbRed: 245/255, green: 158/255, blue: 11/255, alpha: 1).cgColor,
+                    NSColor(srgbRed: 139/255, green: 92/255, blue: 246/255, alpha: 1).cgColor,
+                    NSColor(srgbRed: 14/255, green: 165/255, blue: 233/255, alpha: 1).cgColor
+                ]
+            if let prismGrad = CGGradient(colorsSpace: colorSpace, colors: prismColors as CFArray, locations: [0.0, 0.52, 1.0]) {
+                ctx.drawLinearGradient(
+                    prismGrad,
+                    start: CGPoint(x: iconRect.minX, y: iconRect.maxY),
+                    end: CGPoint(x: iconRect.maxX, y: iconRect.minY),
+                    options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+                )
+            }
+        case .neutral:
+            break
+        }
+        ctx.restoreGState()
+    }
+}
+func tierBadge(_ title: String, scale: TierBadge.Scale = .regular) -> TierBadge { TierBadge(title, scale: scale) }
 
 // MARK: - Apple HIG Modern Avatar View & Shared Tinted Icon Container
 func tintedIconBox(
@@ -1134,7 +1558,7 @@ final class QuotaBarView: NSView {
     private(set) var percentage: Int = 0
     private(set) var percentageKnown: Bool = true
     private(set) var staleData: Bool = false
-    var unknownPlaceholder: String = "待刷新"
+    var unknownPlaceholder: String = L10n.t("common.pending_refresh", fallback: "待刷新")
 
     private var leftStack: NSStackView!
     private var topRow: NSStackView!
@@ -1156,10 +1580,10 @@ final class QuotaBarView: NSView {
     // 重置倒计时颜色：普通倒计时使用 .secondaryLabelColor，仅紧急状态（如“即将重置”/已过/配额告急）使用警示色
     private var resetTextColor: NSColor {
         let text = resetLabel.stringValue
-        let isUrgent = text.contains("即将重置") || text.contains("已过") || text.contains("告急")
+        let isUrgent = text.contains("即将重置") || text.contains("已过") || text.contains("告急") || text.localizedCaseInsensitiveContains("soon") || text.localizedCaseInsensitiveContains("overdue") || text.localizedCaseInsensitiveContains("exhausted")
         guard isUrgent else { return Design.secondary }
         let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        if text.contains("已过") || text.contains("告急") {
+        if text.contains("已过") || text.contains("告急") || text.localizedCaseInsensitiveContains("overdue") || text.localizedCaseInsensitiveContains("exhausted") {
             return isDark
                 ? NSColor(srgbRed: 0.984, green: 0.443, blue: 0.522, alpha: 1.0)
                 : accessibleDangerColor()
@@ -1176,7 +1600,7 @@ final class QuotaBarView: NSView {
         if let unknownPlaceholder = unknownPlaceholder {
             self.unknownPlaceholder = unknownPlaceholder
         } else {
-            self.unknownPlaceholder = "未知"
+            self.unknownPlaceholder = L10n.t("common.unknown", fallback: "未知")
         }
         trackView.percentage = self.percentage
         trackView.percentageKnown = self.percentageKnown
@@ -1249,7 +1673,7 @@ final class QuotaBarView: NSView {
         for constraint in trackView.constraints where constraint.firstAttribute == .height { constraint.constant = 8 }
         trackView.isHidden = false
         resetLabel.isHidden = resetLabel.stringValue.isEmpty
-        let minH = heightAnchor.constraint(greaterThanOrEqualToConstant: 52)
+        let minH = heightAnchor.constraint(greaterThanOrEqualToConstant: 34)
         minH.priority = .defaultHigh
         minH.isActive = true
     }
@@ -1279,16 +1703,16 @@ final class QuotaBarView: NSView {
     }
 
     private func updateAccessibility() {
-        var desc = titleLabel.stringValue.isEmpty ? "剩余配额" : titleLabel.stringValue
-        desc += percentageKnown ? " 剩余 \(percentage)%" : " \(unknownPlaceholder)"
-        if staleData { desc += " · 数据已过期" }
+        var desc = titleLabel.stringValue.isEmpty ? L10n.t("component.quota.remaining", fallback: "剩余配额") : titleLabel.stringValue
+        desc += percentageKnown ? L10n.t("component.quota.a11y_pct", ["pct": percentage], fallback: " 剩余 \(percentage)%") : " \(unknownPlaceholder)"
+        if staleData { desc += L10n.t("component.quota.a11y_stale", fallback: " · 数据已过期") }
         if !resetLabel.stringValue.isEmpty {
-            desc += "，\(resetLabel.stringValue)"
+            desc += ", \(resetLabel.stringValue)"
         }
         setAccessibilityElement(true)
         setAccessibilityRole(.progressIndicator)
         setAccessibilityLabel(desc)
-        setAccessibilityHelp("显示剩余配额；轨道长度对应剩余百分比。")
+        setAccessibilityHelp(L10n.t("component.quota.a11y_help", fallback: "显示剩余配额；轨道长度对应剩余百分比。"))
         if percentageKnown {
             setAccessibilityValue(NSNumber(value: percentage))
             setAccessibilityMinValue(NSNumber(value: 0))
@@ -1392,8 +1816,9 @@ final class UsageTrendChartView: NSView {
         }
         var pts: [Point] = []
         for hr in 0..<24 {
-            let lbl = String(format: "%02d:00", hr)
-            pts.append(.init(label: String(format: "%02d时", hr), tokens: hourMap[lbl] ?? 0))
+            let lbl = String(format: "%02d:00", locale: Locale(identifier: "en_US_POSIX"), hr)
+            let hourText = L10n.t("menu_panel.trend.hour_label", ["hour": String(format: "%02d", locale: Locale(identifier: "en_US_POSIX"), hr)], fallback: String(format: "%02d时", locale: Locale(identifier: "en_US_POSIX"), hr))
+            pts.append(.init(label: hourText, tokens: hourMap[lbl] ?? 0))
         }
         return pts
     }
@@ -1402,6 +1827,8 @@ final class UsageTrendChartView: NSView {
         let label: String
         let tokens: Int
     }
+    private var fixedHeightConstraint: NSLayoutConstraint?
+    private var minHeightConstraint: NSLayoutConstraint?
     private var revealProgress: CGFloat = 1.0
     private let revealMotion = DesignMotion()
     private let hoverMotion = DesignMotion()
@@ -1412,10 +1839,10 @@ final class UsageTrendChartView: NSView {
             hoveredIndex = nil
             animatedHoverX = nil
             hoverMotion.cancel()
-            let activeSummary = points.filter { $0.tokens > 0 }.prefix(8).map { "\($0.label): \(compactTokens($0.tokens))" }.joined(separator: "，")
+            let activeSummary = points.filter { $0.tokens > 0 }.prefix(8).map { "\($0.label): \(compactTokens($0.tokens))" }.joined(separator: ", ")
             let peak = points.map(\.tokens).max() ?? 0
-            let peakText = peak > 0 ? "峰值 \(compactTokens(peak)) Token" : "当前时段无消耗"
-            setAccessibilityHelp(activeSummary.isEmpty ? peakText : "\(peakText)；时段明细：\(activeSummary)")
+            let peakText = peak > 0 ? L10n.t("component.chart.peak_tokens", ["tokens": compactTokens(peak)], fallback: "峰值 \(compactTokens(peak)) Token") : L10n.t("component.chart.no_usage", fallback: "当前时段无消耗")
+            setAccessibilityHelp(activeSummary.isEmpty ? peakText : L10n.t("component.chart.detail_a11y", ["peak": peakText, "summary": activeSummary], fallback: "\(peakText)；时段明细：\(activeSummary)"))
             guard oldValue != points else {
                 needsDisplay = true
                 return
@@ -1423,7 +1850,7 @@ final class UsageTrendChartView: NSView {
             startRevealAnimation()
         }
     }
-    var subtitle: String = "近期消耗分布" {
+    var subtitle: String = L10n.t("component.chart.recent_distribution", fallback: "近期消耗分布") {
         didSet { needsDisplay = true }
     }
     private var hoverTrackingArea: NSTrackingArea?
@@ -1436,10 +1863,21 @@ final class UsageTrendChartView: NSView {
     override init(frame frameRect: NSRect = .zero) {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
-        heightAnchor.constraint(equalToConstant: 96).isActive = true
+        let fixedH = heightAnchor.constraint(equalToConstant: 96)
+        fixedH.isActive = true
+        fixedHeightConstraint = fixedH
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
-        setAccessibilityLabel("Token 用量趋势柱状图")
+        setAccessibilityLabel(L10n.t("component.chart.bar_a11y", fallback: "Token 用量趋势柱状图"))
+    }
+
+    func useFlexibleHeight(minHeight: CGFloat = 92) {
+        fixedHeightConstraint?.isActive = false
+        minHeightConstraint?.isActive = false
+        let minH = heightAnchor.constraint(greaterThanOrEqualToConstant: minHeight)
+        minH.isActive = true
+        minHeightConstraint = minH
+        setContentHuggingPriority(NSLayoutConstraint.Priority(200), for: .vertical)
     }
     required init?(coder: NSCoder) { fatalError() }
     deinit {
@@ -1557,7 +1995,7 @@ final class UsageTrendChartView: NSView {
         baseLine.stroke()
 
         guard !points.isEmpty else {
-            let emptyStr = "暂无该时段会话记录" as NSString
+            let emptyStr = L10n.t("component.chart.no_sessions", fallback: "暂无该时段会话记录") as NSString
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 12),
                 .foregroundColor: Design.secondary
@@ -1569,7 +2007,7 @@ final class UsageTrendChartView: NSView {
 
         let peakVal = points.map(\.tokens).max() ?? 0
         guard peakVal > 0 else {
-            let emptyStr = "当前时段暂无消耗分布" as NSString
+            let emptyStr = L10n.t("component.chart.no_distribution", fallback: "当前时段暂无消耗分布") as NSString
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 11.5),
                 .foregroundColor: Design.secondary
@@ -1580,8 +2018,7 @@ final class UsageTrendChartView: NSView {
         }
         let maxVal = max(peakVal, 1)
 
-        // F12: 纵轴只保留 0 与峰值两个刻度（峰值带 M/K 单位）；峰值参考线属于“带标注的虚线”，
-        // 不再保留原先横穿全图且没有含义说明的中位虚线。
+        // 纵轴刻度：默认保留 0 与峰值两个刻度；当图表纵向空间充裕（>= 88pt）时补充带明确数值标注的 50% 中位参考线。
         let peakText = compactTokens(maxVal) as NSString
         let peakSize = peakText.size(withAttributes: axisAttrs)
         peakText.draw(at: NSPoint(x: max(2, leftPad - 8 - peakSize.width), y: chartTop - peakSize.height), withAttributes: axisAttrs)
@@ -1597,6 +2034,24 @@ final class UsageTrendChartView: NSView {
         designHairline().setStroke()
         peakLine.lineWidth = 0.8
         peakLine.stroke()
+
+        if chartHeight >= 88 && maxVal >= 2 {
+            let midY = round((chartBottom + chartTop) / 2.0)
+            let midVal = Int(round(Double(maxVal) / 2.0))
+            let midText = compactTokens(midVal) as NSString
+            let midSize = midText.size(withAttributes: axisAttrs)
+            let midLabelY = midY - midSize.height / 2.0
+            if midLabelY > chartBottom + zeroSize.height * 0.6 && midLabelY + midSize.height < chartTop - peakSize.height - 2 {
+                midText.draw(at: NSPoint(x: max(2, leftPad - 8 - midSize.width), y: midLabelY), withAttributes: axisAttrs)
+                let midLine = NSBezierPath()
+                midLine.move(to: NSPoint(x: leftPad, y: midY))
+                midLine.line(to: NSPoint(x: bounds.width - rightPad, y: midY))
+                midLine.setLineDash([3, 4], count: 2, phase: 0)
+                designHairline(lightAlpha: 0.075, darkAlpha: 0.045).setStroke()
+                midLine.lineWidth = 0.8
+                midLine.stroke()
+            }
+        }
 
         let count = points.count
         let slotWidth = usableWidth / CGFloat(count)
@@ -1618,17 +2073,21 @@ final class UsageTrendChartView: NSView {
         }
 
         var lastDrawnRight: CGFloat = -999.0
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let baseSlotFill = NSColor.labelColor.withAlphaComponent(isDark ? 0.12 : 0.08)
+        let cursorFill = NSColor.labelColor.withAlphaComponent(isDark ? 0.065 : 0.045)
+        let normalGrad = NSGradient(starting: Design.blue.withAlphaComponent(0.72), ending: Design.blue)
+        let hoverGrad = NSGradient(starting: Design.blue.withAlphaComponent(0.90), ending: Design.blue)
 
         for (idx, pt) in points.enumerated() {
             let cx = leftPad + (CGFloat(idx) + 0.5) * slotWidth
             let isHovered = (hoveredIndex == idx)
-            let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
 
             // 0 柱位浅灰基槽
             let baseH: CGFloat = 2.5
             let baseRect = NSRect(x: cx - barWidth / 2, y: chartBottom + 1, width: barWidth, height: baseH)
             let basePath = NSBezierPath(roundedRect: baseRect, xRadius: min(1.25, barWidth / 2), yRadius: min(1.25, barWidth / 2))
-            NSColor.labelColor.withAlphaComponent(isDark ? 0.12 : 0.08).setFill()
+            baseSlotFill.setFill()
             basePath.fill()
 
             // 悬停即时跟随微光光标
@@ -1636,7 +2095,7 @@ final class UsageTrendChartView: NSView {
                 let cursorCenterX = animatedHoverX ?? cx
                 let cursorRect = NSRect(x: cursorCenterX - slotWidth * 0.44, y: chartBottom + 1, width: slotWidth * 0.88, height: chartHeight)
                 let cursorPath = NSBezierPath(roundedRect: cursorRect, xRadius: 4, yRadius: 4)
-                NSColor.labelColor.withAlphaComponent(isDark ? 0.065 : 0.045).setFill()
+                cursorFill.setFill()
                 cursorPath.fill()
             }
 
@@ -1657,11 +2116,7 @@ final class UsageTrendChartView: NSView {
                 barPath.line(to: NSPoint(x: bx + barWidth, y: by))
                 barPath.close()
 
-                let grad = NSGradient(
-                    starting: Design.blue.withAlphaComponent(isHovered ? 0.90 : 0.72),
-                    ending: Design.blue
-                )
-                grad?.draw(in: barPath, angle: 90)
+                (isHovered ? hoverGrad : normalGrad)?.draw(in: barPath, angle: 90)
             }
 
             // 刻度文本绘制与防撞逻辑：步长对齐，末尾点仅在空间充裕时绘制
@@ -1749,7 +2204,7 @@ final class ModelDonutChartView: NSView {
         heightAnchor.constraint(equalToConstant: 104).isActive = true
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
-        setAccessibilityLabel("模型费用占比环图")
+        setAccessibilityLabel(L10n.t("component.donut.a11y", fallback: "模型费用占比环图"))
     }
     required init?(coder: NSCoder) { fatalError() }
     deinit {
@@ -1926,10 +2381,10 @@ final class ModelDonutChartView: NSView {
             let hSlice = validSlices[hIdx]
             activeUsd = hSlice.usd
             let pct = Int(round((hSlice.usd / sumUsd) * 100.0))
-            subLabelString = "占比 \(pct)%"
+            subLabelString = L10n.t("component.donut.share_pct", ["pct": pct], fallback: "占比 \(pct)%")
         } else {
             activeUsd = totalUsd
-            subLabelString = "等效账单"
+            subLabelString = L10n.t("component.donut.equivalent_bill", fallback: "等效账单")
         }
 
         let usdText: NSString
@@ -1938,9 +2393,9 @@ final class ModelDonutChartView: NSView {
         } else if activeUsd > 0 && activeUsd < 0.001 {
             usdText = "<$0.001" as NSString
         } else if activeUsd < 0.01 && activeUsd > 0 {
-            usdText = String(format: "$%.3f", activeUsd) as NSString
+            usdText = String(format: "$%.3f", locale: Locale(identifier: "en_US_POSIX"), activeUsd) as NSString
         } else {
-            usdText = String(format: "$%.2f", activeUsd) as NSString
+            usdText = String(format: "$%.2f", locale: Locale(identifier: "en_US_POSIX"), activeUsd) as NSString
         }
         let mainAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 15, weight: .bold),

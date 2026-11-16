@@ -6,7 +6,8 @@ final class PreferencesController: NSObject {
 
     unowned let app: Assistant
     var view: NSView!
-    let translationSwitch = DesignSwitch()
+    let languagePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private weak var languageSubtitleField: NSTextField?
     let hudSwitch = DesignSwitch()
     let pricingSyncSwitch = DesignSwitch()
     var pricingSyncCheckBtn: InlineRefreshButton!
@@ -14,7 +15,9 @@ final class PreferencesController: NSObject {
     let login = DesignSwitch()
     let syncLifecycleSwitch = DesignSwitch()
     let storageBadge = pillBadge("", color: Design.blue)
-    static let defaultStorageSubtitle = "清理无损缓存与历史日志，保留核心数据"
+    static var defaultStorageSubtitle: String {
+        L10n.t("settings.storage.default_subtitle", fallback: "清理无损缓存与历史日志，保留核心数据")
+    }
     let storageSubtitleLabel = text(PreferencesController.defaultStorageSubtitle, size: 11, color: Design.secondary, wrap: true)
     var manageCacheBtn: NSButton!
     var pricingSheet: PricingSyncSheetController?
@@ -24,61 +27,77 @@ final class PreferencesController: NSObject {
     init(app: Assistant) {
         self.app = app
         super.init()
-        translationSwitch.controlSize = .small
-        translationSwitch.state = app.statusValue.enabled ? .on : .off
-        translationSwitch.isEnabled = app.reachable && app.statusValue.mode != "unsupported"
-        translationSwitch.target = self; translationSwitch.action = #selector(toggleTranslation); translationSwitch.setAccessibilityLabel("界面汉化")
+        rebuildLanguagePopup()
+        languagePopup.isEnabled = app.statusValue.mode != "unsupported"
+        languagePopup.target = self
+        languagePopup.action = #selector(languageChanged)
+        languagePopup.setAccessibilityLabel(L10n.t("settings.language.title", fallback: "显示语言"))
+        languagePopup.translatesAutoresizingMaskIntoConstraints = false
+        languagePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 148).isActive = true
 
         hudSwitch.controlSize = .small
         hudSwitch.state = app.effectiveHudEnabled() ? .on : .off
         hudSwitch.isEnabled = app.reachable && app.statusValue.mode != "unsupported"
-        hudSwitch.target = self; hudSwitch.action = #selector(toggleHud); hudSwitch.setAccessibilityLabel("对话状态栏")
+        hudSwitch.target = self; hudSwitch.action = #selector(toggleHud); hudSwitch.setAccessibilityLabel(L10n.t("settings.hud.title", fallback: "对话状态栏"))
 
         login.controlSize = .small
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        login.target = self; login.action = #selector(toggleLogin); login.setAccessibilityLabel("登录时启动")
+        login.target = self; login.action = #selector(toggleLogin); login.setAccessibilityLabel(L10n.t("settings.login.title", fallback: "登录时启动"))
 
         syncLifecycleSwitch.controlSize = .small
         syncLifecycleSwitch.state = app.configuration.value.syncAntigravityLifecycle ? .on : .off
         syncLifecycleSwitch.target = self; syncLifecycleSwitch.action = #selector(toggleSyncLifecycle)
-        syncLifecycleSwitch.setAccessibilityLabel("跟随 Antigravity 启停")
+        syncLifecycleSwitch.setAccessibilityLabel(L10n.t("settings.sync_lifecycle.title", fallback: "跟随 Antigravity 启停"))
 
-        refresh.addItems(withTitles: ["手动刷新", "每 5 分钟", "每 10 分钟", "每 15 分钟", "每 30 分钟", "每 60 分钟"])
+        refresh.addItems(withTitles: [
+            L10n.t("settings.refresh.manual", fallback: "手动刷新"),
+            L10n.t("settings.refresh.5m", fallback: "每 5 分钟"),
+            L10n.t("settings.refresh.10m", fallback: "每 10 分钟"),
+            L10n.t("settings.refresh.15m", fallback: "每 15 分钟"),
+            L10n.t("settings.refresh.30m", fallback: "每 30 分钟"),
+            L10n.t("settings.refresh.60m", fallback: "每 60 分钟")
+        ])
         refresh.selectItem(at: Self.refreshIntervals.firstIndex(of: app.configuration.value.quotaRefreshMinutes) ?? 0)
-        refresh.target = self; refresh.action = #selector(refreshChanged); refresh.setAccessibilityLabel("配额刷新间隔")
+        refresh.target = self; refresh.action = #selector(refreshChanged); refresh.setAccessibilityLabel(L10n.t("settings.refresh.title", fallback: "配额刷新间隔"))
         refresh.translatesAutoresizingMaskIntoConstraints = false
-        refresh.widthAnchor.constraint(equalToConstant: 118).isActive = true
+        refresh.widthAnchor.constraint(greaterThanOrEqualToConstant: 142).isActive = true
 
         pricingSyncSwitch.controlSize = .small
         pricingSyncSwitch.state = app.configuration.value.autoPricingSyncEnabled ? .on : .off
         pricingSyncSwitch.target = self; pricingSyncSwitch.action = #selector(togglePricingSync)
-        pricingSyncSwitch.setAccessibilityLabel("自动更新价格基准")
-        pricingSyncCheckBtn = InlineRefreshButton("立即检查", width: 88, target: self, action: #selector(checkPricingSync))
-        pricingSyncCheckBtn.setAccessibilityLabel("检查价格更新")
+        pricingSyncSwitch.setAccessibilityLabel(L10n.t("settings.pricing_sync.title", fallback: "自动更新价格基准"))
+        pricingSyncCheckBtn = InlineRefreshButton(L10n.t("settings.pricing_sync.check_now", fallback: "立即检查"), width: 104, target: self, action: #selector(checkPricingSync))
+        pricingSyncCheckBtn.setAccessibilityLabel(L10n.t("settings.pricing_sync.check_a11y", fallback: "检查价格更新"))
         let pricingControlGroup = horizontal([pricingSyncCheckBtn, pricingSyncSwitch], spacing: 8)
         pricingControlGroup.alignment = .centerY
 
+        let languageRow = settingRow(icon: "globe", tint: .systemGreen, title: L10n.t("settings.language.title", fallback: "显示语言"), subtitle: languageSubtitleText(), control: languagePopup)
+        if let rowStack = languageRow as? NSStackView,
+           let captionsStack = rowStack.arrangedSubviews.dropFirst().first as? NSStackView,
+           let subField = captionsStack.arrangedSubviews.dropFirst().first as? NSTextField {
+            languageSubtitleField = subField
+        }
         let enhanceGroup = vertical([
-            settingRow(icon: "character.book.closed", tint: .systemGreen, title: "界面汉化", subtitle: "实时汉化 Antigravity，不改动官方应用", control: translationSwitch),
+            languageRow,
             divider(),
-            settingRow(icon: "chart.bar.xaxis", tint: .systemIndigo, title: "对话状态栏", subtitle: "在 Antigravity 输入框下方显示轮次、Token 与上下文", control: hudSwitch)
+            settingRow(icon: "chart.bar.xaxis", tint: .systemIndigo, title: L10n.t("settings.hud.title", fallback: "对话状态栏"), subtitle: L10n.t("settings.hud.subtitle", fallback: "在 Antigravity 输入框下方显示轮次、Token 与上下文"), control: hudSwitch)
         ], spacing: 12)
         for child in enhanceGroup.arrangedSubviews { fillWidth(child, in: enhanceGroup) }
 
         let dataSyncGroup = vertical([
-            settingRow(icon: "arrow.clockwise", tint: Design.blue, title: "配额刷新间隔", subtitle: "定时更新已保存账号的剩余配额", control: refresh),
+            settingRow(icon: "arrow.clockwise", tint: Design.blue, title: L10n.t("settings.refresh.title", fallback: "配额刷新间隔"), subtitle: L10n.t("settings.refresh.subtitle", fallback: "定时更新已保存账号的剩余配额"), control: refresh),
             divider(),
-            settingRow(icon: "dollarsign.circle", tint: Design.blue, title: "自动更新价格基准", subtitle: "自动同步公开模型费率，每 24 小时检查一次", control: pricingControlGroup)
+            settingRow(icon: "dollarsign.circle", tint: Design.blue, title: L10n.t("settings.pricing_sync.title", fallback: "自动更新价格基准"), subtitle: L10n.t("settings.pricing_sync.subtitle", fallback: "自动同步公开模型费率，每 24 小时检查一次"), control: pricingControlGroup)
         ], spacing: 12)
         for child in dataSyncGroup.arrangedSubviews { fillWidth(child, in: dataSyncGroup) }
 
         storageBadge.isHidden = true
         storageBadge.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        manageCacheBtn = button("管理存储…", target: self, action: #selector(showMaintenanceSheet))
+        manageCacheBtn = button(L10n.t("settings.storage.manage_btn", fallback: "管理存储…"), target: self, action: #selector(showMaintenanceSheet))
         let storageRow = settingRow(
             icon: "internaldrive",
             tint: .systemOrange,
-            title: "存储与维护",
+            title: L10n.t("settings.storage.title", fallback: "存储与维护"),
             badge: storageBadge,
             subtitle: "",
             control: manageCacheBtn
@@ -91,9 +110,9 @@ final class PreferencesController: NSObject {
             captionsStack.addArrangedSubview(storageSubtitleLabel)
         }
         let systemAndStorageGroup = vertical([
-            settingRow(icon: "power", tint: .systemGray, title: "登录时启动", subtitle: "登录 macOS 时自动在菜单栏驻留", control: login),
+            settingRow(icon: "power", tint: .systemGray, title: L10n.t("settings.login.title", fallback: "登录时启动"), subtitle: L10n.t("settings.login.subtitle", fallback: "登录 macOS 时自动在菜单栏驻留"), control: login),
             divider(),
-            settingRow(icon: "link", tint: .systemTeal, title: "跟随 Antigravity 启停", subtitle: "随 Antigravity 自动启动并同步退出", control: syncLifecycleSwitch),
+            settingRow(icon: "link", tint: .systemTeal, title: L10n.t("settings.sync_lifecycle.title", fallback: "跟随 Antigravity 启停"), subtitle: L10n.t("settings.sync_lifecycle.subtitle", fallback: "随 Antigravity 自动启动并同步退出"), control: syncLifecycleSwitch),
             divider(),
             storageRow
         ], spacing: 12)
@@ -114,11 +133,11 @@ final class PreferencesController: NSObject {
             return grp
         }
 
-        let root = pageStack(title: "设置")
+        let root = pageStack(title: L10n.t("settings.title", fallback: "设置"))
         root.spacing = 14
-        root.addArrangedSubview(sectionGroup("Antigravity 增强", card: enhanceCard))
-        root.addArrangedSubview(sectionGroup("配额与计价", card: dataSyncCard))
-        root.addArrangedSubview(sectionGroup("系统与存储", card: systemAndStorageCard))
+        root.addArrangedSubview(sectionGroup(L10n.t("settings.section.enhance", fallback: "Antigravity 增强"), card: enhanceCard))
+        root.addArrangedSubview(sectionGroup(L10n.t("settings.section.quota_pricing", fallback: "配额与计价"), card: dataSyncCard))
+        root.addArrangedSubview(sectionGroup(L10n.t("settings.section.system_storage", fallback: "系统与存储"), card: systemAndStorageCard))
         view = scrollPage(root); Design.applyControls(view)
     }
 
@@ -130,27 +149,40 @@ final class PreferencesController: NSObject {
         if maintenanceSheet == nil {
             maintenanceSheet = MaintenanceSheetController(app: app)
         }
-        maintenanceSheet?.show(in: window) { [weak self] in
-            self?.refreshStorageRowState(force: true)
+        maintenanceSheet?.show(in: window) { [weak self, weak app = self.app] in
+            self?.maintenanceSheet = nil
+            if let app, app.pendingLocalizedRebuildAfterMaintenance, app.cachePage?.busy != true {
+                app.pendingLocalizedRebuildAfterMaintenance = false
+                app.cachePage = nil
+                app.preferencesController = nil
+                if app.currentPage == 3 {
+                    app.navigate(3, force: true)
+                }
+                return
+            }
+            app?.preferencesController?.refreshStorageRowState(force: true)
         }
     }
 
     func applyStorageScanPayload(_ value: [String: Any]) {
         lastStorageScanAt = Date()
-        let safeBytes = Int64(intVal(value, "safeBytes"))
-        let statefulBytes = Int64(intVal(value, "statefulBytes"))
+        let buckets = value["buckets"] as? [String: Any]
+        let rtBucket = buckets?["runtimeCache"] as? [String: Any] ?? [:]
+        let histBucket = buckets?["historyLogs"] as? [String: Any] ?? [:]
+        let safeBytes = Int64(intVal(rtBucket, "clearableBytes", fallback: intVal(value, "safeBytes")))
+        let statefulBytes = Int64(intVal(histBucket, "clearableBytes", fallback: intVal(value, "statefulBytes")))
         if safeBytes >= 10 * 1024 * 1024 {
             let formatted = ByteCountFormatter.string(fromByteCount: safeBytes, countStyle: .file)
-            storageBadge.title = "可释放 \(formatted)"
+            storageBadge.title = L10n.t("settings.storage.reclaimable", ["size": formatted], fallback: "可释放 \(formatted)")
             storageBadge.tint = Design.blue
             storageBadge.isHidden = false
         } else if statefulBytes >= 50 * 1024 * 1024 {
             let formatted = ByteCountFormatter.string(fromByteCount: statefulBytes, countStyle: .file)
-            storageBadge.title = "可瘦身 \(formatted)"
+            storageBadge.title = L10n.t("settings.storage.slimmable", ["size": formatted], fallback: "可瘦身 \(formatted)")
             storageBadge.tint = Design.secondary
             storageBadge.isHidden = false
         } else if safeBytes + statefulBytes > 0 {
-            storageBadge.title = "状态良好"
+            storageBadge.title = L10n.t("settings.storage.healthy", fallback: "状态良好")
             storageBadge.tint = Design.secondary
             storageBadge.isHidden = false
         } else {
@@ -159,7 +191,7 @@ final class PreferencesController: NSObject {
         if safeBytes > 0 && statefulBytes > 0 {
             let safeStr = ByteCountFormatter.string(fromByteCount: safeBytes, countStyle: .file)
             let statefulStr = ByteCountFormatter.string(fromByteCount: statefulBytes, countStyle: .file)
-            storageSubtitleLabel.stringValue = "可清理 \(safeStr) 无损缓存，另有 \(statefulStr) 历史数据可瘦身"
+            storageSubtitleLabel.stringValue = L10n.t("settings.storage.detail_subtitle", ["safe": safeStr, "stateful": statefulStr], fallback: "运行缓存 \(safeStr)，另有 \(statefulStr) 早期日志可按需释放")
         } else {
             storageSubtitleLabel.stringValue = Self.defaultStorageSubtitle
         }
@@ -183,9 +215,34 @@ final class PreferencesController: NSObject {
         }
     }
 
+    private func languageSubtitleText() -> String {
+        L10n.t("settings.language.subtitle", fallback: "同时决定 GravityBox 与 Antigravity 的界面语言，不改动官方应用")
+    }
+
+    private func rebuildLanguagePopup() {
+        languagePopup.removeAllItems()
+        let systemTitle = L10n.t("language.system", fallback: "跟随系统")
+        languagePopup.addItem(withTitle: systemTitle)
+        languagePopup.lastItem?.representedObject = "system"
+        languagePopup.menu?.addItem(.separator())
+        for meta in L10n.shared.supportedLocales {
+            languagePopup.addItem(withTitle: meta.nativeName)
+            languagePopup.lastItem?.representedObject = meta.code
+        }
+        let configured = app.effectiveConfiguredLanguage()
+        if let idx = languagePopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == configured }) {
+            languagePopup.selectItem(at: idx)
+        } else if let idx = languagePopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == L10n.shared.currentLocale }) {
+            languagePopup.selectItem(at: idx)
+        } else {
+            languagePopup.selectItem(at: 0)
+        }
+    }
+
     func update() {
-        translationSwitch.state = app.statusValue.enabled ? .on : .off
-        translationSwitch.isEnabled = app.reachable && app.statusValue.mode != "unsupported"
+        rebuildLanguagePopup()
+        languageSubtitleField?.stringValue = languageSubtitleText()
+        languagePopup.isEnabled = app.statusValue.mode != "unsupported"
         hudSwitch.state = app.effectiveHudEnabled() ? .on : .off
         hudSwitch.isEnabled = app.reachable && app.statusValue.mode != "unsupported"
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -197,9 +254,11 @@ final class PreferencesController: NSObject {
         pricingSyncCheckBtn?.setBusy(pricingSyncCheckBtn?.isBusy == true, available: app.reachable)
     }
 
-    @objc func toggleTranslation() {
-        let target = translationSwitch.state == .on
-        app.setTranslationEnabled(target)
+    @objc func languageChanged() {
+        guard let selected = languagePopup.selectedItem?.representedObject as? String else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.app.setGlobalLanguage(selected)
+        }
     }
 
     @objc func togglePricingSync() {
@@ -213,7 +272,7 @@ final class PreferencesController: NSObject {
                 try? self.app.configuration.save()
             } else {
                 self.pricingSyncSwitch.state = self.app.configuration.value.autoPricingSyncEnabled ? .on : .off
-                self.app.showMessage("未能更新自动价格同步设置", error: true)
+                self.app.showMessage(L10n.t("settings.pricing_sync.update_failed", fallback: "未能更新自动价格同步设置"), error: true)
             }
         }
     }
@@ -227,6 +286,7 @@ final class PreferencesController: NSObject {
             switch result {
             case .success(let payload):
                 if payload["synced"] as? Bool == true {
+                    self.app.invalidateUsageReportCache()
                     self.app.overview?.fetch()
                     self.app.usagePage?.fetch(force: true)
                 }
@@ -234,14 +294,17 @@ final class PreferencesController: NSObject {
                     if self.pricingSheet == nil {
                         self.pricingSheet = PricingSyncSheetController(app: self.app)
                     }
-                    self.pricingSheet?.show(in: window, payload: payload)
+                    self.pricingSheet?.show(in: window, payload: payload) { [weak self] in
+                        self?.pricingSheet = nil
+                    }
                 } else {
                     let count = (payload["prices"] as? [String: Any])?.count ?? (payload["count"] as? Int ?? 0)
                     let ok = payload["synced"] as? Bool == true
-                    self.app.showMessage(ok ? "价格基准已同步（生效 \(count) 款模型）" : "检查提示：\(payload["error"] as? String ?? "未能同步远端价格")", error: !ok)
+                    let errStr = payload["error"] as? String ?? L10n.t("settings.pricing_sync.default_error", fallback: "未能同步远端价格")
+                    self.app.showMessage(ok ? L10n.t("settings.pricing_sync.synced", ["count": count], fallback: "价格基准已同步（生效 \(count) 款模型）") : L10n.t("settings.pricing_sync.check_failed", ["error": errStr], fallback: "检查提示：\(errStr)"), error: !ok)
                 }
             case .failure(let err):
-                self.app.showMessage("同步失败：\(err.localizedDescription)", error: true)
+                self.app.showMessage(L10n.t("settings.pricing_sync.sync_failed", ["error": err.localizedDescription], fallback: "同步失败：\(err.localizedDescription)"), error: true)
             }
         }
     }

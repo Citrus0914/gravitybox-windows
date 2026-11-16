@@ -1,5 +1,6 @@
-import { compactNumber, durationText, formatTurnDurationCompact } from '../metric-format.js';
+import { compactDecimal, compactNumber, compactPercent, durationText, formatTurnDurationCompact } from '../metric-format.js';
 export { formatTurnDurationCompact };
+import { bt } from '../i18n.js';
 import { lstat, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -7,13 +8,18 @@ import type {
   ConversationHudMetrics,
   HudActivityPhase,
   HudCapacitySource,
+  HudContextStageRole,
   HudDataAvailability,
+  HudModelContextStage,
   ParsedConversationStep,
   ParsedGenMetadata,
 } from './types.js';
 import { resolveModelCapacity } from './model-catalog.js';
 import {
   DEFAULT_API_PRICES,
+  isTemporalPricingEntry,
+  lookupPricingEntry,
+  resolveContextTierPricing,
   resolvePricingFromTable,
   calculateEstimatedUsd,
   type ApiPricingEntry,
@@ -23,7 +29,6 @@ import { resolveDatabaseModelFullName } from '../usage-types.js';
 import { runHudDbScanInWorker } from '../sqlite-read.js';
 import type { HudWorkerRawStepRow } from '../sqlite-worker.js';
 import { decodeVarint64, skipProtobufField } from '../protobuf.js';
-export { decodeVarint64 };
 
 const UUID_REGEX_GLOBAL = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const ACTIVE_STEP_STATUSES = new Set([1, 2, 8, 9]);
@@ -627,6 +632,7 @@ export function parseLatestGenMetadataBlob(
 /**
  * 级联独立裁剪数学模型 (保留纯数学导出以兼容边界测试套件)
  * 严格保证 T_i >= 0, W_i >= 0, sum(T_i) === U, sum(W_i) === Ratio_total
+ * @deprecated 生产环境 HUD Popover 3 已切换为真实 cachedRead / uncachedInput / output 上下文明细，仅保留供数学边界契约测试使用。
  */
 export function computeCascadeContextBreakdown(
   usedTokens: number,
@@ -695,7 +701,7 @@ export function computeTps(
     status: 'calculated',
     rawTps,
     outputTps: rawTps,
-    formatted: `${rawTps.toFixed(2)} tok/s`,
+    formatted: `${compactDecimal(rawTps, 2)} tok/s`,
   };
 }
 
@@ -756,6 +762,7 @@ export interface ComputeHudMetricsInput {
   subagentSteps?: number;
   totalStepsOverride?: number;
   allowDbActiveStepInference?: boolean;
+  isSubagentTrajectory?: boolean;
   modelId?: string;
   modelCapacity?: number;
   pricingTable?: Record<string, ApiPricingEntry>;
@@ -858,6 +865,443 @@ function mergeDurationIntervals(intervals: ReadonlyArray<readonly [number, numbe
   return total;
 }
 
+interface ClassifiedContextSlot {
+  slotKey: string;
+  role: HudContextStageRole;
+  modelId: string;
+  displayName: string;
+  shortLabel: string;
+  compactLabel: string;
+  capacityTokens: number;
+  isFallbackModel: boolean;
+  hasExplicitEvidence: boolean;
+}
+
+interface StageAccumulator {
+  slot: ClassifiedContextSlot;
+  latestStep?: ComputeHudMetricsInput['steps'][number];
+  latestPrompt: number;
+  peakContextTokens: number;
+  explicitCapacity?: number;
+}
+
+const COMPACT_MODEL_LABEL_RULES: ReadonlyArray<readonly [RegExp, string, string]> = [
+  [/^gemini-4-carbon/, 'Carbon', 'C'],
+  [/^gemini-4-argon/, 'Argon', 'A'],
+  [/^gemini-4-hydrogen/, 'Hydrogen', 'H'],
+  [/^gemini-(?:[\d.]+-)?pro|^gemini-pro/, 'Pro', 'P'],
+  [/^gemini-(?:[\d.]+-)?flash|^gemini-flash/, 'Flash', 'F'],
+  [/^claude-.*-opus/, 'Opus', 'O'],
+  [/^claude-.*-sonnet/, 'Sonnet', 'S'],
+  [/^claude-.*-haiku/, 'Haiku', 'H'],
+  [/^gpt-oss/, 'GPT-OSS', 'G'],
+];
+
+function buildCompactModelLabel(modelId: string, displayName: string): { shortLabel: string; compactLabel: string } {
+  const lower = modelId.toLowerCase();
+  for (const [pattern, shortLabel, compactLabel] of COMPACT_MODEL_LABEL_RULES) {
+    if (pattern.test(lower)) return { shortLabel, compactLabel };
+  }
+  const dynamicGemini = lower.match(/^gemini-(?:[4-9](?:\.\d+)?)-([a-z][a-z0-9]*)/);
+  if (dynamicGemini?.[1]) {
+    const code = dynamicGemini[1].charAt(0).toUpperCase() + dynamicGemini[1].slice(1);
+    return { shortLabel: code, compactLabel: code.charAt(0).toUpperCase() };
+  }
+  const cleaned = displayName.trim() || modelId.trim() || 'Model';
+  const shortLabel = cleaned.length <= 10 ? cleaned : (cleaned.split(/\s+/).slice(0, 2).join(' ').slice(0, 10) || cleaned.slice(0, 10));
+  const compactLabel = shortLabel.match(/[A-Za-z0-9]/)?.[0]?.toUpperCase() || 'M';
+  return { shortLabel, compactLabel };
+}
+
+function classifyContextModelSlot(params: {
+  responseModel?: string;
+  modelDisplayName?: string;
+  plannerModelName?: string;
+  stepModelName?: string;
+  modelEnum?: number;
+  fallbackInputModelId?: string;
+  hasPriorOrchestrator?: boolean;
+}): ClassifiedContextSlot {
+  const responseModel = (params.responseModel || '').trim();
+  const modelDisplayName = (params.modelDisplayName || '').trim();
+  const plannerModelName = (params.plannerModelName || '').trim();
+  const stepModelName = (params.stepModelName || '').trim();
+  const modelEnum = params.modelEnum;
+  const fallbackInputModelId = (params.fallbackInputModelId || '').trim();
+  const combinedRaw = [responseModel, modelDisplayName, plannerModelName, stepModelName].filter(Boolean).join(' ');
+
+  const isExecutorHint =
+    modelEnum === 1669 ||
+    /^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M669$/i.test(responseModel) ||
+    /^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M669$/i.test(plannerModelName) ||
+    /^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M669$/i.test(stepModelName) ||
+    /Gemini\s+4\s+Hydrogen\s*\(\s*Orchestrator\s*\)/i.test(modelDisplayName);
+
+  if (isExecutorHint) {
+    const isHydrogen = /\bhydrogen\b/i.test(combinedRaw);
+    const modelKey = isHydrogen ? 'gemini-4-hydrogen' : 'gemini-3.8-flash';
+    const spec = resolveModelCapacity(modelKey);
+    return {
+      slotKey: isHydrogen ? 'orchestrator:hydrogen' : 'orchestrator:flash',
+      role: 'executor',
+      modelId: spec.modelId,
+      displayName: modelDisplayName || stepModelName || (isHydrogen ? 'Gemini 4 Hydrogen (Orchestrator)' : 'Gemini 3.8 Flash'),
+      shortLabel: isHydrogen ? 'Hydrogen' : 'Flash',
+      compactLabel: isHydrogen ? 'H' : 'F',
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: spec.isFallback,
+      hasExplicitEvidence: true,
+    };
+  }
+
+  const isPlannerHint =
+    modelEnum === 1667 ||
+    modelEnum === 1668 ||
+    /\borchestrator\b|^MODEL_PLACEHOLDER_M66[78]$/i.test(responseModel) ||
+    /\borchestrator\b/i.test(modelDisplayName) ||
+    /\borchestrator\b/i.test(plannerModelName) ||
+    /\borchestrator\b/i.test(stepModelName);
+
+  if (isPlannerHint || (!combinedRaw && /\borchestrator\b|^MODEL_PLACEHOLDER_M66[78]$/i.test(fallbackInputModelId))) {
+    const hasCodenameInStep = /\b(?:carbon|argon|hydrogen)\b/i.test(combinedRaw);
+    const isCarbon = /\bcarbon\b/i.test(combinedRaw) || modelEnum === 1667 || /M667$/i.test(responseModel) || (!hasCodenameInStep && /\bcarbon\b/i.test(fallbackInputModelId));
+    const isArgon = !isCarbon && (/\bargon\b/i.test(combinedRaw) || modelEnum === 1668 || /M668$/i.test(responseModel) || (!hasCodenameInStep && /\bargon\b/i.test(fallbackInputModelId)));
+    const dynMatch = !isCarbon && !isArgon ? `${combinedRaw} ${fallbackInputModelId}`.match(/Orchestrator\s*\(\s*([A-Za-z][A-Za-z0-9._-]{1,31})\s*\)/i) : null;
+    const rawCode = isCarbon ? 'Carbon' : isArgon ? 'Argon' : dynMatch?.[1] || 'Argon';
+    const lowerCode = rawCode.toLowerCase();
+    const shortLabel = rawCode.charAt(0).toUpperCase() + rawCode.slice(1);
+    const spec = resolveModelCapacity(`gemini-4-${lowerCode}`);
+    return {
+      slotKey: `orchestrator:${lowerCode}`,
+      role: 'planner',
+      modelId: spec.modelId,
+      displayName: modelDisplayName || stepModelName || `Orchestrator (${shortLabel})`,
+      shortLabel,
+      compactLabel: shortLabel.charAt(0).toUpperCase(),
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: spec.isFallback,
+      hasExplicitEvidence: true,
+    };
+  }
+
+  if (!combinedRaw && /^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M669$/i.test(fallbackInputModelId)) {
+    const spec = resolveModelCapacity('gemini-3.8-flash');
+    return {
+      slotKey: 'orchestrator:flash',
+      role: 'executor',
+      modelId: spec.modelId,
+      displayName: 'Gemini 3.8 Flash',
+      shortLabel: 'Flash',
+      compactLabel: 'F',
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: spec.isFallback,
+      hasExplicitEvidence: true,
+    };
+  }
+
+  const rawModelInput = modelDisplayName || responseModel || plannerModelName || stepModelName || fallbackInputModelId;
+  if (!rawModelInput) {
+    const spec = resolveModelCapacity('');
+    return {
+      slotKey: 'model:unknown',
+      role: 'model',
+      modelId: 'unknown',
+      displayName: '—',
+      shortLabel: '',
+      compactLabel: '',
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: true,
+      hasExplicitEvidence: false,
+    };
+  }
+
+  const spec = resolveModelCapacity(rawModelInput);
+  if (params.hasPriorOrchestrator && (spec.modelId === 'gemini-4-hydrogen' || spec.modelId === 'gemini-3.8-flash')) {
+    const isHydrogen = spec.modelId === 'gemini-4-hydrogen';
+    return {
+      slotKey: isHydrogen ? 'orchestrator:hydrogen' : 'orchestrator:flash',
+      role: 'executor',
+      modelId: spec.modelId,
+      displayName: modelDisplayName || spec.displayName,
+      shortLabel: isHydrogen ? 'Hydrogen' : 'Flash',
+      compactLabel: isHydrogen ? 'H' : 'F',
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: spec.isFallback,
+      hasExplicitEvidence: true,
+    };
+  }
+
+  const { shortLabel, compactLabel } = buildCompactModelLabel(spec.modelId, modelDisplayName || spec.displayName);
+  return {
+    slotKey: `model:${spec.modelId}`,
+    role: 'model',
+    modelId: spec.modelId,
+    displayName: modelDisplayName || spec.displayName,
+    shortLabel,
+    compactLabel,
+    capacityTokens: spec.capacityTokens,
+    isFallbackModel: spec.isFallback,
+    hasExplicitEvidence: true,
+  };
+}
+
+function createStageSnapshot(
+  acc: StageAccumulator,
+  isActive: boolean,
+  inheritedExplicitCapacity?: number
+): HudModelContextStage {
+  const hasUsageData = Boolean(acc.latestStep);
+  const effectiveExplicitCap = acc.explicitCapacity ?? inheritedExplicitCapacity;
+  const capacityTokens = effectiveExplicitCap ?? acc.slot.capacityTokens;
+  const capacityTokensCompact = effectiveExplicitCap !== undefined
+    ? formatCompactTokenNumber(effectiveExplicitCap)
+    : `~${formatCompactTokenNumber(capacityTokens)}`;
+  const capacitySource: HudCapacitySource = effectiveExplicitCap !== undefined
+    ? 'explicit'
+    : acc.slot.isFallbackModel
+    ? 'unknown'
+    : 'reference';
+  const usedTokens = hasUsageData ? acc.latestPrompt : 0;
+  const usedRatio = hasUsageData && capacityTokens > 0 ? usedTokens / capacityTokens : 0;
+  return {
+    slotKey: acc.slot.slotKey,
+    role: acc.slot.role,
+    modelId: acc.slot.modelId,
+    modelDisplayName: acc.slot.displayName,
+    shortLabel: acc.slot.shortLabel,
+    compactLabel: acc.slot.compactLabel,
+    hasUsageData,
+    isActive,
+    usedTokens,
+    usedTokensCompact: formatCompactTokenNumber(usedTokens),
+    usedTokensFormatted: formatThousandsTokens(usedTokens),
+    peakContextTokens: acc.peakContextTokens,
+    peakContextCompact: formatCompactTokenNumber(acc.peakContextTokens),
+    peakContextFormatted: formatThousandsTokens(acc.peakContextTokens),
+    capacityTokens,
+    capacityTokensCompact,
+    isFallbackCapacity: effectiveExplicitCap === undefined,
+    capacitySource,
+    usedRatio,
+    usedRatioFormatted: compactPercent(usedRatio),
+  };
+}
+
+function resolveContextStagesAndActiveSlot(
+  usageContextEntries: ReadonlyArray<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number }>,
+  input: ComputeHudMetricsInput
+): {
+  latestStep?: ComputeHudMetricsInput['steps'][number];
+  latestGenMeta?: ParsedGenMetadata;
+  sessionPeakContextTokens: number;
+  activeStage: HudModelContextStage;
+  hasExplicitModelEvidence: boolean;
+  isMultiModel: boolean;
+  isOrchestrator: boolean;
+  modelStages?: HudModelContextStage[];
+  defaultFallbackModel: string;
+} {
+  const trimmedInputModel = typeof input.modelId === 'string' ? input.modelId.trim() : '';
+  const inputAsStandaloneSlot = trimmedInputModel
+    ? classifyContextModelSlot({ fallbackInputModelId: trimmedInputModel })
+    : null;
+  const inputIsOrchestrator = Boolean(
+    trimmedInputModel && /\borchestrator\b|^MODEL_PLACEHOLDER_M66[789]$/i.test(trimmedInputModel)
+  );
+  const inputExplicitCapacity =
+    typeof input.modelCapacity === 'number' && Number.isSafeInteger(input.modelCapacity) && input.modelCapacity > 0
+      ? input.modelCapacity
+      : undefined;
+
+  if (usageContextEntries.length === 0) {
+    const emptySlot = classifyContextModelSlot({
+      responseModel: input.genMetadata?.responseModel,
+      modelDisplayName: input.genMetadata?.modelDisplayName,
+      plannerModelName: input.genMetadata?.plannerModelName,
+      modelEnum: input.genMetadata?.modelEnum,
+      fallbackInputModelId: trimmedInputModel,
+    });
+    const emptyExplicitCap = [inputExplicitCapacity, input.genMetadata?.maxContextTokens].find(
+      (v): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0
+    );
+    const emptyAcc: StageAccumulator = {
+      slot: emptySlot,
+      latestStep: undefined,
+      latestPrompt: 0,
+      peakContextTokens: 0,
+      explicitCapacity: emptyExplicitCap,
+    };
+    const isOrchestrator = emptySlot.role === 'planner' || emptySlot.role === 'executor' || inputIsOrchestrator;
+    if (isOrchestrator) {
+      const pair: StageAccumulator[] = [];
+      if (emptySlot.role === 'executor') {
+        const plannerSlot =
+          inputAsStandaloneSlot && inputAsStandaloneSlot.role === 'planner'
+            ? inputAsStandaloneSlot
+            : classifyContextModelSlot({ fallbackInputModelId: 'Orchestrator (Carbon)' });
+        pair.push({ slot: plannerSlot, latestPrompt: 0, peakContextTokens: 0, explicitCapacity: emptyExplicitCap });
+        pair.push(emptyAcc);
+      } else {
+        pair.push(emptyAcc);
+        if (emptySlot.shortLabel !== 'Hydrogen') {
+          const execSlot = classifyContextModelSlot({ modelEnum: 1669, modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)' });
+          pair.push({ slot: execSlot, latestPrompt: 0, peakContextTokens: 0, explicitCapacity: emptyExplicitCap });
+        }
+      }
+      const stages = pair.map((acc) => createStageSnapshot(acc, acc.slot.slotKey === emptySlot.slotKey, emptyExplicitCap));
+      const activeStage = stages.find((s) => s.isActive) ?? stages[0]!;
+      return {
+        latestStep: undefined,
+        latestGenMeta: input.genMetadata,
+        sessionPeakContextTokens: 0,
+        activeStage,
+        hasExplicitModelEvidence: emptySlot.hasExplicitEvidence,
+        isMultiModel: stages.length >= 2,
+        isOrchestrator: true,
+        modelStages: stages.length >= 2 ? stages : undefined,
+        defaultFallbackModel: emptySlot.hasExplicitEvidence ? (emptySlot.role === 'model' ? emptySlot.displayName : emptySlot.modelId) : '',
+      };
+    }
+    const activeStage = createStageSnapshot(emptyAcc, true);
+    return {
+      latestStep: undefined,
+      latestGenMeta: input.genMetadata,
+      sessionPeakContextTokens: 0,
+      activeStage,
+      hasExplicitModelEvidence: emptySlot.hasExplicitEvidence,
+      isMultiModel: false,
+      isOrchestrator: false,
+      defaultFallbackModel: emptySlot.hasExplicitEvidence ? emptySlot.displayName : '',
+    };
+  }
+
+  const stageMap = new Map<string, StageAccumulator>();
+  let hasPriorOrchestrator = false;
+  let sessionPeakContextTokens = 0;
+  let latestEntry!: {
+    step: ComputeHudMetricsInput['steps'][number];
+    slot: ClassifiedContextSlot;
+    genMeta?: ParsedGenMetadata;
+  };
+
+  for (let i = 0; i < usageContextEntries.length; i++) {
+    const entry = usageContextEntries[i]!;
+    const isGlobalLatest = i === usageContextEntries.length - 1;
+    const stepGenMeta = entry.step.generation ?? (isGlobalLatest ? input.genMetadata : undefined);
+    const slot = classifyContextModelSlot({
+      responseModel: stepGenMeta?.responseModel,
+      modelDisplayName: stepGenMeta?.modelDisplayName,
+      plannerModelName: stepGenMeta?.plannerModelName,
+      stepModelName: entry.step.modelName,
+      modelEnum: stepGenMeta?.modelEnum,
+      fallbackInputModelId: trimmedInputModel,
+      hasPriorOrchestrator,
+    });
+    if (slot.role === 'planner' || slot.role === 'executor') {
+      hasPriorOrchestrator = true;
+    }
+    const stepExplicitCap = [inputExplicitCapacity, stepGenMeta?.maxContextTokens, entry.step.modelMaxTokens].find(
+      (v): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0
+    );
+    const prev = stageMap.get(slot.slotKey);
+    stageMap.set(slot.slotKey, {
+      slot,
+      latestStep: entry.step,
+      latestPrompt: entry.prompt,
+      peakContextTokens: Math.max(prev?.peakContextTokens ?? 0, entry.prompt),
+      explicitCapacity: stepExplicitCap ?? prev?.explicitCapacity,
+    });
+    sessionPeakContextTokens = Math.max(sessionPeakContextTokens, entry.prompt);
+    latestEntry = { step: entry.step, slot, genMeta: stepGenMeta };
+  }
+
+  const activeSlotKey = latestEntry.slot.slotKey;
+  const activeAcc = stageMap.get(activeSlotKey)!;
+  const activeStage = createStageSnapshot(activeAcc, true);
+  const allAccs = [...stageMap.values()];
+  const isOrchestrator = hasPriorOrchestrator || inputIsOrchestrator;
+
+  let orderedAccs: StageAccumulator[];
+  let inheritedOrchCap: number | undefined;
+  if (isOrchestrator) {
+    const planners = allAccs.filter((a) => a.slot.role === 'planner');
+    const executors = allAccs.filter((a) => a.slot.role === 'executor');
+    const others = allAccs.filter((a) => a.slot.role === 'model');
+    inheritedOrchCap = [...planners, ...executors].find((a) => a.explicitCapacity !== undefined)?.explicitCapacity;
+
+    if (planners.length === 0) {
+      const fallbackPlannerSlot =
+        inputAsStandaloneSlot && inputAsStandaloneSlot.role === 'planner'
+          ? inputAsStandaloneSlot
+          : classifyContextModelSlot({ fallbackInputModelId: 'Orchestrator (Carbon)' });
+      planners.push({
+        slot: fallbackPlannerSlot,
+        latestPrompt: 0,
+        peakContextTokens: 0,
+        explicitCapacity: inheritedOrchCap ?? inputExplicitCapacity,
+      });
+    }
+    const primaryPlanner = planners[0]!;
+    if (executors.length === 0 && primaryPlanner.slot.shortLabel !== 'Hydrogen') {
+      const defaultExecSlot = classifyContextModelSlot({
+        modelEnum: 1669,
+        modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      });
+      executors.push({
+        slot: defaultExecSlot,
+        latestPrompt: 0,
+        peakContextTokens: 0,
+        explicitCapacity: inheritedOrchCap ?? inputExplicitCapacity,
+      });
+    }
+    orderedAccs = [...planners, ...executors, ...others];
+  } else {
+    orderedAccs = [...allAccs];
+  }
+
+  if (
+    inputAsStandaloneSlot &&
+    inputAsStandaloneSlot.hasExplicitEvidence &&
+    inputAsStandaloneSlot.modelId !== 'unknown' &&
+    !orderedAccs.some((a) => a.slot.slotKey === inputAsStandaloneSlot.slotKey)
+  ) {
+    orderedAccs.push({
+      slot: inputAsStandaloneSlot,
+      latestPrompt: 0,
+      peakContextTokens: 0,
+      explicitCapacity: inputExplicitCapacity,
+    });
+  }
+
+  const finalAccs = orderedAccs.length > 3 && !isOrchestrator ? orderedAccs.slice(-3) : orderedAccs;
+  const isMultiModel = finalAccs.length >= 2;
+  const modelStages = isMultiModel
+    ? finalAccs.map((acc) => {
+        const inheritCap =
+          !acc.latestStep && isOrchestrator && (acc.slot.role === 'planner' || acc.slot.role === 'executor')
+            ? inheritedOrchCap
+            : undefined;
+        return createStageSnapshot(acc, acc.slot.slotKey === activeSlotKey, inheritCap);
+      })
+    : undefined;
+
+  return {
+    latestStep: latestEntry.step,
+    latestGenMeta: latestEntry.genMeta,
+    sessionPeakContextTokens,
+    activeStage,
+    hasExplicitModelEvidence: latestEntry.slot.hasExplicitEvidence,
+    isMultiModel,
+    isOrchestrator,
+    modelStages,
+    defaultFallbackModel: latestEntry.slot.hasExplicitEvidence
+      ? latestEntry.slot.role === 'model'
+        ? latestEntry.slot.displayName
+        : latestEntry.slot.modelId
+      : '',
+  };
+}
+
 export function buildConversationHudMetrics(input: ComputeHudMetricsInput): ConversationHudMetrics {
   const steps = input.steps || [];
   const contextSteps = input.contextSteps ?? steps;
@@ -866,6 +1310,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   let toolSteps = 0;
   let mainCompletedModelDuration = 0;
   let unanchoredChildModelDuration = 0;
+  const mainCompletedModelIntervals: Array<readonly [number, number]> = [];
   const childCompletedModelIntervals: Array<readonly [number, number]> = [];
   const completedToolIntervals: Array<readonly [number, number]> = [];
   let timedOutputTokens = 0;
@@ -941,6 +1386,9 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
           }
         } else {
           mainCompletedModelDuration += duration;
+          if (validSeconds(start)) {
+            mainCompletedModelIntervals.push([start, start + duration]);
+          }
         }
         if (step.hasUsage !== false && Number.isSafeInteger(step.outputTokens) && step.outputTokens! >= 0) {
           timedOutputTokens += output;
@@ -965,8 +1413,8 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
         validTtftCount++;
         const ttftSnapshot = {
           seconds: ttft,
-          formatted: `${ttft.toFixed(2)} 秒`,
-          formattedEn: `${ttft.toFixed(2)}s`,
+          formatted: bt('metrics.ttft_seconds', { value: compactDecimal(ttft, 2) }),
+          formattedEn: `${compactDecimal(ttft, 2)}s`,
         };
         if (!isChildStep) {
           latestForegroundStepTtft = ttftSnapshot;
@@ -980,13 +1428,21 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       }
     }
   }
-  const childCompletedAnchoredTotal = mergeDurationIntervals(childCompletedModelIntervals);
-  const childCompletedModelDuration = childCompletedAnchoredTotal + unanchoredChildModelDuration;
+  const mainCompletedAnchoredTotal = mergeDurationIntervals(mainCompletedModelIntervals);
+  const allCompletedModelIntervals = [
+    ...mainCompletedModelIntervals,
+    ...childCompletedModelIntervals,
+  ];
+  const allCompletedAnchoredTotal = mergeDurationIntervals(allCompletedModelIntervals);
+  const incrementalChildAnchoredDuration = Math.max(
+    0,
+    allCompletedAnchoredTotal - mainCompletedAnchoredTotal
+  );
+  const childCompletedModelDuration = incrementalChildAnchoredDuration + unanchoredChildModelDuration;
   const modelDurationSeconds = mainCompletedModelDuration + childCompletedModelDuration;
   const toolDurationSeconds = mergeDurationIntervals(completedToolIntervals);
 
-  let latestStep: ComputeHudMetricsInput['steps'][number] | undefined;
-  let peakContextTokens = 0;
+  const usageContextEntries: Array<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number }> = [];
   let turns = 0;
   let compactionCount = 0;
   for (const step of contextSteps) {
@@ -998,39 +1454,24 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     const prompt = safeTokens(step.rawInput ?? step.rawInputTokens) +
       safeTokens(step.cachedTokens ?? step.cachedReadTokens) + safeTokens(step.cacheWriteTokens);
     if (step.hasUsage === true || prompt > 0) {
-      latestStep = step;
-      peakContextTokens = Math.max(peakContextTokens, prompt);
+      usageContextEntries.push({ step, prompt });
     }
   }
-  const genMeta = latestStep?.generation ?? input.genMetadata;
-  const needsGenDisambiguation = Boolean(
-    genMeta && (
-      (genMeta.responseModel && /\borchestrator\b|^gemini-flash-worker|^MODEL_PLACEHOLDER_M66[789]$/i.test(genMeta.responseModel)) ||
-      (genMeta.modelDisplayName && /\borchestrator\b/i.test(genMeta.modelDisplayName)) ||
-      genMeta.modelEnum === 1667 ||
-      genMeta.modelEnum === 1668 ||
-      genMeta.modelEnum === 1669
-    )
-  );
-  const disambiguatedGenModel = needsGenDisambiguation
-    ? resolveDatabaseModelFullName(genMeta?.responseModel, genMeta?.modelDisplayName, genMeta?.modelEnum ?? null)
-    : '';
-  const historicalModel = disambiguatedGenModel || genMeta?.modelDisplayName || genMeta?.responseModel ||
-    genMeta?.plannerModelName || latestStep?.modelName;
-  const hasExplicitModelEvidence = Boolean(historicalModel || (typeof input.modelId === 'string' && input.modelId.trim()));
-  const modelSpec = resolveModelCapacity(historicalModel || input.modelId);
-  const explicitCapacity = [
-    input.modelCapacity, genMeta?.maxContextTokens, latestStep?.modelMaxTokens,
-  ].find(value => typeof value === 'number' && Number.isSafeInteger(value) && value > 0);
-  const capacityTokens = explicitCapacity ?? modelSpec.capacityTokens;
-  const capacityTokensCompact = explicitCapacity
-    ? formatCompactTokenNumber(explicitCapacity)
-    : `~${formatCompactTokenNumber(capacityTokens)}`;
-  const capacitySource: HudCapacitySource = explicitCapacity !== undefined
-    ? 'explicit'
-    : modelSpec.isFallback
-    ? 'unknown'
-    : 'reference';
+  const {
+    latestStep,
+    sessionPeakContextTokens,
+    activeStage,
+    hasExplicitModelEvidence,
+    isMultiModel,
+    isOrchestrator,
+    modelStages,
+    defaultFallbackModel: stageFallbackModel,
+  } = resolveContextStagesAndActiveSlot(usageContextEntries, input);
+  const peakContextTokens = activeStage.peakContextTokens;
+  const capacityTokens = activeStage.capacityTokens;
+  const capacityTokensCompact = activeStage.capacityTokensCompact;
+  const capacitySource = activeStage.capacitySource;
+  const hasExplicitDbCapacity = !activeStage.isFallbackCapacity;
   const stepCached = safeTokens(latestStep?.cachedTokens ?? latestStep?.cachedReadTokens);
   const stepUncached = safeTokens(latestStep?.rawInput ?? latestStep?.rawInputTokens) +
     safeTokens(latestStep?.cacheWriteTokens);
@@ -1087,7 +1528,8 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     }
   }
   const tpsInfo = computeTps(timedOutputSeconds, timedOutputTokens);
-  const outputTpsFormatted = timedOutputCount > 0 ? tpsInfo.formatted : isStreaming ? '计算中...' : '—';
+  const outputTpsPending = timedOutputCount === 0 && isStreaming;
+  const outputTpsFormatted = timedOutputCount > 0 ? tpsInfo.formatted : isStreaming ? bt('metrics.calculating') : '—';
   const latestStepTpsInfo = timedOutputCount > 0 ? (latestForegroundStepTps ?? latestAnyStepTps) : null;
   const latestStepTtftInfo = validTtftCount > 0 ? (latestForegroundStepTtft ?? latestAnyStepTtft) : null;
   const averageTtftSeconds = validTtftCount > 0 ? validTtftSum / validTtftCount : 0;
@@ -1102,7 +1544,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   let pricedUsageSteps = 0;
   let unpricedUsageSteps = 0;
   const defaultFallbackModel =
-    (typeof historicalModel === 'string' && historicalModel.trim()) ||
+    (typeof stageFallbackModel === 'string' && stageFallbackModel.trim()) ||
     (typeof input.modelId === 'string' && input.modelId.trim()) ||
     '';
   const defaultPriceTsSeconds = Math.floor(nowMs / 1000);
@@ -1117,7 +1559,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
           )
         : '';
     const stepModel =
-      (resolvedStepGenModel && resolvedStepGenModel !== '未知模型' ? resolvedStepGenModel : '') ||
+      (resolvedStepGenModel && resolvedStepGenModel !== '未知模型' && resolvedStepGenModel !== 'Unknown Model' && resolvedStepGenModel !== bt('usage.unknown_model') ? resolvedStepGenModel : '') ||
       step.generation?.plannerModelName ||
       step.modelName ||
       (item.isChildStep ? '' : defaultFallbackModel);
@@ -1129,18 +1571,26 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       step.endTimeSeconds,
       step.completedAtSeconds,
     ].find((ts) => validSeconds(ts) && ts > 0);
-    const price = stepModel
-      ? resolvePricingFromTable(pricingTable, stepModel, stepTs ?? defaultPriceTsSeconds)
+    const rawPricingEntry = stepModel ? lookupPricingEntry(pricingTable, stepModel) : null;
+    const price = !stepModel
+      ? null
+      : stepTs
+        ? resolvePricingFromTable(pricingTable, stepModel, stepTs)
+        : rawPricingEntry && !isTemporalPricingEntry(rawPricingEntry.entry)
+          ? resolvePricingFromTable(pricingTable, stepModel, defaultPriceTsSeconds)
+          : null;
+    const effectivePrice = price
+      ? resolveContextTierPricing(price, item.rawInput + item.cached + item.written)
       : null;
-    if (!price || (item.written > 0 && !Number.isFinite(price.cacheWrite))) {
+    if (!effectivePrice || (item.written > 0 && !Number.isFinite(effectivePrice.cacheWrite))) {
       if (item.rawInput + item.cached + item.written + item.output > 0) {
         unpricedUsageSteps++;
       }
       continue;
     }
     try {
-      estimatedCostUsd += calculateEstimatedUsd(item.rawInput, item.output, item.cached, price, item.written);
-      const unitSaved = Math.max(0, price.input - price.cached);
+      estimatedCostUsd += calculateEstimatedUsd(item.rawInput, item.output, item.cached, effectivePrice, item.written);
+      const unitSaved = Math.max(0, effectivePrice.input - effectivePrice.cached);
       if (item.cached > 0 && unitSaved > 0) {
         cacheSavedUsd += (item.cached * unitSaved) / 1_000_000;
       }
@@ -1153,11 +1603,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   cacheSavedUsd = Math.round(cacheSavedUsd * 1e8) / 1e8;
   const observedAt = input.observedAt !== undefined ? input.observedAt : (availability === 'unavailable' ? null : nowMs);
   const lastSuccessAt = input.lastSuccessAt !== undefined ? input.lastSuccessAt : observedAt;
-  const resolvedModelId = !hasExplicitModelEvidence ? 'unknown' : modelSpec.modelId;
+  const resolvedModelId = !hasExplicitModelEvidence ? 'unknown' : activeStage.modelId;
   const resolvedModelDisplayName =
     !hasExplicitModelEvidence
       ? '—'
-      : genMeta?.modelDisplayName || modelSpec.displayName;
+      : activeStage.modelDisplayName;
 
   // 计算本轮起步点与当轮耗时 (Turn Duration)
   let lastTurnStartIndex = -1;
@@ -1251,6 +1701,24 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     }
   }
 
+  let prevTurnBoundarySeconds: number | null = null;
+  if (lastTurnStartIndex > 0) {
+    for (let index = lastTurnStartIndex - 1; index >= 0; index--) {
+      const prev = contextSteps[index]!;
+      const prevEnd =
+        prev.t_end ??
+        prev.endTimeSeconds ??
+        prev.finishedGeneratingSeconds ??
+        prev.completedAtSeconds ??
+        prev.t_start ??
+        prev.startTimeSeconds ??
+        prev.createdAtSeconds;
+      if (validSeconds(prevEnd)) {
+        prevTurnBoundarySeconds =
+          prevTurnBoundarySeconds === null ? prevEnd : Math.max(prevTurnBoundarySeconds, prevEnd);
+      }
+    }
+  }
   const childStepsAll = steps.length > contextSteps.length ? steps.slice(contextSteps.length) : [];
   const childStepsInTurn = childStepsAll.filter((step) => {
     const start = step.t_start ?? step.startTimeSeconds ?? step.createdAtSeconds;
@@ -1258,6 +1726,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     if (turnWallStart !== null) {
       if (validSeconds(start)) return start >= turnWallStart - 1;
       if (validSeconds(end)) return end >= turnWallStart - 1;
+      return false;
+    }
+    if (prevTurnBoundarySeconds !== null) {
+      if (validSeconds(start)) return start >= prevTurnBoundarySeconds;
+      if (validSeconds(end)) return end >= prevTurnBoundarySeconds;
       return false;
     }
     return isSubagentRunning;
@@ -1304,8 +1777,8 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   }
   const inFlightModelDurationSeconds = Math.max(
     0,
-    mergeDurationIntervals([...childCompletedModelIntervals, ...activeModelIntervals]) -
-      childCompletedAnchoredTotal
+    mergeDurationIntervals([...allCompletedModelIntervals, ...activeModelIntervals]) -
+      allCompletedAnchoredTotal
   );
   const inFlightToolDurationSeconds = Math.max(
     0,
@@ -1321,11 +1794,23 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     mergeDurationIntervals([...turnModelIntervals, ...turnToolIntervals, ...turnChildIntervals]) +
     unanchoredTurnModelDuration;
   let currentTurnDurationSeconds = mergedTurnDuration;
-  if (hasSubagentInTurn && turnWallStart !== null) {
+  // 本轮用时按挂钟时间展示：覆盖上下文压缩、步骤间调度/排队等不属于任何步骤区间的空档；
+  // 仅在能定位到本轮起点（存在用户输入步）或独立子智能体轨迹中启用，避免把轮次之间的空闲时间算入。
+  if ((hasSubagentInTurn || input.isSubagentTrajectory === true || lastTurnStartIndex >= 0) && turnWallStart !== null) {
     const completedWallSpan = turnCompletedEnd !== null && turnCompletedEnd > turnWallStart
       ? turnCompletedEnd - turnWallStart
       : 0;
-    if (isStreaming || isSubagentRunning || hasActiveStepInTurn) {
+    const lastTurnStep = turnSteps[turnSteps.length - 1];
+    const lastTurnStepAborted =
+      lastTurnStep !== undefined && (lastTurnStep.status === 6 || lastTurnStep.status === 7);
+    // 前台流式中但末步已被中止/取消时视为轮次已终止，不再按挂钟累加；
+    // 主库处于错误回退缓存态 (availability === 'cached') 时快照已冻结，不再把旧轮起始时间外推到当前时刻。
+    const wallClockRunning =
+      availability !== 'cached' &&
+      (isSubagentRunning ||
+        hasActiveStepInTurn ||
+        (isStreaming && (hasSubagentInTurn || !lastTurnStepAborted)));
+    if (wallClockRunning) {
       currentTurnDurationSeconds = Math.max(mergedTurnDuration, nowSeconds - turnWallStart, completedWallSpan);
     } else if (completedWallSpan > 0) {
       currentTurnDurationSeconds = Math.max(mergedTurnDuration, completedWallSpan);
@@ -1339,14 +1824,26 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     ? formatTurnDurationCard(currentTurnDurationSeconds, 'en')
     : '—';
   const currentTurnTpsInfo = computeTps(currentTurnTimedOutputSeconds, currentTurnTimedOutputTokens);
+  const currentTurnOutputTpsPending = currentTurnTimedSamples === 0 && isStreaming;
   const currentTurnOutputTpsFormatted =
-    currentTurnTimedSamples > 0 ? currentTurnTpsInfo.formatted : isStreaming ? '计算中...' : '—';
+    currentTurnTimedSamples > 0 ? currentTurnTpsInfo.formatted : isStreaming ? bt('metrics.calculating') : '—';
+  const lastContextStep = contextSteps.length > 0 ? contextSteps[contextSteps.length - 1] : undefined;
+  const lastContextStepType = lastContextStep ? (lastContextStep.step_type ?? lastContextStep.stepType ?? 0) : 0;
+  const awaitingFirstTurnStep = Boolean(
+    input.isStreaming &&
+      !isSubagentRunning &&
+      activeModelStepCount === 0 &&
+      activeToolStepCount === 0 &&
+      (contextSteps.length === 0 ||
+        lastTurnStartIndex === contextSteps.length - 1 ||
+        (lastContextStepType === 2 && (lastContextStep?.status ?? 3) === 3))
+  );
   const currentTurnDurationCompactZh = hasTurnDuration
     ? formatTurnDurationCompact(currentTurnDurationSeconds, 'zh')
-    : '本轮 0s';
+    : formatTurnDurationCompact(0, 'zh');
   const currentTurnDurationCompactEn = hasTurnDuration
     ? formatTurnDurationCompact(currentTurnDurationSeconds, 'en')
-    : 'Turn 0s';
+    : formatTurnDurationCompact(0, 'en');
 
   return {
     conversationId: input.conversationId || 'default',
@@ -1375,6 +1872,9 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       subagentCount: Math.max(input.subagentCount ?? detectedSubagents, runningSubagentCount),
       runningSubagentCount,
       subagentSteps: input.subagentSteps ?? 0,
+      hasSubagentInTurn,
+      ...(input.isSubagentTrajectory ? { isSubagentTrajectory: true } : {}),
+      ...(awaitingFirstTurnStep ? { awaitingFirstTurnStep: true } : {}),
       modelDurationSeconds,
       modelDurationFormatted: formatDurationSeconds(modelDurationSeconds, 'zh'),
       modelDurationFormattedEn: formatDurationSeconds(modelDurationSeconds, 'en'),
@@ -1382,10 +1882,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       toolDurationFormatted: formatDurationSeconds(toolDurationSeconds, 'zh'),
       toolDurationFormattedEn: formatDurationSeconds(toolDurationSeconds, 'en'),
       averageTtftSeconds,
-      averageTtftFormatted: validTtftCount > 0 ? `${averageTtftSeconds.toFixed(2)} 秒` : '—',
-      averageTtftFormattedEn: validTtftCount > 0 ? `${averageTtftSeconds.toFixed(2)}s` : '—',
+      averageTtftFormatted: validTtftCount > 0 ? bt('metrics.ttft_seconds', { value: compactDecimal(averageTtftSeconds, 2) }) : '—',
+      averageTtftFormattedEn: validTtftCount > 0 ? `${compactDecimal(averageTtftSeconds, 2)}s` : '—',
       outputTps: tpsInfo.outputTps,
       outputTpsFormatted,
+      outputTpsPending,
       ...(latestStepTpsInfo
         ? {
             latestStepOutputTps: latestStepTpsInfo.outputTps,
@@ -1401,6 +1902,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
         : {}),
       currentTurnOutputTps: currentTurnTpsInfo.outputTps,
       currentTurnOutputTpsFormatted,
+      currentTurnOutputTpsPending,
       currentTurnTimedSamples,
       currentTurnDurationSeconds,
       currentTurnDurationFormatted,
@@ -1419,7 +1921,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       totalTokensCompact: `${formatCompactTokenNumber(totalTokens)} tok`,
       totalTokensFormatted: formatThousandsTokens(totalTokens),
       cacheHitRate,
-      cacheHitRateFormatted: `${(cacheHitRate * 100).toFixed(2)}%`,
+      cacheHitRateFormatted: compactPercent(cacheHitRate),
       uncachedInputTokens,
       uncachedInputFormatted: formatThousandsTokens(uncachedInputTokens),
       cachedReadTokens,
@@ -1444,6 +1946,16 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       hasUsageData: Boolean(latestStep),
       modelId: resolvedModelId,
       modelDisplayName: resolvedModelDisplayName,
+      ...(hasExplicitModelEvidence && activeStage.shortLabel
+        ? {
+            modelShortLabel: activeStage.shortLabel,
+            modelCompactLabel: activeStage.compactLabel,
+          }
+        : {}),
+      ...(isMultiModel ? { isMultiModel: true } : {}),
+      ...(isOrchestrator ? { isOrchestrator: true } : {}),
+      ...(sessionPeakContextTokens > 0 ? { sessionPeakContextTokens } : {}),
+      ...(modelStages ? { modelStages } : {}),
       usedTokens,
       usedTokensCompact: formatCompactTokenNumber(usedTokens),
       usedTokensFormatted: formatThousandsTokens(usedTokens),
@@ -1452,13 +1964,13 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       peakContextFormatted: formatThousandsTokens(peakContextTokens),
       capacityTokens,
       capacityTokensCompact,
-      hasExplicitDbCapacity: explicitCapacity !== undefined,
-      isFallbackCapacity: explicitCapacity === undefined,
+      hasExplicitDbCapacity,
+      isFallbackCapacity: !hasExplicitDbCapacity,
       capacitySource,
       usedRatio,
-      usedRatioFormatted: `${(usedRatio * 100).toFixed(2)}%`,
+      usedRatioFormatted: compactPercent(usedRatio),
       stepCacheRatio,
-      stepCacheRatioFormatted: `${(stepCacheRatio * 100).toFixed(2)}%`,
+      stepCacheRatioFormatted: compactPercent(stepCacheRatio),
       breakdown: {
         cachedContextTokens: stepCached,
         cachedContextFormatted: formatThousandsTokens(stepCached),
@@ -1525,7 +2037,7 @@ export class ConversationMetricsEngine {
   private cachedPricingTable: { key: string; table: Record<string, ApiPricingEntry> } | null = null;
   private readonly cache = new Map<string, CachedConversationState>();
   private readonly pendingReads = new Map<string, Promise<CachedConversationState | null>>();
-  private sniffDirCache: { at: number; recentIds: string[] } | null = null;
+  private sniffDirCache: { at: number; dirMtimeMs: number; recentIds: string[] } | null = null;
   private sniffDirListCache: { dirMtimeMs: number; dbEntries: Array<{ file: string; id: string }> } | null = null;
 
   constructor(options?: { geminiDir?: string; conversationsDir?: string; stateDir?: string }) {
@@ -1567,7 +2079,7 @@ export class ConversationMetricsEngine {
   public resolveDbPath(conversationId: string): string {
     const cleanId = conversationId.replace(/[^a-zA-Z0-9_-]/g, '');
     if (!cleanId) {
-      throw new Error('无效的会话 ID');
+      throw new Error(bt('metrics.err.invalid_conversation_id'));
     }
     return join(this.conversationsDir, `${cleanId}.db`);
   }
@@ -1680,7 +2192,7 @@ export class ConversationMetricsEngine {
         workerRes = await runHudDbScanInWorker(scanParams);
       } catch (firstErr) {
         const msg = (firstErr as Error)?.message ?? '';
-        if (!/busy|locked|投影失败|工作线程|预算|no such table|unable to open/i.test(msg)) {
+        if (!/busy|locked|投影失败|工作线程|预算|projection|worker|budget|timeout|no such table|unable to open/i.test(msg)) {
           throw firstErr;
         }
         await new Promise(resolve => setTimeout(resolve, 60));
@@ -1782,14 +2294,33 @@ export class ConversationMetricsEngine {
       const stepByIndex = new Map(baseSteps.map(step => [step.idx, step]));
       for (const generation of generations.values()) {
         const linked = [...new Set(generation.stepIndices ?? [])]
-          .map(index => stepByIndex.get(index)).filter(step => step?.stepType === 15);
-        if (linked.length !== 1 || !generation.usage || !generation.executionId) continue;
-        const step = linked[0]!;
-        if (!step.hasUsage || step.executionId !== generation.executionId) continue;
-        const usageKeys = ['rawInputTokens', 'outputTokens', 'cachedReadTokens', 'cacheWriteTokens',
-          'reasoningTokens', 'candidateTokens'] as const;
-        if (!usageKeys.every(key => step[key] === generation.usage![key])) continue;
-        step.generation = generation;
+          .map(index => stepByIndex.get(index))
+          .filter((step): step is ParsedConversationStep => step?.stepType === 15);
+        if (linked.length === 1 && generation.usage && generation.executionId) {
+          const step = linked[0]!;
+          if (step.hasUsage && step.executionId === generation.executionId) {
+            const usageKeys = ['rawInputTokens', 'outputTokens', 'cachedReadTokens', 'cacheWriteTokens',
+              'reasoningTokens', 'candidateTokens'] as const;
+            if (usageKeys.every(key => step[key] === generation.usage![key])) {
+              step.generation = generation;
+              continue;
+            }
+          }
+        }
+        if (linked.length > 1 && generation.executionId && (generation.responseModel || generation.modelDisplayName || generation.plannerModelName || generation.modelEnum || generation.maxContextTokens)) {
+          const modelOnlyGen: ParsedGenMetadata = {
+            ...(generation.responseModel ? { responseModel: generation.responseModel } : {}),
+            ...(generation.modelDisplayName ? { modelDisplayName: generation.modelDisplayName } : {}),
+            ...(generation.plannerModelName ? { plannerModelName: generation.plannerModelName } : {}),
+            ...(generation.modelEnum ? { modelEnum: generation.modelEnum } : {}),
+            ...(generation.maxContextTokens ? { maxContextTokens: generation.maxContextTokens } : {}),
+          };
+          for (const step of linked) {
+            if (!step.generation && step.executionId === generation.executionId) {
+              step.generation = modelOnlyGen;
+            }
+          }
+        }
       }
       const latestModelStep = [...baseSteps].reverse().find(step => step.stepType === 15 && step.hasUsage);
       let genMetadata = latestModelStep?.generation;
@@ -1886,7 +2417,7 @@ export class ConversationMetricsEngine {
         paneSlotId,
         sessionRevision,
         metricsSequence,
-        availability: 'unavailable',
+        availability: isStreaming || isSubagentRunning ? 'ready' : 'unavailable',
         observedAt: null,
         lastSuccessAt: null,
         isStreaming,
@@ -1931,11 +2462,16 @@ export class ConversationMetricsEngine {
     );
     if (!dbPathOverride && (isSubagentRunning || hasActiveSubagentStep)) {
       try {
+        const dirStat = await lstat(this.conversationsDir).catch(() => null);
+        const dirMtimeMs = dirStat?.mtimeMs ?? -1;
         let recentIds: string[];
-        if (this.sniffDirCache && nowMs - this.sniffDirCache.at < 2500) {
+        if (
+          this.sniffDirCache &&
+          nowMs - this.sniffDirCache.at < 2500 &&
+          this.sniffDirCache.dirMtimeMs === dirMtimeMs
+        ) {
           recentIds = this.sniffDirCache.recentIds;
         } else {
-          const dirStat = await lstat(this.conversationsDir).catch(() => null);
           let dbEntries: Array<{ file: string; id: string }>;
           if (dirStat && this.sniffDirListCache && this.sniffDirListCache.dirMtimeMs === dirStat.mtimeMs) {
             dbEntries = this.sniffDirListCache.dbEntries;
@@ -1970,7 +2506,7 @@ export class ConversationMetricsEngine {
             }));
           }
           recentIds = found;
-          this.sniffDirCache = { at: nowMs, recentIds: found };
+          this.sniffDirCache = { at: nowMs, dirMtimeMs, recentIds: found };
         }
         for (const potentialChildId of recentIds) {
           if (
@@ -2078,7 +2614,23 @@ export class ConversationMetricsEngine {
               activeChildSubagents++;
             }
           }
-          descendants.push(...childState.steps);
+          const cg = childState.genMetadata;
+          const childFallbackGen: ParsedGenMetadata | undefined =
+            cg && (cg.responseModel || cg.modelDisplayName || cg.plannerModelName || cg.modelEnum)
+              ? {
+                  ...(cg.responseModel ? { responseModel: cg.responseModel } : {}),
+                  ...(cg.modelDisplayName ? { modelDisplayName: cg.modelDisplayName } : {}),
+                  ...(cg.plannerModelName ? { plannerModelName: cg.plannerModelName } : {}),
+                  ...(cg.modelEnum ? { modelEnum: cg.modelEnum } : {}),
+                }
+              : undefined;
+          for (const cStep of childState.steps) {
+            if (childFallbackGen && cStep.stepType === 15 && cStep.hasUsage && !cStep.generation && !cStep.modelName) {
+              descendants.push({ ...cStep, generation: childFallbackGen });
+            } else {
+              descendants.push(cStep);
+            }
+          }
           for (const nested of childState.childConversationIds) {
             pendingChildren.push({ childId: nested, parentId: childId, explicit: true, sniffed: false });
           }
@@ -2130,6 +2682,7 @@ export class ConversationMetricsEngine {
       subagentSteps: totalSubagentSteps,
       totalStepsOverride: mainState.steps.length + totalSubagentSteps,
       allowDbActiveStepInference: mainIsRecent || isStreaming || effectiveSubagentRunning,
+      isSubagentTrajectory: Boolean(dbPathOverride || (mainState.hasParentMetadataBlob && mainState.referencedUuidsInMetaBlob.size > 0)),
       modelId,
       pricingTable,
       genMetadata: mainState.genMetadata,
@@ -2143,5 +2696,7 @@ export class ConversationMetricsEngine {
   public clearCache(): void {
     this.cache.clear();
     this.sniffDirCache = null;
+    this.sniffDirListCache = null;
+    this.cachedPricingTable = null;
   }
 }

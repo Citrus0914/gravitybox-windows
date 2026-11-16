@@ -2,6 +2,7 @@ import { get as httpsGet } from 'node:https';
 import { get as httpGet } from 'node:http';
 import { createHash } from 'node:crypto';
 import type { Dictionary } from './dictionary.js';
+import { bt } from './i18n.js';
 
 /** 已收录的界面包指纹清单；不代表当前构建逐版本完成实机验收。 */
 export const SUPPORTED_BUNDLES = new Map([
@@ -33,7 +34,7 @@ function fetchLoopbackBytes(
 ): Promise<{ buffer: Buffer; hash: string }> {
   const parsed = new URL(url);
   if (!['127.0.0.1', '[::1]'].includes(parsed.hostname) || !['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password) {
-    return Promise.reject(new Error(options.originError ?? '只允许读取本机界面包'));
+    return Promise.reject(new Error(options.originError ?? bt('bundle.origin_only')));
   }
   const secure = parsed.protocol === 'https:';
   const get = secure ? httpsGet : httpGet;
@@ -51,7 +52,7 @@ function fetchLoopbackBytes(
       response.on('data', (chunk: Buffer) => {
         size += chunk.length;
         if (size > 20_000_000) {
-          request.destroy(new Error(options.sizeError ?? '界面包超过大小限制'));
+          request.destroy(new Error(options.sizeError ?? bt('bundle.size_exceeded')));
           return;
         }
         if (hash) hash.update(chunk);
@@ -59,7 +60,7 @@ function fetchLoopbackBytes(
       });
       response.on('end', () => resolve({ buffer: Buffer.concat(chunks), hash: hash ? hash.digest('hex') : '' }));
     });
-    request.on('timeout', () => request.destroy(new Error(options.timeoutError ?? '读取界面包超时')));
+    request.on('timeout', () => request.destroy(new Error(options.timeoutError ?? bt('bundle.timeout'))));
     request.on('error', reject);
   });
 }
@@ -370,9 +371,9 @@ export async function fetchBundleWithHash(origin: string, timeout = 8000): Promi
   const url = new URL('/main.js', origin);
   const { buffer, hash } = await fetchLoopbackBytes(url.href, timeout, {
     withHash: true,
-    originError: '仅允许本机界面资源',
-    sizeError: '界面包过大',
-    timeoutError: '界面包读取超时',
+    originError: bt('bundle.resource_origin_only'),
+    sizeError: bt('bundle.resource_too_large'),
+    timeoutError: bt('bundle.resource_timeout'),
   });
   return { source: buffer.toString('utf8'), hash, bytes: buffer.length };
 }

@@ -45,16 +45,29 @@ final class MenuMeterBar: NSView {
         NSGraphicsContext.current?.restoreGraphicsState()
     }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+    deinit { motion.cancel() }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { motion.cancel() }
+    }
 }
 
 /// 菜单卡片与面板共用的配额展示辅助。
 enum MenuQuotaHelpers {
     /// "4 小时 13 分钟后重置" -> "4小时13分后重置"，菜单内保持一行。
     static func compactReset(_ raw: String) -> String {
-        InterfaceText.countdown(raw)
+        let converted = InterfaceText.countdown(raw)
+        if L10n.shared.isEnglish {
+            return converted
+        }
+        return converted
             .replacingOccurrences(of: "分钟", with: "分")
             .replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "·", with: " · ")
+    }
+
+    static func localizedPeriodLabel(_ raw: String) -> String {
+        QuotaPresentation.localizedWindowLabel(period: "", label: raw)
     }
 
     static func groupHeader(_ title: String, brands: [String], fontSize: CGFloat = 11.5, iconSize: CGFloat = 13, spacing: CGFloat = 5) -> NSView {
@@ -74,44 +87,6 @@ enum MenuQuotaHelpers {
         let row = horizontal(views, spacing: spacing)
         row.alignment = .centerY
         return row
-    }
-
-    static func syncExtraStandaloneGroups(_ models: [QuotaPresentation.Argon], into stack: NSStackView, withLeadingDividers: Bool, headerFontSize: CGFloat = 11.5, iconSize: CGFloat = 13) {
-        stack.arrangedSubviews.forEach {
-            stack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-        guard !models.isEmpty else {
-            stack.isHidden = true
-            return
-        }
-        stack.isHidden = false
-        for (idx, item) in models.enumerated() {
-            if withLeadingDividers || idx > 0 {
-                let div = divider()
-                stack.addArrangedSubview(div)
-                fillWidth(div, in: stack)
-            }
-            let brands = ModelIcons.brands(for: item.modelName)
-            let hdr = groupHeader(item.modelName, brands: brands, fontSize: headerFontSize, iconSize: iconSize, spacing: 5)
-            let rowTitle: String
-            switch item.periodLabel {
-            case "5小时": rowTitle = "5 小时"
-            case "每周": rowTitle = "每周"
-            case "周期未知": rowTitle = "周期未知"
-            default: rowTitle = ""
-            }
-            let row = MenuMeterRow(title: rowTitle)
-            row.accessibilityGroupName = item.modelName
-            let placeholder = item.availability == "disabled" ? "不可用" : item.placeholder
-            row.apply(percentage: item.percentage, placeholder: placeholder, reset: item.percentage == nil ? "" : item.resetText, stale: item.stale)
-            let grp = vertical([hdr, row], spacing: 6)
-            grp.alignment = .leading
-            fillWidth(hdr, in: grp)
-            fillWidth(row, in: grp)
-            stack.addArrangedSubview(grp)
-            fillWidth(grp, in: stack)
-        }
     }
 }
 
@@ -188,11 +163,12 @@ final class MenuMeterRow: NSView {
             resetLabel.textColor = .secondaryLabelColor
             setAccessibilityValue(nil)
         }
-        setAccessibilityLabel([accessibilityGroupName, titleLabel.stringValue, valueLabel.stringValue, compactReset].filter { !$0.isEmpty }.joined(separator: "，"))
+        let sep = L10n.shared.isEnglish ? ", " : "，"
+        setAccessibilityLabel([accessibilityGroupName, titleLabel.stringValue, valueLabel.stringValue, compactReset].filter { !$0.isEmpty }.joined(separator: sep))
     }
 }
 
-// MARK: - Three-Tab Native Menu Panel ("用量｜配额｜账号", 396pt Popover)
+// MARK: - Three-Tab Native Menu Panel ("用量｜配额｜账号", 424pt Popover)
 
 final class MenuSegmentedTabsView: NSView {
     enum Style {
@@ -272,6 +248,7 @@ final class MenuSegmentedTabsView: NSView {
 
             let pStyle = NSMutableParagraphStyle()
             pStyle.alignment = .center
+            pStyle.lineBreakMode = .byTruncatingTail
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: fontSize, weight: weight),
                 .foregroundColor: fg,
@@ -327,6 +304,12 @@ final class MenuSegmentedTabsView: NSView {
     override func layout() {
         super.layout()
         needsDisplay = true
+    }
+
+    deinit { slideMotion.cancel() }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { slideMotion.cancel() }
     }
 
     func setSelected(_ index: Int) {
@@ -516,7 +499,8 @@ final class MenuMetricTileView: NSView {
     }
 
     func refreshAccessibility() {
-        setAccessibilityLabel("\(titleLabel.stringValue)，\(valueLabel.stringValue)")
+        let sep = L10n.shared.isEnglish ? ", " : "，"
+        setAccessibilityLabel("\(titleLabel.stringValue)\(sep)\(valueLabel.stringValue)")
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -549,7 +533,7 @@ final class MenuTrendChartView: NSView {
     var dimension: Dimension = .tokens {
         didSet {
             if oldValue != dimension {
-                setAccessibilityLabel(dimension == .tokens ? "菜单栏 Token 用量趋势图" : "菜单栏请求数趋势图")
+                setAccessibilityLabel(dimension == .tokens ? L10n.t("menu_panel.chart.tokens_a11y", fallback: "菜单栏 Token 用量趋势图") : L10n.t("menu_panel.chart.requests_a11y", fallback: "菜单栏请求数趋势图"))
                 needsDisplay = true
             }
         }
@@ -579,7 +563,7 @@ final class MenuTrendChartView: NSView {
         heightAnchor.constraint(equalToConstant: 86).isActive = true
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
-        setAccessibilityLabel("菜单栏 Token 用量趋势图")
+        setAccessibilityLabel(L10n.t("menu_panel.chart.tokens_a11y", fallback: "菜单栏 Token 用量趋势图"))
     }
     required init?(coder: NSCoder) { fatalError() }
     deinit {
@@ -677,7 +661,7 @@ final class MenuTrendChartView: NSView {
         if dimension == .tokens {
             return InterfaceText.formatCompactTokens(value, formatSmallWithLocale: true)
         }
-        return value >= 1000 ? String(format: "%.1fK", Double(value) / 1000.0) : "\(value)"
+        return value >= 1000 ? String(format: "%.1fK", locale: Locale(identifier: "en_US_POSIX"), Double(value) / 1000.0) : "\(value)"
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -699,7 +683,7 @@ final class MenuTrendChartView: NSView {
 
         let peakVal = buckets.filter { !$0.isFuture }.map(\.value).max() ?? 0
         guard !buckets.isEmpty, peakVal > 0 else {
-            let emptyStr = (buckets.isEmpty ? "暂无该时段会话记录" : "当前时段暂无消耗分布") as NSString
+            let emptyStr = (buckets.isEmpty ? L10n.t("component.chart.no_sessions", fallback: "暂无该时段会话记录") : L10n.t("component.chart.no_distribution", fallback: "当前时段暂无消耗分布")) as NSString
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 11.5),
                 .foregroundColor: Design.secondary
@@ -730,18 +714,22 @@ final class MenuTrendChartView: NSView {
         let barWidth = min(18, max(3.5, slotWidth * 0.64))
         let effectiveStep: Int = count > 20 ? 6 : (count > 10 ? 3 : (count > 6 ? 2 : 1))
         var lastDrawnRight: CGFloat = -999.0
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let baseSlotFill = NSColor.labelColor.withAlphaComponent(isDark ? 0.12 : 0.08)
+        let cursorFill = NSColor.labelColor.withAlphaComponent(isDark ? 0.065 : 0.045)
+        let normalGrad = NSGradient(starting: Design.blue.withAlphaComponent(0.72), ending: Design.blue)
+        let hoverGrad = NSGradient(starting: Design.blue.withAlphaComponent(0.90), ending: Design.blue)
 
         for (idx, bucket) in buckets.enumerated() {
             let cx = leftGutter + (CGFloat(idx) + 0.5) * slotWidth
             let isHovered = (hoveredIndex == idx)
-            let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
 
             // 0 柱位浅灰基槽
             if !bucket.isFuture {
                 let baseH: CGFloat = 2.5
                 let baseRect = NSRect(x: cx - barWidth / 2, y: chartBottom, width: barWidth, height: baseH)
                 let basePath = NSBezierPath(roundedRect: baseRect, xRadius: min(1.25, barWidth / 2), yRadius: min(1.25, barWidth / 2))
-                NSColor.labelColor.withAlphaComponent(isDark ? 0.12 : 0.08).setFill()
+                baseSlotFill.setFill()
                 basePath.fill()
             }
 
@@ -750,7 +738,7 @@ final class MenuTrendChartView: NSView {
                 let cursorCenterX = animatedHoverX ?? cx
                 let cursorRect = NSRect(x: cursorCenterX - slotWidth * 0.44, y: chartBottom, width: slotWidth * 0.88, height: chartHeight)
                 let cursorPath = NSBezierPath(roundedRect: cursorRect, xRadius: 4, yRadius: 4)
-                NSColor.labelColor.withAlphaComponent(isDark ? 0.065 : 0.045).setFill()
+                cursorFill.setFill()
                 cursorPath.fill()
             }
 
@@ -769,11 +757,7 @@ final class MenuTrendChartView: NSView {
                 barPath.line(to: NSPoint(x: bx + barWidth, y: by))
                 barPath.close()
 
-                let grad = NSGradient(
-                    starting: Design.blue.withAlphaComponent(isHovered ? 0.90 : 0.72),
-                    ending: Design.blue
-                )
-                grad?.draw(in: barPath, angle: 90)
+                (isHovered ? hoverGrad : normalGrad)?.draw(in: barPath, angle: 90)
             }
 
             let isStepMatch = (idx % effectiveStep == 0)
@@ -798,7 +782,7 @@ final class MenuTrendChartView: NSView {
             let barH = (!b.isFuture && b.value > 0) ? chartHeight * ratio : 0
             let capStr: NSString
             if b.isFuture {
-                capStr = "未到达" as NSString
+                capStr = L10n.t("menu_panel.chart.future", fallback: "未到达") as NSString
             } else if dimension == .tokens {
                 capStr = InterfaceText.formatCompactTokens(b.value, formatSmallWithLocale: true) as NSString
             } else {
@@ -918,15 +902,19 @@ final class MenuModelUsageItemView: NSView {
 
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
-        setAccessibilityLabel("\(display)，\(tokensText) Token")
+        setAccessibilityLabel(Self.accessibilityText(display: display, tokensText: tokensText))
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    private static func accessibilityText(display: String, tokensText: String) -> String {
+        L10n.shared.isEnglish ? "\(display), \(tokensText) Tokens" : "\(display)，\(tokensText) Token"
+    }
 
     func update(tokensText: String, shareFraction: CGFloat) {
         if tokensLabel.stringValue != tokensText {
             tokensLabel.stringValue = tokensText
             let display = rawModel
-            setAccessibilityLabel("\(display)，\(tokensText) Token")
+            setAccessibilityLabel(Self.accessibilityText(display: display, tokensText: tokensText))
         }
         shareBar.fraction = max(0.02, min(1.0, shareFraction))
     }
@@ -945,22 +933,17 @@ final class MenuExpandableAccountCardView: NSBox {
     let headerButton = MenuPlainClickButton(frame: .zero)
     let stateIcon = symbol("circle", size: 12, color: Design.secondary)
     let nameLabel = text("", size: 12.5, weight: .semibold, color: .labelColor)
-    let tierBadge = pillBadge("", color: .systemBlue)
+    let tierBadge = TierBadge("", scale: .compact)
     let statusBadge = pillBadge("", color: Design.blue)
     let chevronIcon = symbol("chevron.down", size: 10, color: Design.secondary)
     let emailLabel = text("", size: 10.5, color: .secondaryLabelColor)
 
     let detailContainer = NSStackView()
-    let gemini5hRow = MenuMeterRow(title: "Gemini · 5 小时")
-    let geminiWeeklyRow = MenuMeterRow(title: "Gemini · 每周")
-    let claude5hRow = MenuMeterRow(title: "Claude/GPT · 5 小时")
-    let claudeWeeklyRow = MenuMeterRow(title: "Claude/GPT · 每周")
-    let argonRow = MenuMeterRow(title: "Gemini 4 Argon")
-    let carbonRow = MenuMeterRow(title: "Gemini 4 Carbon")
-    let extraStandaloneStack = NSStackView()
+    let quotaRowsStack = NSStackView()
+    private var quotaRowViews: [MenuMeterRow] = []
     let warningLabel = text("", size: 10.5, color: accessibleWarningColor(), wrap: true)
     let timestampLabel = text("", size: 10.5, color: Design.secondary)
-    let switchButton = button("切换账号…", target: nil, action: #selector(switchPressed))
+    let switchButton = button(L10n.t("menu_panel.account_card.switch_btn", fallback: "切换账号…"), target: nil, action: #selector(switchPressed))
     let singleRefreshButton = QuotaRefreshButton(target: nil, action: #selector(refreshSinglePressed))
 
     var onToggleExpand: ((String) -> Void)?
@@ -1072,7 +1055,7 @@ final class MenuExpandableAccountCardView: NSBox {
         headerButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let copyMenu = NSMenu()
-        let copyItem = NSMenuItem(title: "复制完整邮箱", action: #selector(copyEmail), keyEquivalent: "")
+        let copyItem = NSMenuItem(title: L10n.t("common.copy_full_email", fallback: "复制完整邮箱"), action: #selector(copyEmail), keyEquivalent: "")
         copyItem.target = self
         copyMenu.addItem(copyItem)
         headerButton.menu = copyMenu
@@ -1087,21 +1070,14 @@ final class MenuExpandableAccountCardView: NSBox {
         actionRow.alignment = .centerY
         actionRow.detachesHiddenViews = true
 
-        extraStandaloneStack.orientation = .vertical
-        extraStandaloneStack.alignment = .leading
-        extraStandaloneStack.spacing = 6
-        extraStandaloneStack.isHidden = true
-        extraStandaloneStack.detachesHiddenViews = true
+        quotaRowsStack.orientation = .vertical
+        quotaRowsStack.alignment = .leading
+        quotaRowsStack.spacing = 6
+        quotaRowsStack.detachesHiddenViews = true
 
         let detailViews: [NSView] = [
             divider(),
-            gemini5hRow,
-            geminiWeeklyRow,
-            claude5hRow,
-            claudeWeeklyRow,
-            argonRow,
-            carbonRow,
-            extraStandaloneStack,
+            quotaRowsStack,
             warningLabel,
             actionRow
         ]
@@ -1130,7 +1106,7 @@ final class MenuExpandableAccountCardView: NSBox {
     required init?(coder: NSCoder) { fatalError() }
 
     func apply(account: [String: Any], isCurrent: Bool, isLiveVerified: Bool, isRecommended: Bool, isExpanded: Bool, reachable: Bool, switchInFlight: Bool, globalBusy: Bool, singleBusy: Bool, singleError: String?) {
-        let email = account["email"] as? String ?? "未命名账号"
+        let email = account["email"] as? String ?? L10n.t("menu_panel.account_card.unnamed", fallback: "未命名账号")
         fullEmail = email
         let rawName = account["name"] as? String
         let display = AccountIdentity.displayName(name: rawName, email: email)
@@ -1141,32 +1117,31 @@ final class MenuExpandableAccountCardView: NSBox {
         self.isAccountReachable = reachable
         self.isSwitchInFlight = switchInFlight
 
-        stateIcon.image = NSImage(systemSymbolName: isCurrent ? "checkmark.circle.fill" : "circle", accessibilityDescription: isCurrent ? "当前账号" : "切换至该账号")
+        let roleCurrentTitle = L10n.t("menu_panel.quota.current_account", fallback: "当前账号")
+        let switchToTitle = L10n.t("menu_panel.account_card.switch_to", fallback: "切换至该账号")
+        stateIcon.image = NSImage(systemSymbolName: isCurrent ? "checkmark.circle.fill" : "circle", accessibilityDescription: isCurrent ? roleCurrentTitle : switchToTitle)
         stateIcon.contentTintColor = isCurrent ? Design.blue : Design.secondary.withAlphaComponent(0.45)
         stateButton.toolTip = nil
-        stateButton.setAccessibilityLabel(isCurrent ? "当前账号" : "切换至该账号")
+        stateButton.setAccessibilityLabel(isCurrent ? roleCurrentTitle : switchToTitle)
         stateButton.setAccessibilityRole(.button)
         nameLabel.stringValue = display
         emailLabel.stringValue = email
         emailLabel.toolTip = nil
 
         tierBadge.title = tier
-        tierBadge.tint = tier == "ULTRA" ? .systemPurple : (tier == "PRO" ? .systemBlue : Design.inactivePill)
         tierBadge.isHidden = tier.isEmpty
 
         if isCurrent {
-            statusBadge.title = isLiveVerified ? "当前账号" : "已选记录"
-            statusBadge.tint = isLiveVerified ? Design.blue : Design.inactivePill
-            statusBadge.isHidden = false
+            statusBadge.isHidden = true
         } else if isRecommended {
-            statusBadge.title = "推荐备用"
+            statusBadge.title = L10n.t("menu_panel.account_card.recommended", fallback: "推荐备用")
             statusBadge.tint = .systemGreen
             statusBadge.isHidden = false
         } else {
             statusBadge.isHidden = true
         }
 
-        borderColor = isCurrent ? Design.blue.withAlphaComponent(0.42) : Design.popoverCardBorder
+        borderColor = isCurrent ? Design.dynamicAlpha(Design.blue, 0.42) : Design.popoverCardBorder
         borderWidth = isCurrent ? 1.25 : 1.0
         fillColor = Design.popoverCardBackground
         chevronIcon.image = NSImage(systemSymbolName: isExpanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil)
@@ -1184,57 +1159,79 @@ final class MenuExpandableAccountCardView: NSBox {
         } else {
             detailContainer.alphaValue = 1.0
         }
-        headerButton.setAccessibilityLabel("\(display)，\(email)，\(isCurrent ? "当前账号" : "备用账号")，\(summary)")
+        let roleText = isCurrent ? roleCurrentTitle : L10n.t("menu_panel.account_card.backup_account", fallback: "备用账号")
+        headerButton.setAccessibilityLabel(L10n.t("menu_panel.account_card.a11y", ["name": display, "email": email, "role": roleText, "summary": summary], fallback: "\(display)，\(email)，\(roleText)，\(summary)"))
 
         let contract = QuotaPresentation.contract(account)
-        gemini5hRow.titleLabel.stringValue = "Gemini · \(contract.geminiPrimary.label)"
-        gemini5hRow.apply(percentage: contract.geminiPrimary.window?.percentage, placeholder: contract.geminiPrimary.window?.placeholder ?? "未知", reset: contract.geminiPrimary.window?.resetText ?? "", stale: contract.geminiPrimary.window?.stale == true)
-        geminiWeeklyRow.titleLabel.stringValue = "Gemini · 每周"
-        geminiWeeklyRow.apply(percentage: contract.geminiWeekly?.percentage, placeholder: contract.geminiWeekly?.placeholder ?? "未知", reset: contract.geminiWeekly?.resetText ?? "", stale: contract.geminiWeekly?.stale == true)
-
-        claude5hRow.titleLabel.stringValue = "Claude/GPT · \(contract.claudePrimary.label)"
-        claude5hRow.apply(percentage: contract.claudePrimary.window?.percentage, placeholder: contract.claudePrimary.window?.placeholder ?? "未知", reset: contract.claudePrimary.window?.resetText ?? "", stale: contract.claudePrimary.window?.stale == true)
-        claudeWeeklyRow.titleLabel.stringValue = "Claude/GPT · 每周"
-        claudeWeeklyRow.apply(percentage: contract.claudeWeekly?.percentage, placeholder: contract.claudeWeekly?.placeholder ?? "未知", reset: contract.claudeWeekly?.resetText ?? "", stale: contract.claudeWeekly?.stale == true)
-
-        let argonState = contract.argon
-        let argonPlaceholder = argonState?.availability == "disabled" ? "不可用" : (argonState?.placeholder ?? "未知")
-        argonRow.titleLabel.stringValue = argonState?.title ?? "Gemini 4 Argon"
-        argonRow.apply(percentage: argonState?.percentage, placeholder: argonPlaceholder, reset: argonState?.percentage == nil ? "" : (argonState?.resetText ?? ""), stale: argonState?.stale == true)
-
-        let carbonState = contract.carbon
-        let carbonPlaceholder = carbonState?.availability == "disabled" ? "不可用" : (carbonState?.placeholder ?? "未知")
-        carbonRow.titleLabel.stringValue = carbonState?.title ?? "Gemini 4 Carbon"
-        carbonRow.apply(percentage: carbonState?.percentage, placeholder: carbonPlaceholder, reset: carbonState?.percentage == nil ? "" : (carbonState?.resetText ?? ""), stale: carbonState?.stale == true)
-
-        extraStandaloneStack.arrangedSubviews.forEach {
-            extraStandaloneStack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
+        struct DynamicMeterSpec {
+            let title: String
+            let groupName: String
+            let percentage: Int?
+            let placeholder: String
+            let reset: String
+            let stale: Bool
         }
-        let extraModels = contract.extraStandaloneModels
-        extraStandaloneStack.isHidden = extraModels.isEmpty
-        for extra in extraModels {
-            let row = MenuMeterRow(title: extra.title)
-            let ph = extra.availability == "disabled" ? "不可用" : extra.placeholder
-            row.apply(percentage: extra.percentage, placeholder: ph, reset: extra.percentage == nil ? "" : extra.resetText, stale: extra.stale)
-            extraStandaloneStack.addArrangedSubview(row)
-            fillWidth(row, in: extraStandaloneStack)
+        var specs: [DynamicMeterSpec] = []
+        for group in contract.displayGroups {
+            if group.windows.isEmpty {
+                let fallbackLabel = L10n.t("quota.model_quota", fallback: "模型配额")
+                let ph = group.availability == "disabled" ? L10n.t("common.unavailable", fallback: "不可用") : L10n.t("common.unknown", fallback: "未知")
+                specs.append(DynamicMeterSpec(
+                    title: "\(group.displayName) · \(fallbackLabel)",
+                    groupName: group.displayName,
+                    percentage: nil,
+                    placeholder: ph,
+                    reset: "",
+                    stale: false
+                ))
+            } else {
+                for win in group.windows {
+                    specs.append(DynamicMeterSpec(
+                        title: group.barTitle(for: win),
+                        groupName: group.displayName,
+                        percentage: win.percentage,
+                        placeholder: win.placeholder(availability: group.availability),
+                        reset: win.percentage == nil ? "" : win.resetText,
+                        stale: win.stale
+                    ))
+                }
+            }
+        }
+        if quotaRowViews.count != specs.count {
+            quotaRowsStack.arrangedSubviews.forEach {
+                quotaRowsStack.removeArrangedSubview($0)
+                $0.removeFromSuperview()
+            }
+            quotaRowViews = specs.map { spec in
+                let row = MenuMeterRow(title: spec.title)
+                quotaRowsStack.addArrangedSubview(row)
+                fillWidth(row, in: quotaRowsStack)
+                return row
+            }
+        }
+        for (idx, spec) in specs.enumerated() where idx < quotaRowViews.count {
+            let row = quotaRowViews[idx]
+            row.titleLabel.stringValue = spec.title
+            row.accessibilityGroupName = spec.groupName
+            row.apply(percentage: spec.percentage, placeholder: spec.placeholder, reset: spec.reset, stale: spec.stale)
         }
 
         var warnings: [String] = []
         if let readiness = account["credentialReadiness"] as? [String: Any], readiness["state"] as? String == "needs_authorization" {
-            warnings.append("登录授权已失效，请前往主界面重新授权")
+            warnings.append(L10n.t("menu_panel.quota.reauth_needed", fallback: "登录授权已失效，请前往主界面重新授权"))
         }
         if let singleError, !singleError.isEmpty {
             warnings.append(InterfaceText.quotaMessage(singleError))
-        } else if let refreshErr = account["quota_refresh_error"] as? String, !refreshErr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !refreshErr.contains("双周期") {
+        } else if let refreshErr = account["quota_refresh_error"] as? String, !refreshErr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !InterfaceText.isInternalDualWindowError(refreshErr) {
             warnings.append(InterfaceText.quotaMessage(refreshErr))
         }
         if let quota = account["quota"] as? [String: Any], let staleGroups = quota["stale_groups"] as? [[String: Any]], !staleGroups.isEmpty {
             let names = staleGroups.compactMap { $0["name"] as? String }.filter { !$0.isEmpty }
-            warnings.append("部分分组沿用上次记录：" + (names.isEmpty ? "部分分组" : names.joined(separator: "、")))
+            let sep = L10n.shared.isEnglish ? ", " : "、"
+            let namesStr = names.isEmpty ? L10n.t("menu_panel.quota.partial_groups", fallback: "部分分组") : names.joined(separator: sep)
+            warnings.append(L10n.t("menu_panel.quota.stale_groups", ["names": namesStr], fallback: "部分分组沿用上次记录：\(namesStr)"))
         }
-        warningLabel.stringValue = warnings.joined(separator: "；")
+        warningLabel.stringValue = warnings.joined(separator: L10n.shared.isEnglish ? "; " : "；")
         warningLabel.isHidden = warnings.isEmpty
 
         let quota = account["quota"] as? [String: Any]
@@ -1242,7 +1239,7 @@ final class MenuExpandableAccountCardView: NSBox {
         if stamp > 0 {
             let date = Date(timeIntervalSince1970: stamp)
             let fmt = Calendar.current.isDateInToday(date) ? Self.todayFormatter : Self.dateFormatter
-            timestampLabel.stringValue = "更新于 \(fmt.string(from: date))"
+            timestampLabel.stringValue = L10n.t("common.updated_at", ["time": fmt.string(from: date)], fallback: "更新于 \(fmt.string(from: date))")
             timestampLabel.isHidden = false
         } else {
             timestampLabel.stringValue = ""
@@ -1276,6 +1273,12 @@ final class MenuExpandableAccountCardView: NSBox {
         guard !fullEmail.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(fullEmail, forType: .string)
+    }
+
+    deinit { hoverMotion.cancel() }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { hoverMotion.cancel() }
     }
 }
 

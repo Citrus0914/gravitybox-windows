@@ -2,6 +2,10 @@ import { readFile } from 'node:fs/promises';
 import { atomicJson, readOptionalJson } from './files.js';
 import { APP_VERSION } from './version.js';
 import {
+  registerRemoteModelMetadata,
+  sanitizeRemoteModelMetadata,
+} from './model-catalog.js';
+import {
   DEFAULT_API_PRICES,
   DEFAULT_PRICING_FEED_URLS,
   PRICING_METADATA,
@@ -12,6 +16,7 @@ import {
   type ApiPricingEntry,
   type ApiPricingInterval,
 } from './pricing.js';
+import { bt } from './i18n.js';
 
 export interface PricingSyncMutableState {
   lastRemoteSyncAt: number;
@@ -40,15 +45,16 @@ export async function loadRawPricingTable(
     const isOlderDatedFeed = /^\d{4}-\d{2}-\d{2}$/.test(remoteVer)
       && /^\d{4}-\d{2}-\d{2}$/.test(PRICING_METADATA.version)
       && remoteVer < PRICING_METADATA.version;
+    registerRemoteModelMetadata(parsedRemote, { onlyNewEntries: isOlderDatedFeed });
     if (remotePrices && typeof remotePrices === 'object' && !Array.isArray(remotePrices)) {
       const filteredRemote = isOlderDatedFeed
         ? Object.fromEntries(Object.entries(remotePrices).filter(([k]) => !Object.hasOwn(merged, k)))
         : remotePrices;
-      mergePricingEntries(merged, filteredRemote, '远程价格条目待修复：', warnings);
+      mergePricingEntries(merged, filteredRemote, bt('pricing.warn.remote_entry_prefix'), warnings);
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      warnings.push('远程价格缓存无法读取');
+      warnings.push(bt('pricing.warn.remote_cache_unreadable'));
     }
   }
 
@@ -57,11 +63,11 @@ export async function loadRawPricingTable(
     const rawCustom = await readFile(pricingCachePath, 'utf8');
     const cached = JSON.parse(rawCustom);
     if (cached && typeof cached === 'object' && !Array.isArray(cached)) {
-      mergePricingEntries(merged, cached, '自定义价格条目待修复：', warnings);
+      mergePricingEntries(merged, cached, bt('pricing.warn.custom_entry_prefix'), warnings);
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      warnings.push('自定义价格无法读取');
+      warnings.push(bt('pricing.warn.custom_unreadable'));
     }
   }
 
@@ -139,19 +145,19 @@ export function selectRemotePricingCandidateUrls(options: {
 const MAX_PRICING_FEED_BYTES = 2 * 1024 * 1024;
 
 export function assertAllowedPricingFeedUrl(rawUrl: unknown): string {
-  if (typeof rawUrl !== 'string' || !rawUrl.trim()) throw new Error('价格源地址无效');
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) throw new Error(bt('pricing.err.url_invalid'));
   let parsed: URL;
   try {
     parsed = new URL(rawUrl.trim());
   } catch {
-    throw new Error('价格源地址格式无效');
+    throw new Error(bt('pricing.err.url_format_invalid'));
   }
-  if (parsed.username || parsed.password) throw new Error('价格源地址不允许内嵌凭据');
+  if (parsed.username || parsed.password) throw new Error(bt('pricing.err.url_credentials_forbidden'));
   if (parsed.protocol === 'https:') return parsed.href;
   if (parsed.protocol === 'http:' && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '[::1]')) {
     return parsed.href;
   }
-  throw new Error('仅允许 HTTPS 官方或受信任价格源地址');
+  throw new Error(bt('pricing.err.https_trusted_only'));
 }
 
 export async function executeRemotePricingSync(options: {
@@ -173,21 +179,28 @@ export async function executeRemotePricingSync(options: {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const contentLen = Number(res.headers.get('content-length') ?? 0);
       if (Number.isFinite(contentLen) && contentLen > MAX_PRICING_FEED_BYTES) {
-        throw new Error('价格源响应体积超出安全上限');
+        throw new Error(bt('pricing.err.response_too_large'));
       }
       const rawBuf = await res.arrayBuffer();
       if (rawBuf.byteLength > MAX_PRICING_FEED_BYTES) {
-        throw new Error('价格源响应体积超出安全上限');
+        throw new Error(bt('pricing.err.response_too_large'));
       }
       const data = JSON.parse(new TextDecoder('utf-8').decode(rawBuf));
       const prices = data && typeof data === 'object' && data.prices ? data.prices : data;
       const validated = validateRawPrices(prices);
+      const remoteMeta = sanitizeRemoteModelMetadata(data);
       const feedVersion = (data && typeof data === 'object' && typeof data.version === 'string') ? data.version : 'unknown';
+      const isOlderDatedFeed = /^\d{4}-\d{2}-\d{2}$/.test(feedVersion)
+        && /^\d{4}-\d{2}-\d{2}$/.test(PRICING_METADATA.version)
+        && feedVersion < PRICING_METADATA.version;
+      registerRemoteModelMetadata(remoteMeta, { onlyNewEntries: isOlderDatedFeed });
       await atomicJson(remotePricingCachePath, {
         version: 1,
         syncedAt: new Date(now).toISOString(),
         sourceUrl: targetUrl,
         feedVersion,
+        ...(remoteMeta.aliases ? { aliases: remoteMeta.aliases } : {}),
+        ...(remoteMeta.models ? { models: remoteMeta.models } : {}),
         prices: validated,
       });
       state.lastRemoteSyncAt = now;

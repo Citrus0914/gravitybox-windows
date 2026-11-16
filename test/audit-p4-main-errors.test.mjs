@@ -22,7 +22,7 @@ process.argv.length = 0; process.argv.push(...savedArgv);
 delete process.env.GRAVITYBOX_IMPORT_ONLY;
 after(async () => { await rm(importState, { recursive: true, force: true }); });
 
-const TIERS = ['FREE', 'PRO', 'ULTRA', '待确认'];
+const TIERS = ['FREE', 'PLUS', 'PRO', 'TEAM', 'ULTRA', 'ENTERPRISE', '待确认'];
 
 function healthyDeps(overrides = {}) {
   const account = { id: 'acc-1', email: 'user@example.test', name: '用户', quota: { subscription_tier: 'PRO', last_updated: 1 } };
@@ -100,11 +100,14 @@ test('B12: accounts 与 usage 同时失败时两段错误分别返回且不抛�
 });
 
 // B13: 套餐枚举归一化。
-test('B13: subscriptionTier 空值/未知值统一为 待确认，合法值收敛为 FREE/PRO/ULTRA', async () => {
+test('B13: subscriptionTier 空值/未知值统一为 待确认，合法值收敛为标准套餐枚举', async () => {
   const cases = [
     ['FREE', 'FREE'], ['free', 'FREE'], ['Free', 'FREE'], ['starter', 'FREE'],
+    ['PLUS', 'PLUS'], ['Google One AI Plus', 'PLUS'],
     ['PRO', 'PRO'], ['pro', 'PRO'], ['Google AI Pro', 'PRO'],
+    ['TEAM', 'TEAM'], ['Workspace Team', 'TEAM'],
     ['ULTRA', 'ULTRA'], ['Ultra', 'ULTRA'], ['Gemini Ultra', 'ULTRA'],
+    ['ENTERPRISE', 'ENTERPRISE'], ['Cloud Enterprise Standard', 'ENTERPRISE'],
     ['', '待确认'], ['   ', '待确认'], [null, '待确认'], [undefined, '待确认'], ['mystery-tier', '待确认'], [123, '待确认'],
   ];
   for (const [input, expected] of cases) {

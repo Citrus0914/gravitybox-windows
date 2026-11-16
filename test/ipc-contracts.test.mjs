@@ -430,4 +430,129 @@ test('Main IPC 集成测试: 0.9.0 账号管理、额度策略、Token 用量与
     await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
+
+test('P0-02/P1-15/P1-17/P1-19/P1-20: 维护目录动态双语、resume切回中文重载词典、统一投影与守护契约', async t => {
+  const { CACHE_METADATA, getCacheMetadata } = await import('../dist/maintenance-catalog.js');
+  const { setActiveLocale, getActiveLocale } = await import('../dist/i18n.js');
+  const { projectAccountForIpcNormalized } = await import('../dist/ipc-projections.js');
+  const { Tasks } = await import('../dist/tasks.js');
+  const prevLocale = getActiveLocale();
+  t.after(() => setActiveLocale(prevLocale));
+
+  const catalogKeys = Object.keys(CACHE_METADATA);
+  assert.ok(catalogKeys.length > 0);
+  setActiveLocale('zh-Hans');
+  const zhTitle = CACHE_METADATA[catalogKeys[0]].title;
+  assert.equal(zhTitle, getCacheMetadata(catalogKeys[0]).title);
+  setActiveLocale('en');
+  const enTitle = CACHE_METADATA[catalogKeys[0]].title;
+  assert.equal(enTitle, getCacheMetadata(catalogKeys[0]).title);
+  assert.notEqual(zhTitle, enTitle, 'CACHE_METADATA 代理必须随运行态语言动态变化');
+  assert.equal(Object.fromEntries(Object.entries(CACHE_METADATA))[catalogKeys[0]].title, enTitle);
+  setActiveLocale('zh-Hans');
+
+  const dir = await mkdtemp(join(tmpdir(), 'gb-ipc-p002-'));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  await mkdir(join(dir, '词典'), { recursive: true });
+  await mkdir(join(dir, 'profile'), { recursive: true });
+  await mkdir(join(dir, 'home'), { recursive: true });
+  await mkdir(join(dir, 'appsupport'), { recursive: true });
+  await mkdir(join(dir, 'gemini'), { recursive: true });
+  await writeFile(join(dir, 'config.json'), JSON.stringify({ schema: 2, appLanguage: 'en', applicationChannel: 'stable' }));
+
+  const mgr = new AccountsManager(dir);
+  const acc1 = await mgr.upsertAccount({
+    email: 'one@example.invalid', refreshToken: 'SECRET_R1', accessToken: 'SECRET_A1', expiresIn: 3600,
+  });
+  const acc2 = await mgr.upsertAccount({
+    email: 'two@example.invalid', refreshToken: 'SECRET_R2', accessToken: 'SECRET_A2', expiresIn: 3600,
+  });
+
+  const projectedOverview = projectAccountForIpcNormalized(acc1, mgr, {
+    includeOverviewFields: true,
+    revisionWithReadiness: true,
+  });
+  assert.equal(projectedOverview.token, undefined);
+  assert.equal(projectedOverview.quota.five_hour_remaining, null);
+  assert.ok(projectedOverview.revision.endsWith(':' + projectedOverview.credentialReadiness.state));
+
+  const tasks = new Tasks(dir, () => {});
+  await tasks.start();
+  let quotaCancelled = false;
+  const quotaTaskId = tasks.begin('quota-refresh', 'refresh', signal => new Promise(resolve => {
+    signal.addEventListener('abort', () => { quotaCancelled = true; resolve({ ok: false }); }, { once: true });
+    setTimeout(() => resolve({ ok: true }), 80);
+  }));
+  assert.equal(tasks.cancel('non-existent'), false);
+  await tasks.stop();
+  assert.equal(quotaCancelled, true);
+  assert.equal(typeof quotaTaskId, 'string');
+
+  const child = spawn(
+    process.execPath,
+    [
+      fileURLToPath(new URL('../dist/main.js', import.meta.url)),
+      '--state-dir', dir,
+      '--app', '/nonexistent',
+      '--profile', join(dir, 'profile'),
+      '--gemini-dir', join(dir, 'gemini'),
+      '--home-dir', join(dir, 'home'),
+      '--app-support-dir', join(dir, 'appsupport'),
+    ],
+    {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, GRAVITYBOX_PROBE_LS: 'false' },
+    }
+  );
+  let stderr = '';
+  child.stderr.on('data', bytes => { stderr += bytes; });
+  try {
+    await until(async () => {
+      try {
+        return (await rpc(dir, { command: 'status' })).ok;
+      } catch {
+        return false;
+      }
+    }, 15000);
+
+    const initialStatus = await rpc(dir, { command: 'status' });
+    assert.equal(initialStatus.ok, true);
+    assert.equal(initialStatus.status.locale, 'en');
+    assert.equal(initialStatus.status.translationEnabled, false);
+
+    const resumed = await rpc(dir, { command: 'resume' });
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.status.locale, 'zh-Hans');
+    assert.equal(resumed.status.configuredLanguage, 'zh-Hans');
+    assert.equal(resumed.status.translationEnabled, true);
+    assert.ok(resumed.status.entries > 0, '从 en 恢复必须加载中文词典词条');
+
+    const persistedConfig = JSON.parse(await readFile(join(dir, 'config.json'), 'utf8'));
+    assert.equal(persistedConfig.appLanguage, 'zh-Hans');
+    const persistedPrefs = JSON.parse(await readFile(join(dir, 'runtime-preferences.json'), 'utf8'));
+    assert.equal(persistedPrefs.language, 'zh-Hans');
+    assert.equal(persistedPrefs.translationEnabled, true);
+
+    const reorderRes = await rpc(dir, { command: 'account_reorder', ids: [acc2.id, acc1.id] });
+    assert.equal(reorderRes.ok, true);
+    assert.equal(reorderRes.accounts[0].id, acc2.id);
+    assert.ok(reorderRes.accounts[0].credentialReadiness);
+    assert.equal(reorderRes.accounts[0].token, undefined);
+
+    const preflightRes = await rpc(dir, { command: 'account_switch_preflight' });
+    assert.equal(preflightRes.ok, true);
+    assert.equal(typeof preflightRes.insidersRunning, 'boolean');
+
+    const mainSource = await readFile(fileURLToPath(new URL('../src/main.ts', import.meta.url)), 'utf8');
+    assert.ok(!/if\s*\(\s*\['pause',\s*'restore',\s*'stop'\]/.test(mainSource), 'pause/restore 不得无差别取消所有任务');
+    assert.ok(mainSource.includes("'/Applications/Antigravity - Insiders.app/Contents/'"), 'preflight 必须按 Insiders 目录前缀检测');
+    assert.equal(stderr, '');
+    await rpc(dir, { command: 'stop' });
+    await until(async () => child.exitCode === 0, 10000);
+    await sleep(50);
+  } finally {
+    if (child.exitCode === null) child.kill('SIGTERM');
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
 });

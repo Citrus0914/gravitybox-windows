@@ -1,6 +1,7 @@
 import Cocoa
 
 struct ToolboxFailure: LocalizedError { let message:String;var errorDescription:String?{message} }
+/// @deprecated 历史 AppleLanguages 域偏好读写兼容辅助类（仅保留供 native-language 单测验证，运行时统一由 L10n 与 runtime-preferences.json 驱动）
 final class MenuLanguagePreferences {
     let state:URL;let domain:String
     init(state:URL,domain:String?=nil){
@@ -25,7 +26,7 @@ final class MenuLanguagePreferences {
         // Save rollback state before changing the one application-scoped preference.
         try PropertyListSerialization.data(fromPropertyList:payload,format:.binary,options:0).write(to:backup,options:.atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:backup.path)
-        guard let preferences=UserDefaults(suiteName:domain) else { throw ToolboxFailure(message:"无法打开目标应用语言偏好域。") }
+        guard let preferences=UserDefaults(suiteName:domain) else { throw ToolboxFailure(message:L10n.t("menu_lang.error.open_domain")) }
         if let value { preferences.set(value,forKey:"AppleLanguages") } else { preferences.removeObject(forKey:"AppleLanguages") }
         preferences.synchronize()
 
@@ -33,8 +34,8 @@ final class MenuLanguagePreferences {
     func restore()throws {
         let data=try Data(contentsOf:backup);var payload=try PropertyListSerialization.propertyList(from:data,format:nil) as? [String:Any] ?? [:]
         let expectedPresent=payload["writtenPresent"] as? Bool ?? true
-        guard expectedPresent ? current as? [String] == payload["written"] as? [String] : current == nil else {throw ToolboxFailure(message:"语言偏好已在其它位置更改，已保留当前设置。")}
-        guard let preferences=UserDefaults(suiteName:domain) else { throw ToolboxFailure(message:"无法打开目标应用语言偏好域。") }
+        guard expectedPresent ? current as? [String] == payload["written"] as? [String] : current == nil else {throw ToolboxFailure(message:L10n.t("menu_lang.error.modified_externally"))}
+        guard let preferences=UserDefaults(suiteName:domain) else { throw ToolboxFailure(message:L10n.t("menu_lang.error.open_domain")) }
         if payload["present"] as? Bool == true{preferences.set(payload["value"],forKey:"AppleLanguages")}else{preferences.removeObject(forKey:"AppleLanguages")};preferences.synchronize()
 
         payload["restored"]=true

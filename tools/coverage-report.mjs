@@ -183,15 +183,22 @@ export async function loadDictLayers(dictDir = join(root, 'dict')) {
 
 }
 
+function stripScopedPrefix(key) {
+  if (!key.startsWith('@ui:')) return key;
+  const parts = key.slice(4).split('|');
+  return parts.length >= 3 ? parts.slice(2).join('|') : key;
+}
+
 /** 专有名词违规：英文键里出现专名，但译文把这个专名丢了。 */
 export function properNounViolations(entries) {
   const violations = [];
   for (const [key, { value, file }] of entries) {
+    const rawKey = stripScopedPrefix(key).replace(/(?:https?|file):\/\/\S+/gi, ' ');
     // 只检查键里确实是独立词元出现的专名，避免 "Node" 命中 "Nodejs" 之类的噪声
     for (const noun of PROPER_NOUNS) {
-      const inKey = new RegExp(`(?:^|[^A-Za-z])${noun.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^A-Za-z])`).test(key);
+      const inKey = new RegExp(`(?:^|[^A-Za-z])${noun.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^A-Za-z])`, 'i').test(rawKey);
       if (!inKey) continue;
-      const inValue = value.includes(noun);
+      const inValue = value.toLowerCase().includes(noun.toLowerCase());
       // 译文里出现该专名的任何形式都算保留；中文里专名通常原样保留
       if (!inValue) { violations.push({ key, value, file, noun }); break; }
     }
@@ -245,9 +252,10 @@ export function reconcile(uiStrings, entries, bundleSource) {
   const obsolete = [];
   const notExtracted = [];
   for (const [key, meta] of entries) {
-    if (uiSet.has(key)) continue;
-    if (uiFolded.has(key.toLowerCase())) continue;
-    if (bundleSource && bundleSource.includes(key)) notExtracted.push({ key, value: meta.value, file: meta.file });
+    const rawKey = stripScopedPrefix(key);
+    if (uiSet.has(rawKey)) continue;
+    if (uiFolded.has(rawKey.toLowerCase())) continue;
+    if (bundleSource && (bundleSource.includes(key) || (rawKey !== key && bundleSource.includes(rawKey)))) notExtracted.push({ key, value: meta.value, file: meta.file });
     else obsolete.push({ key, value: meta.value, file: meta.file });
   }
   return { covered, missing, caseOnly, templates, fragments, obsolete, notExtracted };
