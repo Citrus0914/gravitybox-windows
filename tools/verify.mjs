@@ -146,6 +146,8 @@ async function main() {
     }
   }
 
+  await step('隐私门禁', process.execPath, [join(root, 'tools/check-privacy.mjs')]);
+
   let swiftPromise = null;
   if (!dictOnly) {
     await mkdir(join(root, '.cache'), { recursive: true });

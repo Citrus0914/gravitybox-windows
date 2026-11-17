@@ -1,0 +1,13 @@
+#!/bin/sh
+# GravityBox pre-commit 隐私安全门禁钩子
+# 拦截暂存区中的真实私人邮箱及个人敏感账号标识，防止意外提交至 Git 历史。
+
+if [ "$GRAVITYBOX_SKIP_PRE_COMMIT" = "1" ]; then
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$REPO_ROOT" || exit 1
+
+node tools/check-privacy.mjs --staged
+exit $?
