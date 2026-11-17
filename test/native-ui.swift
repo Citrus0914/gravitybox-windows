@@ -1799,7 +1799,7 @@ import Cocoa
             enMainCache.fetch(force: true); pump()
             for (hostLabel, targetCache) in [("minimal", enMaintSheet.cachePage), ("mainFixture", enMainCache)] {
                 let confirmEn = targetCache.buildRunningClearConfirmationBody()
-                check(confirmEn.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) == nil && confirmEn.contains("selected category"), "English \(hostLabel) confirmation body must not leak CJK: \(confirmEn)")
+                check(confirmEn.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) == nil && (confirmEn.contains("selected categories") || confirmEn.contains("selected category")), "English \(hostLabel) confirmation body must not leak CJK: \(confirmEn)")
                 for kind in [CachePage.DetailKind.runtime, .history, .protected, .snapshot] {
                     targetCache.openDetailPopover(kind, relativeTo: targetCache.runtimeInfoButton)
                     guard let popView = targetCache.detailPopover?.contentViewController?.view else {

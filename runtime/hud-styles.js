@@ -44,9 +44,11 @@ export const HUD_STYLES_CSS = `
   --hud-compaction-low-shadow: 0 1px 2px rgba(49, 134, 255, 0.28), inset 0 0.5px 0 rgba(255, 255, 255, 0.24);
   --hud-compaction-warn-bg: linear-gradient(180deg, #D97706 0%, #B45309 100%);
   --hud-compaction-warn-fg: #FFFFFF;
+  --hud-compaction-warn-border: transparent;
   --hud-compaction-warn-shadow: 0 1px 2px rgba(180, 83, 9, 0.28), inset 0 0.5px 0 rgba(255, 255, 255, 0.24);
   --hud-compaction-danger-bg: linear-gradient(180deg, #DC2626 0%, #B91C1C 100%);
   --hud-compaction-danger-fg: #FFFFFF;
+  --hud-compaction-danger-border: transparent;
   --hud-compaction-danger-shadow: 0 1px 2px rgba(185, 28, 28, 0.30), inset 0 0.5px 0 rgba(255, 255, 255, 0.24);
 
   /* 骨架屏扫描动效 Tokens (Light) */
@@ -105,9 +107,11 @@ export const HUD_STYLES_CSS = `
   --hud-compaction-low-shadow: 0 1px 2px rgba(37, 99, 235, 0.32), inset 0 0.5px 0 rgba(255, 255, 255, 0.24);
   --hud-compaction-warn-bg: linear-gradient(180deg, #FF9F0A 0%, #D97706 100%);
   --hud-compaction-warn-fg: #FFFFFF;
+  --hud-compaction-warn-border: transparent;
   --hud-compaction-warn-shadow: 0 1px 2px rgba(217, 119, 6, 0.34), inset 0 0.5px 0 rgba(255, 255, 255, 0.28);
   --hud-compaction-danger-bg: linear-gradient(180deg, #FF453A 0%, #DC2626 100%);
   --hud-compaction-danger-fg: #FFFFFF;
+  --hud-compaction-danger-border: transparent;
   --hud-compaction-danger-shadow: 0 1px 3px rgba(239, 68, 68, 0.36), inset 0 0.5px 0 rgba(255, 255, 255, 0.26);
 
   /* 骨架屏扫描动效 Tokens (Dark) */
@@ -308,14 +312,14 @@ export const HUD_STYLES_CSS = `
 }
 
 .hud-compaction-badge.is-compaction-warn {
-  border-color: transparent;
+  border-color: var(--hud-compaction-warn-border);
   background: var(--hud-compaction-warn-bg);
   color: var(--hud-compaction-warn-fg);
   box-shadow: var(--hud-compaction-warn-shadow);
 }
 
 .hud-compaction-badge.is-compaction-danger {
-  border-color: transparent;
+  border-color: var(--hud-compaction-danger-border);
   background: var(--hud-compaction-danger-bg);
   color: var(--hud-compaction-danger-fg);
   box-shadow: var(--hud-compaction-danger-shadow);
@@ -707,7 +711,7 @@ export const HUD_STYLES_CSS = `
   }
 }
 
-@container hud (max-width: 260px) {
+@container hud (max-width: 259.98px) {
   .capsule-donut,
   .hud-subagent-sep {
     display: none !important;
@@ -1055,7 +1059,9 @@ export const HUD_STYLES_CSS = `
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  flex-wrap: wrap;
+  row-gap: 2px;
+  column-gap: 8px;
   line-height: 1.25;
 }
 
@@ -1066,7 +1072,7 @@ export const HUD_STYLES_CSS = `
   font-size: 11px;
   font-weight: 500;
   color: var(--hud-text-secondary);
-  flex: 1 1 auto;
+  flex: 1 1 96px;
   min-width: 0;
   overflow: hidden;
 }
@@ -1116,6 +1122,50 @@ export const HUD_STYLES_CSS = `
   flex-shrink: 0;
 }
 
+.hud-stage-compaction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3.5px;
+  border-radius: 9999px;
+  border: 1px solid var(--hud-compaction-low-border);
+  background: var(--hud-compaction-low-bg);
+  color: var(--hud-compaction-low-fg);
+  box-shadow: var(--hud-compaction-low-shadow);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  flex-shrink: 0;
+}
+
+.hud-stage-compaction.is-compaction-low {
+  border-color: var(--hud-compaction-low-border);
+  background: var(--hud-compaction-low-bg);
+  color: var(--hud-compaction-low-fg);
+  box-shadow: var(--hud-compaction-low-shadow);
+}
+
+.hud-stage-compaction.is-compaction-warn {
+  border-color: var(--hud-compaction-warn-border);
+  background: var(--hud-compaction-warn-bg);
+  color: var(--hud-compaction-warn-fg);
+  box-shadow: var(--hud-compaction-warn-shadow);
+}
+
+.hud-stage-compaction.is-compaction-danger {
+  border-color: var(--hud-compaction-danger-border);
+  background: var(--hud-compaction-danger-bg);
+  color: var(--hud-compaction-danger-fg);
+  box-shadow: var(--hud-compaction-danger-shadow);
+}
+
 .hud-stage-val {
   font-size: 11px;
   font-weight: 500;
@@ -1123,6 +1173,7 @@ export const HUD_STYLES_CSS = `
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   flex-shrink: 0;
+  margin-left: auto;
 }
 
 .hud-stage-item.is-pending .hud-stage-val {

@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, lstat, readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { UsageStatsManager } from '../dist/usage.js';
 import { UsageLedger } from '../dist/usage-ledger.js';
@@ -797,6 +798,215 @@ test('P1-3: 未知模型盘上语言中立存储与中英切换零分裂聚合/�
     assert.equal(aggZh.all_time.by_model.length, 1);
     assert.equal(aggZh.all_time.by_model[0].model, '未知模型');
     assert.equal(aggZh.all_time.by_model[0].request_count, 2);
+  });
+});
+
+test('跨 source_id 三轮以上归并、存量重复自愈、稳定 source_id 与大总账持久化缓存', async t => {
+  await withFixture(t, async ({ stateDir, geminiDir, convDir }) => {
+    const now = Math.floor(Date.now() / 1000);
+
+    // 1. 验证连续 3 次 source_id 漂移（含 timestamp=0 补齐及不同观察顺序）不产生重复计数，并保留 observed 归属与 rate_locks
+    const multiLedger = new UsageLedger(join(stateDir, 'multi-src-dedup'));
+    const legKey = createHash('sha256').update('legacy-multi-src-1').digest('hex');
+    const k1 = 'a'.repeat(64);
+    const k2 = 'b'.repeat(64);
+    const k3 = 'c'.repeat(64);
+    const k4 = 'd'.repeat(64);
+    const accounts = [{ id: 'acc-1', email: 'alice@example.invalid', name: 'Alice' }];
+
+    await multiLedger.save([
+      {
+        event_key: k1,
+        source_id: 'src-dev-16',
+        db_file: 'conv-dup.db',
+        generation_index: 0,
+        legacy_event_key: legKey,
+        model: 'gemini-3.8-flash',
+        input_tokens: 1000,
+        output_tokens: 500,
+        cached_tokens: 0,
+        total_tokens: 1500,
+        timestamp_seconds: 0,
+        account_id: 'acc-1',
+        account_email: 'alice@example.invalid',
+        account_confidence: 'observed',
+        source_observed_at: 100,
+      },
+    ]);
+    await multiLedger.saveLocks({
+      [k1]: { usd: 0.2, price: { model: 'gemini-3.8-flash', input: 100, output: 200, cached: 1 } },
+    });
+
+    // 第 2 轮（dev 变化）并补齐真实时间戳
+    await multiLedger.save([
+      {
+        event_key: k2,
+        source_id: 'src-dev-15',
+        db_file: 'conv-dup.db',
+        generation_index: 0,
+        legacy_event_key: legKey,
+        model: 'gemini-3.8-flash',
+        input_tokens: 1000,
+        output_tokens: 500,
+        cached_tokens: 0,
+        total_tokens: 1500,
+        timestamp_seconds: now - 120,
+        account_confidence: 'unknown',
+        source_observed_at: 200,
+      },
+    ]);
+
+    // 第 3、4 轮（继续变换 source_id，模拟多次重启后跨版本迁移）
+    await multiLedger.save([
+      {
+        event_key: k3,
+        source_id: 'src-dev-14',
+        db_file: 'conv-dup.db',
+        generation_index: 0,
+        legacy_event_key: legKey,
+        model: 'gemini-3.8-flash',
+        input_tokens: 1000,
+        output_tokens: 500,
+        cached_tokens: 0,
+        total_tokens: 1500,
+        timestamp_seconds: now - 120,
+        account_confidence: 'unknown',
+        source_observed_at: 300,
+      },
+    ]);
+    await multiLedger.save([
+      {
+        event_key: k4,
+        source_id: 'src-stable',
+        db_file: 'conv-dup.db',
+        generation_index: 0,
+        legacy_event_key: legKey,
+        model: 'gemini-3.8-flash',
+        input_tokens: 1000,
+        output_tokens: 500,
+        cached_tokens: 0,
+        total_tokens: 1500,
+        timestamp_seconds: now - 120,
+        account_confidence: 'unknown',
+        source_observed_at: 400,
+      },
+    ]);
+
+    const aggMulti = await multiLedger.aggregate({ prices: {}, accountId: 'all', accounts, now });
+    assert.equal(aggMulti.all_time.totals.request_count, 1, '4 轮 source_id 漂移后只能统计 1 条');
+    assert.equal(aggMulti.all_time.totals.total_tokens, 1500);
+    assert.equal(aggMulti.all_time.estimated_usd, 0.2);
+    assert.equal(aggMulti.historical_amount_receipts?.unmatchedCount, 0);
+    const aliceSummary = aggMulti.available_accounts?.find(a => a.id === 'acc-1');
+    assert.equal(aliceSummary?.request_count, 1, '归并后必须保留 observed 账号归属');
+    const pageMulti = await multiLedger.events({ snapshot: aggMulti.ledger_snapshot, period: 'all', query: '', offset: 0, limit: 10 });
+    assert.equal(pageMulti.total, 1);
+    assert.equal(pageMulti.rows[0].account_id, 'acc-1');
+
+    // 2. 验证存量损坏库（两条同 legacy_event_key 均未进 event_aliases）在首次 aggregate 时自动自愈去重
+    const dirtyState = join(stateDir, 'dirty-ledger');
+    await mkdir(dirtyState, { recursive: true });
+    const dirtyDbPath = join(dirtyState, 'usage-ledger-v2.sqlite');
+    const rawDb = new DatabaseSync(dirtyDbPath);
+    rawDb.exec(`
+      CREATE TABLE events(event_key TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, account_id TEXT, model TEXT NOT NULL, payload TEXT NOT NULL, observed_at REAL NOT NULL DEFAULT 0);
+      CREATE TABLE event_revisions(seq INTEGER PRIMARY KEY AUTOINCREMENT,event_key TEXT NOT NULL,timestamp INTEGER NOT NULL,payload TEXT NOT NULL);
+      CREATE TABLE rate_locks(event_key TEXT PRIMARY KEY,unit_price TEXT NOT NULL,usd REAL NOT NULL);
+      CREATE TABLE event_aliases(legacy_key TEXT PRIMARY KEY,event_key TEXT NOT NULL);
+      CREATE TABLE rate_changes(version INTEGER PRIMARY KEY,min_event_seq INTEGER NOT NULL);
+      CREATE TABLE snapshot_pins(snapshot_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,expires INTEGER NOT NULL);
+      CREATE TABLE ledger_maintenance(key TEXT PRIMARY KEY,last_run INTEGER NOT NULL);
+      PRAGMA user_version=2;
+    `);
+    const dupLegacy = createHash('sha256').update('legacy-corrupt-dup').digest('hex');
+    const oldWin = '1'.repeat(64);
+    const newDup = '2'.repeat(64);
+    const pOld = JSON.stringify({
+      event_key: oldWin,
+      source_id: 'old-src',
+      db_file: 'archived-conv.db',
+      generation_index: 5,
+      legacy_event_key: dupLegacy,
+      model: 'gemini-3.8-flash',
+      input_tokens: 2000,
+      output_tokens: 500,
+      cached_tokens: 0,
+      total_tokens: 2500,
+      timestamp_seconds: now - 3600,
+      account_id: 'acc-1',
+      account_email: 'alice@example.invalid',
+      account_confidence: 'observed',
+      source_observed_at: 1000,
+      ingested_at: '2026-11-12T10:00:00.000Z',
+    });
+    const pNew = JSON.stringify({
+      event_key: newDup,
+      source_id: 'new-src',
+      db_file: 'archived-conv.db',
+      generation_index: 5,
+      legacy_event_key: dupLegacy,
+      model: 'gemini-3.8-flash',
+      input_tokens: 2000,
+      output_tokens: 500,
+      cached_tokens: 0,
+      total_tokens: 2500,
+      timestamp_seconds: now - 3600,
+      account_confidence: 'unknown',
+      source_observed_at: 2000,
+      ingested_at: '2026-11-12T10:00:00.000Z',
+    });
+    rawDb.prepare('INSERT INTO events VALUES(?,?,?,?,?,?)').run(oldWin, now - 3600, 'acc-1', 'gemini-3.8-flash', pOld, 1000);
+    rawDb.prepare('INSERT INTO events VALUES(?,?,?,?,?,?)').run(newDup, now - 3600, null, 'gemini-3.8-flash', pNew, 2000);
+    rawDb.prepare('INSERT INTO event_revisions(event_key,timestamp,payload) VALUES(?,?,?)').run(oldWin, now - 3600, pOld);
+    rawDb.prepare('INSERT INTO event_revisions(event_key,timestamp,payload) VALUES(?,?,?)').run(newDup, now - 3600, pNew);
+    rawDb.prepare('INSERT INTO rate_locks VALUES(?,?,?)').run(oldWin, JSON.stringify({ model: 'gemini-3.8-flash', input: 100, output: 200, cached: 1 }), 0.3);
+    rawDb.close();
+
+    const healedLedger = new UsageLedger(dirtyState);
+    const aggHealed = await healedLedger.aggregate({ prices: {}, accountId: 'all', accounts, now });
+    assert.equal(aggHealed.all_time.totals.request_count, 1, '存量未遮蔽重复行应在 aggregate 时自动去重');
+    assert.equal(aggHealed.all_time.totals.total_tokens, 2500);
+    assert.equal(aggHealed.all_time.estimated_usd, 0.3, '胜出者必须继承旧行已锁定的 rate_locks');
+    assert.equal(aggHealed.available_accounts?.find(a => a.id === 'acc-1')?.request_count, 1, '胜出者必须保留 observed 账号归属');
+    assert.equal((await healedLedger.load()).length, 1, 'load() 也应过滤已被 alias 遮蔽的旧记录');
+
+    // 3. 验证 source_id 不受 fileStat.dev 影响（仅由 basename + ino + birthtimeMs 决定）
+    const stableDb = join(convDir, 'stable-source-id.db');
+    const sdb = new DatabaseSync(stableDb);
+    sdb.exec('CREATE TABLE gen_metadata(idx INTEGER PRIMARY KEY,data BLOB);CREATE TABLE steps(idx INTEGER PRIMARY KEY,step_type INTEGER,metadata BLOB)');
+    const genBlob = Buffer.concat([
+      W.encodeLengthDelimited(
+        1,
+        Buffer.concat([
+          W.encodeLengthDelimited(4, W.encodeVarintField(2, 300)),
+          W.encodeLengthDelimited(9, W.encodeLengthDelimited(4, W.encodeVarintField(1, now - 20))),
+        ])
+      ),
+      W.encodeLengthDelimited(2, W.encodeVarint(1)),
+    ]);
+    sdb.prepare('INSERT INTO gen_metadata VALUES(0,?)').run(genBlob);
+    sdb.close();
+
+    const st = await lstat(stableDb);
+    const expectedSourceId = createHash('sha256')
+      .update(JSON.stringify([basename(stableDb), st.ino, st.birthtimeMs]))
+      .digest('hex');
+    const persistPath = join(stateDir, 'persist-file-cache.json');
+    const mgr = new UsageStatsManager({
+      stateDir: join(stateDir, 'scanner-state'),
+      geminiDir,
+    });
+    mgr.persistCachePath = persistPath;
+    const scanRes = await mgr.scanDatabaseEvents(stableDb);
+    assert.equal(scanRes.events.length, 1);
+    assert.equal(scanRes.events[0].source_id, expectedSourceId, 'source_id 必须脱离易漂移的 dev 字段');
+
+    // 4. 验证 largeLedger 分支也会保存持久化文件缓存
+    mgr.largeLedger = true;
+    await mgr.getUsageSummary(true);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const persistedRaw = JSON.parse(await readFile(persistPath, 'utf8'));
+    assert.ok(persistedRaw?.entries?.[stableDb], 'largeLedger 分支下也必须持久化文件缓存');
   });
 });
 

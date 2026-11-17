@@ -1520,3 +1520,394 @@ test('P1-06 & P1-07: 多子代理步骤间空档防抖不掉数 + 历史多代�
   assert.equal(coldMetrics.tokens.outputTokens, 600, '主库 150 + 子库 450 = 600 outputTokens');
 });
 
+test('已完结或已中止轮次闲置后收到瞬时 isStreaming 脉冲时，严禁把跨轮挂机时间外推入本轮用时', () => {
+  const nowSec = Date.now() / 1000;
+  const oldStart = nowSec - 2688; // 44m48s 前开始
+  const oldEnd = oldStart + 404; // 6m44s 后完成，距今已闲置 38 分钟
+
+  // 场景 1: 末步为已完成的模型步 (stepType=15, status=3)，闲置 38 分钟后瞬时收到 isStreaming=true
+  const staleModelTurn = metrics(
+    [
+      step({ idx: 0, stepType: 14, startTimeSeconds: null, endTimeSeconds: null }),
+      step({
+        idx: 1,
+        stepType: 15,
+        status: 3,
+        startTimeSeconds: oldStart,
+        endTimeSeconds: oldEnd,
+        outputTokens: 200,
+        generation: { timeToFirstTokenSeconds: 2, streamingDurationSeconds: 402 },
+      }),
+    ],
+    { isStreaming: true, allowDbActiveStepInference: true }
+  );
+  assert.equal(
+    Math.round(staleModelTurn.session.currentTurnDurationSeconds),
+    404,
+    `已完结 38 分钟的轮次收到瞬时 isStreaming 不得计入空闲挂机时间，实际 ${staleModelTurn.session.currentTurnDurationSeconds}`
+  );
+
+  // 场景 2: 末步为明确收尾步 (stepType=2, status=3)，即使刚结束 2s 内收到 isStreaming=true 也不得外推旧轮挂钟
+  const closedTurn = metrics(
+    [
+      step({ idx: 0, stepType: 14, startTimeSeconds: nowSec - 120, endTimeSeconds: nowSec - 120 }),
+      step({ idx: 1, stepType: 15, status: 3, startTimeSeconds: nowSec - 120, endTimeSeconds: nowSec - 2 }),
+      step({ idx: 2, stepType: 2, status: 3, startTimeSeconds: nowSec - 2, endTimeSeconds: nowSec - 2, hasUsage: false }),
+    ],
+    { isStreaming: true, allowDbActiveStepInference: true }
+  );
+  assert.equal(Math.round(closedTurn.session.currentTurnDurationSeconds), 118);
+
+  // 场景 3: 含历史已完成子智能体的中止轮次 (status=6)，无运行中子智能体时收到 isStreaming=true 不得继续计时
+  const abortedWithDoneSub = buildConversationHudMetrics({
+    conversationId: 'aborted-with-historical-subagent',
+    isStreaming: true,
+    isSubagentRunning: false,
+    allowDbActiveStepInference: true,
+    contextSteps: [
+      step({ idx: 0, stepType: 14, startTimeSeconds: oldStart, endTimeSeconds: oldStart }),
+      step({ idx: 1, stepType: 127, status: 3, isSubagentStep: true, toolCallName: 'invoke_subagent', startTimeSeconds: oldStart + 1, endTimeSeconds: oldStart + 10 }),
+      step({ idx: 2, stepType: 15, status: 6, startTimeSeconds: oldStart + 10, endTimeSeconds: oldStart + 50, hasUsage: false }),
+    ],
+    steps: [
+      step({ idx: 0, stepType: 14, startTimeSeconds: oldStart, endTimeSeconds: oldStart }),
+      step({ idx: 1, stepType: 127, status: 3, isSubagentStep: true, toolCallName: 'invoke_subagent', startTimeSeconds: oldStart + 1, endTimeSeconds: oldStart + 10 }),
+      step({ idx: 2, stepType: 15, status: 6, startTimeSeconds: oldStart + 10, endTimeSeconds: oldStart + 50, hasUsage: false }),
+      step({ idx: 3, stepType: 15, status: 3, startTimeSeconds: oldStart + 1, endTimeSeconds: oldStart + 9 }),
+    ],
+  });
+  assert.equal(Math.round(abortedWithDoneSub.session.currentTurnDurationSeconds), 50);
+});
+
+test('多模型与曾用模型 (history) 压缩归因、当前模型峰值解耦及角色去重守恒', () => {
+  // 场景 1：历史 Opus 压缩 2 次后切换到 Orchestrator (Carbon 规划 0 次 + Hydrogen 执行 1 次)
+  const opusStep1 = step({
+    idx: 1,
+    rawInputTokens: 20000,
+    cachedReadTokens: 165000,
+    cacheWriteTokens: 0,
+    outputTokens: 1200,
+    generation: {
+      responseModel: 'claude-opus-4-6-thinking',
+      modelDisplayName: 'Claude Opus 4.6 (Thinking)',
+      maxContextTokens: 200000,
+    },
+  });
+  const opusStep2 = step({
+    idx: 3,
+    rawInputTokens: 15000,
+    cachedReadTokens: 175000,
+    cacheWriteTokens: 0,
+    outputTokens: 900,
+    generation: {
+      responseModel: 'claude-opus-4-6-thinking',
+      modelDisplayName: 'Claude Opus 4.6 (Thinking)',
+      maxContextTokens: 200000,
+    },
+  });
+  const carbonStep = step({
+    idx: 6,
+    rawInputTokens: 12000,
+    cachedReadTokens: 244000,
+    cacheWriteTokens: 0,
+    outputTokens: 800,
+    generation: {
+      modelEnum: 1667,
+      responseModel: 'gemini-pro-orchestrator',
+      modelDisplayName: 'Orchestrator (Carbon)',
+      maxContextTokens: 512000,
+    },
+  });
+  const hydrogenStep = step({
+    idx: 7,
+    rawInputTokens: 40000,
+    cachedReadTokens: 360000,
+    cacheWriteTokens: 0,
+    outputTokens: 1500,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  });
+
+  // 刚切到 Carbon 时：Opus 压缩 2 次（含一次由后台轻量摘要模型执行的 CHECKPOINT，不得生成幽灵模型阶段），Carbon 自身压缩 0 次
+  const atCarbon = buildConversationHudMetrics({
+    conversationId: 'conv-compaction-history-orch',
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      opusStep1,
+      { idx: 2, stepType: 23, status: 3 }, // 无 metadata 的常规 CHECKPOINT -> 归因至紧邻前置 Opus
+      opusStep2,
+      {
+        idx: 4,
+        stepType: 23,
+        status: 5,
+        generation: { responseModel: 'gemini-2.5-flash-lite', modelDisplayName: 'Internal Summarizer' },
+      }, // 后台摘要模型不在对话阶段列表中 -> 回退归因至 Opus 且不产生幽灵阶段
+      { idx: 5, stepType: 14, status: 3 },
+      carbonStep,
+    ],
+  });
+
+  assert.equal(atCarbon.session.compactionCount, 2);
+  assert.equal(atCarbon.context.activeModelCompactionCount, 0);
+  assert.equal(atCarbon.context.modelStages?.length, 3);
+  const carbonStage1 = atCarbon.context.modelStages?.find((s) => s.slotKey === 'orchestrator:carbon');
+  const opusHistoryStage = atCarbon.context.modelStages?.find((s) => s.shortLabel === 'Opus');
+  assert.equal(carbonStage1?.isActive, true);
+  assert.equal(carbonStage1?.compactionCount, undefined);
+  assert.equal(opusHistoryStage?.section, 'history');
+  assert.equal(opusHistoryStage?.compactionCount, 2);
+
+  // Hydrogen 执行器介入并触发 1 次压缩后：总压缩 3 次，当前活跃 Hydrogen 压缩 1 次，曾用模型 Opus 保持 2 次
+  const atHydrogen = buildConversationHudMetrics({
+    conversationId: 'conv-compaction-history-orch',
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      opusStep1,
+      { idx: 2, stepType: 23, status: 3 },
+      opusStep2,
+      { idx: 4, stepType: 23, status: 5 },
+      { idx: 5, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenStep,
+      { idx: 8, stepType: 23, status: 3 },
+    ],
+  });
+  assert.equal(atHydrogen.session.compactionCount, 3);
+  assert.equal(atHydrogen.context.activeModelCompactionCount, 1);
+  const carbonStage2 = atHydrogen.context.modelStages?.find((s) => s.slotKey === 'orchestrator:carbon');
+  const hydrogenStage2 = atHydrogen.context.modelStages?.find((s) => s.slotKey === 'orchestrator:hydrogen');
+  const opusHistory2 = atHydrogen.context.modelStages?.find((s) => s.shortLabel === 'Opus');
+  assert.equal(carbonStage2?.compactionCount, undefined);
+  assert.equal(hydrogenStage2?.isActive, true);
+  assert.equal(hydrogenStage2?.compactionCount, 1);
+  assert.equal(opusHistory2?.section, 'history');
+  assert.equal(opusHistory2?.compactionCount, 2);
+
+  // 场景 2：Orchestrator Hydrogen 压缩 1 次后切回独立 Gemini 4 Hydrogen (High)，去重合并时压缩次数守恒不丢失
+  const standaloneHydrogenStep = step({
+    idx: 10,
+    rawInputTokens: 30000,
+    cachedReadTokens: 50000,
+    cacheWriteTokens: 0,
+    outputTokens: 600,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 200000,
+    },
+  });
+  const deduped = buildConversationHudMetrics({
+    conversationId: 'conv-compaction-dedup',
+    modelId: 'Gemini 4 Hydrogen (High)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenStep,
+      { idx: 8, stepType: 23, status: 3 },
+      { idx: 9, stepType: 14, status: 3 },
+      standaloneHydrogenStep,
+    ],
+  });
+  assert.equal(deduped.session.compactionCount, 1);
+  assert.equal(deduped.context.activeModelCompactionCount, 1);
+  assert.equal(deduped.context.modelStages?.length, 2);
+  assert.equal(deduped.context.modelStages?.[1]?.slotKey, 'model:gemini-4-hydrogen');
+  assert.equal(deduped.context.modelStages?.[1]?.compactionCount, 1);
+});
+
+test('SQLite 压缩步 (step_type=23) 关联 gen_metadata 时兼具模型阶段归因与独立计费 Token 守恒', async (t) => {
+  const { create, engine } = databaseFixture(t);
+  const db = create(ids.main);
+
+  // step 1: Claude Opus 4.6 模型步 (100 + 200 + 30 + 120 = 450 tok)
+  insertStep(db, { idx: 1, execution: 'exec-opus-1', value: usage() });
+  const opusGen = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(usage())),
+      ...string(19, 'claude-opus-4-6-thinking'),
+    ]),
+    ...message(2, varint(1)),
+    ...string(4, 'exec-opus-1'),
+  ]);
+  db.prepare('INSERT INTO gen_metadata VALUES (?, ?, ?)').run(1, opusGen, opusGen.length);
+
+  // step 2: CHECKPOINT (step_type=23)，计费仅存于 gen_metadata idx=2 (500 + 1500 + 0 + 100 = 2100 tok)
+  db.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, 23, 3, ?)').run(2, null);
+  const cpUsage = usage({
+    rawInputTokens: 500,
+    cachedReadTokens: 1500,
+    cacheWriteTokens: 0,
+    outputTokens: 100,
+    reasoningTokens: 0,
+    candidateTokens: 100,
+  });
+  const cpGen = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(cpUsage)),
+      ...string(19, 'claude-opus-4-6-thinking'),
+    ]),
+    ...message(2, varint(2)),
+    ...string(4, 'exec-cp-1'),
+  ]);
+  db.prepare('INSERT INTO gen_metadata VALUES (?, ?, ?)').run(2, cpGen, cpGen.length);
+
+  // step 3: 切换到 Gemini 3.8 Flash 模型步 (100 + 200 + 30 + 120 = 450 tok)，无压缩
+  insertStep(db, { idx: 3, execution: 'exec-flash-1', value: usage() });
+  insertGeneration(db, { indices: [3], execution: 'exec-flash-1' }, 3);
+
+  const result = await engine.getConversationMetrics({ conversationId: ids.main });
+  assert.equal(result.session.compactionCount, 1);
+  assert.equal(result.context.isMultiModel, true);
+  assert.equal(result.context.activeModelCompactionCount, 0);
+  // Token 守恒：450 (Opus) + 2100 (CHECKPOINT unmatchedUsageGenerations) + 450 (Flash) = 3000 tok
+  assert.equal(result.tokens.totalTokens, 3000);
+  const opusStage = result.context.modelStages?.find((s) => s.shortLabel === 'Opus');
+  const flashStage = result.context.modelStages?.find((s) => s.modelId === 'gemini-3.8-flash');
+  assert.equal(opusStage?.compactionCount, 1);
+  assert.equal(flashStage?.isActive, true);
+  assert.equal(flashStage?.compactionCount, undefined);
+});
+
+test('SQLite 跨模型压缩归因：Model A 命中精确匹配且与 Model B 共用 step_type=23 索引时不得被 Model B 抢占', async (t) => {
+  const { create, engine } = databaseFixture(t);
+  const db = create(ids.main);
+
+  db.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(
+    Buffer.from(seconds(1, 1000))
+  );
+  // step 1: Model A (Opus) 精确匹配自身 usage，同时关联压缩步 idx=2 (exec-A)
+  insertStep(db, { idx: 1, execution: 'exec-A', value: usage({ rawInputTokens: 40_000, cachedReadTokens: 120_000, outputTokens: 800 }) });
+  const genA = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(usage({ rawInputTokens: 40_000, cachedReadTokens: 120_000, outputTokens: 800 }))),
+      ...string(19, 'claude-opus-4-6-thinking'),
+      ...string(21, 'Claude Opus 4.6 (Thinking)'),
+    ]),
+    ...message(2, [1, 2].flatMap(varint)),
+    ...string(4, 'exec-A'),
+  ]);
+  db.prepare('INSERT INTO gen_metadata VALUES (?, ?, ?)').run(0, genA, genA.length);
+
+  // step 2: 压缩步 (step_type=23) 自身带 executionId = exec-A（依赖 sqlite-worker 放开 step_type=23 读取）
+  db.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (2, 23, 3, ?)').run(
+    Buffer.from([...seconds(1, 1008), ...string(12, 'exec-A')])
+  );
+
+  // step 3: 接手的 Model B (Sonnet) 未命中 exactMatch（cacheWrite 不同）且 stepIndices 也覆盖了 [2, 3]
+  insertStep(db, { idx: 3, execution: 'exec-B', value: usage({ rawInputTokens: 20_000, cachedReadTokens: 30_000, cacheWriteTokens: 0, outputTokens: 500 }) });
+  const genB = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(usage({ rawInputTokens: 20_000, cachedReadTokens: 30_000, cacheWriteTokens: 500, outputTokens: 500 }))),
+      ...string(19, 'claude-sonnet-4-6'),
+      ...string(21, 'Claude Sonnet 4.6'),
+    ]),
+    ...message(2, [2, 3].flatMap(varint)),
+    ...string(4, 'exec-B'),
+  ]);
+  db.prepare('INSERT INTO gen_metadata VALUES (?, ?, ?)').run(1, genB, genB.length);
+
+  const res = await engine.getConversationMetrics({ conversationId: ids.main });
+  assert.equal(res.session.compactionCount, 1);
+  assert.equal(res.context.activeModelCompactionCount, 0);
+  const opusStage = res.context.modelStages?.find((s) => s.shortLabel === 'Opus');
+  const sonnetStage = res.context.modelStages?.find((s) => s.shortLabel === 'Sonnet');
+  assert.equal(opusStage?.compactionCount, 1, '压缩步 exec-A 必须精准归因至触发压缩的 Opus');
+  assert.equal(sonnetStage?.isActive, true);
+  assert.equal(sonnetStage?.compactionCount, undefined, '接手模型 Sonnet 不得抢占 Opus 的压缩归因');
+});
+
+test('Orchestrator 吸收同名独立模型阶段及单物理模型跨角色合并时均保留历史峰值与激活阶段', () => {
+  const standaloneHydrogenHighPeak = step({
+    idx: 1,
+    rawInputTokens: 180_000,
+    cachedReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 400,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 512000,
+    },
+  });
+  const carbonStep = step({
+    idx: 4,
+    rawInputTokens: 20_000,
+    cachedReadTokens: 200_000,
+    cacheWriteTokens: 0,
+    outputTokens: 600,
+    generation: {
+      modelEnum: 1667,
+      responseModel: 'gemini-pro-orchestrator',
+      modelDisplayName: 'Orchestrator (Carbon)',
+      maxContextTokens: 512000,
+    },
+  });
+  const hydrogenExecLowPeak = step({
+    idx: 5,
+    rawInputTokens: 50_000,
+    cachedReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 300,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  });
+
+  // 1. Orchestrator 吸收同名独立 Hydrogen 时保留历史峰值 180K 与压缩次数
+  const orchMerged = buildConversationHudMetrics({
+    conversationId: 'conv-orch-absorb-peak',
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      standaloneHydrogenHighPeak,
+      { idx: 2, stepType: 23, status: 3 },
+      { idx: 3, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenExecLowPeak,
+    ],
+  });
+  assert.equal(orchMerged.context.peakContextTokens, 180_000);
+  assert.equal(orchMerged.context.activeModelCompactionCount, 1);
+  assert.equal(orchMerged.context.modelStages?.some((s) => s.isActive), true);
+
+  // 2. Turn 2 独立 Hydrogen 为最后一步，选择器切回 Orchestrator (Carbon) 未发言时，执行器吸收后仍保持 isActive
+  const selectorBack = buildConversationHudMetrics({
+    conversationId: 'conv-orch-absorb-active',
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenExecLowPeak,
+      { idx: 6, stepType: 14, status: 3 },
+      { ...standaloneHydrogenHighPeak, idx: 7 },
+    ],
+  });
+  assert.equal(selectorBack.context.modelStages?.some((s) => s.isActive), true);
+
+  // 3. 仅有单个物理模型跨角色合并（orderedEntries.length === 1）时保留历史峰值 190K 与压缩 1 次
+  const singlePhysMerged = buildConversationHudMetrics({
+    conversationId: 'conv-single-phys-merge',
+    modelId: 'Gemini 4 Hydrogen (High)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      { ...hydrogenExecLowPeak, idx: 1, rawInputTokens: 190_000 },
+      { idx: 2, stepType: 23, status: 3 },
+      { idx: 3, stepType: 14, status: 3 },
+      { ...standaloneHydrogenHighPeak, idx: 4, rawInputTokens: 80_000 },
+    ],
+  });
+  assert.equal(Boolean(singlePhysMerged.context.isMultiModel), false);
+  assert.equal(singlePhysMerged.context.peakContextTokens, 190_000);
+  assert.equal(singlePhysMerged.context.activeModelCompactionCount, 1);
+});
+
+

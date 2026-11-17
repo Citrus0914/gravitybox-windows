@@ -191,6 +191,201 @@ function readValidatedLegacyEvents(legacyPath: string): LedgerEvent[] {
     return legacy.events;
 }
 
+function mergeLegacyMetadataIntoEvent(target: LedgerEvent, old: LedgerEvent): void {
+    if (old.ingested_at && (!target.ingested_at || old.ingested_at < target.ingested_at)) {
+        target.ingested_at = old.ingested_at;
+    }
+    if (old.account_confidence === 'observed') {
+        if (!target.account_id) {
+            target.account_id = old.account_id;
+            target.account_email = old.account_email;
+            target.account_confidence = 'observed';
+        }
+        if (old.account_type && old.account_type !== 'unknown' && (!target.account_type || target.account_type === 'unknown')) {
+            target.account_type = old.account_type;
+        }
+    }
+    if (!target.timestamp_seconds && old.timestamp_seconds > 0) {
+        target.timestamp_seconds = old.timestamp_seconds;
+    }
+}
+
+interface LegacyCandidateRow {
+    event_key: string;
+    payload: string;
+    observed_at: number;
+    parsed: LedgerEvent;
+}
+
+function findMatchingLegacyRows(
+    stmt: ReturnType<DatabaseSync['prepare']>,
+    legacyKey: string,
+    excludeKey: string,
+    dbFile?: string
+): LegacyCandidateRow[] {
+    const rows = stmt.all(legacyKey, excludeKey) as Array<{ event_key: string; payload: string; observed_at: number }>;
+    const matched: LegacyCandidateRow[] = [];
+    for (const row of rows) {
+        try {
+            const parsed = JSON.parse(String(row.payload)) as LedgerEvent;
+            if (
+                parsed.legacy_event_key === legacyKey &&
+                (!dbFile || !parsed.db_file || parsed.db_file === dbFile)
+            ) {
+                matched.push({
+                    event_key: String(row.event_key),
+                    payload: String(row.payload),
+                    observed_at: Number(row.observed_at ?? 0),
+                    parsed,
+                });
+            }
+        } catch {
+            // ignore unparseable historical row
+        }
+    }
+    matched.sort((a, b) => a.observed_at - b.observed_at);
+    return matched;
+}
+
+const DEDUP_MAINTENANCE_KEY = 'dedup_legacy_aliases_v1';
+
+function reconcileDuplicateLegacyAliases(db: DatabaseSync): void {
+    const done = db.prepare('SELECT last_run FROM ledger_maintenance WHERE key=?').get(DEDUP_MAINTENANCE_KEY);
+    if (done) return;
+
+    const dupRows = db.prepare(`
+        SELECT e.event_key, e.timestamp, e.observed_at, e.payload,
+               json_extract(e.payload, '$.legacy_event_key') AS leg
+        FROM events e
+        JOIN (
+            SELECT json_extract(e2.payload, '$.legacy_event_key') AS leg
+            FROM events e2
+            LEFT JOIN event_aliases a2 ON a2.legacy_key = e2.event_key
+            WHERE a2.legacy_key IS NULL
+              AND COALESCE(json_extract(e2.payload, '$.db_file'), '') NOT IN ('recovered_session.db', 'recovered_enterprise_session.db')
+              AND json_extract(e2.payload, '$.legacy_event_key') IS NOT NULL
+            GROUP BY leg
+            HAVING COUNT(*) > 1
+        ) d ON json_extract(e.payload, '$.legacy_event_key') = d.leg
+        LEFT JOIN event_aliases a ON a.legacy_key = e.event_key
+        WHERE a.legacy_key IS NULL
+          AND COALESCE(json_extract(e.payload, '$.db_file'), '') NOT IN ('recovered_session.db', 'recovered_enterprise_session.db')
+    `).all() as Array<{ event_key: string; timestamp: number; observed_at: number; payload: string; leg: string }>;
+
+    if (dupRows.length === 0) {
+        db.prepare('INSERT OR REPLACE INTO ledger_maintenance VALUES(?,?)').run(DEDUP_MAINTENANCE_KEY, Date.now());
+        return;
+    }
+
+    const byLegacy = new Map<string, Array<{ event_key: string; timestamp: number; observed_at: number; payload: string; parsed: LedgerEvent }>>();
+    for (const row of dupRows) {
+        try {
+            const parsed = JSON.parse(String(row.payload)) as LedgerEvent;
+            const arr = byLegacy.get(row.leg) ?? [];
+            arr.push({
+                event_key: String(row.event_key),
+                timestamp: Number(row.timestamp ?? 0),
+                observed_at: Number(row.observed_at ?? 0),
+                payload: String(row.payload),
+                parsed,
+            });
+            byLegacy.set(row.leg, arr);
+        } catch {
+            // ignore
+        }
+    }
+
+    const alias = db.prepare('INSERT OR REPLACE INTO event_aliases VALUES(?,?)');
+    const redirectAlias = db.prepare('UPDATE event_aliases SET event_key=? WHERE event_key=?');
+    const copyLock = db.prepare('INSERT OR IGNORE INTO rate_locks(event_key,unit_price,usd) SELECT ?,unit_price,usd FROM rate_locks WHERE event_key=?');
+    const updateWinner = db.prepare('UPDATE events SET timestamp=?,account_id=?,payload=?,observed_at=? WHERE event_key=?');
+    const insertRevision = db.prepare('INSERT INTO event_revisions(event_key,timestamp,payload) VALUES(?,?,?)');
+
+    const scoreCandidate = (item: { event_key: string; timestamp: number; observed_at: number; parsed: LedgerEvent }): [number, number, number, number] => [
+        item.parsed.source_id ? 1 : 0,
+        item.observed_at,
+        item.timestamp > 0 ? 1 : 0,
+        item.parsed.account_confidence === 'observed' ? 1 : 0,
+    ];
+    const compareCandidate = (
+        a: { event_key: string; timestamp: number; observed_at: number; parsed: LedgerEvent },
+        b: { event_key: string; timestamp: number; observed_at: number; parsed: LedgerEvent }
+    ): number => {
+        const sa = scoreCandidate(a);
+        const sb = scoreCandidate(b);
+        for (let i = 0; i < sa.length; i++) {
+            if (sb[i]! !== sa[i]!) return sb[i]! - sa[i]!;
+        }
+        return b.event_key < a.event_key ? -1 : b.event_key > a.event_key ? 1 : 0;
+    };
+
+    let reconciledGroups = 0;
+    let revisionsInserted = 0;
+    let lastWinner: { event_key: string; timestamp: number; payload: string } | null = null;
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+        for (const [leg, items] of byLegacy.entries()) {
+            const buckets = new Map<string, typeof items>();
+            for (const item of items) {
+                const dbName = typeof item.parsed.db_file === 'string' ? item.parsed.db_file : '';
+                const list = buckets.get(dbName) ?? [];
+                list.push(item);
+                buckets.set(dbName, list);
+            }
+            const emptyBucket = buckets.get('');
+            if (emptyBucket && buckets.size === 2) {
+                for (const [dbName, list] of buckets.entries()) {
+                    if (dbName !== '') {
+                        list.push(...emptyBucket);
+                        buckets.delete('');
+                        break;
+                    }
+                }
+            }
+            for (const bucket of buckets.values()) {
+                if (bucket.length <= 1) continue;
+                bucket.sort(compareCandidate);
+                const winner = bucket[0]!;
+                const merged: LedgerEvent = { ...winner.parsed };
+                let maxObserved = winner.observed_at;
+                for (let i = bucket.length - 1; i >= 1; i--) {
+                    const loser = bucket[i]!;
+                    mergeLegacyMetadataIntoEvent(merged, loser.parsed);
+                    if (loser.observed_at > maxObserved) maxObserved = loser.observed_at;
+                }
+                if (maxObserved > (merged.source_observed_at ?? 0)) {
+                    merged.source_observed_at = maxObserved;
+                }
+                const nextPayload = JSON.stringify(merged);
+                const nextTs = merged.timestamp_seconds || winner.timestamp;
+                if (nextPayload !== winner.payload || nextTs !== winner.timestamp || maxObserved !== winner.observed_at) {
+                    updateWinner.run(nextTs, merged.account_id ?? null, nextPayload, maxObserved, winner.event_key);
+                    insertRevision.run(winner.event_key, nextTs, nextPayload);
+                    revisionsInserted++;
+                }
+                lastWinner = { event_key: winner.event_key, timestamp: nextTs, payload: nextPayload };
+                for (let i = 1; i < bucket.length; i++) {
+                    const loser = bucket[i]!;
+                    copyLock.run(winner.event_key, loser.event_key);
+                    alias.run(loser.event_key, winner.event_key);
+                    redirectAlias.run(winner.event_key, loser.event_key);
+                }
+                alias.run(leg, winner.event_key);
+                reconciledGroups++;
+            }
+        }
+        if (reconciledGroups > 0 && revisionsInserted === 0 && lastWinner) {
+            insertRevision.run(lastWinner.event_key, lastWinner.timestamp, lastWinner.payload);
+        }
+        db.prepare('INSERT OR REPLACE INTO ledger_maintenance VALUES(?,?)').run(DEDUP_MAINTENANCE_KEY, Date.now());
+        db.exec('COMMIT');
+    } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+    }
+}
+
 function runRequest(payload: {
     locale?: string;
     path: string;
@@ -243,7 +438,11 @@ function runRequest(payload: {
         if (operation === 'load') {
             if (Number(db.prepare('PRAGMA user_version').get()?.user_version) !== 2)
                 throw Error(bt('ledger.err.unsupported_version'));
-            for (const row of db.prepare('SELECT payload,observed_at FROM events ORDER BY timestamp, event_key').iterate()) {
+            const hasAliases = Boolean(db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='event_aliases'").get()?.ok);
+            const loadSql = hasAliases
+                ? 'SELECT e.payload,e.observed_at FROM events e LEFT JOIN event_aliases a ON a.legacy_key=e.event_key WHERE a.legacy_key IS NULL ORDER BY e.timestamp, e.event_key'
+                : 'SELECT payload,observed_at FROM events ORDER BY timestamp, event_key';
+            for (const row of db.prepare(loadSql).iterate()) {
                 const event = JSON.parse(String(row.payload));
                 if (!validLedgerEvent(event))
                     throw Error(bt('ledger.err.corrupt_event_stop'));
@@ -272,6 +471,7 @@ function runRequest(payload: {
             "CREATE TABLE IF NOT EXISTS events(event_key TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, account_id TEXT, model TEXT NOT NULL, payload TEXT NOT NULL);",
             "CREATE INDEX IF NOT EXISTS events_time ON events(timestamp);",
             "CREATE INDEX IF NOT EXISTS events_account_time ON events(account_id,timestamp);",
+            "CREATE INDEX IF NOT EXISTS events_legacy_key ON events(json_extract(payload,'$.legacy_event_key'));",
             "PRAGMA user_version=2;",
         ].join('\n'));
         db.exec([
@@ -316,6 +516,7 @@ function runRequest(payload: {
             return Number(db.prepare('SELECT COUNT(*) AS count FROM events').get()?.count) + legacyEvents.length;
         if (operation === 'revalue') {
             ensureImportedLegacyBaseline(db, path, legacyPath, legacyEvents);
+            reconcileDuplicateLegacyAliases(db);
             return revalueLedger(db, path, options);
         }
         if (operation === 'save-locks') {
@@ -360,68 +561,79 @@ function runRequest(payload: {
         }
         if (operation === 'aggregate') {
             ensureImportedLegacyBaseline(db, path, legacyPath, legacyEvents);
+            reconcileDuplicateLegacyAliases(db);
             return { ...aggregateLedger(db, options), ledger_review_records: legacyEvents.filter(event => !event.source_id || isSyntheticRecoveredDb(event.db_file)).length };
         }
+        reconcileDuplicateLegacyAliases(db);
         if (!Array.isArray(events) || !events.every(validLedgerEvent))
             throw Error(bt('ledger.err.invalid_usage_event'));
         const upsert = db.prepare('INSERT INTO events(event_key,timestamp,account_id,model,payload,observed_at) VALUES(?,?,?,?,?,?) ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp,account_id=excluded.account_id,model=excluded.model,payload=excluded.payload,observed_at=excluded.observed_at WHERE payload<>excluded.payload');
         const updateObserved = db.prepare('UPDATE events SET observed_at=MAX(observed_at,?) WHERE event_key=?');
         const revision = db.prepare('INSERT INTO event_revisions(event_key,timestamp,payload) VALUES(?,?,?)');
         const previous = db.prepare('SELECT payload,observed_at FROM events WHERE event_key=?');
-        const byTimestamp = db.prepare('SELECT event_key,payload,observed_at FROM events WHERE timestamp=? AND event_key<>?');
+        const byLegacyKey = db.prepare("SELECT event_key,payload,observed_at FROM events WHERE json_extract(payload,'$.legacy_event_key')=? AND event_key<>?");
         const copyLock = db.prepare('INSERT OR IGNORE INTO rate_locks(event_key,unit_price,usd) SELECT ?,unit_price,usd FROM rate_locks WHERE event_key=?');
         const alias = db.prepare('INSERT OR REPLACE INTO event_aliases VALUES(?,?)');
+        const redirectAlias = db.prepare('UPDATE event_aliases SET event_key=? WHERE event_key=?');
+        const bindAliases = (targetKey: string, legacyKey: string | undefined, matches: LegacyCandidateRow[]) => {
+            for (let i = matches.length - 1; i >= 0; i--) {
+                const match = matches[i]!;
+                copyLock.run(targetKey, match.event_key);
+                alias.run(match.event_key, targetKey);
+                redirectAlias.run(targetKey, match.event_key);
+            }
+            if (legacyKey) alias.run(legacyKey, targetKey);
+        };
         db.exec('BEGIN IMMEDIATE');
         try {
             for (const event of events) {
-                let stored = previous.get(event.event_key!);
-                if (!stored && event.legacy_event_key) {
-                    // 换机或备份恢复导致文件 inode 变更时，按同时间戳 + legacy_event_key + db_file 归并旧 source_id 记录
-                    const candidates = byTimestamp.all(event.timestamp_seconds, event.event_key!) as Array<{ event_key: string; payload: string; observed_at: number }>;
-                    const matched = candidates.find(candidate => {
-                        try {
-                            const parsed = JSON.parse(String(candidate.payload));
-                            return parsed.legacy_event_key === event.legacy_event_key
-                                && (!event.db_file || !parsed.db_file || parsed.db_file === event.db_file);
-                        } catch {
-                            return false;
-                        }
-                    });
-                    if (matched) {
-                        stored = matched;
-                        alias.run(String(matched.event_key), event.event_key!);
-                        copyLock.run(event.event_key!, String(matched.event_key));
-                    }
-                }
-                if (stored) {
-                    if (Number(stored.observed_at) > (event.source_observed_at ?? 0)) continue;
-                    const old = JSON.parse(String(stored.payload));
-                    event.ingested_at = old.ingested_at ?? event.ingested_at;
-                    if (old.account_confidence === 'observed') {
-                        if (!event.account_id) {
-                            event.account_id = old.account_id;
-                            event.account_email = old.account_email;
-                            event.account_confidence = 'observed';
-                        }
-                        if (old.account_type && old.account_type !== 'unknown' && (!event.account_type || event.account_type === 'unknown')) {
-                            event.account_type = old.account_type;
-                        }
-                    }
-                    if (!event.timestamp_seconds)
-                        event.timestamp_seconds = old.timestamp_seconds;
-                    const comparable = { ...event, source_observed_at: old.source_observed_at };
-                    if (JSON.stringify(comparable) === String(stored.payload)) {
-                        if ((event.source_observed_at ?? 0) > Number(stored.observed_at)) {
-                            updateObserved.run(event.source_observed_at ?? 0, event.event_key!);
-                        }
+                const sameKeyStored = previous.get(event.event_key!) as { payload: string; observed_at: number } | undefined;
+                const legacyMatches = event.legacy_event_key
+                    ? findMatchingLegacyRows(byLegacyKey, event.legacy_event_key, event.event_key!, event.db_file)
+                    : [];
+                if (sameKeyStored) {
+                    if (Number(sameKeyStored.observed_at) > (event.source_observed_at ?? 0) && legacyMatches.length === 0) {
                         continue;
+                    }
+                    const old = JSON.parse(String(sameKeyStored.payload)) as LedgerEvent;
+                    for (const legacyMatch of legacyMatches) {
+                        mergeLegacyMetadataIntoEvent(event, legacyMatch.parsed);
+                    }
+                    mergeLegacyMetadataIntoEvent(event, old);
+                    const maxObserved = Math.max(
+                        event.source_observed_at ?? 0,
+                        Number(sameKeyStored.observed_at ?? 0),
+                        ...legacyMatches.map(m => m.observed_at)
+                    );
+                    if (Number(sameKeyStored.observed_at) > (event.source_observed_at ?? 0)) {
+                        // 当前事件观测更旧时，不覆写新观测的 payload，仅完成孤立旧别名归并
+                        bindAliases(event.event_key!, event.legacy_event_key, legacyMatches);
+                        continue;
+                    }
+                    const comparable = { ...event, source_observed_at: old.source_observed_at };
+                    if (JSON.stringify(comparable) === String(sameKeyStored.payload)) {
+                        if (maxObserved > Number(sameKeyStored.observed_at)) {
+                            updateObserved.run(maxObserved, event.event_key!);
+                        }
+                        bindAliases(event.event_key!, event.legacy_event_key, legacyMatches);
+                        continue;
+                    }
+                } else if (legacyMatches.length > 0) {
+                    // 换机、备份恢复或底层文件索引变更导致 source_id 变化时，归并全部同 legacy_event_key + db_file 旧版本
+                    let maxObserved = event.source_observed_at ?? 0;
+                    for (const legacyMatch of legacyMatches) {
+                        mergeLegacyMetadataIntoEvent(event, legacyMatch.parsed);
+                        if (legacyMatch.observed_at > maxObserved) maxObserved = legacyMatch.observed_at;
+                    }
+                    if (maxObserved > (event.source_observed_at ?? 0)) {
+                        event.source_observed_at = maxObserved;
                     }
                 }
                 const payload = JSON.stringify(event);
-                if (event.legacy_event_key)
-                    alias.run(event.legacy_event_key, event.event_key!);
-                if (upsert.run(event.event_key!, event.timestamp_seconds, event.account_id ?? null, event.model, payload, event.source_observed_at ?? 0).changes)
+                if (upsert.run(event.event_key!, event.timestamp_seconds, event.account_id ?? null, event.model, payload, event.source_observed_at ?? 0).changes) {
                     revision.run(event.event_key!, event.timestamp_seconds, payload);
+                }
+                bindAliases(event.event_key!, event.legacy_event_key, legacyMatches);
             }
             db.exec('COMMIT');
         }

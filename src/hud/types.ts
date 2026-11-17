@@ -18,6 +18,7 @@ export interface HudModelContextStage {
   compactLabel: string;
   hasUsageData: boolean;
   isActive: boolean;
+  compactionCount?: number;
   usedTokens: number;
   usedTokensCompact: string;
   usedTokensFormatted: string;
@@ -220,6 +221,8 @@ export interface ConversationHudMetrics {
     modelCompactLabel?: string;
     /** 会话级跨模型单步最高上下文 Token 数（与当前模型专属峰值分离保留） */
     sessionPeakContextTokens?: number;
+    /** 当前激活模型在会话内经历的上下文压缩次数（多模型模式下与全对话总压缩次数解耦） */
+    activeModelCompactionCount?: number;
     /** 按模型/阶段拆分的独立上下文水位列表 */
     modelStages?: HudModelContextStage[];
     /** 当前上下文实际总输入 Token 数 (最近一步 rawInput + cachedRead + cacheWrite) */
@@ -228,11 +231,11 @@ export interface ConversationHudMetrics {
     usedTokensCompact: string;
     /** 当前上下文千分位精确读数 (如 "226,412 tok") */
     usedTokensFormatted?: string;
-    /** 会话历史单步最高上下文 Token 数 (真实观测峰值) */
+    /** 当前激活模型阶段单步最高上下文 Token 数 (真实观测峰值；多模型模式下与全会话峰值 sessionPeakContextTokens 分离) */
     peakContextTokens?: number;
-    /** 会话历史峰值紧凑读数 (如 "226.4K") */
+    /** 当前激活模型阶段峰值紧凑读数 (如 "226.4K") */
     peakContextCompact?: string;
-    /** 会话历史峰值千分位读数 (如 "226,412 tok") */
+    /** 当前激活模型阶段峰值千分位读数 (如 "226,412 tok") */
     peakContextFormatted?: string;
     /** 当前上下文窗口有效容量阈值 (优先取 DB context_window_metadata / planner_config 真实阈值，无则取 Antigravity 标准压缩阈值) */
     capacityTokens: number;

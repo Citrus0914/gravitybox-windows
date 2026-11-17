@@ -140,7 +140,9 @@ export class CdpHudBridge implements ICdpHudBridge {
     if (parsed.type === 'SESSION_DETACHED') {
       if (!existing || revision !== existing.sessionRevision || conversationId !== existing.conversationId) return;
       this.activePanes.delete(paneKey);
-      this.activePanes.delete(`${targetId}::${cascadeId}`);
+      if (paneSlotId === cascadeId) {
+        this.activePanes.delete(`${targetId}::${cascadeId}`);
+      }
       return;
     }
 
@@ -204,6 +206,7 @@ export class CdpHudBridge implements ICdpHudBridge {
         resolvedStreaming || parsed.type === 'STREAMING_CHANGED' || isSubagentRunning
           ? nowMs
           : sameConv?.lastActivityAt ?? nowMs,
+      ...(sameConv?.autoHealAttempts ? { autoHealAttempts: sameConv.autoHealAttempts } : {}),
     };
 
     this.activePanes.set(paneKey, session);
@@ -256,6 +259,9 @@ export class CdpHudBridge implements ICdpHudBridge {
           currentTurnToolDurationSeconds: 0,
           inFlightModelDurationSeconds: 0,
           inFlightToolDurationSeconds: 0,
+          hasTurnDurationAnchor: (metrics.session.currentTurnDurationSeconds ?? 0) > 0,
+          hasInFlightModelAnchor: (metrics.session.inFlightModelDurationSeconds ?? 0) > 0,
+          hasInFlightToolAnchor: (metrics.session.inFlightToolDurationSeconds ?? 0) > 0,
         }
       : {
           ...metrics.session,
@@ -270,7 +276,7 @@ export class CdpHudBridge implements ICdpHudBridge {
       tokens: metrics.tokens,
       context: metrics.context,
       availability: metrics.availability,
-      observedAt: metrics.observedAt,
+      observedAt: metrics.isStreaming && metrics.availability === 'ready' ? 0 : metrics.observedAt,
       failedChildCount: metrics.failedChildCount,
       isStreaming: metrics.isStreaming,
       activityPhase: metrics.activityPhase,

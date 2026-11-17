@@ -89,6 +89,7 @@ export class UsageStatsManager {
   private persistCachePath?: string;
   private persistLoaded = false;
   private fileCacheDirty = false;
+  private persistSaveChain: Promise<void> = Promise.resolve();
   private observationsPath: string;
   private observationsLoaded = false;
   private observationTimeline: Array<{ at: number; id?: string; email?: string; account_type: 'consumer' | 'enterprise_vertex' | 'unknown' }> = [];
@@ -411,17 +412,21 @@ export class UsageStatsManager {
     } catch {}
   }
 
-  private async savePersistentFileCache(): Promise<void> {
-    if (!this.persistCachePath || !this.fileCacheDirty) return;
+  private savePersistentFileCache(): Promise<void> {
+    if (!this.persistCachePath || !this.fileCacheDirty) return this.persistSaveChain;
     this.fileCacheDirty = false;
     const entries: Record<string, any> = {};
     for (const [k, v] of this.fileCache.entries()) {
       if (!v.hasError) entries[k] = v;
     }
     const targetPath = this.persistCachePath;
-    await atomicJson(targetPath, { version: 3, entries }, undefined, { durability: 'relaxed' }).catch(() => {
-      this.fileCacheDirty = true;
-    });
+    this.persistSaveChain = this.persistSaveChain
+      .catch(() => {})
+      .then(() => atomicJson(targetPath, { version: 3, entries }, undefined, { durability: 'relaxed' }))
+      .catch(() => {
+        this.fileCacheDirty = true;
+      });
+    return this.persistSaveChain;
   }
 
   private normalizeArchivedDbKey(dbPath: string): { key: string; dirName: string } {
@@ -617,27 +622,56 @@ export class UsageStatsManager {
   private upsertLedger(event: LedgerEvent): void {
     const key = event.event_key;
     if (!key || event.db_file === 'recovered_session.db' || event.db_file === 'recovered_enterprise_session.db') return;
-    let previous = this.usageLedgerEvents.get(key);
-    if (!previous && event.legacy_event_key) {
+    const sameKeyPrev = this.usageLedgerEvents.get(key);
+    let previous = sameKeyPrev;
+    const migratedFromKeys: string[] = [];
+    if (event.legacy_event_key) {
+      const legacyCandidates: Array<[string, LedgerEvent]> = [];
       for (const [oldKey, candidate] of this.usageLedgerEvents.entries()) {
         if (
           oldKey !== key &&
           candidate.legacy_event_key === event.legacy_event_key &&
           (!event.db_file || !candidate.db_file || candidate.db_file === event.db_file)
         ) {
+          legacyCandidates.push([oldKey, candidate]);
+        }
+      }
+      legacyCandidates.sort((a, b) => (a[1].source_observed_at ?? 0) - (b[1].source_observed_at ?? 0));
+      for (const [oldKey, candidate] of legacyCandidates) {
+        migratedFromKeys.push(oldKey);
+        this.usageLedgerEvents.delete(oldKey);
+        this.pendingLedgerEvents.delete(oldKey);
+        if (this.rateLocks[oldKey] && !this.rateLocks[key]) {
+          this.rateLocks[key] = this.rateLocks[oldKey]!;
+          this.rateLocksDirty = true;
+        }
+        if (!previous) {
           previous = candidate;
-          this.usageLedgerEvents.delete(oldKey);
-          this.pendingLedgerEvents.delete(oldKey);
-          if (this.rateLocks[oldKey] && !this.rateLocks[key]) {
-            this.rateLocks[key] = this.rateLocks[oldKey]!;
-            this.rateLocksDirty = true;
+        } else {
+          if (candidate.account_confidence === 'observed' && previous.account_confidence !== 'observed') {
+            previous = {
+              ...previous,
+              account_id: candidate.account_id,
+              account_email: candidate.account_email,
+              account_confidence: 'observed',
+              account_type: candidate.account_type ?? previous.account_type,
+            };
           }
-          break;
+          if (!previous.timestamp_seconds && candidate.timestamp_seconds) {
+            previous = { ...previous, timestamp_seconds: candidate.timestamp_seconds };
+          }
+          if (candidate.ingested_at && (!previous.ingested_at || candidate.ingested_at < previous.ingested_at)) {
+            previous = { ...previous, ingested_at: candidate.ingested_at };
+          }
+          if ((candidate.source_observed_at ?? 0) > (previous.source_observed_at ?? 0)) {
+            previous = { ...previous, source_observed_at: candidate.source_observed_at };
+          }
         }
       }
     }
-    if ((previous?.source_observed_at ?? 0) > (event.source_observed_at ?? 0)) return;
+    if (sameKeyPrev && (sameKeyPrev.source_observed_at ?? 0) > (event.source_observed_at ?? 0) && migratedFromKeys.length === 0) return;
     const next = { ...previous, ...event,
+      source_observed_at: Math.max(event.source_observed_at ?? 0, previous?.source_observed_at ?? 0) || event.source_observed_at,
       timestamp_seconds: event.timestamp_seconds || previous?.timestamp_seconds || 0,
       ingested_at: previous?.ingested_at ?? event.ingested_at ?? new Date().toISOString() };
     // Absence of new attribution evidence must not erase an existing observed identity.
@@ -651,7 +685,7 @@ export class UsageStatsManager {
         next.account_type = previous.account_type;
       }
     }
-    if (previous && ledgerEventsEqual(previous, next)) return;
+    if (sameKeyPrev && migratedFromKeys.length === 0 && ledgerEventsEqual(sameKeyPrev, next)) return;
     this.usageLedgerEvents.set(key, next);
     if (this.usageLedgerEvents.size > 50_000) this.largeLedger = true;
     this.pendingLedgerEvents.set(key, next);
@@ -1187,7 +1221,9 @@ export class UsageStatsManager {
     while(nextDatabase<dbPaths.length) {
       if(signal.aborted){allCacheHits=false;break;}
       const p=dbPaths[nextDatabase++]!;
-      const bypassFileCache = forceRefresh || Boolean(this.fileCache.get(p)?.hasError);
+      // forceRefresh 绕过内存摘要 TTL 并重新读取目录与全部 .db/.db-wal 物理 stat；
+      // 对物理指纹完全一致且无错误的历史静态库直接命中 fileCache，消除全盘冷重扫引发的 30s 超时。
+      const bypassFileCache = Boolean(this.fileCache.get(p)?.hasError);
       const res = await this.scanDatabaseEvents(p, bypassFileCache, signal);
       if (!res.cacheHit) allCacheHits = false;
       if (this.largeLedger && !this.ledgerUnavailable) {
@@ -1273,6 +1309,7 @@ export class UsageStatsManager {
       void this.syncRemotePricing().catch(() => {});
     }
     if (this.largeLedger && !this.ledgerUnavailable) {
+      void this.savePersistentFileCache();
       for (const event of allEvents) this.upsertLedger(event);
       await this.saveUsageLedger();
       const rawPricing = await this.getRawPricingTable();
@@ -1388,7 +1425,7 @@ export class UsageStatsManager {
       };
     }
 
-    await this.savePersistentFileCache();
+    void this.savePersistentFileCache();
     if (this.usageLedgerDirty) {
       await this.saveUsageLedger();
     }

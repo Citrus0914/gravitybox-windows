@@ -1,6 +1,6 @@
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
-import type { HudWorkerScanRequest, HudWorkerScanResult } from './sqlite-worker.js';
+import type { HudWorkerScanRequest, HudWorkerScanResult, UsageWorkerScanRequest, UsageWorkerScanResult } from './sqlite-worker.js';
 import { bt, getActiveLocale } from './i18n.js';
 
 const MAX_IDLE_WORKERS = 8;
@@ -212,5 +212,89 @@ export async function runHudDbScanInWorker(
     worker.once('error', onError);
     worker.once('exit', onExit);
     worker.postMessage({ id, hudScan, locale: getActiveLocale() });
+  });
+}
+
+export async function runUsageDbScanInWorker(
+  usageScan: UsageWorkerScanRequest,
+  signal?: AbortSignal,
+  timeoutMs = 8000
+): Promise<UsageWorkerScanResult> {
+  if (signal?.aborted) {
+    return {
+      ok: false,
+      error: String((signal.reason as Error | undefined)?.message ?? bt('sqlite.err.read_cancelled')),
+      genRows: [],
+      stepSchemaOk: true,
+      stepRows: [],
+    };
+  }
+  const worker = acquirePooledWorker('');
+  const id = randomUUID();
+  return new Promise<UsageWorkerScanResult>((resolve) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      worker.removeListener('message', onMessage);
+      worker.removeListener('error', onError);
+      worker.removeListener('exit', onExit);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      void worker.terminate();
+      resolve({
+        ok: false,
+        error: String((signal?.reason as Error | undefined)?.message ?? bt('sqlite.err.read_cancelled')),
+        genRows: [],
+        stepSchemaOk: true,
+        stepRows: [],
+      });
+    };
+    const onMessage = (msg: any) => {
+      if (!msg || msg.id !== id || settled) return;
+      settled = true;
+      cleanup();
+      releasePooledWorker(worker);
+      if (msg.ok && msg.usageResult) {
+        resolve(msg.usageResult as UsageWorkerScanResult);
+      } else {
+        resolve({
+          ok: false,
+          error: msg.error || bt('sqlite.err.connection_closed'),
+          genRows: [],
+          stepSchemaOk: true,
+          stepRows: [],
+        });
+      }
+    };
+    const onError = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      void worker.terminate();
+      resolve({ ok: false, error: err.message, genRows: [], stepSchemaOk: true, stepRows: [] });
+    };
+    const onExit = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ ok: false, error: bt('sqlite.err.connection_closed'), genRows: [], stepSchemaOk: true, stepRows: [] });
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      void worker.terminate();
+      resolve({ ok: false, error: bt('sqlite.err.batch_budget'), genRows: [], stepSchemaOk: true, stepRows: [] });
+    }, timeoutMs);
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+    worker.on('message', onMessage);
+    worker.once('error', onError);
+    worker.once('exit', onExit);
+    worker.postMessage({ id, usageScan, locale: getActiveLocale() });
   });
 }

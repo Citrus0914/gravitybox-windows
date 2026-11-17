@@ -150,7 +150,7 @@ export function projectAccountForIpcNormalized(
   return normalized;
 }
 
-export function projectUsagePeriodSummary(usage: TokenUsageSummary, periodInput: unknown) {
+function projectSingleUsagePeriod(usage: TokenUsageSummary, periodInput: unknown) {
   const periodKey: 'today' | 'last_7_days' | 'last_30_days' | 'all_time' =
     periodInput === 'today' ? 'today' : periodInput === '7d' ? 'last_7_days' : periodInput === '30d' ? 'last_30_days' : 'all_time';
   const p: TokenUsagePeriod = usage[periodKey] ?? usage.all_time;
@@ -179,6 +179,9 @@ export function projectUsagePeriodSummary(usage: TokenUsageSummary, periodInput:
   }));
   const cacheDenom = p.totals.input_tokens + p.totals.cached_tokens + (p.totals.cache_write_tokens ?? 0);
   const cacheHitRate = cacheDenom > 0 ? Math.round((p.totals.cached_tokens / cacheDenom) * 1000) / 10 : 0;
+  const lastScannedAt = (usage.availability === 'cached'
+    ? usage.generated_at
+    : (usage.last_attempt_at ?? usage.generated_at)) ?? 0;
   const periodSummary = {
     ...usage,
     totalTokens: p.totals.total_tokens,
@@ -203,7 +206,7 @@ export function projectUsagePeriodSummary(usage: TokenUsageSummary, periodInput:
     unpricedModels: p.unpriced_models ?? usage.unpriced_models ?? 0,
     failedDatabasesCount: usage.failed_databases_count ?? 0,
     skippedLargeRecords: usage.skipped_large_records ?? 0,
-    lastScannedAt: usage.generated_at ?? 0,
+    lastScannedAt,
     hasError: usage.has_error === true,
     availability: usage.availability ?? 'complete',
     unknownTimeRecords: usage.unknown_time_records ?? 0,
@@ -215,8 +218,10 @@ export function projectUsagePeriodSummary(usage: TokenUsageSummary, periodInput:
     available_accounts: usage.available_accounts ?? [],
   };
   const { today: _t, last_7_days: _w, last_30_days: _m, all_time: _a, daily_trends, today_hourly, ...selectedSummary } = periodSummary;
+  const safeDailyTrends = Array.isArray(daily_trends) ? daily_trends : [];
+  const safeTodayHourly = Array.isArray(today_hourly) ? today_hourly : [];
   const days = periodInput === 'today' ? 1 : periodInput === '7d' ? 7 : periodInput === '30d' ? 30 : null;
-  const selectedTrends = days ? daily_trends.slice(-days) : daily_trends;
+  const selectedTrends = days ? safeDailyTrends.slice(-days) : safeDailyTrends;
   return {
     ok: true,
     period: typeof periodInput === 'string' ? periodInput : 'all',
@@ -227,6 +232,26 @@ export function projectUsagePeriodSummary(usage: TokenUsageSummary, periodInput:
     byModel,
     models: byModel,
     dailyTrends: selectedTrends,
-    todayHourly: periodInput === 'today' ? today_hourly : [],
+    todayHourly: periodInput === 'today' ? safeTodayHourly : [],
   };
+}
+
+export function projectAllUsagePeriodSummaries(usage: TokenUsageSummary) {
+  return {
+    today: projectSingleUsagePeriod(usage, 'today'),
+    '7d': projectSingleUsagePeriod(usage, '7d'),
+    '30d': projectSingleUsagePeriod(usage, '30d'),
+    all: projectSingleUsagePeriod(usage, 'all'),
+  };
+}
+
+export function projectUsagePeriodSummary(usage: TokenUsageSummary, periodInput: unknown, options?: { includeAllPeriods?: boolean }) {
+  const projected = projectSingleUsagePeriod(usage, periodInput);
+  if (options?.includeAllPeriods) {
+    return {
+      ...projected,
+      periods: projectAllUsagePeriodSummaries(usage),
+    };
+  }
+  return projected;
 }

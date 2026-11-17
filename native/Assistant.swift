@@ -56,6 +56,14 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
     var cachePage: CachePage?
     var preferencesController: PreferencesController?
     var aboutPage: AboutPage?
+    var cachedDashboardBootstrapSummary: [String: Any]?
+    var cachedAccountsBootstrapPayload: [String: Any]?
+    var bootstrappedAccounts = false
+    var bootstrappedUsagePeriods = Set<String>()
+    var lastMaintenanceScanPayload: [String: Any]?
+    var lastMaintenanceScanAt: Date = .distantPast
+    let uiBootstrapQueue = DispatchQueue(label: "local.gravitybox.ui-bootstrap", qos: .utility)
+    var uiBootstrapSaveWorkItem: DispatchWorkItem?
     var cachedAccounts: [[String: Any]] = []
     var activeAccountId: String = ""
     var cachedRecommendedAccountId: String? = nil
@@ -108,6 +116,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
     var timer: Timer?
     var directorySource: DispatchSourceFileSystemObject?
     var refreshInFlight = false
+    var pendingRefreshRequested = false
+    var pendingTaskPollRequested = false
     var quitting = false
     let serviceFootnoteLabel = text("", size: 10.5, color: Design.secondary)
     var configSaveWorkItem: DispatchWorkItem?
@@ -197,6 +207,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         if configuration.value.navigationVersion != 5 {
             configuration.value.migrateNavigation(); try? configuration.save()
         }
+        loadUIBootstrapSnapshot()
         installApplicationMenu()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = baseMenuConnectedIcon()
@@ -206,7 +217,15 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         updateStatusItemState()
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(showPanel), name: NSNotification.Name("local.gravitybox.show-panel"), object: nil)
-        bridge.launch { [weak self] result in if case .failure(let error) = result { self?.showMessage(error.localizedDescription, error: true) } }
+        bridge.launch { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.refresh()
+            case .failure(let error):
+                self.showMessage(error.localizedDescription, error: true)
+            }
+        }
         watchState()
         let data = NSAppleEventManager.shared().currentAppleEvent?.paramDescriptor(forKeyword: AEKeyword(keyAEPropData))
         let loginLaunch = data?.enumCodeValue == OSType(keyAELaunchedAsLogInItem)
@@ -928,13 +947,13 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             isNewPage = accountsPage == nil
             let page = accountsPage ?? AccountsPage(app: self)
             accountsPage = page
-            page.update()
+            if !isNewPage { page.update() }
             content = page.view
         case 2:
             isNewPage = usagePage == nil
             let page = usagePage ?? UsagePage(app: self)
             usagePage = page
-            page.update()
+            if !isNewPage { page.update() }
             content = page.view
         case 3:
             isNewPage = preferencesController == nil
@@ -952,7 +971,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             isNewPage = overview == nil
             let page = overview ?? DashboardPage(app: self)
             overview = page
-            page.update()
+            if !isNewPage { page.update() }
             content = page.view
         }
         let oldViews = pageHost.subviews.filter { $0 !== content }
@@ -1048,36 +1067,66 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             checkAntigravityExitedAndQuitIfNeeded()
         }
         #endif
-        guard !refreshInFlight, !quitting else { return }; refreshInFlight = true
+        guard !quitting else { return }
+        if refreshInFlight {
+            if taskPollOnly {
+                pendingTaskPollRequested = true
+            } else {
+                pendingRefreshRequested = true
+            }
+            return
+        }
+        refreshInFlight = true
         if let started = quotaRefreshStartedAt, Date().timeIntervalSince(started) > 45 { failPendingQuotaRefresh(L10n.t("assistant.quota_refresh_timeout", fallback: "刷新超时，请重试；保留上次配额")) }
         let needTasks = taskPollOnly || pendingAccountTaskId != nil || quotaRefreshing
         let includeAccounts = !taskPollOnly && (menuTracking || (contentVisible && currentPage <= 1))
+        let previousTaskRev = lastTaskRevision
         bridge.send(["command": "status","includeTasks":needTasks,"includeAccounts":includeAccounts,"tasksSince":reachable ? lastTaskRevision:-1]) { [weak self] result in guard let self else { return }; self.refreshInFlight = false
             switch result {
             case .success(let value):
                 self.updateManager.cleanupAfterSuccessfulLaunch()
-                self.reachable = true; self.recoveryAttempts = 0; self.autoRestartAttempts = 0; var raw=value["status"] as? [String:Any] ?? [:];raw["taskRevision"]=value["taskRevision"];raw["runningTasks"]=value["runningTasks"];self.statusValue=self.mergeStatusSnapshot(raw, previous:self.statusValue);if let rows=value["tasks"] as? [[String:Any]]{self.taskRows=rows;self.lastTaskRevision=value["taskRevision"] as? Int ?? 0}
+                self.reachable = true; self.recoveryAttempts = 0; self.autoRestartAttempts = 0; var raw=value["status"] as? [String:Any] ?? [:];raw["taskRevision"]=value["taskRevision"];raw["runningTasks"]=value["runningTasks"];self.statusValue=self.mergeStatusSnapshot(raw, previous:self.statusValue)
+                var taskRevAdvanced = false
+                if let rows=value["tasks"] as? [[String:Any]] {
+                    self.taskRows=rows
+                    let incomingRev = value["taskRevision"] as? Int ?? 0
+                    taskRevAdvanced = previousTaskRev >= 0 && incomingRev != previousTaskRev
+                    self.lastTaskRevision = incomingRev
+                }
                 if includeAccounts {
-                    let accountsChanged = (!self.statusValue.accountsRevision.isEmpty && self.statusValue.accountsRevision != self.lastFetchedAccountsRevision) || self.statusValue.liveAccountEmail != self.lastFetchedLiveEmail
+                    let accountsChanged = self.bootstrappedAccounts || (!self.statusValue.accountsRevision.isEmpty && self.statusValue.accountsRevision != self.lastFetchedAccountsRevision) || self.statusValue.liveAccountEmail != self.lastFetchedLiveEmail
                     let periodicAccountRefreshDue = (self.menuTracking || (self.contentVisible && self.currentPage == 1)) && Date().timeIntervalSince(self.lastAccountListFetchAt) >= 15.0
                     if self.cachedAccounts.isEmpty || accountsChanged || periodicAccountRefreshDue {
                         self.fetchAccountList(notifyPage: true)
                     }
                 }
-                if let pending = self.pendingAccountTaskId, let task = self.taskRows.first(where: { $0["id"] as? String == pending && $0["state"] as? String != "running" }) {
-                    self.pendingAccountTaskId = nil
-                    if self.quotaRefreshing { self.finishQuotaRefresh(error: task["state"] as? String == "succeeded" ? nil : (task["message"] as? String ?? L10n.t("assistant.quota_refresh_incomplete", fallback: "配额刷新未完成"))) }
-                    else { self.showMessage(task["message"] as? String ?? L10n.t("assistant.account_op_finished", fallback: "账号操作已结束"), error: task["state"] as? String != "succeeded"); self.fetchAccountList(notifyPage: true); self.overview?.update(force: true) }
+                if let pending = self.pendingAccountTaskId {
+                    if let task = self.taskRows.first(where: { $0["id"] as? String == pending && $0["state"] as? String != "running" }) {
+                        self.pendingAccountTaskId = nil
+                        if self.quotaRefreshing { self.finishQuotaRefresh(error: task["state"] as? String == "succeeded" ? nil : (task["message"] as? String ?? L10n.t("assistant.quota_refresh_incomplete", fallback: "配额刷新未完成"))) }
+                        else { self.showMessage(task["message"] as? String ?? L10n.t("assistant.account_op_finished", fallback: "账号操作已结束"), error: task["state"] as? String != "succeeded"); self.fetchAccountList(notifyPage: true); self.overview?.update(force: true) }
+                    } else if self.quotaRefreshing && taskRevAdvanced {
+                        self.fetchAccountList(notifyPage: true)
+                        self.overview?.update(force: true)
+                    }
                 }
             case .failure:
                 self.reachable = false
                 self.failPendingQuotaRefresh(L10n.t("assistant.service_disconnected_keep_quota", fallback: "本机服务连接中断，保留上次配额"))
                 if !self.bridge.isOwnedProcessRunning && !self.bridge.isRestarting && !self.selfHealingPending && self.recoveryAttempts < 3 && Date() >= self.nextRecoveryAt {
                     self.recoveryAttempts += 1; self.nextRecoveryAt = Date().addingTimeInterval(Double(self.recoveryAttempts * 10))
-                    self.bridge.launch()
+                    self.bridge.launch { [weak self] launchResult in
+                        if case .success = launchResult { self?.refresh() }
+                    }
                 }
             }
             self.updateViews()
+            if !self.quitting && (self.pendingRefreshRequested || self.pendingTaskPollRequested) {
+                let needsFull = self.pendingRefreshRequested
+                self.pendingRefreshRequested = false
+                self.pendingTaskPollRequested = false
+                self.refresh(taskPollOnly: !needsFull)
+            }
         }
     }
     func updateServiceFootnote() {

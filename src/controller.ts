@@ -312,7 +312,7 @@ export class Controller {
           await cdp.send('Page.enable'); await cdp.send('Runtime.enable');
           await cdp.send('Runtime.addBinding',{name:'__gravityboxLanguageChanged',executionContextName:WORLD});
           await this.hudBridge.attachToTarget(target.id, cdp, () => session.contextId, WORLD);
-          cdp.on('Runtime.bindingCalled',(event)=>{if(event.name==='__gravityboxLanguageChanged'&&event.executionContextId===session.contextId&&['zh','en'].includes(event.payload)){session.languageMode=event.payload;this.publish();}else if(event.name===HUD_BRIDGE_BINDING_NAME&&this.hudEnabled&&event.executionContextId===session.contextId){this.hudBridge.handleRawBindingPayload(target.id,event.payload);}});
+          cdp.on('Runtime.bindingCalled',(event)=>{if(event.name==='__gravityboxLanguageChanged'&&event.executionContextId===session.contextId&&['zh','en'].includes(event.payload)){session.languageMode=event.payload;this.publish();if(this.hudEnabled){void this.hudBridge.refreshAllForLocaleChange();}}else if(event.name===HUD_BRIDGE_BINDING_NAME&&this.hudEnabled&&event.executionContextId===session.contextId){this.hudBridge.handleRawBindingPayload(target.id,event.payload);}});
           await this.refreshRegistration(session);
           await this.queueBootstrap(session, false);
         } catch(error) {
@@ -398,15 +398,16 @@ export class Controller {
       if(this.dormant||this.stopped||session.detaching)return;
       if (!previous?.active) previous = await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.state()', session.contextId);
       if(this.dormant||this.stopped||session.detaching)return;
+      const preservedManualEn = !this.paused && session.languageMode === 'en';
       if (previous?.active&&previous.runtimeId===this.runtimeId) {
         if (previous.version === this.options.dictionary.version) await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.refresh()', session.contextId);
         else await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__.update(${JSON.stringify(this.options.dictionary)})`, session.contextId);
-        const desiredLanguageMode = this.paused ? 'en' : (this.locale === 'zh-Hans' ? 'zh' : 'en');
+        const desiredLanguageMode = this.paused ? 'en' : preservedManualEn ? 'en' : (this.locale === 'zh-Hans' ? 'zh' : 'en');
         if (!this.paused && !this.options.fixture && previous.languageMode && previous.languageMode !== desiredLanguageMode) {
           await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage?.(${JSON.stringify(desiredLanguageMode)})`, session.contextId);
         }
       }
-      else{if(previous?.active)await session.cdp.evaluate('(globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.(),globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.())',session.contextId);await session.cdp.evaluate(this.boot(session.url),session.contextId);if(this.options.fixture&&previous?.active&&previous.languageMode==='en')await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.toggleLanguage("en")',session.contextId);}
+      else{if(previous?.active)await session.cdp.evaluate(this.hudEnabled?'globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.({keepHud:true})':'(globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.(),globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.())',session.contextId);await session.cdp.evaluate(this.boot(session.url),session.contextId);if((this.options.fixture||preservedManualEn)&&!this.paused&&(previous?.languageMode==='en'||preservedManualEn))await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage?.("en")',session.contextId);}
       let state: any;
       for (let i = 0; i < 10; i++) {
         state = await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.state()', session.contextId);
@@ -415,7 +416,7 @@ export class Controller {
       }
       if (state?.version !== this.options.dictionary.version) throw new Error(this.t('controller.err.dict_version_unconfirmed'));
       session.languageMode=state.languageMode??'zh';
-      const effectiveHudLocale = this.effectiveHudLocale();
+      const effectiveHudLocale = !this.paused && session.languageMode === 'en' ? 'en' : this.effectiveHudLocale();
       if (this.hudEnabled) {
         await session.cdp.evaluate(`(globalThis.__GRAVITYBOX_ATTACH_HUD__?.(), globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(${JSON.stringify(effectiveHudLocale)}), globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true), globalThis.__GRAVITYBOX_HUD_V1__?.syncAllSessions?.())`, session.contextId).catch(() => {});
       } else {
@@ -544,13 +545,54 @@ export class Controller {
     await this.controlChain.catch(() => {});
     await this.quiescePages();
   }
+  private async transitionActiveSessionsToHudOnly(): Promise<void> {
+    await this.connecting?.catch(() => {});
+    if (this.syncing) await new Promise<void>(resolve => this.syncWaiters.push(resolve));
+    if (!this.hudEnabled) {
+      await this.disconnectPages();
+      return;
+    }
+    const hudLocale = this.effectiveHudLocale();
+    for (const [id, session] of [...this.pages.entries()]) {
+      if (session.detaching) continue;
+      try {
+        await session.updateChain.catch(() => {});
+        const tree = await session.cdp.send('Page.getFrameTree');
+        const frame = tree.frameTree.frame;
+        if (!allowedTarget({ type: 'page', url: frame.url }, this.options.fixture?.origin)) {
+          await this.detach(session);
+          this.pages.delete(id);
+          continue;
+        }
+        session.url = frame.url;
+        await this.refreshRegistration(session);
+        if (session.contextId === undefined) {
+          const world = await session.cdp.send('Page.createIsolatedWorld', { frameId: frame.id, worldName: WORLD });
+          session.contextId = world.executionContextId;
+        }
+        await session.cdp.evaluate(
+          '(globalThis.__GRAVITYBOX_PENDING_BOOT__?.cancel?.(),globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.({keepHud:true}))',
+          session.contextId
+        );
+        await session.cdp.evaluate(this.boot(session.url), session.contextId);
+        await session.cdp.evaluate(
+          `(globalThis.__GRAVITYBOX_ATTACH_HUD__?.(), globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(${JSON.stringify(hudLocale)}), globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true))`,
+          session.contextId
+        );
+        session.languageMode = 'en';
+      } catch {
+        await this.detach(session);
+        this.pages.delete(id);
+      }
+    }
+  }
   pause(): Promise<void> {
     return this.enqueueControl(async () => {
       const prevHudLocale = this.effectiveHudLocale();
       this.paused = true;
       this.status.errors = [];
       this.bootCache.clear();
-      await this.quiescePages();
+      await this.transitionActiveSessionsToHudOnly();
       if (this.hudEnabled) {
         await this.resumeHudOnly();
         if (this.effectiveHudLocale() !== prevHudLocale) {
@@ -571,11 +613,31 @@ export class Controller {
       this.configuredLanguage = 'zh-Hans';
       this.hasTargetDictionary = true;
     }
-    if (this.paused && this.pages.size) await this.disconnectPages();
+    const wasPaused = this.paused;
+    if (wasPaused && this.pages.size && !this.hudEnabled) await this.disconnectPages();
     this.paused = false;
     this.reconnectionDelay = 1000;
     this.unverifiedWindowRetries = 0;
     this.bootCache.clear();
+    if (wasPaused && this.hudEnabled && this.pages.size) {
+      for (const [id, session] of [...this.pages.entries()]) {
+        if (session.detaching) continue;
+        session.languageMode = undefined;
+        try {
+          if (session.contextId !== undefined) {
+            await session.cdp.evaluate(
+              '(globalThis.__GRAVITYBOX_PENDING_BOOT__?.cancel?.(),globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.({keepHud:true}))',
+              session.contextId
+            );
+          }
+          await this.refreshRegistration(session);
+          await this.queueBootstrap(session, false);
+        } catch {
+          await this.detach(session);
+          this.pages.delete(id);
+        }
+      }
+    }
     try {
       if (this.browser) await this.sync();
       else { clearTimeout(this.reconnection); await this.tryConnect(); }
@@ -610,12 +672,15 @@ export class Controller {
         this.status.dictionaryVersion = options.dictionary.version;
         this.status.entries = Object.keys(options.dictionary.entries).length;
       }
+      if (previousLocale !== resolved) {
+        for (const s of this.pages.values()) s.languageMode = undefined;
+      }
       this.bootCache.clear();
       const shouldTranslateDom = resolved !== 'en' && this.hasTargetDictionary;
       if (!shouldTranslateDom) {
         this.paused = true;
         if (!previousPaused || previousLocale !== resolved) {
-          await this.quiescePages();
+          await this.transitionActiveSessionsToHudOnly();
           if (this.hudEnabled) {
             await this.resumeHudOnly();
             await this.hudBridge.refreshAllForLocaleChange();

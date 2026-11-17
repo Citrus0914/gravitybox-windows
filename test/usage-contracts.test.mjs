@@ -501,6 +501,22 @@ test('UsageStatsManager: Protobuf 解码、SQLite 扫描与 API 价格估算', a
     ]);
     const summaryFull = await usageMgr.getUsageSummary(true);
     assert.ok(summaryFull.today.by_model.some(m => m.model === 'gemini-3.8-flash-n' && m.priced === true));
+
+    // 验证 forceRefresh 下未变更历史数据库直接命中 fileCache（不重复冷扫），同时单库新增事件能增量感知且四周期投影不污染 summary.today
+    let workerScanCalls = 0;
+    const origScanOnce = usageMgr.scanDatabaseEvents.bind(usageMgr);
+    usageMgr.scanDatabaseEvents = async (p, bypass, sig, preStats) => {
+      if (bypass) workerScanCalls += 1;
+      return origScanOnce(p, bypass, sig, preStats);
+    };
+    const forcedCached = await usageMgr.getUsageSummary(true);
+    assert.equal(workerScanCalls, 0, 'forceRefresh 对未出错且文件指纹未变更的历史数据库必须命中缓存而非绕过缓存全量重扫');
+    assert.equal(forcedCached.generated_at, summaryFull.generated_at, '底层事件未变时 generated_at 保持稳定');
+    assert.ok((forcedCached.last_attempt_at ?? 0) >= summaryFull.generated_at, 'last_attempt_at 反映最新一次手动刷新时刻');
+    const { projectUsagePeriodSummary } = await import('../dist/ipc-projections.js');
+    const projectedWithAll = projectUsagePeriodSummary(forcedCached, 'today', { includeAllPeriods: true });
+    assert.equal(projectedWithAll.summary.today, undefined, '单周期导出 summary 不得夹带其他周期字段');
+    assert.deepEqual(Object.keys(projectedWithAll.periods).sort(), ['30d', '7d', 'all', 'today']);
   } finally {
     await rm(sandbox, { recursive: true, force: true });
   }

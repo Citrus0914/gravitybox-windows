@@ -604,7 +604,7 @@ final class MenuPanelController: NSViewController {
             let periodKey = Self.periods[selectedPeriod]
             app.fetchUsageSummary(period: periodKey, force: force)
         case 1:
-            if app.cachedAccounts.isEmpty {
+            if app.cachedAccounts.isEmpty || app.bootstrappedAccounts {
                 app.fetchAccountList(notifyPage: true)
             } else if force {
                 if let active = app.resolvedMenuAccount(), let id = active["id"] as? String, !id.isEmpty {
@@ -614,7 +614,7 @@ final class MenuPanelController: NSViewController {
                 }
             }
         default:
-            if app.cachedAccounts.isEmpty {
+            if app.cachedAccounts.isEmpty || app.bootstrappedAccounts {
                 app.fetchAccountList(notifyPage: true)
             } else if force {
                 app.refreshAccountQuotas()
@@ -659,11 +659,11 @@ final class MenuPanelController: NSViewController {
     func onUsageReportUpdated(period: String, result: Result<[String: Any], Error>) {
         guard isViewLoaded else { return }
         let currentPeriodKey = Self.periods[selectedPeriod]
-        if period == currentPeriodKey, selectedTab == 0 {
-            performWithoutAnimation {
+        performWithoutAnimation {
+            if period == currentPeriodKey, selectedTab == 0 {
                 syncUsageTabFromCache()
-                syncHeaderRefreshState()
             }
+            syncHeaderRefreshState()
         }
     }
 
@@ -678,6 +678,13 @@ final class MenuPanelController: NSViewController {
                 syncQuotaTab()
             default:
                 syncAccountsTab()
+            }
+        }
+        if app.reachable && (app.menuTracking || app.menuPopover?.isShown == true) && selectedTab == 0 {
+            let periodKey = Self.periods[selectedPeriod]
+            let needsInitialOrLiveUsage = app.cachedUsageReportsByPeriod[periodKey] == nil || app.bootstrappedUsagePeriods.contains(periodKey)
+            if needsInitialOrLiveUsage && app.usageInFlightByPeriod[periodKey] != true && app.usageFetchErrorsByPeriod[periodKey] == nil {
+                app.fetchUsageSummary(period: periodKey, force: false)
             }
         }
     }

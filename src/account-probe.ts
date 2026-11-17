@@ -307,128 +307,151 @@ export async function probeLiveLanguageServerOnce(
     ports: number[],
     preferredProtocol?: 'https' | 'http'
   ): Promise<LiveLanguageServerStatus | null> => {
-    for (const port of ports) {
-      try {
-        let userStatusData: any = null;
-        let quotaSummaryData: any = null;
-        let activeProtocol: 'https' | 'http' = preferredProtocol ?? 'https';
-
-        if (fetchImpl !== globalThis.fetch) {
+    const probeSinglePortStatus = async (port: number): Promise<{ port: number; userStatusData: any; activeProtocol: 'https' | 'http' } | null> => {
+      if (fetchImpl !== globalThis.fetch) {
+        try {
           const resp = await fetchImpl(`http://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-codeium-csrf-token': csrfToken },
             body: '{}',
           });
-          if (resp.ok) userStatusData = await resp.json();
-        } else {
-          const firstProto: 'https' | 'http' = preferredProtocol ?? 'https';
-          const secondProto: 'https' | 'http' = firstProto === 'https' ? 'http' : 'https';
-          try {
-            userStatusData = await localRpcFetch(firstProto, port, '/exa.language_server_pb.LanguageServerService/GetUserStatus', csrfToken);
-            activeProtocol = firstProto;
-          } catch {
-            try {
-              userStatusData = await localRpcFetch(secondProto, port, '/exa.language_server_pb.LanguageServerService/GetUserStatus', csrfToken);
-              activeProtocol = secondProto;
-            } catch {}
+          if (resp.ok) {
+            const data = await resp.json();
+            if (data?.userStatus?.email) return { port, userStatusData: data, activeProtocol: preferredProtocol ?? 'https' };
           }
+        } catch {}
+        return null;
+      }
+      const firstProto: 'https' | 'http' = preferredProtocol ?? 'https';
+      const secondProto: 'https' | 'http' = firstProto === 'https' ? 'http' : 'https';
+      try {
+        const data = await localRpcFetch(firstProto, port, '/exa.language_server_pb.LanguageServerService/GetUserStatus', csrfToken, '{}', 1200);
+        if (data?.userStatus?.email) return { port, userStatusData: data, activeProtocol: firstProto };
+      } catch {
+        try {
+          const data = await localRpcFetch(secondProto, port, '/exa.language_server_pb.LanguageServerService/GetUserStatus', csrfToken, '{}', 1000);
+          if (data?.userStatus?.email) return { port, userStatusData: data, activeProtocol: secondProto };
+        } catch {}
+      }
+      return null;
+    };
+
+    let matchedPortInfo: { port: number; userStatusData: any; activeProtocol: 'https' | 'http' } | null = null;
+    if (fetchImpl !== globalThis.fetch || ports.length <= 1) {
+      for (const port of ports) {
+        const found = await probeSinglePortStatus(port);
+        if (found) {
+          matchedPortInfo = found;
+          break;
         }
+      }
+    } else {
+      try {
+        matchedPortInfo = await Promise.any(
+          ports.map(async port => {
+            const found = await probeSinglePortStatus(port);
+            if (!found) throw new Error('port_not_rpc');
+            return found;
+          })
+        );
+      } catch {
+        matchedPortInfo = null;
+      }
+    }
 
-        const userStatus = userStatusData?.userStatus;
-        if (!userStatus?.email) continue;
+    if (!matchedPortInfo) return null;
+    const { port, userStatusData, activeProtocol } = matchedPortInfo;
+    const userStatus = userStatusData?.userStatus;
+    if (!userStatus?.email) return null;
 
-        if (fetchImpl === globalThis.fetch) {
-          cachedLiveEndpoint = {
-            targetAppPath: target.appPath,
-            pid: targetPid,
-            port,
-            protocol: activeProtocol,
-            csrfToken,
-          };
+    if (fetchImpl === globalThis.fetch) {
+      cachedLiveEndpoint = {
+        targetAppPath: target.appPath,
+        pid: targetPid,
+        port,
+        protocol: activeProtocol,
+        csrfToken,
+      };
+    }
+
+    let quotaSummaryData: any = null;
+    if (fetchImpl !== globalThis.fetch) {
+      try {
+        const respQ = await fetchImpl(`http://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-codeium-csrf-token': csrfToken },
+          body: '{}',
+        });
+        if (respQ.ok) {
+          const qRes = await respQ.json() as any;
+          quotaSummaryData = qRes.response || qRes;
         }
-
-        if (fetchImpl !== globalThis.fetch) {
-          try {
-            const respQ = await fetchImpl(`http://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'x-codeium-csrf-token': csrfToken },
-              body: '{}',
-            });
-            if (respQ.ok) {
-              const qRes = await respQ.json() as any;
-              quotaSummaryData = qRes.response || qRes;
-            }
-          } catch {}
-        } else {
-          const fallbackProtocol: 'https' | 'http' = activeProtocol === 'https' ? 'http' : 'https';
-          const reqBody = JSON.stringify({ forceRefresh: options.forceRefresh === true });
-          const summaryTimeoutMs = 6000;
-          try {
-            const qRes = await localRpcFetch(activeProtocol, port, '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary', csrfToken, reqBody, summaryTimeoutMs);
-            quotaSummaryData = qRes?.response || qRes;
-          } catch {
-            try {
-              const qRes = await localRpcFetch(fallbackProtocol, port, '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary', csrfToken, reqBody, summaryTimeoutMs);
-              quotaSummaryData = qRes?.response || qRes;
-            } catch {}
-          }
-        }
-
-        const email = String(userStatus.email);
-        const name = userStatus.name ? String(userStatus.name) : null;
-        const userTierId = typeof userStatus.userTier?.id === 'string' ? userStatus.userTier.id : null;
-        const userTierName = typeof userStatus.userTier?.name === 'string' ? userStatus.userTier.name : null;
-        const isEnterpriseVertex = isEnterpriseVertexUserStatus(userStatus);
-        const accountType: 'consumer' | 'enterprise_vertex' = isEnterpriseVertex ? 'enterprise_vertex' : 'consumer';
-        const tier = resolveProbeSubscriptionTier(userStatus, isEnterpriseVertex);
-
-        const observedAt = Math.floor(Date.now() / 1000);
-        const clientConfigs = userStatus.cascadeModelConfigData?.clientModelConfigs || [];
-        const models = mergeModelCatalogues([normalizeLiveModels(clientConfigs, observedAt)]);
-        const groups = mergeGroupSets([normalizeLiveGroups(quotaSummaryData, observedAt)]);
-        const windows = familyWindowsFromGroups(groups, Date.now());
-        const applied = applyFamilyWindows(models, windows);
-        const liveArgon = buildArgonStatus(applied, groups, windows, Date.now(), tier);
-        const liveCarbon = buildCarbonStatus(applied, groups, windows, Date.now(), liveArgon, tier);
-        const isIgnoredStandalone = (family: 'gemini' | 'claude' | 'argon' | 'carbon'): boolean =>
-          (family === 'argon' && (liveArgon.mode === 'unified' || liveArgon.mode === 'disabled'))
-          || (family === 'carbon' && (liveCarbon.mode === 'unified' || liveCarbon.mode === 'disabled'));
-        const missingFamilies = (['gemini', 'claude', 'argon', 'carbon'] as const).filter(family =>
-          !isIgnoredStandalone(family)
-          && models.some(model => model.family === family && model.disabled !== true)
-          && !groups.some(group => group.family === family && group.buckets.some(bucket => bucket.remaining_fraction_known))
-          && !((family === 'argon' || family === 'carbon') && models.some(m => m.family === family && m.own_percentage_known && !m.own_stale)));
-        const quotaData: QuotaData = {
-          models: applied.map(mappers.modelQuotaFromNormalized),
-          quota_groups: groups.map(mappers.groupToQuotaGroup),
-          is_forbidden: false,
-          subscription_tier: tier,
-          last_updated: observedAt,
-          model_forwarding_rules: {},
-          source: 'live',
-          refresh_state: {
-            complete: models.length > 0 && groups.length > 0 && missingFamilies.length === 0,
-            endpointsAttempted: ['live:GetUserStatus', 'live:RetrieveUserQuotaSummary'],
-            endpointsSucceeded: ['live:GetUserStatus', ...(quotaSummaryData ? ['live:RetrieveUserQuotaSummary'] : [])],
-            missingFamilies,
-            missingWindows: [],
-            carriedGroups: 0,
-            refreshedAt: observedAt,
-          },
-          quota_warnings: models.length === 0 ? [bt('account_probe.warn.no_model_records')] : undefined,
-        };
-
-        return {
-          email,
-          name,
-          tier,
-          accountType,
-          userTierId,
-          userTierName,
-          quota: quotaData,
-        };
+      } catch {}
+    } else {
+      const reqBody = JSON.stringify({ forceRefresh: options.forceRefresh === true });
+      // GetUserStatus 已验证端口传输协议，严禁反向协议重试以免超时翻倍；被动探测收紧预算防止拖慢冷启动
+      const summaryTimeoutMs = options.forceRefresh === true ? 4500 : 2200;
+      try {
+        const qRes = await localRpcFetch(activeProtocol, port, '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary', csrfToken, reqBody, summaryTimeoutMs);
+        quotaSummaryData = qRes?.response || qRes;
       } catch {}
     }
+
+    try {
+      const email = String(userStatus.email);
+      const name = userStatus.name ? String(userStatus.name) : null;
+      const userTierId = typeof userStatus.userTier?.id === 'string' ? userStatus.userTier.id : null;
+      const userTierName = typeof userStatus.userTier?.name === 'string' ? userStatus.userTier.name : null;
+      const isEnterpriseVertex = isEnterpriseVertexUserStatus(userStatus);
+      const accountType: 'consumer' | 'enterprise_vertex' = isEnterpriseVertex ? 'enterprise_vertex' : 'consumer';
+      const tier = resolveProbeSubscriptionTier(userStatus, isEnterpriseVertex);
+
+      const observedAt = Math.floor(Date.now() / 1000);
+      const clientConfigs = userStatus.cascadeModelConfigData?.clientModelConfigs || [];
+      const models = mergeModelCatalogues([normalizeLiveModels(clientConfigs, observedAt)]);
+      const groups = mergeGroupSets([normalizeLiveGroups(quotaSummaryData, observedAt)]);
+      const windows = familyWindowsFromGroups(groups, Date.now());
+      const applied = applyFamilyWindows(models, windows);
+      const liveArgon = buildArgonStatus(applied, groups, windows, Date.now(), tier);
+      const liveCarbon = buildCarbonStatus(applied, groups, windows, Date.now(), liveArgon, tier);
+      const isIgnoredStandalone = (family: 'gemini' | 'claude' | 'argon' | 'carbon'): boolean =>
+        (family === 'argon' && (liveArgon.mode === 'unified' || liveArgon.mode === 'disabled'))
+        || (family === 'carbon' && (liveCarbon.mode === 'unified' || liveCarbon.mode === 'disabled'));
+      const missingFamilies = (['gemini', 'claude', 'argon', 'carbon'] as const).filter(family =>
+        !isIgnoredStandalone(family)
+        && models.some(model => model.family === family && model.disabled !== true)
+        && !groups.some(group => group.family === family && group.buckets.some(bucket => bucket.remaining_fraction_known))
+        && !((family === 'argon' || family === 'carbon') && models.some(m => m.family === family && m.own_percentage_known && !m.own_stale)));
+      const quotaData: QuotaData = {
+        models: applied.map(mappers.modelQuotaFromNormalized),
+        quota_groups: groups.map(mappers.groupToQuotaGroup),
+        is_forbidden: false,
+        subscription_tier: tier,
+        last_updated: observedAt,
+        model_forwarding_rules: {},
+        source: 'live',
+        refresh_state: {
+          complete: models.length > 0 && groups.length > 0 && missingFamilies.length === 0,
+          endpointsAttempted: ['live:GetUserStatus', 'live:RetrieveUserQuotaSummary'],
+          endpointsSucceeded: ['live:GetUserStatus', ...(quotaSummaryData ? ['live:RetrieveUserQuotaSummary'] : [])],
+          missingFamilies,
+          missingWindows: [],
+          carriedGroups: 0,
+          refreshedAt: observedAt,
+        },
+        quota_warnings: models.length === 0 ? [bt('account_probe.warn.no_model_records')] : undefined,
+      };
+
+      return {
+        email,
+        name,
+        tier,
+        accountType,
+        userTierId,
+        userTierName,
+        quota: quotaData,
+      };
+    } catch {}
     return null;
   };
 

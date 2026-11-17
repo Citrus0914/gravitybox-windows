@@ -163,7 +163,10 @@ final class PreferencesController: NSObject {
     }
 
     func applyStorageScanPayload(_ value: [String: Any]) {
-        lastStorageScanAt = Date()
+        let now = Date()
+        lastStorageScanAt = now
+        app.lastMaintenanceScanPayload = value
+        app.lastMaintenanceScanAt = now
         let buckets = value["buckets"] as? [String: Any]
         let rtBucket = buckets?["runtimeCache"] as? [String: Any] ?? [:]
         let histBucket = buckets?["historyLogs"] as? [String: Any] ?? [:]

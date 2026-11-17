@@ -1,9 +1,94 @@
 import Cocoa
 
 extension Assistant {
+    func loadUIBootstrapSnapshot() {
+        #if !NATIVE_UI_TEST
+        let url = state.appendingPathComponent("ui-bootstrap-cache-v1.json")
+        guard let data = try? Data(contentsOf: url),
+              let raw = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        if let dash = raw["dashboardSummary"] as? [String: Any] {
+            cachedDashboardBootstrapSummary = dash
+            if let usg = dash["usage"] as? [String: Any], let periodsMap = usg["periods"] as? [String: Any] {
+                for p in ["today", "7d", "30d", "all"] {
+                    if var item = periodsMap[p] as? [String: Any] {
+                        item.removeValue(forKey: "periods")
+                        cachedUsageReportsByPeriod[p] = item
+                        bootstrappedUsagePeriods.insert(p)
+                    }
+                }
+            }
+        }
+        if let accPayload = raw["accountsPayload"] as? [String: Any],
+           let list = accPayload["accounts"] as? [[String: Any]] {
+            cachedAccountsBootstrapPayload = accPayload
+            let resolvedActive = accPayload["activeId"] as? String ?? (accPayload["currentAccountId"] as? String ?? "")
+            activeAccountId = resolvedActive
+            cachedAccounts = list.enumerated().sorted { lhs, rhs in
+                let l = lhs.element["id"] as? String == resolvedActive
+                let r = rhs.element["id"] as? String == resolvedActive
+                return l == r ? lhs.offset < rhs.offset : l
+            }.map(\.element)
+            bootstrappedAccounts = true
+        }
+        if let usageByPeriod = raw["usageByPeriod"] as? [String: [String: Any]] {
+            for (p, var report) in usageByPeriod where ["today", "7d", "30d", "all"].contains(p) {
+                report.removeValue(forKey: "periods")
+                cachedUsageReportsByPeriod[p] = report
+                bootstrappedUsagePeriods.insert(p)
+            }
+        }
+        #endif
+    }
+
+    func scheduleUIBootstrapSave() {
+        #if !NATIVE_UI_TEST
+        uiBootstrapSaveWorkItem?.cancel()
+        let dashSnap = cachedDashboardBootstrapSummary
+        let accSnap = cachedAccountsBootstrapPayload
+        let usageSnap = cachedUsageReportsByPeriod
+        let targetURL = state.appendingPathComponent("ui-bootstrap-cache-v1.json")
+        let work = DispatchWorkItem { [weak self] in
+            guard self != nil else { return }
+            var doc: [String: Any] = ["schema": 1, "savedAt": Date().timeIntervalSince1970]
+            if let dashSnap, JSONSerialization.isValidJSONObject(dashSnap) {
+                doc["dashboardSummary"] = dashSnap
+            }
+            if let accSnap, JSONSerialization.isValidJSONObject(accSnap) {
+                doc["accountsPayload"] = accSnap
+            }
+            var validUsage: [String: Any] = [:]
+            for (k, v) in usageSnap where ["today", "7d", "30d", "all"].contains(k) && JSONSerialization.isValidJSONObject(v) {
+                validUsage[k] = v
+            }
+            if !validUsage.isEmpty {
+                doc["usageByPeriod"] = validUsage
+            }
+            guard JSONSerialization.isValidJSONObject(doc),
+                  let bytes = try? JSONSerialization.data(withJSONObject: doc) else { return }
+            try? bytes.write(to: targetURL, options: .atomic)
+            chmod(targetURL.path, 0o600)
+        }
+        uiBootstrapSaveWorkItem = work
+        uiBootstrapQueue.asyncAfter(deadline: .now() + 0.35, execute: work)
+        #endif
+    }
+
+    func ingestUsagePeriods(from rawPeriods: [String: Any]?, fetchedAt: Date) {
+        guard let rawPeriods else { return }
+        for p in ["today", "7d", "30d", "all"] {
+            guard var item = rawPeriods[p] as? [String: Any] else { continue }
+            item.removeValue(forKey: "periods")
+            cachedUsageReportsByPeriod[p] = item
+            usageLastFetchTimeByPeriod[p] = fetchedAt
+            usageFetchErrorsByPeriod[p] = nil
+            bootstrappedUsagePeriods.remove(p)
+        }
+    }
+
     func fetchUsageSummary(period: String, force: Bool = false, allowCached: Bool = true, completion: ((Result<[String: Any], Error>) -> Void)? = nil) {
         let cacheKey = period
         if !force && allowCached,
+           !bootstrappedUsagePeriods.contains(cacheKey),
            let cached = cachedUsageReportsByPeriod[cacheKey],
            let lastAt = usageLastFetchTimeByPeriod[cacheKey],
            Date().timeIntervalSince(lastAt) < 15.0,
@@ -43,16 +128,29 @@ extension Assistant {
             }
             self.usageInFlightByPeriod[cacheKey] = false
             self.usageManualRefreshPeriods.remove(cacheKey)
-            guard generation >= (self.usageGenerationByPeriod[cacheKey] ?? 0) else { return }
-            self.usageLastFetchTimeByPeriod[cacheKey] = Date()
+            guard generation >= (self.usageGenerationByPeriod[cacheKey] ?? 0) else {
+                self.menuPanelController?.syncHeaderRefreshState()
+                return
+            }
+            let fetchedAt = Date()
+            self.usageLastFetchTimeByPeriod[cacheKey] = fetchedAt
+            self.bootstrappedUsagePeriods.remove(cacheKey)
             let waiters = self.usageWaitersByPeriod.removeValue(forKey: cacheKey) ?? []
+            var resolvedResponse = response
             switch response {
             case .failure(let error):
                 self.usageFetchErrorsByPeriod[cacheKey] = error.localizedDescription
             case .success(let value):
                 self.usageFetchErrorsByPeriod[cacheKey] = nil
-                self.cachedUsageReportsByPeriod[cacheKey] = value
-                let failedCount = (value["summary"] as? [String: Any])?["failedDatabasesCount"] as? Int ?? 0
+                if let periodsMap = value["periods"] as? [String: Any] {
+                    self.ingestUsagePeriods(from: periodsMap, fetchedAt: fetchedAt)
+                }
+                var cleanValue = value
+                cleanValue.removeValue(forKey: "periods")
+                self.cachedUsageReportsByPeriod[cacheKey] = cleanValue
+                resolvedResponse = .success(cleanValue)
+                self.scheduleUIBootstrapSave()
+                let failedCount = (cleanValue["summary"] as? [String: Any])?["failedDatabasesCount"] as? Int ?? 0
                 if failedCount == 0 {
                     self.usageAutoHealAttemptsByPeriod[cacheKey] = 0
                 } else {
@@ -74,8 +172,9 @@ extension Assistant {
                     self.usagePage?.update(force: false)
                 }
             }
-            self.menuPanelController?.onUsageReportUpdated(period: period, result: response)
-            for waiter in waiters { waiter(response) }
+            self.menuPanelController?.onUsageReportUpdated(period: period, result: resolvedResponse)
+            self.menuPanelController?.syncHeaderRefreshState()
+            for waiter in waiters { waiter(resolvedResponse) }
         }
     }
 
@@ -169,6 +268,7 @@ extension Assistant {
         cachedUsageReportsByPeriod.removeAll()
         usageLastFetchTimeByPeriod.removeAll()
         usageFetchErrorsByPeriod.removeAll()
+        bootstrappedUsagePeriods.removeAll()
         overview?.metricsKey = ""
         usagePage?.metricsKey = ""
         if contentVisible && currentPage == 2 {
@@ -294,7 +394,7 @@ extension Assistant {
     @objc func refreshAccountQuotas() {
         guard !quotaRefreshing, pendingAccountTaskId == nil, reachable else { return }
         quotaRefreshing = true; quotaRefreshStartedAt = Date(); quotaRefreshError = nil; updateQuotaRefreshControls()
-        let poll = Timer(timeInterval: 0.75, repeats: true) { [weak self] _ in self?.refresh(taskPollOnly: true) }
+        let poll = Timer(timeInterval: 0.35, repeats: true) { [weak self] _ in self?.refresh(taskPollOnly: true) }
         quotaRefreshPollTimer?.invalidate(); quotaRefreshPollTimer = poll
         RunLoop.main.add(poll, forMode: .common); RunLoop.main.add(poll, forMode: .eventTracking)
         bridge.send(["command": "quota_refresh_start"]) { [weak self] response in
@@ -313,10 +413,15 @@ extension Assistant {
     }
     func updateQuotaRefreshControls() {
         let available = reachable && (pendingAccountTaskId == nil || quotaRefreshing)
+        let overviewActiveId = ((overview?.lastSuccessfulSummary?["accounts"] as? [String: Any])?["currentAccountId"] as? String) ?? activeAccountId
         func apply(_ view: NSView) {
             if let control = view as? QuotaRefreshButton {
                 let cid = control.identifier?.rawValue ?? ""
-                control.applyGlobalRefreshState(globalBusy: quotaRefreshing, available: available, error: quotaRefreshError, cardBusy: refreshingAccountIds.contains(cid))
+                let isOverviewHeroBtn = (control === overview?.refreshQuotaButton)
+                let targetId = isOverviewHeroBtn ? overviewActiveId : cid
+                let isCardBusy = !targetId.isEmpty && refreshingAccountIds.contains(targetId)
+                let resolvedErr = (isOverviewHeroBtn && !targetId.isEmpty ? singleAccountRefreshErrors[targetId] : nil) ?? quotaRefreshError
+                control.applyGlobalRefreshState(globalBusy: quotaRefreshing, available: available, error: resolvedErr, cardBusy: isCardBusy)
             }
             for child in view.subviews { apply(child) }
         }
@@ -342,6 +447,8 @@ extension Assistant {
             self.accountListWaiters.removeAll()
             self.accountListPendingNotifyPage = false
             if case .success(let val) = res, generation >= self.accountListGeneration, let list = val["accounts"] as? [[String: Any]] {
+                self.bootstrappedAccounts = false
+                self.cachedAccountsBootstrapPayload = val
                 self.lastFetchedAccountsRevision = self.statusValue.accountsRevision
                 self.lastFetchedLiveEmail = self.statusValue.liveAccountEmail
                 var resolvedActiveId = val["activeId"] as? String ?? (val["currentAccountId"] as? String ?? "")
@@ -375,6 +482,7 @@ extension Assistant {
                         self.quotaRefreshError = nil
                     }
                 }
+                self.scheduleUIBootstrapSave()
                 self.updateQuotaRefreshControls()
                 if shouldNotifyPage { self.accountsPage?.fetch(val) }
             }

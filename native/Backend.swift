@@ -20,7 +20,7 @@ final class BackendBridge {
     private var _preferredLocale: String?
     private let queue = DispatchQueue(label: "local.gravitybox.bridge", qos: .userInitiated)
     private let controlQueue = DispatchQueue(label:"local.gravitybox.control",qos:.userInitiated,attributes:.concurrent)
-    private let controlSemaphore = DispatchSemaphore(value: 4)
+    private let controlSemaphore = DispatchSemaphore(value: 8)
     private static let maxReplyBytes = 4_000_000
     #if NATIVE_UI_TEST
     var fixtureReply: (([String:Any]) -> [String:Any])?
@@ -281,7 +281,8 @@ final class BackendBridge {
             "account_oauth_status", "account_oauth_cancel", "maintenance_preflight",
             "maintenance_scan", "maintenance_history", "usage_summary", "usage_events",
             "usage_snapshot_release", "usage_ledger_review", "auto_switch_get",
-            "account_recovery_info", "api_pricing_get", "pricing_sync_status"
+            "account_recovery_info", "api_pricing_get", "pricing_sync_status",
+            "quota_refresh", "quota_refresh_start"
         ]
         let isReadOnlyAutoSwitch = command == "auto_switch_best" && (payload["execute"] as? Bool != true)
         let useControlThrottle = readOnlyCommands.contains(command) || isReadOnlyAutoSwitch
@@ -290,15 +291,21 @@ final class BackendBridge {
             if useControlThrottle { controlSemaphore.wait() }
             defer { if useControlThrottle { controlSemaphore.signal() } }
             let result = Result { try request(payload) }
-            DispatchQueue.main.async { guard requestGeneration == self.generation else { return }; completion(result) }
+            DispatchQueue.main.async {
+                guard requestGeneration == self.generation else {
+                    completion(.failure(BackendFailure(message: L10n.t("backend.error.switching_target"))))
+                    return
+                }
+                completion(result)
+            }
         }
     }
 
     func request(_ payload: [String: Any]) throws -> [String: Any] {
         var last: BackendFailure?
-        let isBooting = child?.isRunning == true
-        let maxAttempts = isBooting ? 8 : 3
-        let delays: [useconds_t] = [35_000, 50_000, 75_000, 100_000, 140_000, 180_000, 220_000]
+        let isBooting = isOwnedProcessRunning
+        let maxAttempts = isBooting ? 12 : 3
+        let delays: [useconds_t] = [18_000, 25_000, 35_000, 50_000, 70_000, 95_000, 130_000, 170_000, 220_000]
         for attempt in 0..<maxAttempts {
             do { return try performRequest(payload) }
             catch let failure as BackendFailure {

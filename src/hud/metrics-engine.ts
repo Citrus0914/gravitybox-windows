@@ -42,6 +42,7 @@ const SUBAGENT_TOOL_NAMES = new Set([
 ]);
 const MAX_CACHED_CONVERSATIONS = 128;
 const ACTIVE_DB_RECENCY_MS = 60 * 60 * 1000;
+const TURN_STEP_HANDOFF_GRACE_SEC = 600;
 const INLINE_BLOB_LIMIT_BYTES = 65_536;
 const UTF8_DECODER = new TextDecoder('utf-8');
 
@@ -936,6 +937,7 @@ interface StageAccumulator {
   latestPrompt: number;
   peakContextTokens: number;
   explicitCapacity?: number;
+  compactionCount?: number;
 }
 
 const COMPACT_MODEL_LABEL_RULES: ReadonlyArray<readonly [RegExp, string, string]> = [
@@ -944,9 +946,9 @@ const COMPACT_MODEL_LABEL_RULES: ReadonlyArray<readonly [RegExp, string, string]
   [/^gemini-4-hydrogen/, 'Hydrogen', 'H'],
   [/^gemini-(?:[\d.]+-)?pro|^gemini-pro/, 'Pro', 'P'],
   [/^gemini-(?:[\d.]+-)?flash|^gemini-flash/, 'Flash', 'F'],
-  [/^claude-.*-opus/, 'Opus', 'O'],
-  [/^claude-.*-sonnet/, 'Sonnet', 'S'],
-  [/^claude-.*-haiku/, 'Haiku', 'H'],
+  [/^claude-(?:.*-)?opus/, 'Opus', 'O'],
+  [/^claude-(?:.*-)?sonnet/, 'Sonnet', 'S'],
+  [/^claude-(?:.*-)?haiku/, 'Haiku', 'H'],
   [/^gpt-oss/, 'GPT-OSS', 'G'],
 ];
 
@@ -1144,6 +1146,7 @@ function createStageSnapshot(
     compactLabel: acc.slot.compactLabel,
     hasUsageData,
     isActive,
+    ...(acc.compactionCount && acc.compactionCount > 0 ? { compactionCount: acc.compactionCount } : {}),
     usedTokens,
     usedTokensCompact: formatCompactTokenNumber(usedTokens),
     usedTokensFormatted: formatThousandsTokens(usedTokens),
@@ -1161,7 +1164,12 @@ function createStageSnapshot(
 
 function resolveContextStagesAndActiveSlot(
   usageContextEntries: ReadonlyArray<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number; turnIndex?: number }>,
-  input: ComputeHudMetricsInput
+  input: ComputeHudMetricsInput,
+  compactionContextEntries: ReadonlyArray<{
+    step: ComputeHudMetricsInput['steps'][number];
+    precedingUsageIndex: number;
+    turnIndex: number;
+  }> = []
 ): {
   latestStep?: ComputeHudMetricsInput['steps'][number];
   latestGenMeta?: ParsedGenMetadata;
@@ -1206,6 +1214,7 @@ function resolveContextStagesAndActiveSlot(
     const isOrchestrator = emptySlot.role === 'planner' || emptySlot.role === 'executor' || inputIsOrchestrator;
     if (isOrchestrator) {
       const pair: StageAccumulator[] = [];
+      let historyModelAcc: StageAccumulator | undefined;
       if (emptySlot.role === 'executor') {
         const plannerSlot =
           inputAsStandaloneSlot && inputAsStandaloneSlot.role === 'planner'
@@ -1213,7 +1222,7 @@ function resolveContextStagesAndActiveSlot(
             : classifyContextModelSlot({ fallbackInputModelId: 'Orchestrator (Carbon)' });
         pair.push({ slot: plannerSlot, latestPrompt: 0, peakContextTokens: 0, explicitCapacity: emptyExplicitCap });
         pair.push(emptyAcc);
-      } else {
+      } else if (emptySlot.role === 'planner') {
         pair.push(emptyAcc);
         if (emptySlot.shortLabel !== 'Hydrogen') {
           pair.push({
@@ -1223,10 +1232,67 @@ function resolveContextStagesAndActiveSlot(
             explicitCapacity: emptyExplicitCap,
           });
         }
+      } else {
+        const plannerSlot =
+          inputAsStandaloneSlot && inputAsStandaloneSlot.role === 'planner'
+            ? inputAsStandaloneSlot
+            : classifyContextModelSlot({ fallbackInputModelId: 'Orchestrator (Carbon)' });
+        const plannerExplicitCap = inputExplicitCapacity ?? plannerSlot.capacityTokens;
+        pair.push({
+          slot: plannerSlot,
+          latestPrompt: 0,
+          peakContextTokens: 0,
+          explicitCapacity: plannerExplicitCap,
+        });
+        if (plannerSlot.shortLabel !== 'Hydrogen') {
+          pair.push({
+            slot: createPendingExecutorSlot(plannerExplicitCap, plannerSlot.isFallbackModel),
+            latestPrompt: 0,
+            peakContextTokens: 0,
+            explicitCapacity: plannerExplicitCap,
+          });
+        }
+        if (emptySlot.hasExplicitEvidence && emptySlot.modelId !== 'unknown') {
+          historyModelAcc = emptyAcc;
+        }
       }
-      const stages = pair.map((acc) =>
-        createStageSnapshot(acc, acc.slot.slotKey === emptySlot.slotKey, emptyExplicitCap, 'primary')
-      );
+      const fallbackTargetAcc = pair[0] ?? emptyAcc;
+      for (const cpEntry of compactionContextEntries) {
+        const cpGen = cpEntry.step.generation;
+        let targetAcc: StageAccumulator | undefined;
+        if (
+          cpGen?.responseModel ||
+          cpGen?.modelDisplayName ||
+          cpGen?.plannerModelName ||
+          cpGen?.modelEnum ||
+          cpEntry.step.modelName
+        ) {
+          const cpSlot = classifyContextModelSlot({
+            responseModel: cpGen?.responseModel,
+            modelDisplayName: cpGen?.modelDisplayName,
+            plannerModelName: cpGen?.plannerModelName,
+            stepModelName: cpEntry.step.modelName,
+            modelEnum: cpGen?.modelEnum,
+            hasPriorOrchestrator: true,
+          });
+          if (cpSlot.hasExplicitEvidence && cpSlot.modelId !== 'unknown') {
+            targetAcc =
+              pair.find((a) => a.slot.slotKey === cpSlot.slotKey || a.slot.modelId === cpSlot.modelId) ??
+              (historyModelAcc &&
+              (historyModelAcc.slot.slotKey === cpSlot.slotKey || historyModelAcc.slot.modelId === cpSlot.modelId)
+                ? historyModelAcc
+                : undefined);
+          }
+        }
+        const resolved = targetAcc ?? (emptySlot.role === 'model' && historyModelAcc ? historyModelAcc : fallbackTargetAcc);
+        resolved.compactionCount = (resolved.compactionCount ?? 0) + 1;
+      }
+      const stages = [
+        ...pair.map((acc) => createStageSnapshot(acc, acc.slot.slotKey === emptySlot.slotKey, emptyExplicitCap, 'primary')),
+        ...(historyModelAcc
+          ? [createStageSnapshot(historyModelAcc, historyModelAcc.slot.slotKey === emptySlot.slotKey, undefined, 'history')]
+          : []),
+      ];
       const activeStage = stages.find((s) => s.isActive) ?? stages[0]!;
       return {
         latestStep: undefined,
@@ -1239,6 +1305,9 @@ function resolveContextStagesAndActiveSlot(
         modelStages: stages.length >= 2 ? stages : undefined,
         defaultFallbackModel: emptySlot.hasExplicitEvidence ? (emptySlot.role === 'model' ? emptySlot.displayName : emptySlot.modelId) : '',
       };
+    }
+    if (compactionContextEntries.length > 0) {
+      emptyAcc.compactionCount = compactionContextEntries.length;
     }
     const activeStage = createStageSnapshot(emptyAcc, true);
     return {
@@ -1254,6 +1323,7 @@ function resolveContextStagesAndActiveSlot(
   }
 
   const stageMap = new Map<string, StageAccumulator & { lastSeenSeq: number }>();
+  const slotKeyByUsageIndex: string[] = [];
   const orchestratorTurns = new Set<number>();
   let sessionPeakContextTokens = 0;
   let latestEntry!: {
@@ -1261,21 +1331,43 @@ function resolveContextStagesAndActiveSlot(
     slot: ClassifiedContextSlot;
     genMeta?: ParsedGenMetadata;
   };
+  const hasAnyExplicitUsageModel = usageContextEntries.some((entry, idx) => {
+    const isGlobalLatest = idx === usageContextEntries.length - 1;
+    const gm = entry.step.generation ?? (isGlobalLatest ? input.genMetadata : undefined);
+    return Boolean(
+      gm?.responseModel || gm?.modelDisplayName || gm?.plannerModelName || gm?.modelEnum || entry.step.modelName
+    );
+  });
+  let lastExplicitFallbackModel = '';
 
   for (let i = 0; i < usageContextEntries.length; i++) {
     const entry = usageContextEntries[i]!;
     const turnIndex = entry.turnIndex ?? 0;
     const isGlobalLatest = i === usageContextEntries.length - 1;
     const stepGenMeta = entry.step.generation ?? (isGlobalLatest ? input.genMetadata : undefined);
+    const hasStepExplicitModel = Boolean(
+      stepGenMeta?.responseModel ||
+        stepGenMeta?.modelDisplayName ||
+        stepGenMeta?.plannerModelName ||
+        stepGenMeta?.modelEnum ||
+        entry.step.modelName
+    );
+    const stepFallbackModel =
+      !hasAnyExplicitUsageModel || (isGlobalLatest && !isStepCompleted(entry.step))
+        ? trimmedInputModel
+        : lastExplicitFallbackModel;
     const slot = classifyContextModelSlot({
       responseModel: stepGenMeta?.responseModel,
       modelDisplayName: stepGenMeta?.modelDisplayName,
       plannerModelName: stepGenMeta?.plannerModelName,
       stepModelName: entry.step.modelName,
       modelEnum: stepGenMeta?.modelEnum,
-      fallbackInputModelId: trimmedInputModel,
+      fallbackInputModelId: stepFallbackModel,
       hasPriorOrchestrator: orchestratorTurns.has(turnIndex),
     });
+    if (hasStepExplicitModel && slot.hasExplicitEvidence && slot.modelId !== 'unknown') {
+      lastExplicitFallbackModel = slot.role === 'model' ? slot.displayName : slot.modelId;
+    }
     if (slot.role === 'planner' || slot.role === 'executor') {
       orchestratorTurns.add(turnIndex);
     }
@@ -1289,15 +1381,56 @@ function resolveContextStagesAndActiveSlot(
       latestPrompt: entry.prompt,
       peakContextTokens: Math.max(prev?.peakContextTokens ?? 0, entry.prompt),
       explicitCapacity: stepExplicitCap ?? prev?.explicitCapacity,
+      ...(prev?.compactionCount ? { compactionCount: prev.compactionCount } : {}),
       lastSeenSeq: i,
     });
+    slotKeyByUsageIndex.push(slot.slotKey);
     sessionPeakContextTokens = Math.max(sessionPeakContextTokens, entry.prompt);
     latestEntry = { step: entry.step, slot, genMeta: stepGenMeta };
   }
 
-  const activeSlotKey = latestEntry.slot.slotKey;
-  const activeAcc = stageMap.get(activeSlotKey)!;
-  const activeStage = createStageSnapshot(activeAcc, true);
+  for (const cpEntry of compactionContextEntries) {
+    let targetSlotKey: string | undefined;
+    const cpGen = cpEntry.step.generation;
+    if (
+      cpGen?.responseModel ||
+      cpGen?.modelDisplayName ||
+      cpGen?.plannerModelName ||
+      cpGen?.modelEnum ||
+      cpEntry.step.modelName
+    ) {
+      const cpSlot = classifyContextModelSlot({
+        responseModel: cpGen?.responseModel,
+        modelDisplayName: cpGen?.modelDisplayName,
+        plannerModelName: cpGen?.plannerModelName,
+        stepModelName: cpEntry.step.modelName,
+        modelEnum: cpGen?.modelEnum,
+        hasPriorOrchestrator: orchestratorTurns.has(cpEntry.turnIndex),
+      });
+      if (cpSlot.hasExplicitEvidence && cpSlot.modelId !== 'unknown') {
+        if (stageMap.has(cpSlot.slotKey)) {
+          targetSlotKey = cpSlot.slotKey;
+        } else {
+          const matchedByModelId = [...stageMap.values()].find((a) => a.slot.modelId === cpSlot.modelId);
+          if (matchedByModelId) targetSlotKey = matchedByModelId.slot.slotKey;
+        }
+      }
+    }
+    if (!targetSlotKey) {
+      if (cpEntry.precedingUsageIndex >= 0 && cpEntry.precedingUsageIndex < slotKeyByUsageIndex.length) {
+        targetSlotKey = slotKeyByUsageIndex[cpEntry.precedingUsageIndex];
+      } else {
+        targetSlotKey = slotKeyByUsageIndex[0] ?? latestEntry.slot.slotKey;
+      }
+    }
+    const targetAcc = targetSlotKey ? stageMap.get(targetSlotKey) : undefined;
+    if (targetAcc) {
+      targetAcc.compactionCount = (targetAcc.compactionCount ?? 0) + 1;
+    }
+  }
+
+  let effectiveActiveSlotKey = latestEntry.slot.slotKey;
+  const activeAcc = stageMap.get(effectiveActiveSlotKey)!;
   const allAccs = [...stageMap.values()];
   const isOrchestrator =
     latestEntry.slot.role === 'planner' ||
@@ -1349,14 +1482,41 @@ function resolveContextStagesAndActiveSlot(
       });
     }
 
-    const activePeModelIds = new Set(
-      [...planners, ...executors]
-        .filter((pe) => Boolean(pe.latestStep))
-        .map((pe) => pe.slot.modelId)
-    );
-    const filteredOthers = others.filter(
-      (other) => Boolean(other.latestStep) && !activePeModelIds.has(other.slot.modelId)
-    );
+    const activePeByModelId = new Map<string, StageAccumulator & { lastSeenSeq?: number }>();
+    for (const pe of [...planners, ...executors]) {
+      if (Boolean(pe.latestStep)) {
+        activePeByModelId.set(pe.slot.modelId, pe);
+      }
+    }
+    const filteredOthersRaw: Array<StageAccumulator & { lastSeenSeq: number }> = [];
+    for (const other of others) {
+      if (!Boolean(other.latestStep)) continue;
+      const absorbedTarget = activePeByModelId.get(other.slot.modelId);
+      if (absorbedTarget) {
+        absorbedTarget.peakContextTokens = Math.max(absorbedTarget.peakContextTokens, other.peakContextTokens);
+        if (other.compactionCount && other.compactionCount > 0) {
+          absorbedTarget.compactionCount = (absorbedTarget.compactionCount ?? 0) + other.compactionCount;
+        }
+        if (other.slot.slotKey === effectiveActiveSlotKey) {
+          effectiveActiveSlotKey = absorbedTarget.slot.slotKey;
+        }
+        continue;
+      }
+      filteredOthersRaw.push(other);
+    }
+    const filteredOthersSorted = [...filteredOthersRaw].sort((a, b) => a.lastSeenSeq - b.lastSeenSeq);
+    let filteredOthers: StageAccumulator[];
+    if (filteredOthersSorted.length > 3) {
+      const tail = filteredOthersSorted.slice(-3);
+      const activeInOthers = filteredOthersSorted.find((a) => a.slot.slotKey === effectiveActiveSlotKey);
+      if (activeInOthers && !tail.includes(activeInOthers)) {
+        filteredOthers = [activeInOthers, ...tail.slice(1)];
+      } else {
+        filteredOthers = tail;
+      }
+    } else {
+      filteredOthers = filteredOthersSorted;
+    }
 
     const primaryAccs: StageAccumulator[] = [...planners, ...executors];
     if (hasPendingInputSlot([...primaryAccs, ...filteredOthers]) && inputAsStandaloneSlot) {
@@ -1376,8 +1536,26 @@ function resolveContextStagesAndActiveSlot(
     for (const acc of allAccs) {
       const key = acc.slot.modelId || acc.slot.slotKey;
       const existing = dedupByModelId.get(key);
+      const mergedCompactions = (existing?.compactionCount ?? 0) + (acc.compactionCount ?? 0);
+      const mergedPeak = Math.max(existing?.peakContextTokens ?? 0, acc.peakContextTokens);
       if (!existing || acc.lastSeenSeq > existing.lastSeenSeq) {
-        dedupByModelId.set(key, acc);
+        if (existing && existing.slot.slotKey === effectiveActiveSlotKey) {
+          effectiveActiveSlotKey = acc.slot.slotKey;
+        }
+        dedupByModelId.set(key, {
+          ...acc,
+          peakContextTokens: mergedPeak,
+          ...(mergedCompactions > 0 ? { compactionCount: mergedCompactions } : {}),
+        });
+      } else {
+        if (acc.slot.slotKey === effectiveActiveSlotKey) {
+          effectiveActiveSlotKey = existing.slot.slotKey;
+        }
+        dedupByModelId.set(key, {
+          ...existing,
+          peakContextTokens: mergedPeak,
+          ...(mergedCompactions > 0 ? { compactionCount: mergedCompactions } : {}),
+        });
       }
     }
     const orderedAccs: StageAccumulator[] = [...dedupByModelId.values()].sort(
@@ -1391,20 +1569,54 @@ function resolveContextStagesAndActiveSlot(
         explicitCapacity: inputExplicitCapacity,
       });
     }
-    const finalAccs = orderedAccs.length > 3 ? orderedAccs.slice(-3) : orderedAccs;
+    let finalAccs: StageAccumulator[];
+    if (orderedAccs.length > 4) {
+      const tail = orderedAccs.slice(-4);
+      const pinnedInput =
+        inputAsStandaloneSlot &&
+        inputAsStandaloneSlot.hasExplicitEvidence &&
+        inputAsStandaloneSlot.modelId !== 'unknown'
+          ? orderedAccs.find(
+              (a) =>
+                a.slot.slotKey === inputAsStandaloneSlot.slotKey ||
+                a.slot.modelId === inputAsStandaloneSlot.modelId
+            )
+          : undefined;
+      if (pinnedInput && !tail.includes(pinnedInput)) {
+        const dropIdx = tail.findIndex((a) => a.slot.slotKey !== effectiveActiveSlotKey);
+        if (dropIdx >= 0) {
+          tail.splice(dropIdx, 1);
+          finalAccs = [pinnedInput, ...tail];
+        } else {
+          finalAccs = tail;
+        }
+      } else {
+        finalAccs = tail;
+      }
+    } else {
+      finalAccs = orderedAccs;
+    }
     orderedEntries = finalAccs.map((acc) => ({ acc, section: 'primary' as const }));
   }
 
-  const isMultiModel = orderedEntries.length >= 2;
+  const primaryNonPending = orderedEntries.filter(({ acc }) => Boolean(acc.latestStep));
+  const isMultiModel =
+    orderedEntries.length >= 2 &&
+    (isOrchestrator ||
+      primaryNonPending.length >= 2 ||
+      orderedEntries.some(({ acc }) => !acc.latestStep));
   const modelStages = isMultiModel
     ? orderedEntries.map(({ acc, section }) => {
         const inheritCap =
           !acc.latestStep && isOrchestrator && (acc.slot.role === 'planner' || acc.slot.role === 'executor')
             ? inheritedOrchCap
             : undefined;
-        return createStageSnapshot(acc, acc.slot.slotKey === activeSlotKey, inheritCap, section);
+        return createStageSnapshot(acc, acc.slot.slotKey === effectiveActiveSlotKey, inheritCap, section);
       })
     : undefined;
+  const activeStage =
+    modelStages?.find((s) => s.isActive) ??
+    createStageSnapshot(orderedEntries[0]?.acc ?? activeAcc, true);
 
   return {
     latestStep: latestEntry.step,
@@ -1605,13 +1817,25 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const toolDurationSeconds = mergeDurationIntervals(completedToolIntervals);
 
   const usageContextEntries: Array<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number; turnIndex: number }> = [];
+  const compactionContextEntries: Array<{
+    step: ComputeHudMetricsInput['steps'][number];
+    precedingUsageIndex: number;
+    turnIndex: number;
+  }> = [];
   let turns = 0;
   let compactionCount = 0;
   for (const step of contextSteps) {
     const stepType = step.step_type ?? step.stepType ?? 0;
     const rawStatus = step.status ?? 3;
     if (stepType === 14) turns++;
-    if (stepType === 23 && (rawStatus === 3 || rawStatus === 5)) compactionCount++;
+    if (stepType === 23 && (rawStatus === 3 || rawStatus === 5)) {
+      compactionCount++;
+      compactionContextEntries.push({
+        step,
+        precedingUsageIndex: usageContextEntries.length - 1,
+        turnIndex: turns,
+      });
+    }
     if (stepType !== 15 || step.hasUsage === false) continue;
     const prompt = safeTokens(step.rawInput ?? step.rawInputTokens) +
       safeTokens(step.cachedTokens ?? step.cachedReadTokens) + safeTokens(step.cacheWriteTokens);
@@ -1628,7 +1852,8 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     isOrchestrator,
     modelStages,
     defaultFallbackModel: stageFallbackModel,
-  } = resolveContextStagesAndActiveSlot(usageContextEntries, input);
+  } = resolveContextStagesAndActiveSlot(usageContextEntries, input, compactionContextEntries);
+  const activeModelCompactionCount = activeStage.compactionCount ?? 0;
   const peakContextTokens = activeStage.peakContextTokens;
   const capacityTokens = activeStage.capacityTokens;
   const capacityTokensCompact = activeStage.capacityTokensCompact;
@@ -1714,8 +1939,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     (typeof input.modelId === 'string' && input.modelId.trim()) ||
     '';
   const defaultPriceTsSeconds = Math.floor(nowMs / 1000);
-  for (const item of usageStepsForCost) {
-    const step = item.step;
+  const resolveExplicitStepModel = (step: ComputeHudMetricsInput['steps'][number]): string => {
     const resolvedStepGenModel =
       step.generation && (step.generation.responseModel || step.generation.modelDisplayName || step.generation.modelEnum)
         ? resolveDatabaseModelFullName(
@@ -1724,11 +1948,43 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
             step.generation.modelEnum ?? null
           )
         : '';
-    const stepModel =
-      (resolvedStepGenModel && resolvedStepGenModel !== '未知模型' && resolvedStepGenModel !== 'Unknown Model' && resolvedStepGenModel !== bt('usage.unknown_model') ? resolvedStepGenModel : '') ||
+    return (
+      (resolvedStepGenModel &&
+      resolvedStepGenModel !== '未知模型' &&
+      resolvedStepGenModel !== 'Unknown Model' &&
+      resolvedStepGenModel !== bt('usage.unknown_model')
+        ? resolvedStepGenModel
+        : '') ||
       step.generation?.plannerModelName ||
       step.modelName ||
-      (item.isChildStep ? '' : defaultFallbackModel);
+      ''
+    );
+  };
+  let firstExplicitMainStepModel = '';
+  for (const candidate of usageStepsForCost) {
+    if (candidate.isChildStep) continue;
+    const explicit = resolveExplicitStepModel(candidate.step);
+    if (explicit) {
+      firstExplicitMainStepModel = explicit;
+      break;
+    }
+  }
+  let lastExplicitMainStepModel = '';
+  for (const item of usageStepsForCost) {
+    const step = item.step;
+    const explicitStepModel = resolveExplicitStepModel(step);
+    if (!item.isChildStep && explicitStepModel) {
+      lastExplicitMainStepModel = explicitStepModel;
+    }
+    const isLiveLatestStep = Boolean(
+      input.isStreaming && latestStep && step === latestStep && !isStepCompleted(step)
+    );
+    const contextualMainFallback = isLiveLatestStep
+      ? defaultFallbackModel
+      : lastExplicitMainStepModel || firstExplicitMainStepModel || defaultFallbackModel;
+    const stepModel =
+      explicitStepModel ||
+      (item.isChildStep ? '' : contextualMainFallback);
     const stepTs = [
       step.t_start,
       step.startTimeSeconds,
@@ -1905,9 +2161,14 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       return false;
     }
     if (prevTurnBoundarySeconds !== null) {
+      const activeChildNow =
+        availability !== 'cached' && isStepActiveNow(step, isStreaming, allowActiveInference);
+      if (!hasSubagentStepInTurn && !activeChildNow) {
+        return false;
+      }
       if (validSeconds(start)) return start >= prevTurnBoundarySeconds;
       if (validSeconds(end)) return end >= prevTurnBoundarySeconds;
-      return false;
+      return activeChildNow;
     }
     return isSubagentRunning;
   });
@@ -2029,13 +2290,29 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     const completedWallSpan = turnCompletedEnd !== null && turnCompletedEnd > turnWallStart
       ? turnCompletedEnd - turnWallStart
       : 0;
-    // 前台流式中但末步已被中止/取消时视为轮次已终止，不再按挂钟累加；
+    const lastTurnStepType = lastTurnStep ? (lastTurnStep.step_type ?? lastTurnStep.stepType ?? 0) : 0;
+    const lastTurnStepStatus = lastTurnStep?.status ?? 3;
+    const lastTurnExplicitlyClosed =
+      lastTurnStep !== undefined &&
+      lastTurnStepType === 2 &&
+      (lastTurnStepStatus === 3 || lastTurnStepStatus === 5);
+    const lastTurnStepStaleCompleted =
+      lastTurnStep !== undefined &&
+      lastTurnStepType !== 14 &&
+      isStepCompleted(lastTurnStep) &&
+      turnCompletedEnd !== null &&
+      nowSeconds - turnCompletedEnd > TURN_STEP_HANDOFF_GRACE_SEC;
+    // 前台流式中但末步已被中止/取消、轮次已明确收尾 (stepType=2)，或上轮末步已完结且超出步间交接宽限期 (600s) 时，
+    // 视为上轮已终止，不再因前端瞬时 isStreaming 信号或新轮未落盘而把跨轮空闲时间外推累加到上轮用时；
     // 主库处于错误回退缓存态 (availability === 'cached') 时快照已冻结，不再把旧轮起始时间外推到当前时刻。
     const wallClockRunning =
       availability !== 'cached' &&
       (isSubagentRunning ||
         hasActiveStepInTurn ||
-        (isStreaming && (hasSubagentInTurn || !lastTurnStepAborted)));
+        (isStreaming &&
+          !lastTurnStepAborted &&
+          !lastTurnExplicitlyClosed &&
+          !lastTurnStepStaleCompleted));
     if (wallClockRunning) {
       currentTurnDurationSeconds = Math.max(mergedTurnDuration, nowSeconds - turnWallStart, completedWallSpan);
     } else if (completedWallSpan > 0) {
@@ -2203,6 +2480,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       ...(isMultiModel ? { isMultiModel: true } : {}),
       ...(isOrchestrator ? { isOrchestrator: true } : {}),
       ...(sessionPeakContextTokens > 0 ? { sessionPeakContextTokens } : {}),
+      ...(compactionCount > 0 ? { activeModelCompactionCount } : {}),
       ...(modelStages ? { modelStages } : {}),
       usedTokens,
       usedTokensCompact: formatCompactTokenNumber(usedTokens),
@@ -2267,6 +2545,7 @@ interface CachedConversationState {
   hasParentMetadataBlob?: boolean;
   trajectoryId?: string;
   referencedUuidsInMetaBlob: Set<string>;
+  rawSteps: ParsedConversationStep[];
   steps: ParsedConversationStep[];
   childConversationIds: Set<string>;
   verifiedSniffedChildren: Set<string>;
@@ -2522,15 +2801,17 @@ export class ConversationMetricsEngine {
         return parsed;
       };
 
-      const baseSteps: ParsedConversationStep[] =
+      const rawSteps: ParsedConversationStep[] =
         stepsMode === 'append' && existing && prevStepPrefixCutoffIdx !== undefined
-          ? existing.steps
-              .filter(s => s.idx < prevStepPrefixCutoffIdx)
-              .map(s => ({ ...s, generation: undefined }))
+          ? existing.rawSteps.filter(s => s.idx < prevStepPrefixCutoffIdx)
           : [];
       for (const row of appendedSteps) {
-        baseSteps.push(parseStepRow(row));
+        rawSteps.push(parseStepRow(row));
       }
+      const baseSteps: ParsedConversationStep[] = rawSteps.map(s => ({
+        ...s,
+        ...(s.childConversationIds ? { childConversationIds: [...s.childConversationIds] } : {}),
+      }));
       let lastIdx = baseSteps.length > 0 ? baseSteps[baseSteps.length - 1]!.idx : -1;
       if (maxIdx > lastIdx) {
         lastIdx = maxIdx;
@@ -2584,6 +2865,38 @@ export class ConversationMetricsEngine {
         step.executionId === gen.executionId;
 
       // 第 1 遍：精确对齐 steps.metadata.field 9 与 gen_metadata.usage 一致的模型步（1:1 认领，防止同轮多次 API 调用被误吞）
+      const attachCompactionStepModel = (generation: ParsedGenMetadata): void => {
+        if (
+          !(
+            generation.responseModel ||
+            generation.modelDisplayName ||
+            generation.plannerModelName ||
+            generation.modelEnum ||
+            generation.maxContextTokens
+          )
+        ) {
+          return;
+        }
+        const modelOnlyGen: ParsedGenMetadata = {
+          ...(generation.responseModel ? { responseModel: generation.responseModel } : {}),
+          ...(generation.modelDisplayName ? { modelDisplayName: generation.modelDisplayName } : {}),
+          ...(generation.plannerModelName ? { plannerModelName: generation.plannerModelName } : {}),
+          ...(generation.modelEnum ? { modelEnum: generation.modelEnum } : {}),
+          ...(generation.maxContextTokens ? { maxContextTokens: generation.maxContextTokens } : {}),
+        };
+        for (const stepIdx of new Set(generation.stepIndices ?? [])) {
+          const cpStep = stepByIndex.get(stepIdx);
+          if (
+            cpStep &&
+            cpStep.stepType === 23 &&
+            !cpStep.generation &&
+            (!generation.executionId || !cpStep.executionId || cpStep.executionId === generation.executionId)
+          ) {
+            cpStep.generation = modelOnlyGen;
+          }
+        }
+      };
+
       for (const [genIdx, generation] of sortedGenerations) {
         const linked = resolveCandidate15Steps(generation);
         if (generation.usage) {
@@ -2610,13 +2923,14 @@ export class ConversationMetricsEngine {
               exactMatch.generation = canAttachAuthoritativeTiming(generation, linked.length, exactMatch)
                 ? generation
                 : stripTimingFromGeneration(generation);
+              attachCompactionStepModel(generation);
               claimedUsageStepIdxs.add(exactMatch.idx);
               matchedGenIdxs.add(genIdx);
               continue;
             }
           }
         }
-        if (linked.length >= 1 && (generation.responseModel || generation.modelDisplayName || generation.plannerModelName || generation.modelEnum || generation.maxContextTokens)) {
+        if (generation.responseModel || generation.modelDisplayName || generation.plannerModelName || generation.modelEnum || generation.maxContextTokens) {
           const modelOnlyGen: ParsedGenMetadata = {
             ...(generation.responseModel ? { responseModel: generation.responseModel } : {}),
             ...(generation.modelDisplayName ? { modelDisplayName: generation.modelDisplayName } : {}),
@@ -2629,6 +2943,7 @@ export class ConversationMetricsEngine {
               step.generation = modelOnlyGen;
             }
           }
+          attachCompactionStepModel(generation);
         }
       }
 
@@ -2774,6 +3089,7 @@ export class ConversationMetricsEngine {
         hasParentMetadataBlob,
         trajectoryId,
         referencedUuidsInMetaBlob,
+        rawSteps,
         steps: baseSteps,
         childConversationIds,
         verifiedSniffedChildren,
@@ -2888,7 +3204,6 @@ export class ConversationMetricsEngine {
       !dbPathOverride &&
       !(isSubagentRunning || hasActiveSubagentStep) &&
       hasSubagentEvidenceInMain &&
-      candidateChildIds.size === 0 &&
       (!coldSniffRec || coldSniffRec.fileId !== mainState.fileId || coldSniffRec.stepCount !== mainState.steps.length);
     if (!dbPathOverride && (isSubagentRunning || hasActiveSubagentStep || needsColdHistoricalSniff)) {
       try {
@@ -2897,9 +3212,10 @@ export class ConversationMetricsEngine {
             const dirStat = await lstat(this.conversationsDir).catch(() => null);
             const dirMtimeMs = dirStat?.mtimeMs ?? -1;
             const checkNow = Date.now();
+            const sniffCacheWindowMs = isSubagentRunning || hasActiveSubagentStep ? 800 : 2500;
             if (
               this.sniffDirCache &&
-              checkNow - this.sniffDirCache.at < 2500 &&
+              checkNow - this.sniffDirCache.at < sniffCacheWindowMs &&
               this.sniffDirCache.dirMtimeMs === dirMtimeMs
             ) {
               return this.sniffDirCache.allEntries;
@@ -3113,21 +3429,23 @@ export class ConversationMetricsEngine {
               }
             }
             if (childActive) {
-              if (
-                this.recentActiveChildUntilByDb.size >= MAX_CACHED_CONVERSATIONS * 2 &&
-                !this.recentActiveChildUntilByDb.has(item.childDbPath)
-              ) {
+              if (this.recentActiveChildUntilByDb.has(item.childDbPath)) {
+                this.recentActiveChildUntilByDb.delete(item.childDbPath);
+              } else if (this.recentActiveChildUntilByDb.size >= MAX_CACHED_CONVERSATIONS * 2) {
                 const oldestActiveKey = this.recentActiveChildUntilByDb.keys().next().value;
                 if (oldestActiveKey !== undefined) this.recentActiveChildUntilByDb.delete(oldestActiveKey);
               }
               this.recentActiveChildUntilByDb.set(item.childDbPath, nowMs + 12_000);
+  // 在活跃多子智能体并行期内，只要还有兄弟子库真正处于运行中且主库无否定收尾，保留刚写入且无 step_type=2 终结符的子库短过渡窗（仅防 15s 步间落库抖动，避免兄弟已彻底落定很久后拖尾虚高）
             } else if (!childTurnTerminated && childState.steps.length > 0) {
               const holdUntil = this.recentActiveChildUntilByDb.get(item.childDbPath) ?? 0;
+              const parentCorroboratesActive = Boolean(isSubagentRunning || hasActiveSubagentStep);
               const childMidStepTransition =
-                nowMs - latestChildMtime <= 15_000 &&
-                (isSubagentRunning || hasActiveSubagentStep);
-              if (holdUntil > nowMs || childMidStepTransition) {
+                nowMs - latestChildMtime <= 15_000 && parentCorroboratesActive;
+              if ((holdUntil > nowMs && parentCorroboratesActive) || childMidStepTransition) {
                 childActive = true;
+              } else if (holdUntil > 0 && !parentCorroboratesActive) {
+                this.recentActiveChildUntilByDb.delete(item.childDbPath);
               }
             } else if (childTurnTerminated) {
               this.recentActiveChildUntilByDb.delete(item.childDbPath);

@@ -269,6 +269,7 @@ export class HudInstance {
     this.languageMode = this.locale === 'zh-Hans' ? 'zh' : this.locale;
     this.onBridgeEvent = typeof options.onBridgeEvent === 'function' ? options.onBridgeEvent : null;
     this.allocateRevision = typeof options.allocateRevision === 'function' ? options.allocateRevision : null;
+    this.onVisibilityResume = typeof options.onVisibilityResume === 'function' ? options.onVisibilityResume : null;
     this.currentConvId = null;
     this.sessionRevision = 0;
     this.lastMetricsSequence = 0;
@@ -310,6 +311,8 @@ export class HudInstance {
     this.toolClockAnchor = null;
     this.turnHighWaterMark = null;
     this.frozenClockSnapshot = null;
+    this.settledIdleTurnState = null;
+    this.streamResumeAtMs = 0;
     this.lastMetrics = createDefaultMetrics('default', 0);
   }
 
@@ -317,6 +320,8 @@ export class HudInstance {
     this.stopTurnClock();
     this.turnHighWaterMark = null;
     this.frozenClockSnapshot = null;
+    this.settledIdleTurnState = null;
+    this.streamResumeAtMs = 0;
     this.currentConvId = null;
     this.currentModelId = '';
     this.domIsStreaming = false;
@@ -380,6 +385,7 @@ export class HudInstance {
       this.stopTurnClock();
       this.turnHighWaterMark = null;
       this.frozenClockSnapshot = null;
+      this.settledIdleTurnState = null;
       this.backendIsSubagentRunning = false;
       this.backendRunningSubagentCount = 0;
       this.backendActivityPhase = null;
@@ -387,6 +393,7 @@ export class HudInstance {
       this.runningSubagentCount = this.domRunningSubagentCount;
       this.isStreaming = this.domIsStreaming;
       this.hasActiveWork = Boolean(this.domIsStreaming || this.isSubagentRunning);
+      this.streamResumeAtMs = this.hasActiveWork ? Date.now() : 0;
       this.activityPhase = this.computeMergedActivityPhase();
       this.sessionRevision = this.allocateRevision
         ? Math.max(this.sessionRevision + 1, this.allocateRevision())
@@ -402,6 +409,7 @@ export class HudInstance {
       this.syncStreamingClass();
       this.emitBridgeEvent('SESSION_ATTACHED');
     } else {
+      const wasActiveWork = this.hasActiveWork;
       this.isSubagentRunning = Boolean(this.domIsSubagentRunning || this.backendIsSubagentRunning);
       this.runningSubagentCount = Math.max(
         this.domRunningSubagentCount,
@@ -414,6 +422,9 @@ export class HudInstance {
           (this.lastMetrics?.session?.activeModelStepCount || 0) > 0 ||
           (this.lastMetrics?.session?.activeToolStepCount || 0) > 0
       );
+      if (!wasActiveWork && this.hasActiveWork) {
+        this.streamResumeAtMs = Date.now();
+      }
       this.activityPhase = this.computeMergedActivityPhase();
       this.syncStreamingClass();
     }
@@ -468,6 +479,7 @@ export class HudInstance {
       nextDomSubagentCount !== this.domRunningSubagentCount ||
       childIdsChanged
     ) {
+      const wasActiveWork = this.hasActiveWork;
       if (
         (this.domActivityPhase === 'executing' && nextDomPhase === 'generating') ||
         nextDomPhase === 'idle'
@@ -491,6 +503,9 @@ export class HudInstance {
           (this.lastMetrics?.session?.activeModelStepCount || 0) > 0 ||
           (this.lastMetrics?.session?.activeToolStepCount || 0) > 0
       );
+      if (!wasActiveWork && this.hasActiveWork) {
+        this.streamResumeAtMs = Date.now();
+      }
       this.activityPhase = this.computeMergedActivityPhase();
       if (!this.hasActiveWork) {
         this.freezeActiveClocksForPendingIdle();
@@ -513,6 +528,32 @@ export class HudInstance {
     return changed;
   }
 
+  isSameOrMigratedFirstTurn(hw, turns, refSec = null) {
+    return Boolean(
+      hw &&
+        (hw.turns === turns ||
+          (hw.turns === 0 && turns === 1 && (refSec === null || refSec < hw.seconds)))
+    );
+  }
+
+  isAwaitingPostIdleNewTurnFlush(metrics) {
+    const s = metrics?.session || {};
+    const rawTurns = isRawNumber(s.turns) ? s.turns : 0;
+    const rawSteps = isRawNumber(s.steps) ? s.steps : 0;
+    const settled = this.settledIdleTurnState;
+    return Boolean(
+      this.domIsStreaming &&
+        !this.isSubagentRunning &&
+        !metrics?.isSubagentRunning &&
+        settled &&
+        settled.convId === this.currentConvId &&
+        settled.turns === rawTurns &&
+        rawSteps <= settled.steps &&
+        !(Number(s.activeModelStepCount) > 0) &&
+        !(Number(s.activeToolStepCount) > 0)
+    );
+  }
+
   /**
    * 当 DOM 先检测到轮次暂停/结束而后端权威包尚未抵达时，停止本地定时器并冻结当前高水位，
    * 避免立刻用过期的 this.lastMetrics 刷旧 DOM，等待真实 updateMetrics 到来后再统一校准或恢复。
@@ -521,21 +562,24 @@ export class HudInstance {
     const nowMs = Date.now();
     const s = this.lastMetrics?.session || {};
     const turns = this.turnClockAnchor?.turns ?? (isRawNumber(s.turns) ? s.turns : 0);
+    const cappedBackendSec = isRawNumber(s.currentTurnDurationSeconds)
+      ? this.capPostIdleBackendTurnSec(s.currentTurnDurationSeconds, this.lastMetrics, nowMs)
+      : 0;
+    const matchesTurn = (hw) => this.isSameOrMigratedFirstTurn(hw, turns, cappedBackendSec);
     const hasSubagent = Boolean(
       this.isSubagentRunning ||
       this.lastMetrics?.isSubagentRunning ||
-      s.hasSubagentInTurn === true ||
       (isRawNumber(s.runningSubagentCount) && s.runningSubagentCount > 0) ||
-      (this.turnHighWaterMark && this.turnHighWaterMark.turns === turns && this.turnHighWaterMark.hasSubagent)
+      (matchesTurn(this.turnHighWaterMark) && this.turnHighWaterMark.hasSubagent)
     );
     const liveTurnSec = this.turnClockAnchor
       ? Math.max(
           this.turnClockAnchor.baseSeconds + (nowMs - this.turnClockAnchor.anchorMs) / 1000,
-          this.turnHighWaterMark?.turns === turns ? (this.turnHighWaterMark.seconds ?? 0) : 0
+          matchesTurn(this.turnHighWaterMark) ? (this.turnHighWaterMark.seconds ?? 0) : 0
         )
       : Math.max(
           this.frozenClockSnapshot?.convId === this.currentConvId ? (this.frozenClockSnapshot?.turnSeconds ?? 0) : 0,
-          isRawNumber(s.currentTurnDurationSeconds) ? s.currentTurnDurationSeconds : 0
+          cappedBackendSec
         );
     const liveModelSec = this.modelClockAnchor
       ? this.getLiveClockSeconds(this.modelClockAnchor, nowMs)
@@ -560,7 +604,7 @@ export class HudInstance {
       hasSubagent,
     };
     if (this.turnClockAnchor || this.turnHighWaterMark) {
-      const prevHigh = this.turnHighWaterMark && this.turnHighWaterMark.turns === turns ? this.turnHighWaterMark.seconds : 0;
+      const prevHigh = matchesTurn(this.turnHighWaterMark) ? this.turnHighWaterMark.seconds : 0;
       this.turnHighWaterMark = {
         turns,
         seconds: Math.max(liveTurnSec, prevHigh),
@@ -678,8 +722,92 @@ export class HudInstance {
       runningSubagentCount: mergedSubagentCount,
     };
     if (!this.hasActiveWork) {
-      // 收到后端权威 idle 确认包，解除挂起冻结态，允许收敛到数据库权威耗时（子智能体高水位仍由 turnHighWaterMark 保护）
+      // 收到后端权威 idle 确认包，解除挂起冻结态，停用旧轮跑表并按子智能体防闪烁/无时间戳中止兜底规则精准收敛
+      this.stopTurnClock();
       this.frozenClockSnapshot = null;
+      this.streamResumeAtMs = 0;
+      if (
+        metrics.availability !== 'cached' &&
+        isRawNumber(metrics.session?.currentTurnDurationSeconds)
+      ) {
+        const rawTurns = isRawNumber(metrics.session?.turns) ? metrics.session.turns : 0;
+        const rawSteps = isRawNumber(metrics.session?.steps) ? metrics.session.steps : 0;
+        const rawBackendSec = Math.max(0, metrics.session.currentTurnDurationSeconds);
+        if (
+          this.turnHighWaterMark &&
+          this.turnHighWaterMark.turns === 0 &&
+          rawTurns === 1 &&
+          rawBackendSec < this.turnHighWaterMark.seconds
+        ) {
+          this.turnHighWaterMark.turns = 1;
+        }
+        const prevSettled =
+          this.settledIdleTurnState &&
+          this.settledIdleTurnState.convId === this.currentConvId &&
+          this.settledIdleTurnState.turns === rawTurns &&
+          rawSteps <= this.settledIdleTurnState.steps
+            ? this.settledIdleTurnState
+            : null;
+        if (prevSettled) {
+          const isLateAbortedZeroResolution =
+            metrics.session?.turnAborted === true &&
+            prevSettled.hadAbortedZeroFallback === true &&
+            rawBackendSec > 0;
+          const floorSec = isLateAbortedZeroResolution
+            ? rawBackendSec
+            : Math.max(rawBackendSec, prevSettled.floorSec);
+          const keepSubagentFloor = Boolean(
+            prevSettled.hasSubagent && floorSec > rawBackendSec + 1e-6
+          );
+          const keepAbortedFloor = Boolean(
+            metrics.session?.turnAborted === true &&
+              rawBackendSec <= 0 &&
+              floorSec > rawBackendSec + 1e-6
+          );
+          this.turnHighWaterMark = keepSubagentFloor || keepAbortedFloor
+            ? { turns: rawTurns, seconds: floorSec, hasSubagent: keepSubagentFloor }
+            : null;
+          this.settledIdleTurnState = {
+            convId: this.currentConvId,
+            turns: rawTurns,
+            steps: Math.max(prevSettled.steps, rawSteps),
+            floorSec,
+            hasSubagent: keepSubagentFloor,
+            hadAbortedZeroFallback: keepAbortedFloor,
+          };
+        } else {
+          const hwMatchesTurn =
+            this.turnHighWaterMark && this.turnHighWaterMark.turns === rawTurns;
+          const isTrueSubagentGap = Boolean(
+            hwMatchesTurn &&
+              this.turnHighWaterMark.hasSubagent &&
+              rawBackendSec < this.turnHighWaterMark.seconds - 1e-6 &&
+              metrics.session?.hasSubagentInTurn !== true &&
+              (Number(metrics.session?.subagentCount) || 0) <= 1 &&
+              (Number(metrics.session?.turns) || 0) === 0
+          );
+          const keepAbortedZeroFallback = Boolean(
+            hwMatchesTurn &&
+              metrics.session?.turnAborted === true &&
+              rawBackendSec <= 0
+          );
+          if (!mergedSubagentRunning && !isTrueSubagentGap && !keepAbortedZeroFallback) {
+            this.turnHighWaterMark = null;
+          }
+          const floorSec =
+            (isTrueSubagentGap || keepAbortedZeroFallback) && this.turnHighWaterMark
+              ? Math.max(rawBackendSec, this.turnHighWaterMark.seconds)
+              : rawBackendSec;
+          this.settledIdleTurnState = {
+            convId: this.currentConvId,
+            turns: rawTurns,
+            steps: rawSteps,
+            floorSec,
+            hasSubagent: isTrueSubagentGap,
+            hadAbortedZeroFallback: keepAbortedZeroFallback,
+          };
+        }
+      }
     }
     this.applyMetricsToDom(this.lastMetrics);
     return true;
@@ -872,6 +1000,13 @@ export class HudInstance {
 
     const doc = targetComposer.ownerDocument || (typeof document !== 'undefined' ? document : null);
     if (!doc) return;
+
+    if (this.host) {
+      try {
+        this.host.remove?.();
+      } catch {}
+      this.host = null;
+    }
 
     this.host = doc.createElement('div');
     this.host.id = this.isPrimaryPane
@@ -1316,8 +1451,10 @@ export class HudInstance {
     const activeSubagentsPop = formatDetailCompactNumber(activeSubagents);
     const subStepsCount = Math.max(0, Number(this.lastMetrics?.session?.subagentSteps) || 0);
     const subStepsPop = formatDetailCompactNumber(subStepsCount);
-    const subStepSuffix =
+    const rawSubSuffix =
       subStepsCount > 0 ? this.t('subStepsSuffix', { steps: subStepsPop }) : '';
+    const subStepSuffix =
+      this.locale === 'en' ? rawSubSuffix.replace(/\b1 steps\b/g, '1 step') : rawSubSuffix;
 
     this.syncSubagentTagElement(this.isSubagentRunning, activeSubagentsBar, activeSubagents);
     if (this.isSubagentRunning) {
@@ -1496,45 +1633,86 @@ export class HudInstance {
     return true;
   }
 
+  capPostIdleBackendTurnSec(rawBackendSec, metrics, nowMs = Date.now()) {
+    if (!isRawNumber(rawBackendSec)) return rawBackendSec;
+    const s = metrics?.session || {};
+    const rawTurns = isRawNumber(s.turns) ? s.turns : 0;
+    const rawSteps = isRawNumber(s.steps) ? s.steps : 0;
+    const settled = this.settledIdleTurnState;
+    if (
+      settled &&
+      settled.convId === this.currentConvId &&
+      settled.turns === rawTurns &&
+      rawSteps <= settled.steps &&
+      !(Number(s.activeModelStepCount) > 0) &&
+      !(Number(s.activeToolStepCount) > 0) &&
+      !this.isSubagentRunning &&
+      !metrics?.isSubagentRunning
+    ) {
+      const elapsedSinceResume =
+        this.streamResumeAtMs > 0 ? Math.max(0, (nowMs - this.streamResumeAtMs) / 1000) : 0;
+      if (this.isAwaitingPostIdleNewTurnFlush(metrics)) {
+        return elapsedSinceResume;
+      }
+      return Math.min(rawBackendSec, settled.floorSec + elapsedSinceResume);
+    }
+    return rawBackendSec;
+  }
+
   syncTurnClock(metrics, isWorkingNow) {
     const s = metrics?.session || {};
-    const backendSec = isRawNumber(s.currentTurnDurationSeconds) ? Math.max(0, s.currentTurnDurationSeconds) : 0;
+    const nowMs = Date.now();
+    const rawBackendSec = isRawNumber(s.currentTurnDurationSeconds) ? Math.max(0, s.currentTurnDurationSeconds) : 0;
+    const awaitingNewTurnFlush = isWorkingNow && this.isAwaitingPostIdleNewTurnFlush(metrics);
+    const backendSec = isWorkingNow
+      ? this.capPostIdleBackendTurnSec(rawBackendSec, metrics, nowMs)
+      : rawBackendSec;
     const turns = isRawNumber(s.turns) ? s.turns : 0;
+    const matchesTurnOrZeroToOne = (hw) =>
+      this.isSameOrMigratedFirstTurn(hw, turns, backendSec);
     const hasSubagentInTurn = Boolean(
       this.isSubagentRunning ||
       metrics?.isSubagentRunning ||
-      s.hasSubagentInTurn === true ||
       (isRawNumber(s.runningSubagentCount) && s.runningSubagentCount > 0) ||
-      (this.turnHighWaterMark && this.turnHighWaterMark.turns === turns && this.turnHighWaterMark.hasSubagent)
+      (matchesTurnOrZeroToOne(this.turnHighWaterMark) && this.turnHighWaterMark.hasSubagent)
     );
     if (!isWorkingNow || !this.shadow) {
       if (this.turnClockAnchor) {
-        const liveSec = this.turnClockAnchor.baseSeconds + (Date.now() - this.turnClockAnchor.anchorMs) / 1000;
-        const prevHigh = this.turnHighWaterMark && this.turnHighWaterMark.turns === turns
-          ? this.turnHighWaterMark.seconds
-          : 0;
-        this.turnHighWaterMark = {
-          turns,
-          seconds: Math.max(backendSec, liveSec, prevHigh),
-          hasSubagent: hasSubagentInTurn,
-        };
+        if (!this.turnClockAnchor.awaitingNewTurnFlush) {
+          const liveSec = this.turnClockAnchor.baseSeconds + (nowMs - this.turnClockAnchor.anchorMs) / 1000;
+          const prevHigh = matchesTurnOrZeroToOne(this.turnHighWaterMark)
+            ? this.turnHighWaterMark.seconds
+            : 0;
+          this.turnHighWaterMark = {
+            turns,
+            seconds: Math.max(backendSec, liveSec, prevHigh),
+            hasSubagent: hasSubagentInTurn,
+          };
+        }
       }
       this.stopTurnClock();
       return;
     }
-    const nowMs = Date.now();
     const frozenMatch =
+      !awaitingNewTurnFlush &&
       this.frozenClockSnapshot &&
       this.frozenClockSnapshot.convId === this.currentConvId &&
-      (this.frozenClockSnapshot.turns === turns ||
-        (this.frozenClockSnapshot.turns === 0 && turns === 1 && backendSec < this.frozenClockSnapshot.turnSeconds));
+      this.isSameOrMigratedFirstTurn(
+        { turns: this.frozenClockSnapshot.turns, seconds: this.frozenClockSnapshot.turnSeconds },
+        turns,
+        backendSec
+      );
     const frozenTurnFloor = frozenMatch ? this.frozenClockSnapshot.turnSeconds : 0;
     const frozenModelFloor =
-      this.frozenClockSnapshot && this.frozenClockSnapshot.convId === this.currentConvId
+      !awaitingNewTurnFlush &&
+      this.frozenClockSnapshot &&
+      this.frozenClockSnapshot.convId === this.currentConvId
         ? this.frozenClockSnapshot.modelSeconds
         : 0;
     const frozenToolFloor =
-      this.frozenClockSnapshot && this.frozenClockSnapshot.convId === this.currentConvId
+      !awaitingNewTurnFlush &&
+      this.frozenClockSnapshot &&
+      this.frozenClockSnapshot.convId === this.currentConvId
         ? this.frozenClockSnapshot.toolSeconds
         : 0;
     const modelBase = isRawNumber(s.modelDurationSeconds) ? Math.max(0, s.modelDurationSeconds) : 0;
@@ -1550,7 +1728,7 @@ export class HudInstance {
     const isOptimisticBoot =
       this.domIsStreaming &&
       !this.isSubagentRunning &&
-      ((modelBackendTotal === 0 && toolBackendTotal === 0) || s.awaitingFirstTurnStep === true);
+      ((modelBackendTotal === 0 && toolBackendTotal === 0) || s.awaitingFirstTurnStep === true || awaitingNewTurnFlush);
     if (modelRate === 0 && toolRate === 0 && isOptimisticBoot) {
       if (this.activityPhase === 'executing') toolRate = 1;
       else modelRate = 1;
@@ -1560,24 +1738,42 @@ export class HudInstance {
 
     if (!this.turnClockAnchor) {
       const sameTurnResumeFloor =
-        this.turnHighWaterMark &&
-        this.turnHighWaterMark.turns === turns
+        !awaitingNewTurnFlush && matchesTurnOrZeroToOne(this.turnHighWaterMark)
           ? this.turnHighWaterMark.seconds
           : 0;
       const startSec = Math.max(backendSec, sameTurnResumeFloor, frozenTurnFloor);
-      this.turnClockAnchor = { baseSeconds: startSec, anchorMs: nowMs, turns, lastRenderedSec: Math.round(startSec) };
+      this.turnClockAnchor = {
+        baseSeconds: startSec,
+        anchorMs: nowMs,
+        turns,
+        lastRenderedSec: Math.round(startSec),
+        ...(awaitingNewTurnFlush ? { awaitingNewTurnFlush: true } : {}),
+      };
     } else if (turns > this.turnClockAnchor.turns) {
       const liveSec = this.turnClockAnchor.baseSeconds + (nowMs - this.turnClockAnchor.anchorMs) / 1000;
-      if (this.turnClockAnchor.turns === 0 && turns === 1 && backendSec < liveSec) {
-        // Delayed SQLite flush of turn 1's USER_INPUT row mid-turn: keep live timer uninterrupted.
+      if (
+        (this.turnClockAnchor.turns === 0 && turns === 1 && backendSec < liveSec) ||
+        (this.turnClockAnchor.awaitingNewTurnFlush && backendSec <= liveSec + 1.5)
+      ) {
+        // Delayed SQLite flush of new turn's USER_INPUT row mid-turn: keep live optimistic timer uninterrupted.
         this.turnClockAnchor.turns = turns;
+        delete this.turnClockAnchor.awaitingNewTurnFlush;
+        if (this.turnHighWaterMark && this.turnHighWaterMark.turns === 0) {
+          this.turnHighWaterMark.turns = turns;
+        }
       } else {
         this.turnClockAnchor = { baseSeconds: backendSec, anchorMs: nowMs, turns, lastRenderedSec: Math.round(backendSec) };
         this.turnHighWaterMark = null;
       }
     } else {
+      if (!awaitingNewTurnFlush && this.turnClockAnchor.awaitingNewTurnFlush) {
+        delete this.turnClockAnchor.awaitingNewTurnFlush;
+      }
       const liveSec = this.turnClockAnchor.baseSeconds + (nowMs - this.turnClockAnchor.anchorMs) / 1000;
-      const highFloor = this.turnHighWaterMark && this.turnHighWaterMark.turns === turns ? this.turnHighWaterMark.seconds : 0;
+      const highFloor =
+        !awaitingNewTurnFlush && matchesTurnOrZeroToOne(this.turnHighWaterMark)
+          ? this.turnHighWaterMark.seconds
+          : 0;
       const effectiveLive = Math.max(liveSec, highFloor);
       if (
         backendSec > effectiveLive + 0.5 ||
@@ -1592,15 +1788,17 @@ export class HudInstance {
       }
     }
     this.frozenClockSnapshot = null;
-    const currentLive = this.turnClockAnchor.baseSeconds + (nowMs - this.turnClockAnchor.anchorMs) / 1000;
-    const prevHigh = this.turnHighWaterMark && this.turnHighWaterMark.turns === turns
-      ? this.turnHighWaterMark.seconds
-      : 0;
-    this.turnHighWaterMark = {
-      turns,
-      seconds: Math.max(backendSec, currentLive, prevHigh),
-      hasSubagent: hasSubagentInTurn,
-    };
+    if (!awaitingNewTurnFlush) {
+      const currentLive = this.turnClockAnchor.baseSeconds + (nowMs - this.turnClockAnchor.anchorMs) / 1000;
+      const prevHigh = matchesTurnOrZeroToOne(this.turnHighWaterMark)
+        ? this.turnHighWaterMark.seconds
+        : 0;
+      this.turnHighWaterMark = {
+        turns,
+        seconds: Math.max(backendSec, currentLive, prevHigh),
+        hasSubagent: hasSubagentInTurn,
+      };
+    }
     if (!this.turnClockTimer) {
       this.turnClockTimer = setInterval(() => this.tickTurnClock(), 250);
       if (typeof this.turnClockTimer?.unref === 'function') {
@@ -1683,12 +1881,15 @@ export class HudInstance {
       );
     }
     const anchorTurnSec = this.turnClockAnchor.baseSeconds + (nowMs - this.turnClockAnchor.anchorMs) / 1000;
-    const highTurnSec =
-      this.turnHighWaterMark && this.turnHighWaterMark.turns === this.turnClockAnchor.turns
-        ? this.turnHighWaterMark.seconds
-        : 0;
+    const highTurnSec = this.isSameOrMigratedFirstTurn(
+      this.turnHighWaterMark,
+      this.turnClockAnchor.turns,
+      anchorTurnSec
+    )
+      ? this.turnHighWaterMark.seconds
+      : 0;
     const elapsedSec = Math.max(anchorTurnSec, highTurnSec);
-    if (this.turnHighWaterMark && this.turnHighWaterMark.turns === this.turnClockAnchor.turns) {
+    if (!this.turnClockAnchor.awaitingNewTurnFlush && highTurnSec > 0 && this.turnHighWaterMark) {
       this.turnHighWaterMark.seconds = Math.max(this.turnHighWaterMark.seconds, elapsedSec);
     }
     const roundedSec = Math.max(0, Math.round(elapsedSec));
@@ -1773,24 +1974,44 @@ export class HudInstance {
     const stepsPopCount = formatDetailCompactNumber(rawSteps);
     const activeSubagentsBar = formatBarCompactCount(activeSubagents);
     const isWorkingNow = Boolean(this.hasActiveWork || this.isStreaming || this.isSubagentRunning);
-    const clockActive = isWorkingNow && !unavailable && metrics.availability !== 'cached';
+    const awaitingNewTurnFlush = isWorkingNow && this.isAwaitingPostIdleNewTurnFlush(metrics);
+    const clockActive =
+      isWorkingNow &&
+      !unavailable &&
+      (metrics.availability !== 'cached' || Boolean(this.turnClockAnchor));
     this.syncTurnClock(metrics, clockActive);
     const clockNowMs = Date.now();
-    const rawBackendTurnSec = isRawNumber(s.currentTurnDurationSeconds) ? Math.max(0, s.currentTurnDurationSeconds) : null;
-    const highWaterCandidate =
+    const rawBackendTurnSec = isRawNumber(s.currentTurnDurationSeconds)
+      ? (isWorkingNow
+          ? this.capPostIdleBackendTurnSec(Math.max(0, s.currentTurnDurationSeconds), metrics, clockNowMs)
+          : Math.max(0, s.currentTurnDurationSeconds))
+      : null;
+    const hwMatchesRawTurns =
+      !awaitingNewTurnFlush &&
+      this.isSameOrMigratedFirstTurn(this.turnHighWaterMark, rawTurns, rawBackendTurnSec);
+    const frozenMatchesRawTurns = Boolean(
       !isWorkingNow &&
-      this.turnHighWaterMark &&
-      this.turnHighWaterMark.turns === rawTurns
-        ? this.turnHighWaterMark.seconds
-        : 0;
+        this.frozenClockSnapshot &&
+        this.frozenClockSnapshot.convId === this.currentConvId &&
+        this.isSameOrMigratedFirstTurn(
+          { turns: this.frozenClockSnapshot.turns, seconds: this.frozenClockSnapshot.turnSeconds },
+          rawTurns,
+          rawBackendTurnSec
+        )
+    );
+    const frozenTurnSec = frozenMatchesRawTurns ? this.frozenClockSnapshot.turnSeconds : 0;
+    const highWaterCandidate =
+      !isWorkingNow && hwMatchesRawTurns ? this.turnHighWaterMark.seconds : 0;
     const sameTurnFloor =
-      highWaterCandidate > 0 &&
-      (this.turnHighWaterMark?.hasSubagent ||
-        s.turnAborted === true ||
-        rawBackendTurnSec === null ||
-        highWaterCandidate - rawBackendTurnSec > 1.5)
-        ? highWaterCandidate
-        : 0;
+      Math.max(
+        frozenTurnSec,
+        highWaterCandidate > 0 &&
+          (this.turnHighWaterMark?.hasSubagent ||
+            (s.turnAborted === true && (rawBackendTurnSec === null || rawBackendTurnSec <= 0)) ||
+            rawBackendTurnSec === null)
+          ? highWaterCandidate
+          : 0
+      );
     const effectiveIdleTurnSec =
       rawBackendTurnSec !== null
         ? Math.max(rawBackendTurnSec, sameTurnFloor)
@@ -1800,16 +2021,18 @@ export class HudInstance {
     const liveElapsedSec = clockActive && this.turnClockAnchor
       ? Math.max(
           this.turnClockAnchor.baseSeconds + (clockNowMs - this.turnClockAnchor.anchorMs) / 1000,
-          this.turnHighWaterMark && this.turnHighWaterMark.turns === rawTurns
-            ? this.turnHighWaterMark.seconds
-            : 0
+          hwMatchesRawTurns ? this.turnHighWaterMark.seconds : 0
         )
       : effectiveIdleTurnSec;
     const liveModelSec = clockActive && this.modelClockAnchor
       ? this.getLiveClockSeconds(this.modelClockAnchor, clockNowMs)
+      : frozenMatchesRawTurns
+      ? Math.max(Number(s.modelDurationSeconds || 0), this.frozenClockSnapshot.modelSeconds)
       : s.modelDurationSeconds;
     const liveToolSec = clockActive && this.toolClockAnchor
       ? this.getLiveClockSeconds(this.toolClockAnchor, clockNowMs)
+      : frozenMatchesRawTurns
+      ? Math.max(Number(s.toolDurationSeconds || 0), this.frozenClockSnapshot.toolSeconds)
       : s.toolDurationSeconds;
     if (this.turnClockAnchor && isRawNumber(liveElapsedSec)) {
       this.turnClockAnchor.lastRenderedSec = Math.max(
@@ -1888,8 +2111,15 @@ export class HudInstance {
     const ctxTxtEl = q('#hud-txt-context');
     const meterFillEl = q('#hud-meter-fill');
     const stages = Array.isArray(c.modelStages) ? c.modelStages : [];
-    const showMultiModel = !unavailable && Boolean(c.isMultiModel && stages.length > 0 && c.modelShortLabel);
-    const compCount = Math.max(0, Math.floor(Number(s.compactionCount) || 0));
+    const isOrchestratorMode = Boolean(c.isOrchestrator);
+    const visibleStages = isOrchestratorMode
+      ? stages
+      : stages.filter((st) => st && !st.isActive);
+    const rawShortLabel = String(
+      c.modelShortLabel || formatConciseStageModelName(c.modelDisplayName || '') || c.modelId || ''
+    ).trim();
+    const showMultiModel = !unavailable && Boolean(c.isMultiModel && visibleStages.length > 0 && rawShortLabel);
+    const compCount = unavailable ? 0 : Math.max(0, Math.floor(Number(s.compactionCount) || 0));
     if (compBadgeEl) {
       compBadgeEl.classList?.remove('is-compaction-low', 'is-compaction-warn', 'is-compaction-danger');
       if (compCount >= 1) {
@@ -1901,8 +2131,8 @@ export class HudInstance {
         compBadgeEl.classList?.add(`is-compaction-${compTier}`);
         compBadgeEl.setAttribute(
           'aria-label',
-          !isZh && compCount === 1
-            ? 'Compacted once'
+          compCount === 1
+            ? this.t('compactionAriaOnce')
             : this.t('compactionAria', { count: compBarText })
         );
         ctxCapsule?.classList?.add('has-compaction');
@@ -1916,7 +2146,7 @@ export class HudInstance {
     }
     if (modelTagEl) {
       if (showMultiModel) {
-        const shortLbl = String(c.modelShortLabel || '');
+        const shortLbl = rawShortLabel;
         const compactLbl = String(c.modelCompactLabel || shortLbl.charAt(0).toUpperCase() || '');
         setElText(modelFullEl, shortLbl);
         setElText(modelShortEl, compactLbl);
@@ -2061,16 +2291,18 @@ export class HudInstance {
     q('#val-tps-latest')?.setAttribute('aria-description', this.t('descTpsLatest'));
 
     const subagentRow = q('#row-subagent-status');
+    setTxt('#lbl-subagent-status', this.t('lblSubagentStatus'));
     const subStepsCount = Math.max(0, Number(s.subagentSteps) || 0);
     const subStepsPop = formatDetailCompactNumber(subStepsCount);
     const activeSubagentsPop = formatDetailCompactNumber(activeSubagents);
     const totalSubagentsPop = formatDetailCompactNumber(totalSubagents);
-    const subStepSuffix =
+    const rawSubSuffix =
       subStepsCount > 0 ? this.t('subStepsSuffix', { steps: subStepsPop }) : '';
+    const subStepSuffix =
+      this.locale === 'en' ? rawSubSuffix.replace(/\b1 steps\b/g, '1 step') : rawSubSuffix;
     if (subagentRow) {
       if (subagentRunning || totalSubagents > 0) {
         subagentRow.removeAttribute('hidden');
-        setTxt('#lbl-subagent-status', this.t('lblSubagentStatus'));
         if (subagentRunning) {
           setTxt(
             '#val-subagent-status',
@@ -2084,6 +2316,7 @@ export class HudInstance {
         }
       } else {
         subagentRow.setAttribute('hidden', '');
+        setTxt('#val-subagent-status', '—');
       }
     }
 
@@ -2097,32 +2330,34 @@ export class HudInstance {
     setTxt('#lbl-cached-read', this.t('lblCachedRead'));
     setTxt('#val-cached-read', formatTokenCount(t.cachedReadTokens, t.cachedReadFormatted));
     const cacheWriteRow = q('#row-cache-write');
+    setTxt('#lbl-cache-write', this.t('lblCacheWrite'));
     if (cacheWriteRow) {
       if (Number(t.cacheWriteTokens) > 0) {
         cacheWriteRow.removeAttribute('hidden');
-        setTxt('#lbl-cache-write', this.t('lblCacheWrite'));
         setTxt(
           '#val-cache-write',
           formatTokenCount(t.cacheWriteTokens, t.cacheWriteFormatted)
         );
       } else {
         cacheWriteRow.setAttribute('hidden', '');
+        setTxt('#val-cache-write', '0 tok');
       }
     }
     setTxt('#lbl-output-tok', this.t('lblOutputTok'));
     setTxt('#val-output-tok', formatTokenCount(t.outputTokens, t.outputFormatted));
 
     const reasoningRow = q('#row-reasoning-tok');
+    setTxt('#lbl-reasoning-tok', this.t('lblReasoningTok'));
     if (reasoningRow) {
       if (Number(t.reasoningTokens) > 0) {
         reasoningRow.removeAttribute('hidden');
-        setTxt('#lbl-reasoning-tok', this.t('lblReasoningTok'));
         setTxt(
           '#val-reasoning-tok',
           `${formatDetailCompactNumber(t.reasoningTokens)} / ${formatDetailCompactNumber(t.candidateTokens || 0)} tok`
         );
       } else {
         reasoningRow.setAttribute('hidden', '');
+        setTxt('#val-reasoning-tok', '0 / 0 tok');
       }
     }
 
@@ -2154,7 +2389,7 @@ export class HudInstance {
     setTxt(
       '#pop-ctx-prefix',
       showMultiModel
-        ? this.t('popCtxPrefixWithModel', { model: String(c.modelShortLabel || '') })
+        ? this.t('popCtxPrefixWithModel', { model: rawShortLabel })
         : this.t('popCtxPrefix')
     );
     setTxt('#pop-ctx-pct', `${ctxPctPrefix}${formatPopoverPercent(contextRatio, c.usedRatioFormatted)}`);
@@ -2187,6 +2422,19 @@ export class HudInstance {
     setTxt('#lbl-seg-msg', this.t('lblSegMsg'));
     setTxt('#val-seg-msg', hasContextUsage ? formatTokenCount(b.latestOutputTokens ?? b.messageTokens, b.latestOutputFormatted || b.messageTokensCompact) : '—');
 
+    const activeStageObj = stages.find((st) => st && st.isActive);
+    const hasPerModelCompaction =
+      isRawNumber(c.activeModelCompactionCount) ||
+      stages.some((st) => st && isRawNumber(st.compactionCount));
+    const effectivePeakCompCount =
+      showMultiModel && hasPerModelCompaction
+        ? Math.max(
+            0,
+            Math.floor(
+              Number(c.activeModelCompactionCount ?? activeStageObj?.compactionCount) || 0
+            )
+          )
+        : compCount;
     const peakRow = q('#row-ctx-peak');
     if (peakRow) {
       setTxt('#lbl-ctx-peak', showMultiModel ? this.t('lblCtxModelPeak') : this.t('lblCtxPeak'));
@@ -2198,9 +2446,9 @@ export class HudInstance {
           c.peakContextTokens ?? c.usedTokens,
           c.peakContextFormatted || c.usedTokensFormatted
         );
-        const compPopText = formatDetailCompactNumber(compCount);
+        const compPopText = formatDetailCompactNumber(effectivePeakCompCount);
         const compSuffix =
-          compCount > 0 ? this.t('ctxPeakCompSuffix', { count: compPopText }) : '';
+          effectivePeakCompCount > 0 ? this.t('ctxPeakCompSuffix', { count: compPopText }) : '';
         setTxt('#val-ctx-peak', `${peakVal}${compSuffix}`);
       }
     }
@@ -2215,11 +2463,13 @@ export class HudInstance {
     const stagesListEl = q('#hud-ctx-stages-list');
     if (stagesWrapEl) {
       if (showMultiModel) {
-        setTxt(
-          '#lbl-ctx-stages',
-          c.isOrchestrator ? this.t('lblStageSectionOrchestrator') : this.t('lblStageSectionMulti')
-        );
-        this.renderModelStagesList(stagesListEl, stages, isDark);
+        const stagesSectionTitle = isOrchestratorMode
+          ? this.t('lblStageSectionOrchestrator')
+          : visibleStages.every((st) => st.hasUsageData !== true)
+          ? this.t('lblStageSectionPending')
+          : this.t('lblStageSectionMulti');
+        setTxt('#lbl-ctx-stages', stagesSectionTitle);
+        this.renderModelStagesList(stagesListEl, visibleStages, isDark);
         stagesWrapEl.removeAttribute('hidden');
       } else {
         stagesWrapEl.setAttribute('hidden', '');
@@ -2265,14 +2515,23 @@ export class HudInstance {
     }
     if (capContext) {
       const modelNote = showMultiModel
-        ? this.t('ariaContextModelNote', { model: String(c.modelShortLabel || '') })
+        ? this.t('ariaContextModelNote', { model: rawShortLabel })
         : '';
-      const compNote =
-        compCount >= 1
-          ? !isZh && compCount === 1
-            ? ', Compacted once'
-            : this.t('ariaContextCompNote', { count: formatBarCompactCount(compCount) })
-          : '';
+      let compNote = '';
+      if (compCount >= 1) {
+        const useSessionNote = showMultiModel && effectivePeakCompCount !== compCount;
+        if (useSessionNote) {
+          compNote =
+            compCount === 1
+              ? this.t('ariaContextSessionCompNoteOnce')
+              : this.t('ariaContextSessionCompNote', { count: formatBarCompactCount(compCount) });
+        } else {
+          compNote =
+            compCount === 1
+              ? this.t('ariaContextCompNoteOnce')
+              : this.t('ariaContextCompNote', { count: formatBarCompactCount(compCount) });
+        }
+      }
       capContext.setAttribute(
         'aria-label',
         this.t('ariaContextSummary', { readout: contextReadout, note: `${modelNote}${compNote}` })
@@ -2300,7 +2559,7 @@ export class HudInstance {
       popContext.setAttribute('aria-label', this.t('popoverContextAria'));
       popContext.setAttribute(
         'data-exact-summary',
-        `used=${Math.floor(Number(c.usedTokens) || 0)}; capacity=${Math.floor(Number(c.capacityTokens) || 0)}; peak=${Math.floor(Number(c.peakContextTokens ?? c.usedTokens) || 0)}; compactions=${compCount}; model=${c.modelDisplayName || c.modelId || ''}`
+        `used=${Math.floor(Number(c.usedTokens) || 0)}; capacity=${Math.floor(Number(c.capacityTokens) || 0)}; peak=${Math.floor(Number(c.peakContextTokens ?? c.usedTokens) || 0)}; compactions=${compCount}; modelCompactions=${showMultiModel ? effectivePeakCompCount : compCount}; model=${c.modelDisplayName || c.modelId || ''}`
       );
     }
 
@@ -2404,6 +2663,16 @@ export class HudInstance {
 
       const barWidthPct = isPending ? 0 : Number((ratioClamped * 100).toFixed(2));
       const barColor = computeContextProgressColor(ratioClamped, isDark);
+      const stageCompCount = Math.max(0, Math.floor(Number(stage.compactionCount) || 0));
+      const stageCompTier =
+        stageCompCount >= 3 ? 'danger' : stageCompCount === 2 ? 'warn' : stageCompCount === 1 ? 'low' : '';
+      const stageCompText = stageCompCount >= 1 ? formatBarCompactCount(stageCompCount) : '';
+      const stageCompAria =
+        stageCompCount === 1
+          ? this.t('compactionAriaOnce')
+          : stageCompCount > 1
+          ? this.t('compactionAria', { count: formatDetailCompactNumber(stageCompCount) })
+          : '';
       const itemClasses = [
         'hud-stage-item',
         isActive ? 'is-active' : '',
@@ -2416,6 +2685,7 @@ export class HudInstance {
         const item = doc.createElement('div');
         item.className = itemClasses;
         if (stage.slotKey) item.setAttribute('data-stage-slot', String(stage.slotKey));
+        if (stageCompCount >= 1) item.setAttribute('data-stage-compactions', String(stageCompCount));
 
         const head = doc.createElement('div');
         head.className = 'hud-stage-head';
@@ -2438,6 +2708,15 @@ export class HudInstance {
           badge.className = 'hud-stage-badge';
           badge.textContent = this.t('stageActiveBadge');
           nameEl.appendChild(badge);
+        }
+
+        if (stageCompCount >= 1 && stageCompTier) {
+          const compBadge = doc.createElement('span');
+          compBadge.className = `hud-stage-compaction is-compaction-${stageCompTier}`;
+          compBadge.setAttribute('data-compaction-tier', stageCompTier);
+          if (stageCompAria) compBadge.setAttribute('aria-label', stageCompAria);
+          compBadge.textContent = stageCompText;
+          nameEl.appendChild(compBadge);
         }
 
         const valEl = doc.createElement('span');
@@ -2464,10 +2743,17 @@ export class HudInstance {
         const badgeHtml = isActive
           ? `<span class="hud-stage-badge">${escapeHudHtml(this.t('stageActiveBadge'))}</span>`
           : '';
+        const compAriaAttr = stageCompAria ? ` aria-label="${escapeHudHtml(stageCompAria)}"` : '';
+        const compBadgeHtml =
+          stageCompCount >= 1 && stageCompTier
+            ? `<span class="hud-stage-compaction is-compaction-${stageCompTier}" data-compaction-tier="${stageCompTier}"${compAriaAttr}>${escapeHudHtml(stageCompText)}</span>`
+            : '';
+        const slotAttr = stage.slotKey ? ` data-stage-slot="${escapeHudHtml(String(stage.slotKey))}"` : '';
+        const compAttr = stageCompCount >= 1 ? ` data-stage-compactions="${stageCompCount}"` : '';
         htmlParts.push(
-          `<div class="${itemClasses}" data-stage-slot="${escapeHudHtml(stage.slotKey || '')}">` +
+          `<div class="${itemClasses}"${slotAttr}${compAttr}>` +
             `<div class="hud-stage-head">` +
-              `<span class="hud-stage-name"><span class="hud-stage-dot" aria-hidden="true"></span><span class="hud-stage-label">${escapeHudHtml(stageTitle)}</span>${badgeHtml}</span>` +
+              `<span class="hud-stage-name"><span class="hud-stage-dot" aria-hidden="true"></span><span class="hud-stage-label">${escapeHudHtml(stageTitle)}</span>${badgeHtml}${compBadgeHtml}</span>` +
               `<span class="hud-stage-val">${escapeHudHtml(valText)}</span>` +
             `</div>` +
             `<div class="hud-stage-bar-track"><div class="hud-stage-bar-fill" data-stage-ratio="${ratioClamped}" style="width:${barWidthPct}%;background-color:${barColor}"></div></div>` +
@@ -2513,8 +2799,13 @@ export class HudInstance {
       'visibilitychange',
       () => {
         if (doc.visibilityState === 'visible') {
+          try {
+            this.onVisibilityResume?.();
+          } catch {}
           this.syncTheme();
-          if (this.turnClockAnchor) this.tickTurnClock();
+          if (this.turnClockAnchor && (this.hasActiveWork || this.isStreaming || this.isSubagentRunning)) {
+            this.tickTurnClock();
+          }
         }
       },
       { signal }

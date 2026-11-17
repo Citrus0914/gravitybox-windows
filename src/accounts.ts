@@ -154,6 +154,7 @@ export class AccountsManager {
   private autoSwitchPath: string;
   private tombstonesPath: string;
   private reconciled = false;
+  private dirReadyPromise: Promise<void> | null = null;
   private inFlightRefreshes = new Map<string, Promise<Account>>();
   private mutex = new ReentrantMutex();
   private liveProbeCache: { status: LiveLanguageServerStatus | null; expiresAt: number } | null = null;
@@ -187,6 +188,7 @@ export class AccountsManager {
     this.liveProbeCache = null;
     clearLiveEndpointCache();
     this.desktopEmailCache = null;
+    this.vscdbEmailCache = null;
     this.indexCache = null;
     this.accountCache.clear();
     this.providerContextCache = null;
@@ -265,7 +267,13 @@ export class AccountsManager {
   }
 
   async init(): Promise<void> {
-    await mkdir(this.accountsDir, { recursive: true, mode: 0o700 });
+    if (!this.dirReadyPromise) {
+      this.dirReadyPromise = mkdir(this.accountsDir, { recursive: true, mode: 0o700 }).then(() => undefined).catch(err => {
+        this.dirReadyPromise = null;
+        throw err;
+      });
+    }
+    await this.dirReadyPromise;
     const journal = join(this.stateDir, 'account-delete-commit.json');
     let hasJournal = false;
     try {
@@ -280,9 +288,11 @@ export class AccountsManager {
         try { changes = JSON.parse(await readFile(journal, 'utf8')).changes; }
         catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
         const accountPaths = (await readdir(this.accountsDir)).filter(name => /^[a-zA-Z0-9_-]+\.json$/.test(name)).map(name => join(this.accountsDir, name));
-        // A deleted account path can already be absent after an interrupted commit.
         for (const change of changes ?? []) if (typeof change.path === 'string' && change.path.startsWith(this.accountsDir + '/') && /^[a-zA-Z0-9_-]+\.json$/.test(change.path.slice(this.accountsDir.length+1))) accountPaths.push(change.path);
         await recoverFileSet(journal, [this.indexPath, this.tombstonesPath, ...accountPaths]);
+        this.indexCache = null;
+        this.accountCache.clear();
+        this.reconciled = false;
       });
     }
     if (!this.reconciled) {
@@ -1481,38 +1491,50 @@ export class AccountsManager {
   /**
    * 刷新账号池所有可用账号的配额数据
    */
-  async refreshAllQuotas(fetchImpl: typeof globalThis.fetch = globalThis.fetch, options?: { signal?: AbortSignal }): Promise<{ accounts: Account[]; failures: { id: string; message: string }[] }> {
+  async refreshAllQuotas(
+    fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+    options?: { signal?: AbortSignal; onAccountUpdated?: (account: Account, done: number, total: number) => void }
+  ): Promise<{ accounts: Account[]; failures: { id: string; message: string }[] }> {
     options?.signal?.throwIfAborted();
     const index = await this.loadIndex();
-    const enabledAccounts = index.accounts.filter(acc => !acc.disabled);
+    const activeId = index.current_account_id;
+    const enabledAccounts = index.accounts.filter(acc => !acc.disabled).sort((a, b) => {
+      const aActive = a.id === activeId ? 1 : 0;
+      const bActive = b.id === activeId ? 1 : 0;
+      return bActive - aActive;
+    });
     if (fetchImpl === globalThis.fetch && enabledAccounts.length > 0) {
-      await Promise.all([
-        this.probeLiveLanguageServer(fetchImpl, { forceRefresh: true }).catch(() => null),
-        this.resolveProviderContext(fetchImpl).catch(() => null),
-      ]);
+      void this.probeLiveLanguageServer(fetchImpl, { forceRefresh: true }).catch(() => null);
+      void this.resolveProviderContext(fetchImpl).catch(() => null);
     }
-    const results: Account[] = [];
+    const resultsByIndex: Array<Account | undefined> = new Array(enabledAccounts.length);
     const failures: { id: string; message: string }[] = [];
-    const concurrency = fetchImpl === globalThis.fetch ? Math.min(3, Math.max(1, enabledAccounts.length)) : 1;
+    const concurrency = fetchImpl === globalThis.fetch ? Math.min(5, Math.max(1, enabledAccounts.length)) : 1;
     let cursor = 0;
+    let completed = 0;
     await Promise.all(Array.from({ length: concurrency }, async () => {
       while (cursor < enabledAccounts.length) {
         options?.signal?.throwIfAborted();
-        const accMeta = enabledAccounts[cursor++]!;
+        const slot = cursor++;
+        const accMeta = enabledAccounts[slot]!;
         try {
           const updated = await this.refreshQuota(accMeta.id, fetchImpl, { signal: options?.signal });
-          results.push(updated);
+          resultsByIndex[slot] = updated;
+          completed += 1;
+          options?.onAccountUpdated?.(updated, completed, enabledAccounts.length);
         } catch (error) {
           if (options?.signal?.aborted) throw error;
+          completed += 1;
           failures.push({ id: accMeta.id, message: error instanceof Error ? error.message : bt('accounts.err.refresh_failed') });
         }
       }
     }));
     options?.signal?.throwIfAborted();
-    return { accounts: results, failures };
+    return { accounts: resultsByIndex.filter((a): a is Account => Boolean(a)), failures };
   }
 
   private desktopEmailCache: { email: string | null; expiresAt: number } | null = null;
+  private vscdbEmailCache: { sig: string; email: string | null } | null = null;
 
   /**
    * 探测本机 Antigravity 当前真实登录邮箱：
@@ -1534,26 +1556,38 @@ export class AccountsManager {
     }
     let detected: string | null = null;
     const vscdbPath = join(this.target.profile, 'User', 'globalStorage', 'state.vscdb');
-    const stateRows = await readAntigravityStateDb(vscdbPath, [
-      'antigravityUnifiedStateSync.userStatus',
-      'antigravityAuthStatus',
+    const [vscStat, vscWalStat] = await Promise.all([
+      lstat(vscdbPath).catch(() => null),
+      lstat(`${vscdbPath}-wal`).catch(() => null),
     ]);
-    const userStatusB64 = extractTopicDataString(stateRows.get('antigravityUnifiedStateSync.userStatus'));
-    if (userStatusB64) {
-      const buf = decodeTopicRow(userStatusB64, 'userStatusSentinelKey');
-      const email = buf ? ProtobufReader.findString(buf, 7) : null;
-      if (email && /^[^\s@]+@[^\s@]+$/.test(email)) detected = email;
-    }
-    if (!detected) {
-      const authStatusRaw = stateRows.get('antigravityAuthStatus');
-      if (authStatusRaw) {
-        try {
-          const parsed = JSON.parse(authStatusRaw);
-          if (typeof parsed?.email === 'string' && /^[^\s@]+@[^\s@]+$/.test(parsed.email)) {
-            detected = parsed.email;
-          }
-        } catch {}
+    const vscSig = vscStat ? `${vscStat.mtimeMs}:${vscStat.size}:${vscWalStat?.mtimeMs ?? 0}:${vscWalStat?.size ?? 0}` : 'missing';
+    if (this.vscdbEmailCache && this.vscdbEmailCache.sig === vscSig) {
+      detected = this.vscdbEmailCache.email;
+    } else {
+      const stateRows = vscStat
+        ? await readAntigravityStateDb(vscdbPath, [
+            'antigravityUnifiedStateSync.userStatus',
+            'antigravityAuthStatus',
+          ])
+        : new Map<string, string>();
+      const userStatusB64 = extractTopicDataString(stateRows.get('antigravityUnifiedStateSync.userStatus'));
+      if (userStatusB64) {
+        const buf = decodeTopicRow(userStatusB64, 'userStatusSentinelKey');
+        const email = buf ? ProtobufReader.findString(buf, 7) : null;
+        if (email && /^[^\s@]+@[^\s@]+$/.test(email)) detected = email;
       }
+      if (!detected) {
+        const authStatusRaw = stateRows.get('antigravityAuthStatus');
+        if (authStatusRaw) {
+          try {
+            const parsed = JSON.parse(authStatusRaw);
+            if (typeof parsed?.email === 'string' && /^[^\s@]+@[^\s@]+$/.test(parsed.email)) {
+              detected = parsed.email;
+            }
+          } catch {}
+        }
+      }
+      this.vscdbEmailCache = { sig: vscSig, email: detected };
     }
     if (!detected) {
       try {

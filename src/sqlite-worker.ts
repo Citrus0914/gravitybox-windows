@@ -69,11 +69,21 @@ const TERMINAL_STEP_STATUSES = new Set([3, 5]);
 
 function hashRawStepRow(hash: Hash, r: any): void {
   hash.update(`${r.idx}:${r.step_type}:${r.status}:${r.metadata_len ?? 0}:`);
-  if (r.metadata && r.metadata.byteLength > 0) hash.update(r.metadata);
+  if (r.metadata && r.metadata.byteLength > 0) {
+    hash.update(r.metadata);
+  } else {
+    if (r.metadata_head && r.metadata_head.byteLength > 0) hash.update(r.metadata_head);
+    if (r.metadata_tail && r.metadata_tail.byteLength > 0) hash.update(r.metadata_tail);
+  }
   hash.update(`:${r.data?.byteLength ?? 0}:`);
   if (r.data && r.data.byteLength > 0) hash.update(r.data);
   hash.update(`:${r.render_info_len ?? r.render_info?.byteLength ?? 0}:`);
-  if (r.render_info && r.render_info.byteLength > 0) hash.update(r.render_info);
+  if (r.render_info && r.render_info.byteLength > 0) {
+    hash.update(r.render_info);
+  } else {
+    if (r.render_info_head && r.render_info_head.byteLength > 0) hash.update(r.render_info_head);
+    if (r.render_info_tail && r.render_info_tail.byteLength > 0) hash.update(r.render_info_tail);
+  }
   hash.update(`:${r.step_payload?.byteLength ?? 0}:`);
   if (r.step_payload && r.step_payload.byteLength > 0) hash.update(r.step_payload);
   hash.update('\n');
@@ -197,14 +207,14 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
     }
 
     const buildStepSelectColumns = () => {
-      const metaExpr = `CASE WHEN step_type NOT IN (14, 23, 101) AND length(metadata) <= ${inlineLimit} THEN metadata ELSE NULL END as metadata, CASE WHEN step_type NOT IN (14, 23, 101) THEN COALESCE(length(metadata), 0) ELSE 0 END as metadata_len`;
+      const metaExpr = `CASE WHEN step_type != 101 AND length(metadata) <= ${inlineLimit} THEN metadata ELSE NULL END as metadata, CASE WHEN step_type != 101 THEN COALESCE(length(metadata), 0) ELSE 0 END as metadata_len, CASE WHEN step_type != 101 AND length(metadata) > ${inlineLimit} THEN substr(metadata, 1, 512) ELSE NULL END as metadata_head, CASE WHEN step_type != 101 AND length(metadata) > ${inlineLimit} THEN substr(metadata, max(1, length(metadata) - 511), 512) ELSE NULL END as metadata_tail`;
       const extraCols: string[] = [];
       if (hasDataColumn) {
         extraCols.push(`CASE WHEN step_type IN (85, 127, 132) THEN substr(data, 1, ${inlineLimit}) ELSE NULL END as data`);
       }
       if (hasRenderInfoColumn) {
         extraCols.push(
-          `CASE WHEN step_type IN (85, 127, 132) AND length(render_info) <= ${inlineLimit} THEN render_info WHEN step_type NOT IN (14, 15, 23, 101) AND length(metadata) > ${inlineLimit} THEN substr(render_info, 1, 16384) ELSE NULL END as render_info, CASE WHEN step_type IN (85, 127, 132) THEN COALESCE(length(render_info), 0) ELSE 0 END as render_info_len`
+          `CASE WHEN step_type IN (85, 127, 132) AND length(render_info) <= ${inlineLimit} THEN render_info WHEN step_type NOT IN (14, 15, 23, 101) AND length(metadata) > ${inlineLimit} THEN substr(render_info, 1, 16384) ELSE NULL END as render_info, CASE WHEN step_type IN (85, 127, 132) THEN COALESCE(length(render_info), 0) ELSE 0 END as render_info_len, CASE WHEN step_type IN (85, 127, 132) AND length(render_info) > ${inlineLimit} THEN substr(render_info, 1, 512) ELSE NULL END as render_info_head, CASE WHEN step_type IN (85, 127, 132) AND length(render_info) > ${inlineLimit} THEN substr(render_info, max(1, length(render_info) - 511), 512) ELSE NULL END as render_info_tail`
         );
       }
       if (hasStepPayloadColumn) {
@@ -575,7 +585,233 @@ if (typeof workerData?.path === 'string' && workerData.path.length > 0) {
   openSession(workerData.path);
 }
 
-parentPort?.on('message', (request: { id: string; locale?: string; open?: string; sql?: string; verify?: boolean; close?: boolean; reusable?: boolean; projection?: {table:string;column:string;idx:number}; hudScan?: HudWorkerScanRequest }) => {
+export interface UsageWorkerScanRequest {
+  dbPath: string;
+  inlineBlobLimitBytes?: number;
+}
+
+export interface UsageWorkerScanRow {
+  idx: number;
+  size: number;
+  data_blob?: Uint8Array | null;
+  projected?: boolean;
+}
+
+export interface UsageWorkerScanResult {
+  ok: boolean;
+  error?: string;
+  changedDuringRead?: boolean;
+  countExceeded?: number;
+  genRows: UsageWorkerScanRow[];
+  stepSchemaOk: boolean;
+  stepError?: string;
+  stepRows: UsageWorkerScanRow[];
+}
+
+function hasInlineGenerationTimestamp(buf: Uint8Array): boolean {
+  if (!buf || buf.byteLength < 6) return false;
+  for (let i = 0; i < buf.byteLength - 3; i++) {
+    if (buf[i] === 0x4a && buf[i + 2] === 0x22) return true;
+  }
+  return false;
+}
+
+function executeUsageScan(req: UsageWorkerScanRequest): { result: UsageWorkerScanResult; transfers: ArrayBuffer[] } {
+  const inlineLimit = req.inlineBlobLimitBytes ?? 262_144;
+  const maxDirectBlob = 16_777_216;
+  const db = new DatabaseSync(req.dbPath, { readOnly: true });
+  const transfers = new Set<ArrayBuffer>();
+  const detachBuf = (u8: Uint8Array | null | undefined): Uint8Array | null => {
+    if (!u8 || u8.byteLength === 0) return null;
+    const copy = Uint8Array.from(u8);
+    if (copy.buffer instanceof ArrayBuffer) transfers.add(copy.buffer);
+    return copy;
+  };
+
+  try {
+    db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 250;');
+    const dataVersionBefore = Number((db.prepare('PRAGMA data_version').get() as { data_version?: unknown } | undefined)?.data_version);
+
+    const indexRows = db
+      .prepare('SELECT idx, length(data) AS size FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx;')
+      .all() as Array<{ idx?: unknown; size?: unknown }>;
+
+    if (indexRows.length > 50_000) {
+      return {
+        result: {
+          ok: true,
+          countExceeded: indexRows.length,
+          genRows: [],
+          stepSchemaOk: true,
+          stepRows: [],
+        },
+        transfers: [],
+      };
+    }
+
+    if (indexRows.length === 0) {
+      const dataVersionAfterEmpty = Number((db.prepare('PRAGMA data_version').get() as { data_version?: unknown } | undefined)?.data_version);
+      if (dataVersionBefore !== dataVersionAfterEmpty) {
+        return {
+          result: {
+            ok: false,
+            changedDuringRead: true,
+            error: bt('sqlite.err.changed_during_read'),
+            genRows: [],
+            stepSchemaOk: true,
+            stepRows: [],
+          },
+          transfers: [],
+        };
+      }
+      return {
+        result: {
+          ok: true,
+          genRows: [],
+          stepSchemaOk: true,
+          stepRows: [],
+        },
+        transfers: [],
+      };
+    }
+
+    const genRows: UsageWorkerScanRow[] = [];
+    let mayNeedSteps = false;
+    const inlineStmt = db.prepare(
+      `SELECT idx, length(data) AS size, CASE WHEN length(data) <= ${inlineLimit} THEN data ELSE NULL END AS data_blob FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx;`
+    );
+    let chunkStmt: ReturnType<DatabaseSync['prepare']> | undefined;
+    let fullRowStmt: ReturnType<DatabaseSync['prepare']> | undefined;
+
+    for (const raw of inlineStmt.iterate() as Iterable<any>) {
+      const idx = Number(raw.idx);
+      const size = Number(raw.size ?? 0);
+      if (!Number.isSafeInteger(idx)) {
+        throw new Error(bt('scanner.err.unsupported_row_index'));
+      }
+      if (size <= inlineLimit) {
+        const detached = detachBuf(raw.data_blob);
+        if (!detached || !hasInlineGenerationTimestamp(detached)) {
+          mayNeedSteps = true;
+        }
+        genRows.push({ idx, size, data_blob: detached });
+        continue;
+      }
+      try {
+        chunkStmt ??= db.prepare('SELECT substr(data, ?, ?) AS chunk FROM gen_metadata WHERE idx = ?');
+        const projected = projectProtobuf(
+          size,
+          (offset, length) =>
+            ((chunkStmt!.get(offset + 1, length, idx) as { chunk?: Uint8Array } | undefined)?.chunk) ?? new Uint8Array(0),
+          GENERATION_PROJECTION
+        );
+        const detached = detachBuf(projected.data);
+        if (!detached || !hasInlineGenerationTimestamp(detached)) {
+          mayNeedSteps = true;
+        }
+        genRows.push({ idx, size, data_blob: detached, projected: true });
+      } catch {
+        if (size <= maxDirectBlob) {
+          fullRowStmt ??= db.prepare('SELECT data AS data_blob FROM gen_metadata WHERE idx = ?');
+          const full = fullRowStmt.get(idx) as { data_blob?: Uint8Array } | undefined;
+          const detached = detachBuf(full?.data_blob);
+          if (!detached || !hasInlineGenerationTimestamp(detached)) {
+            mayNeedSteps = true;
+          }
+          genRows.push({ idx, size, data_blob: detached });
+        } else {
+          genRows.push({ idx, size, data_blob: null });
+        }
+      }
+    }
+
+    let stepSchemaOk = true;
+    let stepError: string | undefined;
+    const stepRows: UsageWorkerScanRow[] = [];
+
+    if (mayNeedSteps) {
+      try {
+        const stepCols = db.prepare('PRAGMA table_info(steps);').all() as Array<{ name?: unknown }>;
+        const colSet = new Set(stepCols.map(c => String(c.name ?? '')));
+        if (!['idx', 'metadata', 'step_type'].every(col => colSet.has(col))) {
+          stepSchemaOk = false;
+          stepError = bt('scanner.err.missing_timestamp_schema');
+        } else {
+          const stepStmt = db.prepare(
+            `SELECT idx, COALESCE(length(metadata), 0) AS size, CASE WHEN length(metadata) <= ${inlineLimit} THEN metadata ELSE NULL END AS data_blob FROM steps WHERE step_type = 15 ORDER BY idx;`
+          );
+          let stepChunkStmt: ReturnType<DatabaseSync['prepare']> | undefined;
+          let stepFullStmt: ReturnType<DatabaseSync['prepare']> | undefined;
+          for (const sraw of stepStmt.iterate() as Iterable<any>) {
+            const idx = Number(sraw.idx);
+            const size = Number(sraw.size ?? 0);
+            if (!Number.isSafeInteger(idx)) {
+              throw new Error(bt('scanner.err.unsupported_row_index'));
+            }
+            if (size <= 0) continue;
+            if (size <= inlineLimit) {
+              stepRows.push({ idx, size, data_blob: detachBuf(sraw.data_blob) });
+              continue;
+            }
+            try {
+              stepChunkStmt ??= db.prepare('SELECT substr(metadata, ?, ?) AS chunk FROM steps WHERE idx = ?');
+              const projected = projectProtobuf(
+                size,
+                (offset, length) =>
+                  ((stepChunkStmt!.get(offset + 1, length, idx) as { chunk?: Uint8Array } | undefined)?.chunk) ?? new Uint8Array(0),
+                STEP_PROJECTION
+              );
+              stepRows.push({ idx, size, data_blob: detachBuf(projected.data), projected: true });
+            } catch {
+              if (size <= maxDirectBlob) {
+                stepFullStmt ??= db.prepare('SELECT metadata AS data_blob FROM steps WHERE idx = ?');
+                const full = stepFullStmt.get(idx) as { data_blob?: Uint8Array } | undefined;
+                stepRows.push({ idx, size, data_blob: detachBuf(full?.data_blob) });
+              } else {
+                stepRows.push({ idx, size, data_blob: null });
+              }
+            }
+          }
+        }
+      } catch (err) {
+        stepSchemaOk = false;
+        stepError = (err as Error).message;
+      }
+    }
+
+    const dataVersionAfter = Number((db.prepare('PRAGMA data_version').get() as { data_version?: unknown } | undefined)?.data_version);
+    if (dataVersionBefore !== dataVersionAfter) {
+      return {
+        result: {
+          ok: false,
+          changedDuringRead: true,
+          error: bt('sqlite.err.changed_during_read'),
+          genRows: [],
+          stepSchemaOk: true,
+          stepRows: [],
+        },
+        transfers: [],
+      };
+    }
+
+    return {
+      result: {
+        ok: true,
+        genRows,
+        stepSchemaOk,
+        stepError,
+        stepRows,
+      },
+      transfers: [...transfers],
+    };
+  } finally {
+    try {
+      db.close();
+    } catch {}
+  }
+}
+
+parentPort?.on('message', (request: { id: string; locale?: string; open?: string; sql?: string; verify?: boolean; close?: boolean; reusable?: boolean; projection?: {table:string;column:string;idx:number}; hudScan?: HudWorkerScanRequest; usageScan?: UsageWorkerScanRequest }) => {
   if (typeof request.locale === 'string' && request.locale) {
     setActiveLocale(request.locale);
   }
@@ -583,6 +819,15 @@ parentPort?.on('message', (request: { id: string; locale?: string; open?: string
     try {
       const { result, transfers } = executeHudScan(request.hudScan);
       parentPort?.postMessage({ id: request.id, ok: true, hudResult: result }, transfers);
+    } catch (error) {
+      parentPort?.postMessage({ id: request.id, ok: false, error: (error as Error).message });
+    }
+    return;
+  }
+  if (request.usageScan) {
+    try {
+      const { result, transfers } = executeUsageScan(request.usageScan);
+      parentPort?.postMessage({ id: request.id, ok: true, usageResult: result }, transfers);
     } catch (error) {
       parentPort?.postMessage({ id: request.id, ok: false, error: (error as Error).message });
     }

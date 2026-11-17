@@ -292,7 +292,7 @@ test('macOS 无 LANG 环境或遵循 AppleLanguages 时 system 语言解析与�
   }
 });
 
-test('runtime/hud-i18n.js 与 assets/i18n/*.json#hud 保持 77 键逐字一致，normalizeHudLocale 回退规范严格收敛', async () => {
+test('runtime/hud-i18n.js 与 assets/i18n/*.json#hud 保持全量词条逐字一致，normalizeHudLocale 回退规范严格收敛', async () => {
   const [{ HUD_I18N, normalizeHudLocale }, zhPack, enPack] = await Promise.all([
     import('../runtime/hud-i18n.js'),
     readFile(join(i18nDir, 'zh-Hans.json'), 'utf8').then((raw) => JSON.parse(raw)),
@@ -304,7 +304,7 @@ test('runtime/hud-i18n.js 与 assets/i18n/*.json#hud 保持 77 键逐字一致�
   assert.deepEqual(Object.keys(zhPack.hud).sort(), Object.keys(enPack.hud).sort());
   assert.deepEqual(Object.keys(HUD_I18N['zh-Hans']).sort(), Object.keys(zhPack.hud).sort());
   assert.deepEqual(Object.keys(HUD_I18N.en).sort(), Object.keys(enPack.hud).sort());
-  assert.equal(Object.keys(zhPack.hud).length, 77);
+  assert.equal(Object.keys(zhPack.hud).length, 83);
   assert.deepEqual(HUD_I18N['zh-Hans'], zhPack.hud);
   assert.deepEqual(HUD_I18N.en, enPack.hud);
 

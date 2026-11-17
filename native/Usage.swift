@@ -193,15 +193,18 @@ final class UsagePage: NSObject {
 
     func fetch(force: Bool = false) {
         guard !loading else { return }
-        loading = true
-        refreshButton.setBusy(true, available: app.reachable)
-        exportButton.isEnabled = false
         let requestKey = metricsKeyForCurrentPeriod()
         let segIdx = max(0, min(periods.count - 1, periodSegment.selectedSegment))
         let period = periods[segIdx]
         trendTitleLabel.stringValue = segIdx == 0 ? L10n.t("usage.trend_title.today") : (segIdx == 1 ? L10n.t("usage.trend_title.7d") : (segIdx == 2 ? L10n.t("usage.trend_title.30d") : L10n.t("usage.trend_title.all")))
+        if !force, let preloaded = app.cachedUsageReportsByPeriod[period], !UsageQueryIdentity(period: period).matches(latestReport) {
+            applyUsagePayload(preloaded, period: period, segIdx: segIdx, requestKey: requestKey)
+        }
+        loading = true
+        refreshButton.setBusy(true, available: app.reachable)
+        exportButton.isEnabled = false
 
-        app.fetchUsageSummary(period: period, force: force, allowCached: false) { [weak self] response in
+        app.fetchUsageSummary(period: period, force: force, allowCached: !force) { [weak self] response in
             guard let self else { return }
             self.loading = false
             self.refreshButton.setBusy(false, available: self.app.reachable)
@@ -220,96 +223,100 @@ final class UsagePage: NSObject {
                 self.statusSummary.textColor = accessibleWarningColor()
                 self.footerBox.isHidden = false
             case .success(let value):
-                guard UsageQueryIdentity(period: period).matches(value) else {
-                    self.statusSummary.stringValue = L10n.t("usage.error.period_mismatch")
-                    self.statusSummary.textColor = accessibleWarningColor()
-                    self.footerBox.isHidden = false
-                    self.exportButton.isEnabled = false
-                    return
-                }
-                self.metricsKey = requestKey
-                self.latestReport = value
-                let summary = value["summary"] as? [String: Any] ?? [:]
-                // Request state is independent of chart identity: a successful retry must
-                // clear the old error even when the data snapshot itself did not change.
-                self.updateReadStatus(summary)
-                let snapshotKey = "\(value["snapshotId"] ?? ""):\(period):\(summary["availability"] ?? ""):\(summary["failedDatabasesCount"] ?? 0):\(summary["skippedLargeRecords"] ?? 0):\(summary["unknownTimeRecords"] ?? 0)"
-                if !snapshotKey.hasPrefix(":") && snapshotKey == self.renderedSnapshotKey { self.syncExportButtonState(for: period); return }
-                self.renderedSnapshotKey = snapshotKey
-                self.syncExportButtonState(for: period)
-                if (summary["availability"] as? String) == "unavailable" {
-                    for label in [self.totalTokensMetric, self.usdMetric, self.cacheRateMetric, self.requestsMetric] { label.stringValue = "—" }
-                    self.tokensDetail.stringValue = L10n.t("usage.unavailable.tokens")
-                    self.usdDetail.stringValue = L10n.t("usage.unavailable.cost")
-                    self.requestsDetail.stringValue = L10n.t("usage.unavailable.requests")
-                    self.cacheRateDetail.stringValue = L10n.t("usage.unavailable.cache")
-                    self.modelRows = []; self.trendChart.points = []; self.donutChart.slices = []
-                    self.modelsBreakdownStack.arrangedSubviews.forEach { self.modelsBreakdownStack.removeArrangedSubview($0); $0.removeFromSuperview() }
-                    self.statusSummary.stringValue = L10n.t("usage.unavailable.banner"); self.statusSummary.textColor = accessibleWarningColor(); self.footerBox.isHidden = false
-                    return
-                }
-                let total = intVal(summary, "totalTokens")
-                let prompt = intVal(summary, "promptTokens")
-                let output = intVal(summary, "candidatesTokens")
-                let cached = intVal(summary, "cachedTokens")
-                let cacheWrite = intVal(summary, "cacheWriteTokens", fallback: intVal(summary, "cache_write_tokens"))
-                let requests = intVal(summary, "requestCount")
-                let usd = doubleVal(summary, "estimatedUsd")
-                let cacheDenom = prompt + cached + cacheWrite
-                let cacheHit = doubleVal(summary, "cacheHitRate", fallback: cacheDenom > 0 ? (Double(cached) / Double(cacheDenom)) * 100.0 : 0.0)
+                self.applyUsagePayload(value, period: period, segIdx: segIdx, requestKey: requestKey)
+            }
+        }
+    }
 
-                self.totalTokensMetric.stringValue = self.formatCompactTokens(total)
-                let cacheWritePart = cacheWrite > 0 ? L10n.t("usage.tokens.cache_write_part", ["count": self.formatCompactTokens(cacheWrite)]) : ""
-                self.tokensDetail.stringValue = L10n.t("usage.tokens.summary", [
-                    "input": self.formatCompactTokens(prompt),
-                    "cached": self.formatCompactTokens(cached),
-                    "cacheWrite": cacheWritePart,
-                    "output": self.formatCompactTokens(output)
-                ])
-                let pricedCount = (summary["pricedModels"] as? Int) ?? (summary["priced_models"] as? Int) ?? (value["pricedModels"] as? Int) ?? 0
-                let unpricedCount = (summary["unpricedModels"] as? Int) ?? (summary["unpriced_models"] as? Int) ?? (value["unpricedModels"] as? Int) ?? 0
-                self.costTitle.stringValue = L10n.t("usage.section.cost")
-                self.usdMetric.stringValue = unpricedCount > 0 && pricedCount == 0 && usd == 0 ? L10n.t("menu_panel.usage.unpriced") : self.formatUsd(usd)
-                self.usdDetail.stringValue = ""
-                self.usdDetail.isHidden = true
+    private func applyUsagePayload(_ value: [String: Any], period: String, segIdx: Int, requestKey: String) {
+        guard UsageQueryIdentity(period: period).matches(value) else {
+            self.statusSummary.stringValue = L10n.t("usage.error.period_mismatch")
+            self.statusSummary.textColor = accessibleWarningColor()
+            self.footerBox.isHidden = false
+            self.exportButton.isEnabled = false
+            return
+        }
+        self.metricsKey = requestKey
+        self.latestReport = value
+        let summary = value["summary"] as? [String: Any] ?? [:]
+        // Request state is independent of chart identity: a successful retry must
+        // clear the old error even when the data snapshot itself did not change.
+        self.updateReadStatus(summary)
+        let snapshotKey = "\(value["snapshotId"] ?? ""):\(period):\(summary["availability"] ?? ""):\(summary["failedDatabasesCount"] ?? 0):\(summary["skippedLargeRecords"] ?? 0):\(summary["unknownTimeRecords"] ?? 0)"
+        if !snapshotKey.hasPrefix(":") && snapshotKey == self.renderedSnapshotKey { self.syncExportButtonState(for: period); return }
+        self.renderedSnapshotKey = snapshotKey
+        self.syncExportButtonState(for: period)
+        if (summary["availability"] as? String) == "unavailable" {
+            for label in [self.totalTokensMetric, self.usdMetric, self.cacheRateMetric, self.requestsMetric] { label.stringValue = "—" }
+            self.tokensDetail.stringValue = L10n.t("usage.unavailable.tokens")
+            self.usdDetail.stringValue = L10n.t("usage.unavailable.cost")
+            self.requestsDetail.stringValue = L10n.t("usage.unavailable.requests")
+            self.cacheRateDetail.stringValue = L10n.t("usage.unavailable.cache")
+            self.modelRows = []; self.trendChart.points = []; self.donutChart.slices = []
+            self.modelsBreakdownStack.arrangedSubviews.forEach { self.modelsBreakdownStack.removeArrangedSubview($0); $0.removeFromSuperview() }
+            self.statusSummary.stringValue = L10n.t("usage.unavailable.banner"); self.statusSummary.textColor = accessibleWarningColor(); self.footerBox.isHidden = false
+            return
+        }
+        let total = intVal(summary, "totalTokens")
+        let prompt = intVal(summary, "promptTokens")
+        let output = intVal(summary, "candidatesTokens")
+        let cached = intVal(summary, "cachedTokens")
+        let cacheWrite = intVal(summary, "cacheWriteTokens", fallback: intVal(summary, "cache_write_tokens"))
+        let requests = intVal(summary, "requestCount")
+        let usd = doubleVal(summary, "estimatedUsd")
+        let cacheDenom = prompt + cached + cacheWrite
+        let cacheHit = doubleVal(summary, "cacheHitRate", fallback: cacheDenom > 0 ? (Double(cached) / Double(cacheDenom)) * 100.0 : 0.0)
 
-                self.cacheRateMetric.stringValue = String(format: "%.1f%%", locale: Locale(identifier: "en_US_POSIX"), cacheHit)
-                self.cacheTrack.update(percent: cacheHit)
-                self.cacheRateDetail.stringValue = L10n.t("usage.cache.read_detail", ["count": self.formatCompactTokens(cached)])
+        self.totalTokensMetric.stringValue = self.formatCompactTokens(total)
+        let cacheWritePart = cacheWrite > 0 ? L10n.t("usage.tokens.cache_write_part", ["count": self.formatCompactTokens(cacheWrite)]) : ""
+        self.tokensDetail.stringValue = L10n.t("usage.tokens.summary", [
+            "input": self.formatCompactTokens(prompt),
+            "cached": self.formatCompactTokens(cached),
+            "cacheWrite": cacheWritePart,
+            "output": self.formatCompactTokens(output)
+        ])
+        let pricedCount = (summary["pricedModels"] as? Int) ?? (summary["priced_models"] as? Int) ?? (value["pricedModels"] as? Int) ?? 0
+        let unpricedCount = (summary["unpricedModels"] as? Int) ?? (summary["unpriced_models"] as? Int) ?? (value["unpricedModels"] as? Int) ?? 0
+        self.costTitle.stringValue = L10n.t("usage.section.cost")
+        self.usdMetric.stringValue = unpricedCount > 0 && pricedCount == 0 && usd == 0 ? L10n.t("menu_panel.usage.unpriced") : self.formatUsd(usd)
+        self.usdDetail.stringValue = ""
+        self.usdDetail.isHidden = true
 
-                self.requestsMetric.stringValue = L10n.t("usage.requests.value", ["count": InterfaceText.formatInteger(requests)])
-                let avgIn = requests > 0 ? total / requests : 0
-                self.requestsDetail.stringValue = requests > 0 ? L10n.t("usage.requests.avg_per_call", ["count": self.formatCompactTokens(avgIn)]) : L10n.t("usage.requests.none")
+        self.cacheRateMetric.stringValue = String(format: "%.1f%%", locale: Locale(identifier: "en_US_POSIX"), cacheHit)
+        self.cacheTrack.update(percent: cacheHit)
+        self.cacheRateDetail.stringValue = L10n.t("usage.cache.read_detail", ["count": self.formatCompactTokens(cached)])
 
-                self.updateReadStatus(summary)
+        self.requestsMetric.stringValue = L10n.t("usage.requests.value", ["count": InterfaceText.formatInteger(requests)])
+        let avgIn = requests > 0 ? total / requests : 0
+        self.requestsDetail.stringValue = requests > 0 ? L10n.t("usage.requests.avg_per_call", ["count": self.formatCompactTokens(avgIn)]) : L10n.t("usage.requests.none")
 
-                let priceRows = value["byModel"] as? [[String: Any]] ?? []
-                let outdated = priceRows.filter { ($0["pricingStatus"] as? String ?? "") == "expired" }.count
-                if outdated > 0 {
-                    self.usdDetail.stringValue = L10n.t("usage.cost.outdated_models", ["count": outdated])
-                    self.usdDetail.textColor = accessibleWarningColor()
-                    self.usdDetail.isHidden = false
-                } else {
-                    self.usdDetail.textColor = .secondaryLabelColor
-                    self.usdDetail.isHidden = true
-                }
-                let rows = (value["byModel"] as? [[String: Any]]) ?? (value["models"] as? [[String: Any]]) ?? []
-                self.modelRows = rows
-                let scroll = self.view as? NSScrollView
-                let preservedOrigin = self.restoreScroll ? self.app.usageScrollOrigin : (scroll?.contentView.bounds.origin ?? .zero)
-                self.restoreScroll = false
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0
-                    ctx.allowsImplicitAnimation = false
-                    self.updateChartsAndBreakdown(summary: summary, value: value, segIdx: segIdx, totalTokens: total, totalUsd: usd)
-                    scroll?.layoutSubtreeIfNeeded()
-                    if let scroll {
-                        let maxY = max(0, (scroll.documentView?.bounds.height ?? 0) - scroll.contentView.bounds.height)
-                        let clampedY = max(0, min(preservedOrigin.y, maxY))
-                        scroll.contentView.scroll(to: NSPoint(x: 0, y: clampedY))
-                        scroll.reflectScrolledClipView(scroll.contentView)
-                    }
-                }
+        self.updateReadStatus(summary)
+
+        let priceRows = value["byModel"] as? [[String: Any]] ?? []
+        let outdated = priceRows.filter { ($0["pricingStatus"] as? String ?? "") == "expired" }.count
+        if outdated > 0 {
+            self.usdDetail.stringValue = L10n.t("usage.cost.outdated_models", ["count": outdated])
+            self.usdDetail.textColor = accessibleWarningColor()
+            self.usdDetail.isHidden = false
+        } else {
+            self.usdDetail.textColor = .secondaryLabelColor
+            self.usdDetail.isHidden = true
+        }
+        let rows = (value["byModel"] as? [[String: Any]]) ?? (value["models"] as? [[String: Any]]) ?? []
+        self.modelRows = rows
+        let scroll = self.view as? NSScrollView
+        let preservedOrigin = self.restoreScroll ? self.app.usageScrollOrigin : (scroll?.contentView.bounds.origin ?? .zero)
+        self.restoreScroll = false
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0
+            ctx.allowsImplicitAnimation = false
+            self.updateChartsAndBreakdown(summary: summary, value: value, segIdx: segIdx, totalTokens: total, totalUsd: usd)
+            scroll?.layoutSubtreeIfNeeded()
+            if let scroll {
+                let maxY = max(0, (scroll.documentView?.bounds.height ?? 0) - scroll.contentView.bounds.height)
+                let clampedY = max(0, min(preservedOrigin.y, maxY))
+                scroll.contentView.scroll(to: NSPoint(x: 0, y: clampedY))
+                scroll.reflectScrolledClipView(scroll.contentView)
             }
         }
     }

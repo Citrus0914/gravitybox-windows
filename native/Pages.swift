@@ -263,6 +263,10 @@ final class DashboardPage: NSObject {
             self?.syncBentoModelLimit(forBentoHeight: height)
         }
         refreshQuotaButton.target = self
+        if let boot = app.cachedDashboardBootstrapSummary {
+            lastSuccessfulSummary = boot
+            renderSummary(boot, isStaleFallback: false)
+        }
         update()
     }
 
@@ -581,7 +585,16 @@ final class DashboardPage: NSObject {
         }
     }
 
-    @objc func refreshActiveQuota() { app.refreshAccountQuotas() }
+    @objc func refreshActiveQuota() {
+        let activeId = ((lastSuccessfulSummary?["accounts"] as? [String: Any])?["currentAccountId"] as? String)
+            ?? (app.resolvedActiveAccount()?["id"] as? String)
+            ?? app.activeAccountId
+        if !activeId.isEmpty {
+            app.refreshSingleAccountQuota(id: activeId)
+        } else {
+            app.refreshAccountQuotas()
+        }
+    }
 
     func fetch() {
         update(force: true)
@@ -592,8 +605,10 @@ final class DashboardPage: NSObject {
         updateReadinessMatrix()
         let status = app.statusValue
         guard app.reachable else {
-            accountStatusLabel.stringValue = L10n.t("overview.status.offline")
-            accountStatusLabel.isHidden = false; accountStatusLabel.textColor = accessibleWarningColor()
+            if !app.bridge.isOwnedProcessRunning {
+                accountStatusLabel.stringValue = L10n.t("overview.status.offline")
+                accountStatusLabel.isHidden = false; accountStatusLabel.textColor = accessibleWarningColor()
+            }
             return
         }
         let hasDashboardBentoData = (lastSuccessfulSummary?["usage"] as? [String: Any])?["todayByModel"] != nil
@@ -624,9 +639,15 @@ final class DashboardPage: NSObject {
                     self.dataTimestampLabel.textColor = accessibleWarningColor()
                 }
             case .success(let result):
-                self.lastMetricsFetchTime = Date()
+                let fetchedAt = Date()
+                self.lastMetricsFetchTime = fetchedAt
                 self.metricsKey = currentKey
                 self.lastSuccessfulSummary = result
+                self.app.cachedDashboardBootstrapSummary = result
+                if let usageDict = result["usage"] as? [String: Any], let periodsMap = usageDict["periods"] as? [String: Any] {
+                    self.app.ingestUsagePeriods(from: periodsMap, fetchedAt: fetchedAt)
+                }
+                self.app.scheduleUIBootstrapSave()
                 if (result["usage"] as? [String: Any])?["todayByModel"] == nil {
                     self.app.fetchUsageSummary(period: "today", force: force) { [weak self] _ in
                         self?.updateReadinessMatrix()

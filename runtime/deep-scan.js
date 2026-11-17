@@ -179,5 +179,5 @@
       return{routeRestored,editorsMatch,modelMatch,scrollRestored:restored,scrollExpected:saved.scroll.length,userIntervened:false,message:routeRestored&&editorsMatch&&modelMatch?msg('已恢复原页面，编辑区哈希和模型选择一致。','Original view restored with matching editor hash and model selection.'):msg('页面、编辑区或模型选择恢复未完全确认，请检查当前窗口；没有强制改写内容。','View, editor, or model restoration partially unconfirmed; check the current window without forced changes.')};
     }
   };
-  const dispose=engine.dispose.bind(engine);engine.dispose=()=>{for(const type of ['pointerdown','keydown','input','compositionstart','wheel'])document.removeEventListener(type,intercept,true);current=null;delete globalThis.__GRAVITYBOX_ATTACH_DEEP_SCAN__;return dispose();};
+  const dispose=engine.dispose.bind(engine);engine.dispose=(...args)=>{for(const type of ['pointerdown','keydown','input','compositionstart','wheel'])document.removeEventListener(type,intercept,true);current=null;delete globalThis.__GRAVITYBOX_ATTACH_DEEP_SCAN__;return dispose(...args);};
 })();

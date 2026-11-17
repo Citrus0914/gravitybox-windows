@@ -21,6 +21,7 @@ export {
 import {
   normalizeSubscriptionTier,
   projectAccountForIpcNormalized as projectAccountNormalizedWithManager,
+  projectAllUsagePeriodSummaries,
   projectQuotaContract,
   projectUsagePeriodSummary,
 } from './ipc-projections.js';
@@ -222,10 +223,11 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
           deps.getUsageSummary(),
           deps.getPricingTable(),
         ]);
-        const todayProjected =
+        const allPeriodsProjected =
           Array.isArray(summary?.today?.by_model) && Array.isArray(summary?.today_hourly)
-            ? projectUsagePeriodSummary(summary, 'today')
+            ? projectAllUsagePeriodSummaries(summary)
             : undefined;
+        const todayProjected = allPeriodsProjected?.today;
         usage = {
           todayTokens: summary.today.totals.total_tokens,
           totalTokens: summary.all_time.totals.total_tokens,
@@ -252,6 +254,7 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
             todayHourly: todayProjected.todayHourly,
             todayByModel: todayProjected.byModel,
           } : {}),
+          ...(allPeriodsProjected ? { periods: allPeriodsProjected } : {}),
         };
       } catch (error) { usageError = sanitizeErrorMessage(error); }
     })(),
@@ -738,18 +741,24 @@ async function run() {
         (async () => {
         const counts = store.layerCounts;
         const dictTotal = (counts?.builtin ?? 0) + (counts?.incremental ?? 0) + (counts?.personal ?? 0);
-        await syncActiveOfficialModelsToUsageManager();
-        const liveForDashboard = await probeLiveCached().catch(() => null);
+        const livePromise = probeLiveCached().catch(() => null);
+        const pricingSyncPromise = syncActiveOfficialModelsToUsageManager();
         const [report, aggregate] = await Promise.all([
           controller.coverageReport(),
           buildDashboardAggregate({
-            listAccounts: () => accountsManager.listAccounts({ liveEmailHint: liveForDashboard?.email ?? null }),
+            listAccounts: async () => {
+              const liveForDashboard = await livePromise;
+              return accountsManager.listAccounts({ liveEmailHint: liveForDashboard?.email ?? null });
+            },
             getAutoSwitchConfig: () => accountsManager.getAutoSwitchConfig(),
-            probeLiveLanguageServer: () => Promise.resolve(liveForDashboard),
+            probeLiveLanguageServer: () => livePromise,
             getAccount: (id: string) => accountsManager.getAccount(id),
             getAccountQuotaOverview: (account: any, options?: any) => accountsManager.getAccountQuotaOverview(account, options),
             getUsageSummary: () => usageManager.getUsageSummary(),
-            getPricingTable: () => usageManager.getActivePricingTable(),
+            getPricingTable: async () => {
+              await pricingSyncPromise;
+              return usageManager.getActivePricingTable();
+            },
           }),
         ]);
         /* 总览“已覆盖”与覆盖页同源（translated / 已抽取），并带上应用版本与生成时间。 */
@@ -925,10 +934,42 @@ async function run() {
         })().catch(error => reply({ ok: false, state: 'unknown', error: sanitizeErrorMessage(error) }));
         return;
       }
-      // 只读 IPC 命令直接并发响应，不阻塞在写锁 commandChain 队列后
+      // 只读及自管理锁的配额刷新命令直接并发响应，不阻塞在全局写锁 commandChain 队列后
       const isReadOnlyAutoSwitch = command === 'auto_switch_best' && parsed.execute !== true;
-      if (['maintenance_scan', 'maintenance_history', 'account_recovery_info', 'auto_switch_get', 'usage_snapshot_release', 'usage_events', 'usage_summary', 'usage_ledger_review', 'api_pricing_get', 'pricing_sync_status'].includes(command) || isReadOnlyAutoSwitch) {
+      if (['maintenance_scan', 'maintenance_history', 'account_recovery_info', 'auto_switch_get', 'usage_snapshot_release', 'usage_events', 'usage_summary', 'usage_ledger_review', 'api_pricing_get', 'pricing_sync_status', 'quota_refresh', 'quota_refresh_start'].includes(command) || isReadOnlyAutoSwitch) {
         (async () => {
+          if (command === 'quota_refresh_start') {
+            const taskId = tasks.begin('quota-refresh', bt('main.task.quota_refresh_title'), async (signal, progress, _commit) => {
+              const result = await accountsManager.refreshAllQuotas(globalThis.fetch, {
+                signal,
+                onAccountUpdated: (_account, done, total) => {
+                  progress(done, total);
+                },
+              });
+              const incomplete = result.accounts.filter(a => a.quota?.refresh_state?.complete === false).length;
+              const warnings = result.accounts.filter(a => a.quota_refresh_error || a.quota?.refresh_state?.complete === false).length;
+              const staleAccounts = result.accounts.filter(a => (a.quota?.stale_groups?.length ?? 0) > 0).length;
+              const staleGroups = result.accounts.reduce((total, a) => total + (a.quota?.stale_groups?.length ?? 0), 0);
+              const incompletePart = incomplete ? bt('main.task.quota_refresh_incomplete_part', { count: incomplete }) : '';
+              const stalePart = staleAccounts ? bt('main.task.quota_refresh_stale_part', { accounts: staleAccounts, groups: staleGroups }) : '';
+              return { ok: result.failures.length === 0 && incomplete === 0, partial: (result.failures.length > 0 || incomplete > 0) && result.accounts.length > 0,
+                incomplete, updated: result.accounts.length, failed: result.failures.length, warnings, staleAccounts, staleGroups,
+                message: result.failures.length
+                  ? bt('main.task.quota_refresh_failures', { total: result.accounts.length, failed: result.failures.length })
+                  : bt('main.task.quota_refresh_ok', { total: result.accounts.length, incompletePart, stalePart }) };
+            });
+            reply({ ok: true, taskId });
+            return;
+          }
+          if (command === 'quota_refresh') {
+            const acc = await accountsManager.refreshQuota(parsed.id);
+            const overview = accountsManager.getAccountQuotaOverview(acc);
+            const projected = projectAccountForIpcNormalized(acc, { overview });
+            const partial = acc.quota?.refresh_state?.complete === false || !!projected?.quota_refresh_error;
+            reply({ ok: true, partial, message: partial ? bt('main.quota.read_partial') : bt('main.quota.read_ok'),
+              quota: acc.quota ? (projected?.quota ?? null) : acc.quota, account: projected, subscription_tier: normalizeSubscriptionTier(projected?.subscription_tier) });
+            return;
+          }
           if (command === 'pricing_sync_status') { await syncActiveOfficialModelsToUsageManager(); reply({ ok: true, status: await usageManager.getPricingSyncStatus() }); return; }
           if (command === 'usage_ledger_review') { reply({ ok: true, review: await usageManager.ledgerReview() }); return; }
           if (command === 'maintenance_scan') { reply(await cacheMaintenance.scan({ retentionDays: parsed.retentionDays })); return; }
@@ -960,7 +1001,7 @@ async function run() {
             const targetAccountId = typeof parsed.accountId === 'string' && parsed.accountId ? parsed.accountId : undefined;
             if (targetAccountId) await syncActiveAccountToUsageManager().catch(() => {});
             const usage = await usageManager.getUsageSummary(force, targetAccountId);
-            reply(projectUsagePeriodSummary(usage, parsed.period));
+            reply(projectUsagePeriodSummary(usage, parsed.period, { includeAllPeriods: !targetAccountId || targetAccountId === 'all' }));
             return;
           }
           if (command === 'api_pricing_get') {
@@ -1063,24 +1104,7 @@ async function run() {
             });
             reply({ ok: true, taskId }); return;
           }
-          if (command === 'quota_refresh_start') {
-            const taskId = tasks.begin('quota-refresh', bt('main.task.quota_refresh_title'), async (signal, _progress, _commit) => {
-              // 取消必须能中止后续账号/端点；token 轮换的中间落盘由 accounts.ts 在 signal 检查后阻止。
-              const result = await accountsManager.refreshAllQuotas(globalThis.fetch, { signal });
-              const incomplete = result.accounts.filter(a => a.quota?.refresh_state?.complete === false).length;
-              const warnings = result.accounts.filter(a => a.quota_refresh_error || a.quota?.refresh_state?.complete === false).length;
-              const staleAccounts = result.accounts.filter(a => (a.quota?.stale_groups?.length ?? 0) > 0).length;
-              const staleGroups = result.accounts.reduce((total, a) => total + (a.quota?.stale_groups?.length ?? 0), 0);
-              const incompletePart = incomplete ? bt('main.task.quota_refresh_incomplete_part', { count: incomplete }) : '';
-              const stalePart = staleAccounts ? bt('main.task.quota_refresh_stale_part', { accounts: staleAccounts, groups: staleGroups }) : '';
-              return { ok: result.failures.length === 0 && incomplete === 0, partial: (result.failures.length > 0 || incomplete > 0) && result.accounts.length > 0,
-                incomplete, updated: result.accounts.length, failed: result.failures.length, warnings, staleAccounts, staleGroups,
-                message: result.failures.length
-                  ? bt('main.task.quota_refresh_failures', { total: result.accounts.length, failed: result.failures.length })
-                  : bt('main.task.quota_refresh_ok', { total: result.accounts.length, incompletePart, stalePart }) };
-            });
-            reply({ ok: true, taskId }); return;
-          }
+
           // ---- 备用账号推荐与配额 IPC ----
           if (command === 'auto_switch_set') {
             reply({ ok: true, config: await accountsManager.setAutoSwitchConfig(parsed.config ?? {}) });
@@ -1112,15 +1136,7 @@ async function run() {
               message: best.reason, ...(wantsExecute ? { skipReason: bt('main.auto_switch.no_need') } : {}) });
             return;
           }
-          if (command === 'quota_refresh') {
-            const acc = await accountsManager.refreshQuota(parsed.id);
-            const overview = accountsManager.getAccountQuotaOverview(acc);
-            const projected = projectAccountForIpcNormalized(acc, { overview });
-            const partial = acc.quota?.refresh_state?.complete === false || !!projected?.quota_refresh_error;
-            reply({ ok: true, partial, message: partial ? bt('main.quota.read_partial') : bt('main.quota.read_ok'),
-              quota: acc.quota ? (projected?.quota ?? null) : acc.quota, account: projected, subscription_tier: normalizeSubscriptionTier(projected?.subscription_tier) });
-            return;
-          }
+
           if (command === 'quota_refresh_all') {
             const result = await accountsManager.refreshAllQuotas();
             const accounts = result.accounts.map(account => projectAccountForIpcNormalized(account));
@@ -1178,6 +1194,9 @@ async function run() {
   // A single bad payload must not take the whole localisation helper down; log it and keep serving.
   process.on('uncaughtException', error => { console.error(`[GravityBox] ${sanitizeError(error?.stack ?? error?.message ?? bt('main.uncaught_exception'))}`); if (stopping) void stop(1); });
   process.on('unhandledRejection', reason => { console.error(`[GravityBox] ${reason instanceof Error ? sanitizeError(reason.message) : bt('main.unhandled_rejection')}`); });
+  onStatus(controller.snapshot());
+  void accountsManager.loadIndex().catch(() => {});
+  void usageManager.getUsageSummary(false).catch(() => {});
   await controller.start();
   void syncActiveAccountToUsageManager(true).catch(() => {});
   } catch (error) {

@@ -77,8 +77,8 @@
     globalThis[KEY] = {
       state, getLanguageMode: () => 'en', refresh() {},
       update(next) { dictionary = next; }, setShortcutEnabled() {},
-      dispose() {
-        try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {}
+      dispose(opts) {
+        if (!opts?.keepHud) { try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {} }
         delete globalThis[KEY];
         if (globalThis.__GRAVITYBOX_BOOT__ === options) delete globalThis.__GRAVITYBOX_BOOT__;
         return { restored: 0, skipped: 0, active: false };
@@ -2550,8 +2550,8 @@
         skippedRestores, queueTrimmed, droppedBatches
       };
     },
-    dispose() {
-      try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {}
+    dispose(opts) {
+      if (!opts?.keepHud) { try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {} }
       auditKeys = null; auditTrail.clear();
       active = false; observer.disconnect(); clearTimeout(timer); timer = null; reconcileQueue = null;
       if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
@@ -2666,6 +2666,7 @@
     /* pushState() fires no event of its own; a light poll plus the flush/observer checks above catch
        in-app navigation even when the router swaps the URL before it renders the new view. */
     routeTimer = setInterval(checkRoute, 500);
+    if (typeof routeTimer?.unref === 'function') routeTimer.unref();
   } catch {}
   observe(document); schedule(document);
 })();

@@ -33,27 +33,36 @@ export async function inspectPathTree(root: string, deadline: number, counter: {
   lastModifiedAt: number;
   items: string[];
 }> {
-  const items: string[] = [];
+  const rawItems: Array<{ rel: string; line: string }> = [];
   let bytes = 0;
   let fileCount = 0;
   let lastModifiedAt = 0;
+  const queue: string[] = [root];
 
-  const walk = async (path: string) => {
-    if (++counter.count > 250000 || Date.now() > deadline) throw Error(bt('maintenance.err.dir_too_large'));
-    const s = await lstat(path);
-    if (s.isSymbolicLink()) throw Error(bt('maintenance.err.symlink_skipped'));
-    if (!s.isDirectory() && !s.isFile()) throw Error(bt('maintenance.err.irregular_file_skipped'));
-    items.push(JSON.stringify([path.slice(root.length), s.dev, s.ino, s.size, s.mtimeMs, s.ctimeMs]));
-    if (s.mtimeMs > lastModifiedAt) lastModifiedAt = s.mtimeMs;
-    if (s.isDirectory()) {
-      for (const n of (await readdir(path)).sort()) await walk(join(path, n));
-    } else {
-      bytes += s.size;
-      fileCount++;
-    }
-  };
-  await walk(root);
-  return { bytes, fileCount, lastModifiedAt, items };
+  while (queue.length > 0) {
+    const batch = queue.splice(0, 32);
+    await Promise.all(batch.map(async (currentPath) => {
+      if (++counter.count > 250000 || Date.now() > deadline) throw Error(bt('maintenance.err.dir_too_large'));
+      const s = await lstat(currentPath);
+      if (s.isSymbolicLink()) throw Error(bt('maintenance.err.symlink_skipped'));
+      if (!s.isDirectory() && !s.isFile()) throw Error(bt('maintenance.err.irregular_file_skipped'));
+      const rel = currentPath.slice(root.length);
+      rawItems.push({
+        rel,
+        line: JSON.stringify([rel, s.dev, s.ino, s.size, s.mtimeMs, s.ctimeMs]),
+      });
+      if (s.mtimeMs > lastModifiedAt) lastModifiedAt = s.mtimeMs;
+      if (s.isDirectory()) {
+        const children = await readdir(currentPath);
+        for (const n of children) queue.push(join(currentPath, n));
+      } else {
+        bytes += s.size;
+        fileCount++;
+      }
+    }));
+  }
+  rawItems.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  return { bytes, fileCount, lastModifiedAt, items: rawItems.map(item => item.line) };
 }
 
 export async function inspectSingleProfileItem(ctx: MaintenanceDiscoveryContext, name: string): Promise<InspectedCacheEntry> {
@@ -647,32 +656,35 @@ export async function inspectReadOnlyPaths(paths: string[], limitCount = 80000, 
   const normalizedExclude = excludePaths && excludePaths.size > 0
     ? new Set(Array.from(excludePaths, p => resolve(p)))
     : undefined;
-  const walk = async (path: string) => {
-    if (normalizedExclude?.has(resolve(path))) return;
-    if (++count > limitCount || Date.now() > deadline) {
+  const queue: string[] = [...paths];
+  while (queue.length > 0) {
+    if (count > limitCount || Date.now() > deadline) {
       truncated = true;
-      return;
+      break;
     }
-    try {
-      const s = await lstat(path);
-      if (s.isSymbolicLink()) return;
-      exists = true;
-      if (s.isDirectory()) {
-        const names = await readdir(path);
-        names.sort((a, b) => (a.startsWith('conversation') ? 0 : 1) - (b.startsWith('conversation') ? 0 : 1));
-        for (const n of names) {
-          if (count > limitCount || Date.now() > deadline) {
-            truncated = true;
-            break;
-          }
-          await walk(join(path, n));
-        }
-      } else if (s.isFile()) {
-        bytes += s.size;
-        fileCount++;
+    const batch = queue.splice(0, 32);
+    await Promise.all(batch.map(async (currentPath) => {
+      if (normalizedExclude?.has(resolve(currentPath))) return;
+      if (++count > limitCount || Date.now() > deadline) {
+        truncated = true;
+        return;
       }
-    } catch {}
-  };
-  for (const p of paths) await walk(p);
+      try {
+        const s = await lstat(currentPath);
+        if (s.isSymbolicLink()) return;
+        exists = true;
+        if (s.isDirectory()) {
+          const names = await readdir(currentPath);
+          names.sort((a, b) => (a.startsWith('conversation') ? 0 : 1) - (b.startsWith('conversation') ? 0 : 1));
+          for (const n of names) {
+            queue.push(join(currentPath, n));
+          }
+        } else if (s.isFile()) {
+          bytes += s.size;
+          fileCount++;
+        }
+      } catch {}
+    }));
+  }
   return { bytes, fileCount, exists, truncated };
 }

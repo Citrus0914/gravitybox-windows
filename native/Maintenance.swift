@@ -630,6 +630,16 @@ final class CachePage: NSObject, NSPopoverDelegate {
     }
 
     func fetch(force: Bool = false) {
+        if !force && !hasCompletedScan,
+           let cached = app.lastMaintenanceScanPayload,
+           intVal(cached, "retentionDays", fallback: 7) == selectedRetentionDays,
+           Date().timeIntervalSince(app.lastMaintenanceScanAt) < 30.0 {
+            lastFetchTime = app.lastMaintenanceScanAt
+            applyScanPayload(cached)
+            if Date().timeIntervalSince(app.lastMaintenanceScanAt) < 15.0 {
+                return
+            }
+        }
         if !force && Date().timeIntervalSince(lastFetchTime) < 3.0 && hasCompletedScan {
             return
         }
@@ -658,16 +668,19 @@ final class CachePage: NSObject, NSPopoverDelegate {
         app.bridge.send(["command": "maintenance_scan", "retentionDays": selectedRetentionDays]) { [weak self] response in
             guard let self else { return }
             self.setBusy(false)
-            self.lastFetchTime = Date()
+            let now = Date()
+            self.lastFetchTime = now
             switch response {
             case .failure(let error):
                 if !self.hasCompletedScan {
-                    self.reclaimableValueLabel.stringValue = L10n.t("maintenance.hero.scan_failed")
+                    reclaimableValueLabel.stringValue = L10n.t("maintenance.hero.scan_failed")
                 }
                 self.heroSubtitleLabel.stringValue = error.localizedDescription
                 self.heroSubtitleLabel.textColor = accessibleWarningColor()
                 self.clearButton.isEnabled = false
             case .success(let value):
+                self.app.lastMaintenanceScanPayload = value
+                self.app.lastMaintenanceScanAt = now
                 self.applyScanPayload(value)
                 self.app.preferencesController?.applyStorageScanPayload(value)
             }

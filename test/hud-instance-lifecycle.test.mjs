@@ -193,7 +193,7 @@ class FakeElement {
   querySelectorAll(sel) {
     const out = [];
     const testIdTargets = [...String(sel).matchAll(/\[data-testid="([^"]+)"\]/g)].map((match) => match[1]);
-    const matchButtonTag = /\bbutton\b/.test(String(sel));
+    const matchButtonTag = /(?:^|[\s,>])button(?=$|[\s,\[.:])/i.test(String(sel));
     const matchShimmerClass = String(sel).includes('.animate-shimmer-text');
     const visit = (node) => {
       for (const child of node.children || []) {
@@ -1178,6 +1178,101 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
     assert.equal(sr.querySelector('#hud-txt-session .hud-turn-dur').textContent, '· 本轮 14s');
     assert.equal(sr.querySelector('#val-turn-dur').textContent, '14秒');
     inst.dispose();
+  });
+
+  it('正常轮次高水位曾因瞬时抖动虚高 (>1.5s) 后，进入 idle 必须立即收敛回后端权威耗时', () => {
+    const inst = new HudInstance({ cascadeId: 'pane-turn-converge', isPrimaryPane: true });
+    const composer = new FakeElement('div');
+    composer.setAttribute('data-testid', 'agent-input-box');
+    inst.mount(composer);
+    const sr = inst.host.shadowRoot;
+
+    inst.switchConversation('conv-turn-converge', 'gemini-4-hydrogen', false);
+    inst.updateMetrics({
+      conversationId: 'conv-turn-converge',
+      sessionRevision: inst.getSessionRevision(),
+      metricsSequence: 1,
+      availability: 'ready',
+      isStreaming: false,
+      session: {
+        turns: 2,
+        steps: 93,
+        currentTurnDurationSeconds: 404.46,
+        currentTurnDurationFormatted: '6分44秒',
+        currentTurnDurationFormattedEn: '6m44s',
+        currentTurnDurationCompactZh: '本轮 6m',
+        currentTurnDurationCompactEn: 'Turn 6m',
+      },
+      tokens: { totalTokens: 1000 },
+      context: { hasUsageData: true, usedRatio: 0.2 },
+    });
+    assert.equal(sr.querySelector('#val-turn-dur').textContent, '6分44秒');
+
+    // 模拟前端短暂抖动并推入虚高包 (44分48秒)
+    inst.notifyModelOrStreamingChange('gemini-4-hydrogen', true, false, 0, null, 'generating');
+    inst.updateMetrics({
+      conversationId: 'conv-turn-converge',
+      sessionRevision: inst.getSessionRevision(),
+      metricsSequence: 2,
+      availability: 'ready',
+      isStreaming: true,
+      session: {
+        turns: 2,
+        steps: 93,
+        currentTurnDurationSeconds: 2688,
+        currentTurnDurationFormatted: '44分48秒',
+        currentTurnDurationFormattedEn: '44m48s',
+        currentTurnDurationCompactZh: '本轮 44m',
+        currentTurnDurationCompactEn: 'Turn 44m',
+      },
+      tokens: { totalTokens: 1000 },
+      context: { hasUsageData: true, usedRatio: 0.2 },
+    });
+
+    // 回到 idle 且后端下发权威 6分44秒，不得死锁在 44分48秒
+    inst.notifyModelOrStreamingChange(null, false, false, 0, null, 'idle');
+    inst.updateMetrics({
+      conversationId: 'conv-turn-converge',
+      sessionRevision: inst.getSessionRevision(),
+      metricsSequence: 3,
+      availability: 'ready',
+      isStreaming: false,
+      session: {
+        turns: 2,
+        steps: 93,
+        currentTurnDurationSeconds: 404.46,
+        currentTurnDurationFormatted: '6分44秒',
+        currentTurnDurationFormattedEn: '6m44s',
+        currentTurnDurationCompactZh: '本轮 6m',
+        currentTurnDurationCompactEn: 'Turn 6m',
+      },
+      tokens: { totalTokens: 1000 },
+      context: { hasUsageData: true, usedRatio: 0.2 },
+    });
+    assert.equal(sr.querySelector('#hud-txt-session .hud-turn-dur').textContent, '· 本轮 6m');
+    assert.equal(sr.querySelector('#val-turn-dur').textContent, '6分44秒');
+    assert.equal(inst.turnHighWaterMark, null);
+    inst.dispose();
+  });
+
+  it('闲置输入区出现附件处理态 send-button-pending / send-button-loading 时不得误判为流式活跃', () => {
+    const mgr = new AntigravityHudManager({ enabled: true });
+    const view = new FakeElement('div');
+    view.setAttribute('data-testid', 'conversation-view');
+    const composer = new FakeElement('div');
+    composer.className = 'surface-composer';
+    const sendPendingBtn = new FakeElement('button');
+    sendPendingBtn.setAttribute('data-testid', 'send-button-pending');
+    composer.appendChild(sendPendingBtn);
+    view.appendChild(composer);
+    assert.equal(mgr.resolveActivityPhase(view), 'idle');
+
+    sendPendingBtn.setAttribute('data-testid', 'send-button-loading');
+    assert.equal(mgr.resolveActivityPhase(view), 'idle');
+
+    sendPendingBtn.setAttribute('data-testid', 'input-cancel-button');
+    assert.equal(mgr.resolveActivityPhase(view), 'generating');
+    mgr.dispose();
   });
 
   it('子智能体切换间隙或 turns 延迟落库时，本轮用时保持单调递增不暂停、不回退', () => {
@@ -2281,7 +2376,7 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       assert.equal(inst.shadow.querySelector('#hud-ctx-stages-wrap').hasAttribute('hidden'), false);
       assert.equal(
         inst.shadow.querySelector('#lbl-ctx-stages').textContent,
-        lang === 'en' ? 'Dual-Stage Context' : '双阶段上下文'
+        lang === 'en' ? 'Orchestrator Context' : 'Orchestrator 上下文'
       );
       const listHtml = inst.shadow.querySelector('#hud-ctx-stages-list').innerHTML;
       assert.equal(listHtml.includes(lang === 'en' ? 'Plan · Carbon' : '规划 · Carbon'), true);
@@ -2454,6 +2549,22 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
         breakdown: { cachedContextTokens: 0, uncachedContextTokens: 1000, latestOutputTokens: 10 },
         modelStages: [
           {
+            slotKey: 'model:opus-history',
+            role: 'model',
+            modelId: 'opus',
+            modelDisplayName: 'Claude Opus 4.6',
+            shortLabel: 'Opus',
+            compactLabel: 'O',
+            hasUsageData: true,
+            isActive: false,
+            usedTokens: 500,
+            peakContextTokens: 500,
+            capacityTokens: 200000,
+            isFallbackCapacity: true,
+            usedRatio: 0.0025,
+            usedRatioFormatted: '0.25%',
+          },
+          {
             slotKey: 'model:xss',
             role: 'model',
             modelId: 'xss',
@@ -2461,13 +2572,29 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
             shortLabel: '<script>',
             compactLabel: 'X',
             hasUsageData: true,
-            isActive: true,
+            isActive: false,
             usedTokens: 1000,
             peakContextTokens: 1000,
             capacityTokens: 200000,
             isFallbackCapacity: true,
             usedRatio: 0.005,
             usedRatioFormatted: '0.5%',
+          },
+          {
+            slotKey: 'model:active',
+            role: 'model',
+            modelId: 'active',
+            modelDisplayName: 'Gemini 4 Hydrogen (High)',
+            shortLabel: 'Hydrogen',
+            compactLabel: 'H',
+            hasUsageData: true,
+            isActive: true,
+            usedTokens: 2000,
+            peakContextTokens: 2000,
+            capacityTokens: 200000,
+            isFallbackCapacity: false,
+            usedRatio: 0.01,
+            usedRatioFormatted: '1%',
           },
         ],
       },
@@ -2535,6 +2662,318 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
     } finally {
       globalThis.window = prevWin;
       inst.dispose();
+    }
+  });
+
+  it('多模型阶段与本对话曾用模型渲染三档压缩胶囊，且当前模型峰值与历史模型压缩解耦', () => {
+    assert.match(HUD_STYLES_CSS, /\.hud-stage-compaction\s*\{[^}]*flex:\s*0\s+0\s+auto/);
+    assert.match(HUD_STYLES_CSS, /\.hud-stage-compaction\.is-compaction-low\s*\{/);
+    assert.match(HUD_STYLES_CSS, /\.hud-stage-compaction\.is-compaction-warn\s*\{/);
+    assert.match(HUD_STYLES_CSS, /\.hud-stage-compaction\.is-compaction-danger\s*\{/);
+
+    const buildMultiCompMetrics = (activeCompCount) => ({
+      availability: 'ready',
+      session: { turns: 8, steps: 42, compactionCount: 6 + activeCompCount },
+      tokens: { totalTokens: 2400000, cacheHitRate: 0.91 },
+      context: {
+        hasUsageData: true,
+        modelId: 'gemini-4-carbon',
+        modelDisplayName: 'Orchestrator (Carbon)',
+        modelShortLabel: 'Carbon',
+        modelCompactLabel: 'C',
+        isMultiModel: true,
+        isOrchestrator: true,
+        activeModelCompactionCount: activeCompCount,
+        usedTokens: 256000,
+        usedTokensFormatted: '256,000',
+        peakContextTokens: 256000,
+        peakContextFormatted: '256,000',
+        capacityTokens: 512000,
+        isFallbackCapacity: false,
+        usedRatio: 0.5,
+        usedRatioFormatted: '50%',
+        breakdown: { cachedContextTokens: 240000, uncachedContextTokens: 16000, latestOutputTokens: 1200 },
+        modelStages: [
+          {
+            slotKey: 'orchestrator:carbon',
+            role: 'planner',
+            section: 'primary',
+            modelId: 'gemini-4-carbon',
+            modelDisplayName: 'Orchestrator (Carbon)',
+            shortLabel: 'Carbon',
+            compactLabel: 'C',
+            hasUsageData: true,
+            isActive: true,
+            ...(activeCompCount > 0 ? { compactionCount: activeCompCount } : {}),
+            usedTokens: 256000,
+            peakContextTokens: 256000,
+            capacityTokens: 512000,
+            isFallbackCapacity: false,
+            usedRatio: 0.5,
+            usedRatioFormatted: '50%',
+          },
+          {
+            slotKey: 'orchestrator:hydrogen',
+            role: 'executor',
+            section: 'primary',
+            modelId: 'gemini-4-hydrogen',
+            modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+            shortLabel: 'Hydrogen',
+            compactLabel: 'H',
+            hasUsageData: true,
+            isActive: false,
+            compactionCount: 1,
+            usedTokens: 410000,
+            peakContextTokens: 490000,
+            capacityTokens: 512000,
+            isFallbackCapacity: false,
+            usedRatio: 0.801,
+            usedRatioFormatted: '80.1%',
+          },
+          {
+            slotKey: 'model:claude-opus-4-6-thinking',
+            role: 'model',
+            section: 'history',
+            modelId: 'claude-opus-4-6-thinking',
+            modelDisplayName: 'Claude Opus 4.6 (Thinking)',
+            shortLabel: 'Opus 4.6',
+            compactLabel: 'O4.6',
+            hasUsageData: true,
+            isActive: false,
+            compactionCount: 2,
+            usedTokens: 185000,
+            peakContextTokens: 196000,
+            capacityTokens: 200000,
+            isFallbackCapacity: false,
+            usedRatio: 0.925,
+            usedRatioFormatted: '92.5%',
+          },
+          {
+            slotKey: 'model:gemini-3.1-pro-high',
+            role: 'model',
+            section: 'history',
+            modelId: 'gemini-3.1-pro-high',
+            modelDisplayName: 'Gemini 3.1 Pro (High)',
+            shortLabel: '3.1 Pro',
+            compactLabel: '3.1P',
+            hasUsageData: true,
+            isActive: false,
+            compactionCount: 3,
+            usedTokens: 620000,
+            peakContextTokens: 980000,
+            capacityTokens: 1000000,
+            isFallbackCapacity: false,
+            usedRatio: 0.62,
+            usedRatioFormatted: '62%',
+          },
+        ],
+      },
+    });
+
+    for (const lang of ['zh', 'en']) {
+      // A. 当前活跃 Carbon 自身 0 次压缩：底部会话胶囊仍显示总压缩次数 6 (danger)，但 #val-ctx-peak 不得误挂历史模型压缩后缀
+      const instZeroActive = new HudInstance(`ctx-stage-comp-0-${lang}`, { languageMode: lang });
+      instZeroActive.shadow = new FakeShadowRoot('open', null);
+      instZeroActive.shadow.innerHTML = instZeroActive.buildHudHtml();
+      const payload0 = buildMultiCompMetrics(0);
+      instZeroActive.applyMetricsToDom(payload0);
+
+      const sessionBadge = instZeroActive.shadow.querySelector('#hud-compaction-badge');
+      assert.equal(sessionBadge.hasAttribute('hidden'), false);
+      assert.equal(sessionBadge.getAttribute('data-compaction-tier'), 'danger');
+      assert.equal(sessionBadge.textContent, '6');
+      assert.equal(
+        instZeroActive.shadow.querySelector('#val-ctx-peak').textContent,
+        '256K tok',
+        '当前模型未发生压缩时，当前模型峰值行不得展示曾用模型的压缩后缀'
+      );
+
+      // HTML 字符串渲染路径验证：1/2/3 次三档数字圆圈徽章、aria-label 完整语义与零 title 属性
+      const listHtml = instZeroActive.shadow.querySelector('#hud-ctx-stages-list').innerHTML;
+      assert.equal(listHtml.includes('title='), false);
+      assert.equal(
+        listHtml.includes(
+          lang === 'en'
+            ? '<span class="hud-stage-compaction is-compaction-low" data-compaction-tier="low" aria-label="Compacted once">1</span>'
+            : '<span class="hud-stage-compaction is-compaction-low" data-compaction-tier="low" aria-label="已压缩 1 次">1</span>'
+        ),
+        true
+      );
+      assert.equal(
+        listHtml.includes(
+          lang === 'en'
+            ? '<span class="hud-stage-compaction is-compaction-warn" data-compaction-tier="warn" aria-label="Compacted 2 times">2</span>'
+            : '<span class="hud-stage-compaction is-compaction-warn" data-compaction-tier="warn" aria-label="已压缩 2 次">2</span>'
+        ),
+        true
+      );
+      assert.equal(
+        listHtml.includes(
+          lang === 'en'
+            ? '<span class="hud-stage-compaction is-compaction-danger" data-compaction-tier="danger" aria-label="Compacted 3 times">3</span>'
+            : '<span class="hud-stage-compaction is-compaction-danger" data-compaction-tier="danger" aria-label="已压缩 3 次">3</span>'
+        ),
+        true
+      );
+
+      // DOM 节点路径 (useDomNodes=true) 验证：保持子节点索引契约且 .hud-stage-badge 仅用于活跃标识
+      const findByClass = (root, cls) => {
+        if (!root) return null;
+        if (root.classList?.contains(cls)) return root;
+        for (const ch of root.children || []) {
+          const hit = findByClass(ch, cls);
+          if (hit) return hit;
+        }
+        return null;
+      };
+      const domDoc = { createElement: (tag) => new FakeElement(tag) };
+      const domList = new FakeElement('div', domDoc);
+      domList.replaceChildren = (...items) => {
+        domList.children = items;
+      };
+      instZeroActive.renderModelStagesList(domList, payload0.context.modelStages, false);
+      const stageNodes = domList.children.filter((n) => n.classList.contains('hud-stage-item'));
+      assert.equal(stageNodes.length, 4);
+      // Carbon (0 次压缩)：仅有 dot + label + active badge
+      assert.equal(stageNodes[0].getAttribute('data-stage-compactions'), null);
+      assert.equal(stageNodes[0].children[0].children[0].children[1].className, 'hud-stage-label');
+      assert.equal(findByClass(stageNodes[0], 'hud-stage-badge')?.textContent, lang === 'en' ? 'Active' : '当前');
+      assert.equal(findByClass(stageNodes[0], 'hud-stage-compaction'), null);
+      // Hydrogen (1 次 low)、Opus 历史模型 (2 次 warn)、3.1 Pro 历史模型 (3 次 danger)
+      assert.equal(stageNodes[1].getAttribute('data-stage-compactions'), '1');
+      assert.equal(findByClass(stageNodes[1], 'hud-stage-compaction')?.getAttribute('data-compaction-tier'), 'low');
+      assert.equal(findByClass(stageNodes[1], 'hud-stage-compaction')?.textContent, '1');
+      assert.equal(stageNodes[2].getAttribute('data-stage-compactions'), '2');
+      assert.equal(findByClass(stageNodes[2], 'hud-stage-compaction')?.getAttribute('data-compaction-tier'), 'warn');
+      assert.equal(findByClass(stageNodes[2], 'hud-stage-compaction')?.textContent, '2');
+      assert.equal(stageNodes[3].getAttribute('data-stage-compactions'), '3');
+      assert.equal(findByClass(stageNodes[3], 'hud-stage-compaction')?.getAttribute('data-compaction-tier'), 'danger');
+      assert.equal(findByClass(stageNodes[3], 'hud-stage-compaction')?.textContent, '3');
+
+      // B. 当前活跃 Carbon 自身发生 2 次压缩：#val-ctx-peak 仅展示当前模型的 2 次，且活跃行同时并存“当前”与数字圆圈“2”
+      const instActiveComp = new HudInstance(`ctx-stage-comp-2-${lang}`, { languageMode: lang });
+      instActiveComp.shadow = new FakeShadowRoot('open', null);
+      instActiveComp.shadow.innerHTML = instActiveComp.buildHudHtml();
+      const payload2 = buildMultiCompMetrics(2);
+      instActiveComp.applyMetricsToDom(payload2);
+      assert.equal(
+        instActiveComp.shadow.querySelector('#val-ctx-peak').textContent,
+        lang === 'en' ? '256K tok (2x compacted)' : '256K tok (已压缩 2 次)'
+      );
+      instActiveComp.renderModelStagesList(domList, payload2.context.modelStages, true);
+      const activeStageNode = domList.children.filter((n) => n.classList.contains('hud-stage-item'))[0];
+      assert.equal(findByClass(activeStageNode, 'hud-stage-badge')?.textContent, lang === 'en' ? 'Active' : '当前');
+      assert.equal(findByClass(activeStageNode, 'hud-stage-compaction')?.textContent, '2');
+      assert.equal(
+        findByClass(activeStageNode, 'hud-stage-compaction')?.getAttribute('aria-label'),
+        lang === 'en' ? 'Compacted 2 times' : '已压缩 2 次'
+      );
+
+      // C. 非 Orchestrator 3 模型切换场景：标题为“曾用模型上下文 / Prior Model Context”，自动剔除当前模型防重复，且 unavailable 态清理压缩徽章
+      const nonOrchInst = new HudInstance(`non-orch-dedup-${lang}`, { languageMode: lang });
+      nonOrchInst.shadow = new FakeShadowRoot('open', null);
+      nonOrchInst.shadow.innerHTML = nonOrchInst.buildHudHtml();
+      nonOrchInst.applyMetricsToDom({
+        availability: 'ready',
+        session: { turns: 4, steps: 20, compactionCount: 2 },
+        tokens: { totalTokens: 124_000_000, cacheHitRate: 0.93 },
+        context: {
+          hasUsageData: true,
+          modelId: 'gemini-4-hydrogen',
+          modelDisplayName: 'Gemini 4 Hydrogen (High)',
+          modelShortLabel: 'Hydrogen',
+          modelCompactLabel: 'H',
+          isMultiModel: true,
+          isOrchestrator: false,
+          activeModelCompactionCount: 2,
+          usedTokens: 53200,
+          peakContextTokens: 510000,
+          capacityTokens: 512000,
+          usedRatio: 53200 / 512000,
+          usedRatioFormatted: '10.4%',
+          breakdown: { cachedContextTokens: 50200, uncachedContextTokens: 2990, latestOutputTokens: 1630 },
+          modelStages: [
+            {
+              slotKey: 'model:claude-opus-5-5',
+              role: 'model',
+              section: 'primary',
+              modelId: 'claude-opus-5-5',
+              modelDisplayName: 'Claude Opus 5.5 (Medium)',
+              shortLabel: 'Opus',
+              compactLabel: 'O',
+              hasUsageData: true,
+              isActive: false,
+              compactionCount: 1,
+              usedTokens: 57900,
+              peakContextTokens: 57900,
+              capacityTokens: 840000,
+              usedRatio: 57900 / 840000,
+              usedRatioFormatted: '6.9%',
+            },
+            {
+              slotKey: 'model:gemini-4-carbon',
+              role: 'model',
+              section: 'primary',
+              modelId: 'gemini-4-carbon',
+              modelDisplayName: 'Gemini 4 Carbon (Medium)',
+              shortLabel: 'Carbon',
+              compactLabel: 'C',
+              hasUsageData: true,
+              isActive: false,
+              usedTokens: 272000,
+              peakContextTokens: 272000,
+              capacityTokens: 512000,
+              usedRatio: 272000 / 512000,
+              usedRatioFormatted: '53.1%',
+            },
+            {
+              slotKey: 'model:gemini-4-hydrogen',
+              role: 'model',
+              section: 'primary',
+              modelId: 'gemini-4-hydrogen',
+              modelDisplayName: 'Gemini 4 Hydrogen (High)',
+              shortLabel: 'Hydrogen',
+              compactLabel: 'H',
+              hasUsageData: true,
+              isActive: true,
+              compactionCount: 2,
+              usedTokens: 53200,
+              peakContextTokens: 510000,
+              capacityTokens: 512000,
+              usedRatio: 53200 / 512000,
+              usedRatioFormatted: '10.4%',
+            },
+          ],
+        },
+      });
+      assert.equal(
+        nonOrchInst.shadow.querySelector('#lbl-ctx-stages').textContent,
+        lang === 'en' ? 'Prior Model Context' : '曾用模型上下文'
+      );
+      const nonOrchListHtml = nonOrchInst.shadow.querySelector('#hud-ctx-stages-list').innerHTML;
+      assert.equal(nonOrchListHtml.includes('Opus 5.5 (Medium)'), true);
+      assert.equal(nonOrchListHtml.includes('Carbon (Medium)'), true);
+      assert.equal(nonOrchListHtml.includes('Hydrogen (High)'), false, '非 Orchestrator 下半区必须剔除当前已激活模型防重复');
+      assert.equal(
+        nonOrchListHtml.includes(
+          lang === 'en' ? 'aria-label="Compacted once">1<' : 'aria-label="已压缩 1 次">1<'
+        ),
+        true
+      );
+      assert.equal(
+        nonOrchInst.shadow.querySelector('#hud-popover-context').getAttribute('data-exact-summary').includes('modelCompactions=2'),
+        true
+      );
+
+      nonOrchInst.applyMetricsToDom({
+        availability: 'unavailable',
+        conversationId: 'conv-gone',
+        session: { turns: 0, steps: 0, compactionCount: 3 },
+        tokens: {},
+        context: { hasUsageData: false },
+      });
+      assert.equal(nonOrchInst.shadow.querySelector('#hud-compaction-badge').hasAttribute('hidden'), true);
+      assert.equal(nonOrchInst.shadow.querySelector('.capsule-context').classList.contains('has-compaction'), false);
     }
   });
 });

@@ -267,6 +267,11 @@ final class AccountsPage: NSObject {
         autoSwitchToggle.setAccessibilityLabel(L10n.t("accounts.smart_switch.a11y"))
 
         updateAutoSwitchState()
+        if let boot = app.cachedAccountsBootstrapPayload {
+            fetch(boot)
+        } else if !app.cachedAccounts.isEmpty {
+            fetch(["accounts": app.cachedAccounts, "activeId": app.activeAccountId, "pendingSwitch": false])
+        }
         fetch()
         fetchPolicy()
     }
