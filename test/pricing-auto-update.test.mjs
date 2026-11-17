@@ -152,6 +152,27 @@ test('共识门禁：双源一致放行 green，分歧/孤证/越界波动/未�
     nowMs,
   });
   assert.equal(futureBlocked.status, 'yellow');
+
+  // 若官网价正好吻合本地已排期的未来生效区间（如 gemini-4-hydrogen 的 2027-01-12 cacheWrite=$1.875），不重复报黄灯
+  const hydrogenScheduledEntry = {
+    model: 'gemini-4-hydrogen',
+    input: 1.5,
+    output: 7.5,
+    cached: 0.075,
+    cacheWrite: 0,
+    intervals: [
+      { model: 'gemini-4-hydrogen', validFrom: null, validUntil: '2027-01-11T23:59:59Z', input: 1.5, output: 7.5, cached: 0.075, cacheWrite: 0 },
+      { model: 'gemini-4-hydrogen', validFrom: '2027-01-12T00:00:00Z', validUntil: null, input: 1.5, output: 7.5, cached: 0.075, cacheWrite: 1.875 },
+    ],
+  };
+  const scheduledExpected = evaluateModelConsensus({
+    key: 'gemini-4-hydrogen',
+    localEntry: hydrogenScheduledEntry,
+    official: { officialModelName: 'Gemini 4 Hydrogen', inputPer1M: 1.5, outputPer1M: 7.5, cachedPer1M: 0.075, cacheWritePer1M: 1.875, confidence: 'high', evidenceQuote: '...' },
+    litellm: { input: 1.5, output: 7.5, cached: 0.075 },
+    nowMs,
+  });
+  assert.equal(scheduledExpected.status, 'unchanged');
 });
 
 test('安全增量写入：不篡改历史区间、保持英文 provenance 无中文残留并正确递增 -rN 版本号', () => {

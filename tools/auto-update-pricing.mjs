@@ -220,6 +220,48 @@ export function hasPendingFutureInterval(entry, nowMs = Date.now()) {
   });
 }
 
+function getPendingFutureIntervals(entry, nowMs = Date.now()) {
+  const intervals = Array.isArray(entry) ? entry : entry?.intervals;
+  if (!Array.isArray(intervals)) return [];
+  return intervals.filter((iv) => {
+    const f = iv?.validFrom ? Date.parse(iv.validFrom) : NaN;
+    return Number.isFinite(f) && f > nowMs;
+  });
+}
+
+function tupleMatchesRate(rate, inputVal, outputVal, cachedVal, cacheWriteVal) {
+  if (!rate) return false;
+  if (!ratesClose(rate.input, inputVal) || !ratesClose(rate.output, outputVal)) return false;
+  if (Number.isFinite(cachedVal) && !ratesClose(rate.cached, cachedVal)) return false;
+  if (rate.cacheWrite !== undefined && Number.isFinite(cacheWriteVal) && !ratesClose(rate.cacheWrite, cacheWriteVal)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 若本地已预设未来区间且上游出现的差异正好吻合该预设未来区间（同时未出现未预期的其它价格偏离），
+ * 说明属于已知且已排期生效的过渡期定价，无需每日重复报黄灯。
+ */
+export function isAccountedByFutureInterval({ local, entry, officialValid, official, litellm, nowMs = Date.now() }) {
+  const futureIntervals = getPendingFutureIntervals(entry, nowMs);
+  if (futureIntervals.length === 0) return false;
+
+  return futureIntervals.some((iv) => {
+    const officialMatchesLocalOrFuture =
+      !officialValid ||
+      tupleMatchesRate(local, official.inputPer1M, official.outputPer1M, official.cachedPer1M, official.cacheWritePer1M) ||
+      tupleMatchesRate(iv, official.inputPer1M, official.outputPer1M, official.cachedPer1M, official.cacheWritePer1M);
+
+    const litellmMatchesLocalOrFuture =
+      !litellm ||
+      tupleMatchesRate(local, litellm.input, litellm.output, litellm.cached, litellm.cacheWrite) ||
+      tupleMatchesRate(iv, litellm.input, litellm.output, litellm.cached, litellm.cacheWrite);
+
+    return officialMatchesLocalOrFuture && litellmMatchesLocalOrFuture;
+  });
+}
+
 export function ratesClose(a, b, tolerance = CONSENSUS_TOLERANCE) {
   if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
   const diff = Math.abs(a - b);
@@ -423,6 +465,10 @@ export function evaluateModelConsensus({
         !ratesClose(local.cacheWrite, litellm.cacheWrite)));
 
   if (!officialDiffers && !litellmDiffers) {
+    return { key, status: 'unchanged', local, official, litellm, openrouter };
+  }
+
+  if (isAccountedByFutureInterval({ local, entry: localEntry, officialValid, official, litellm, nowMs })) {
     return { key, status: 'unchanged', local, official, litellm, openrouter };
   }
 
