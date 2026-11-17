@@ -480,6 +480,7 @@ function runRequest(payload: {
             "CREATE INDEX IF NOT EXISTS revisions_time ON event_revisions(timestamp,seq);",
             "CREATE TABLE IF NOT EXISTS rate_locks(event_key TEXT PRIMARY KEY,unit_price TEXT NOT NULL,usd REAL NOT NULL);",
             "CREATE TABLE IF NOT EXISTS event_aliases(legacy_key TEXT PRIMARY KEY,event_key TEXT NOT NULL);",
+            "CREATE INDEX IF NOT EXISTS aliases_event_key ON event_aliases(event_key);",
             "CREATE TABLE IF NOT EXISTS rate_changes(version INTEGER PRIMARY KEY,min_event_seq INTEGER NOT NULL);",
             "CREATE TABLE IF NOT EXISTS snapshot_pins(snapshot_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,expires INTEGER NOT NULL);",
             "CREATE TABLE IF NOT EXISTS ledger_maintenance(key TEXT PRIMARY KEY,last_run INTEGER NOT NULL);",
