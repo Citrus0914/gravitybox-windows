@@ -156,10 +156,24 @@ class FakeElement {
     return !evt.defaultPrevented;
   }
 
+  contains(target) {
+    let cur = target;
+    while (cur) {
+      if (cur === this) return true;
+      cur = cur.parentNode;
+    }
+    return false;
+  }
+
   matches(sel) {
-    if (sel.includes('.surface-composer')) return this.classList.contains('surface-composer');
-    if (sel.includes('conversation-view')) return this.getAttribute('data-testid') === 'conversation-view';
-    if (sel.includes('agent-input-box')) return this.getAttribute('data-testid') === 'agent-input-box';
+    const s = String(sel);
+    if (s.includes('.surface-composer') && this.classList.contains('surface-composer')) return true;
+    if (s.includes('conversation-view') && this.getAttribute('data-testid') === 'conversation-view') return true;
+    if (s.includes('subagent-tab-conversation') && this.getAttribute('data-testid') === 'subagent-tab-conversation') return true;
+    if (s.includes('data-media-drop-scope="subpane"') && this.getAttribute('data-media-drop-scope') === 'subpane') return true;
+    if (s.includes('overview-panel-host') && this.getAttribute('data-testid') === 'overview-panel-host') return true;
+    if (s.includes('data-split-root="true"') && this.getAttribute('data-split-root') === 'true') return true;
+    if (s.includes('agent-input-box') && this.getAttribute('data-testid') === 'agent-input-box') return true;
     return false;
   }
 
@@ -229,6 +243,7 @@ class FakeShadowRoot {
       '#hud-txt-session .hud-turn-dur',
       '#hud-txt-session .hud-speed',
       '#hud-txt-session .hud-subagent-tag',
+      '#hud-txt-session .hud-subagent-count',
       '#hud-txt-tokens .hud-tok-total',
       '#hud-txt-tokens .hud-cache-prefix',
       '#hud-txt-tokens .hud-cache-label',
@@ -412,11 +427,11 @@ describe('HUD raw 数值精度与缺值展示', () => {
       assert.equal(instance.shadow.querySelector('#hud-compaction-badge').hasAttribute('hidden'), false);
       assert.equal(instance.shadow.querySelector('.capsule-context').classList.contains('has-compaction'), true);
       assert.equal(text('#hud-txt-context'), '~113%');
-      assert.equal(text('#val-tps'), '82.74 tok/s');
+      assert.equal(text('#val-tps'), '82.7 tok/s');
       assert.equal(text('#lbl-ttft-latest'), languageMode === 'en' ? 'Latest Step TTFT' : '最近一步 TTFT');
       assert.equal(text('#val-ttft-latest'), languageMode === 'en' ? '1.24s' : '1.24 秒');
       assert.equal(text('#lbl-tps-latest'), languageMode === 'en' ? 'Latest Step TPS' : '最近一步 TPS');
-      assert.equal(text('#val-tps-latest'), '171.17 tok/s');
+      assert.equal(text('#val-tps-latest'), '171 tok/s');
       assert.equal(text('#val-turn-dur'), languageMode === 'en' ? '18s' : '18秒');
       assert.equal(text('#val-ttft'), languageMode === 'en' ? '3.85s' : '3.85 秒');
       assert.equal(text('#val-model-dur'), languageMode === 'en' ? '22m28s' : '22分28秒');
@@ -456,6 +471,11 @@ describe('HUD raw 数值精度与缺值展示', () => {
       assert.equal(builtHtml.includes('hud-copy-stats'), false, 'HUD 展开卡片不应包含复制精确统计按钮');
       assert.equal(builtHtml.includes('复制精确统计'), false);
       assert.equal(builtHtml.includes('Copy Exact Stats'), false);
+      assert.equal(builtHtml.includes('id="seg-msg"'), true);
+      assert.match(builtHtml, /<span class="hud-popover-label">\s*<span class="hud-legend-dot"[^>]*hud-seg-sys-color[^>]*><\/span>\s*<span id="lbl-seg-sys">/);
+      assert.match(builtHtml, /<span class="hud-popover-label">\s*<span class="hud-legend-dot"[^>]*hud-seg-tool-color[^>]*><\/span>\s*<span id="lbl-seg-tool">/);
+      assert.match(builtHtml, /<span class="hud-popover-label">\s*<span id="lbl-seg-msg">/, '#lbl-seg-msg 旁不应再渲染绿色图例圆点');
+      assert.equal(builtHtml.includes('hud-seg-msg-color'), false, '#lbl-seg-msg 不应再引用 --hud-seg-msg-color 圆点');
 
       // 当压缩次数为 0 时隐藏徽章，移除 has-compaction 类
       const zeroComp = render({
@@ -500,8 +520,9 @@ describe('HUD raw 数值精度与缺值展示', () => {
           uncachedInputFormatted: '15.50K',
         },
       }, languageMode);
-      assert.equal(trimmedTrailing.text('#hud-txt-session .hud-turns'), languageMode === 'en' ? '1.55KT ' : '1.55K 轮 ');
-      assert.equal(trimmedTrailing.text('#hud-compaction-badge'), '1.55K');
+      assert.equal(trimmedTrailing.text('#hud-txt-session .hud-turns'), languageMode === 'en' ? '1.6KT ' : '1.6K 轮 ');
+      assert.equal(trimmedTrailing.text('#hud-compaction-badge'), '1.6K');
+      assert.equal(trimmedTrailing.text('#pop-session-badge'), languageMode === 'en' ? '1.55K turns 15.5K steps' : '1.55K 轮 15.5K 步');
       assert.equal(trimmedTrailing.text('#hud-txt-tokens .hud-tok-total'), '15.5K tok');
       assert.equal(trimmedTrailing.text('#val-tps'), '15.5 tok/s');
       assert.equal(trimmedTrailing.text('#val-tps-latest'), '15 tok/s');
@@ -509,6 +530,22 @@ describe('HUD raw 数值精度与缺值展示', () => {
       assert.equal(trimmedTrailing.text('#val-ttft-latest'), languageMode === 'en' ? '1.2s' : '1.2 秒');
       assert.equal(trimmedTrailing.text('#val-cache-hit'), '15.5%');
       assert.equal(trimmedTrailing.text('#val-uncached-in'), '15.5K tok');
+
+      const highSpeed = render({
+        ...metrics,
+        session: { ...metrics.session, outputTps: 1240, outputTpsFormatted: '1.24K tok/s' },
+        tokens: {
+          ...metrics.tokens,
+          estimatedCostUsd: undefined,
+          estimatedCostFormatted: '~$2.00',
+          cacheSavedUsd: undefined,
+          cacheSavedFormatted: '~$0.00',
+        },
+      }, languageMode);
+      assert.equal(highSpeed.text('#hud-txt-session .hud-speed'), ' · 1.2K tok/s');
+      assert.equal(highSpeed.text('#val-tps'), '1.24K tok/s');
+      assert.equal(highSpeed.text('#val-est-cost'), '~$2');
+      assert.equal(highSpeed.text('#val-cache-saved'), '$0');
     });
   }
 
@@ -554,8 +591,8 @@ describe('HUD raw 数值精度与缺值展示', () => {
     assert.equal(zero.text('#val-ttft'), '0 秒');
     assert.equal(zero.text('#val-model-dur'), '0秒');
     assert.equal(zero.text('#val-cache-hit'), '0%');
-    assert.equal(zero.text('#val-est-cost'), '~$0.00');
-    assert.equal(zero.text('#val-cache-saved'), '~$0.00');
+    assert.equal(zero.text('#val-est-cost'), '$0');
+    assert.equal(zero.text('#val-cache-saved'), '$0');
     assert.equal(zero.text('#pop-ctx-pct'), '0%');
     const absent = render({
       session: {
@@ -850,6 +887,14 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
     );
 
     manager.reconcileMounts();
+    assert.equal(
+      instA.updateMetrics({
+        ...sampleMetrics('conv-alpha-11111111', instA.getSessionRevision()),
+        isSubagentRunning: true,
+        runningSubagentCount: 1,
+      }),
+      true
+    );
     assert.equal(instA.isStreaming, false);
     assert.equal(instA.activityPhase, 'idle');
     assert.equal(instA.hasActiveWork, true);
@@ -865,9 +910,28 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
     );
     assert.equal(instA.isSubagentRunning, true);
     assert.equal(
-      instA.shadow.querySelector('#hud-txt-session .hud-subagent-tag').textContent,
-      ' · 子智能体运行中',
-      '状态栏分段 1 应实时展示与全局词典一致的 " · 子智能体运行中"'
+      instA.shadow.querySelector('#hud-txt-session .hud-subagent-tag').hasAttribute('hidden'),
+      false,
+      '子智能体运行时常驻分段 1 应显示紧凑分支图标标签'
+    );
+    assert.equal(
+      instA.shadow.querySelector('#hud-txt-session .hud-subagent-tag').getAttribute('data-subagent-count'),
+      '1'
+    );
+    assert.equal(
+      instA.shadow.querySelector('#hud-txt-session .hud-subagent-count').textContent,
+      '',
+      '单个子智能体运行时仅显示紧凑分支图标，不拼接冗长文字或数字 1'
+    );
+    assert.equal(
+      instA.shadow.innerHTML.includes('class="hud-subagent-icon"'),
+      true,
+      'HTML 骨架应内嵌紧凑子智能体 SVG 分支符号'
+    );
+    assert.match(
+      instA.shadow.querySelector('.capsule-session').getAttribute('aria-label') || '',
+      /子智能体运行中/,
+      '无障碍 aria-label 仍保留完整本地化子智能体状态读数'
     );
     assert.equal(
       instA.shadow.querySelector('#row-subagent-status').hasAttribute('hidden'),
@@ -877,6 +941,23 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
     assert.equal(
       instA.shadow.querySelector('#val-subagent-status').textContent,
       '1 个运行中'
+    );
+
+    // 多子智能体并行运行（如 6 subagents running）：常驻栏仅显示紧凑图标 + 数字 6，弹窗显示完整文本
+    subagentStatusNode.textContent = '6 subagents running';
+    manager.reconcileMounts();
+    assert.equal(
+      instA.shadow.querySelector('#hud-txt-session .hud-subagent-tag').getAttribute('data-subagent-count'),
+      '6'
+    );
+    assert.equal(
+      instA.shadow.querySelector('#hud-txt-session .hud-subagent-count').textContent,
+      '6',
+      '多子智能体运行时常驻栏仅附加紧凑数字 6'
+    );
+    assert.equal(
+      instA.shadow.querySelector('#val-subagent-status').textContent,
+      '6 个运行中'
     );
 
     // 移除子智能体状态文本，确认无前台残留
@@ -957,7 +1038,7 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
     manager.reconcileMounts();
     const streamingEventsBefore = events.filter((e) => e.type === 'STREAMING_CHANGED').length;
     instA.updateMetrics({
-      ...sampleMetrics('conv-3', rev4),
+      ...sampleMetrics('conv-alpha-11111111', instA.getSessionRevision()),
       isStreaming: true,
       isSubagentRunning: true,
       runningSubagentCount: 1,
@@ -1619,7 +1700,7 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       assert.equal(ctxEl.textContent, '60%');
       assert.equal(popTpsEl.textContent, '117 tok/s');
       assert.equal(popLatestTtftEl.textContent, '0.85 秒');
-      assert.equal(popLatestTpsEl.textContent, '179.27 tok/s');
+      assert.equal(popLatestTpsEl.textContent, '179 tok/s');
       assert.equal(popEstCostEl.textContent, '~$0.24');
       assert.equal(popCacheSavedEl.textContent, '~$1.35');
       assert.equal(speedEl.classList.contains('is-tps-measuring'), false);
@@ -1647,7 +1728,7 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       assert.equal(popLatestTtftLbl.textContent, 'Latest Step TTFT');
       assert.equal(popLatestTtftEl.textContent, '0.91s');
       assert.equal(popLatestTpsLbl.textContent, 'Latest Step TPS');
-      assert.equal(popLatestTpsEl.textContent, '179.27 tok/s');
+      assert.equal(popLatestTpsEl.textContent, '179 tok/s');
       assert.equal(rafQueue.size, 0);
       instance.setLanguage('zh');
 
@@ -1666,10 +1747,10 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
 
       instance.applyMetricsToDom(baseMetrics(120, 188.8, 9, 'idle', 6500, 0.93, 0.7, 1.42, 0.55, 2.20));
       assert.equal(popLatestTpsEl.hasAttribute('hidden'), false, '恢复 ready 后 #val-tps-latest 必须保持可见');
-      assert.equal(popLatestTpsEl.textContent, '188.8 tok/s');
+      assert.equal(popLatestTpsEl.textContent, '189 tok/s');
       assert.equal(popLatestTtftEl.textContent, '1.42 秒');
       assert.equal(popEstCostEl.textContent, '~$0.55');
-      assert.equal(popCacheSavedEl.textContent, '~$2.20');
+      assert.equal(popCacheSavedEl.textContent, '~$2.2');
 
       instance.switchConversation('conv-other');
       assert.equal(rafQueue.size, 0);
@@ -2200,7 +2281,7 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       assert.equal(inst.shadow.querySelector('#hud-ctx-stages-wrap').hasAttribute('hidden'), false);
       assert.equal(
         inst.shadow.querySelector('#lbl-ctx-stages').textContent,
-        lang === 'en' ? 'Stage Model Context' : '阶段模型上下文'
+        lang === 'en' ? 'Dual-Stage Context' : '双阶段上下文'
       );
       const listHtml = inst.shadow.querySelector('#hud-ctx-stages-list').innerHTML;
       assert.equal(listHtml.includes(lang === 'en' ? 'Plan · Carbon' : '规划 · Carbon'), true);
@@ -2208,6 +2289,148 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       assert.equal(listHtml.includes(lang === 'en' ? 'Exec · Hydrogen' : '执行 · Hydrogen'), true);
       assert.equal(listHtml.includes(lang === 'en' ? 'Active' : '当前'), true);
       assert.equal(listHtml.includes('91.4% · 468K / 512K'), true);
+      assert.equal(listHtml.includes('class="hud-stage-label"'), true);
+    }
+
+    // 3b. 验证通用待介入执行阶段（不写死 Hydrogen）、history 分组标题与简化模型短名（保留 .hud-stage-label 防徽章裁切）
+    assert.match(HUD_STYLES_CSS, /\.hud-stage-label\s*\{[^}]*text-overflow:\s*ellipsis/);
+    assert.match(HUD_STYLES_CSS, /\.hud-ctx-history-title\s*\{[^}]*border-top:/);
+    assert.match(HUD_STYLES_CSS, /\.hud-stage-badge\s*\{[^}]*flex:\s*0\s+0\s+auto/);
+
+    const historyMetrics = {
+      availability: 'ready',
+      session: { turns: 5, steps: 22, compactionCount: 0 },
+      tokens: { totalTokens: 1200000, cacheHitRate: 0.88 },
+      context: {
+        hasUsageData: true,
+        modelId: 'gemini-4-carbon',
+        modelDisplayName: 'Orchestrator (Carbon)',
+        modelShortLabel: 'Carbon',
+        modelCompactLabel: 'C',
+        isMultiModel: true,
+        isOrchestrator: true,
+        usedTokens: 256000,
+        peakContextTokens: 256000,
+        capacityTokens: 512000,
+        isFallbackCapacity: false,
+        usedRatio: 0.5,
+        usedRatioFormatted: '50%',
+        breakdown: { cachedContextTokens: 250000, uncachedContextTokens: 6000, latestOutputTokens: 1200 },
+        modelStages: [
+          {
+            slotKey: 'orchestrator:carbon',
+            role: 'planner',
+            section: 'primary',
+            modelId: 'gemini-4-carbon',
+            modelDisplayName: 'Orchestrator (Carbon)',
+            shortLabel: 'Carbon',
+            compactLabel: 'C',
+            hasUsageData: true,
+            isActive: true,
+            usedTokens: 256000,
+            peakContextTokens: 256000,
+            capacityTokens: 512000,
+            isFallbackCapacity: false,
+            usedRatio: 0.5,
+            usedRatioFormatted: '50%',
+          },
+          {
+            slotKey: 'orchestrator:executor_pending',
+            role: 'executor',
+            section: 'primary',
+            modelId: 'pending',
+            modelDisplayName: '',
+            shortLabel: '',
+            compactLabel: '',
+            hasUsageData: false,
+            isActive: false,
+            usedTokens: 0,
+            peakContextTokens: 0,
+            capacityTokens: 512000,
+            isFallbackCapacity: false,
+            usedRatio: 0,
+            usedRatioFormatted: '0%',
+          },
+          {
+            slotKey: 'model:gemini-4-hydrogen',
+            role: 'model',
+            section: 'history',
+            modelId: 'gemini-4-hydrogen',
+            modelDisplayName: 'Gemini 4 Hydrogen (High)',
+            shortLabel: 'Hydrogen',
+            compactLabel: 'H',
+            hasUsageData: true,
+            isActive: false,
+            usedTokens: 320000,
+            peakContextTokens: 320000,
+            capacityTokens: 512000,
+            isFallbackCapacity: false,
+            usedRatio: 320000 / 512000,
+            usedRatioFormatted: '62.5%',
+          },
+          {
+            slotKey: 'model:gemini-3.8-flash',
+            role: 'model',
+            section: 'history',
+            modelId: 'gemini-3.8-flash',
+            modelDisplayName: 'Gemini 3.8 Flash (High)',
+            shortLabel: 'Flash',
+            compactLabel: 'F',
+            hasUsageData: true,
+            isActive: false,
+            usedTokens: 100000,
+            peakContextTokens: 100000,
+            capacityTokens: 1000000,
+            isFallbackCapacity: true,
+            usedRatio: 0.1,
+            usedRatioFormatted: '10%',
+          },
+          {
+            slotKey: 'model:claude-sonnet-4-6',
+            role: 'model',
+            section: 'history',
+            modelId: 'claude-sonnet-4-6',
+            modelDisplayName: 'Claude Sonnet 4.6',
+            shortLabel: 'Sonnet',
+            compactLabel: 'S',
+            hasUsageData: true,
+            isActive: false,
+            usedTokens: 50000,
+            peakContextTokens: 50000,
+            capacityTokens: 200000,
+            isFallbackCapacity: true,
+            usedRatio: 0.25,
+            usedRatioFormatted: '25%',
+          },
+        ],
+      },
+    };
+
+    for (const lang of ['zh', 'en']) {
+      const inst = renderWithLang(historyMetrics, lang);
+      const listHtml = inst.shadow.querySelector('#hud-ctx-stages-list').innerHTML;
+      assert.equal(listHtml.includes(lang === 'en' ? 'Exec Stage' : '执行阶段'), true);
+      assert.equal(listHtml.includes(lang === 'en' ? 'Pending' : '待介入'), true);
+      assert.equal(listHtml.includes(lang === 'en' ? 'Earlier in Session' : '本对话曾用模型'), true);
+      assert.equal((listHtml.match(/class="hud-ctx-history-title"/g) || []).length, 1, 'history 标题应只渲染一次');
+      assert.equal(listHtml.includes('<span class="hud-stage-label">Hydrogen (High)</span>'), true);
+      assert.equal(listHtml.includes('<span class="hud-stage-label">3.8 Flash (High)</span>'), true);
+      assert.equal(listHtml.includes('<span class="hud-stage-label">Sonnet 4.6</span>'), true);
+
+      // 同步覆盖真实 DOM 节点路径 (useDomNodes=true)
+      const domDoc = { createElement: (tag) => new FakeElement(tag) };
+      const domList = new FakeElement('div', domDoc);
+      domList.replaceChildren = (...items) => {
+        domList.children = items;
+      };
+      inst.renderModelStagesList(domList, historyMetrics.context.modelStages, false);
+      const historyNodes = domList.children.filter((n) => n.className === 'hud-ctx-history-title');
+      assert.equal(historyNodes.length, 1);
+      assert.equal(historyNodes[0].textContent, lang === 'en' ? 'Earlier in Session' : '本对话曾用模型');
+      const stageNodes = domList.children.filter((n) => n.classList.contains('hud-stage-item'));
+      assert.equal(stageNodes.length, 5);
+      const firstLabel = stageNodes[0].children[0].children[0].children[1];
+      assert.equal(firstLabel.className, 'hud-stage-label');
     }
 
     // 4. 验证渲染阶段的模型名 XSS 防护转义
@@ -2263,5 +2486,55 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
     const fakeView = new FakeElement('div');
     fakeView.appendChild(fakeComposer);
     assert.equal(mgr.resolveActiveModel(fakeView, 1), '+ Orchestrator (Carbon)');
+  });
+
+  it('左侧聊天分栏缩窄且右侧窗口覆盖时，HUD 宿主按可见分栏边界自动夹紧宽度并切换紧凑档位', () => {
+    const prevWin = globalThis.window;
+    globalThis.window = { innerWidth: 1200, innerHeight: 800, getComputedStyle: () => ({ display: 'block', visibility: 'visible' }) };
+    const doc = new FakeElement('document');
+    doc.createElement = (tag) => new FakeElement(tag, doc);
+    const splitRoot = new FakeElement('div', doc);
+    splitRoot.setAttribute('data-split-root', 'true');
+    splitRoot._rect = { left: 0, top: 0, width: 1200, height: 800, right: 1200, bottom: 800 };
+
+    const leftSlot = new FakeElement('div', doc);
+    leftSlot._rect = { left: 0, top: 0, width: 280, height: 800, right: 280, bottom: 800 };
+    const rightPane = new FakeElement('div', doc);
+    rightPane._rect = { left: 280, top: 0, width: 920, height: 800, right: 1200, bottom: 800 };
+
+    const convView = new FakeElement('div', doc);
+    convView.setAttribute('data-testid', 'conversation-view');
+    convView._rect = { left: 0, top: 0, width: 460, height: 800, right: 460, bottom: 800 };
+    const composer = new FakeElement('div', doc);
+    composer.setAttribute('data-testid', 'agent-input-box');
+    // 模拟输入框因缺少 min-width:0 向右溢出至 440px（超出左分栏 280px 边界，被右窗格覆盖）
+    composer._rect = { left: 16, top: 700, width: 424, height: 24, right: 440, bottom: 724 };
+
+    convView.appendChild(composer);
+    leftSlot.appendChild(convView);
+    splitRoot.appendChild(leftSlot);
+    splitRoot.appendChild(rightPane);
+
+    const inst = new HudInstance('pane-split-clamp', { isPrimaryPane: true });
+    try {
+      inst.mount(composer);
+      assert.equal(inst.host.style.maxWidth, '264px', 'HUD 宿主宽度必须夹紧至右侧分栏左边界 (280 - 16 = 264px)');
+      assert.equal(inst.host.style.alignSelf, 'flex-start');
+      assert.equal(
+        inst.shadow.querySelector('.hud-container').classList.contains('is-ultra-compact'),
+        true,
+        '可见分栏宽度 264px (<360px) 应自动进入 is-ultra-compact 紧凑态'
+      );
+
+      // 继续缩窄左分栏至 240px（可见宽 224px < 260px），应进入 is-micro-compact 极微态
+      leftSlot._rect = { left: 0, top: 0, width: 240, height: 800, right: 240, bottom: 800 };
+      rightPane._rect = { left: 240, top: 0, width: 960, height: 800, right: 1200, bottom: 800 };
+      inst.reconcile(composer);
+      assert.equal(inst.host.style.maxWidth, '224px');
+      assert.equal(inst.shadow.querySelector('.hud-container').classList.contains('is-micro-compact'), true);
+    } finally {
+      globalThis.window = prevWin;
+      inst.dispose();
+    }
   });
 });

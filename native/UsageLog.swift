@@ -59,9 +59,19 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
     var listScope = ""
     let refreshButton = InlineRefreshButton(L10n.t("common.refresh"), width: 76, target: nil, action: #selector(reloadSnapshot))
     let exportButton = button(L10n.t("usage.export_btn"), target: nil, action: #selector(exportRows))
+    private let headerTitleLabel = text(L10n.t("usage_log.title"), size: 18, weight: .semibold)
+    private var closeButtonRef: NSButton!
+    private var languageObserver: NSObjectProtocol?
     var rows: [[String: Any]] = []; var offset = 0; var total = 0; var requestRevision = 0
     var onDismiss: (() -> Void)?
     let periods = ["today", "7d", "30d", "all"]
+
+    deinit {
+        searchDebounce?.cancel()
+        if let languageObserver {
+            NotificationCenter.default.removeObserver(languageObserver)
+        }
+    }
     init(app: Assistant, period selected: String) {
         self.app = app; super.init()
         sheet.title = L10n.t("usage_log.title"); sheet.isReleasedWhenClosed = false; table.rowHeight = 64; table.backgroundColor = .clear
@@ -108,6 +118,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
             pageNumber.heightAnchor.constraint(equalToConstant: 28)
         ])
         let close = button(L10n.t("usage_log.done"), target: self, action: #selector(closeSheet)); close.bezelColor = Design.blue; close.keyEquivalent = "\u{1b}"
+        closeButtonRef = close
         searchSpinner.style = .spinning; searchSpinner.controlSize = .small; searchSpinner.isDisplayedWhenStopped = false
         searchSpinner.translatesAutoresizingMaskIntoConstraints = false; searchSpinner.isHidden = true
         NSLayoutConstraint.activate([searchSpinner.widthAnchor.constraint(equalToConstant: 16), searchSpinner.heightAnchor.constraint(equalToConstant: 16)])
@@ -117,7 +128,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         let headerActions = horizontal([refreshButton, exportButton], spacing: 8)
         headerActions.alignment = .centerY
         let root = vertical([
-            horizontal([text(L10n.t("usage_log.title"), size: 18, weight: .semibold), flexibleSpace(), headerActions]),
+            horizontal([headerTitleLabel, flexibleSpace(), headerActions]),
             horizontal([searchRow, period], spacing: 12),
             listHost,
             status,
@@ -125,6 +136,51 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         ], spacing: 12)
         let surface = SheetVisualEffectView(); sheet.isOpaque = false; sheet.backgroundColor = .clear; sheet.contentView = surface
         let content = fixedPage(root); surface.addSubview(content); pin(content, to: surface); Design.applyControls(surface)
+        languageObserver = NotificationCenter.default.addObserver(
+            forName: L10n.didChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            if Thread.isMainThread {
+                self?.syncLocalizedChrome()
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.syncLocalizedChrome() }
+            }
+        }
+    }
+
+    private func syncLocalizedChrome() {
+        let title = L10n.t("usage_log.title")
+        sheet.title = title
+        headerTitleLabel.stringValue = title
+        search.placeholderString = L10n.t("usage_log.search_placeholder")
+        search.setAccessibilityLabel(L10n.t("usage_log.search_a11y"))
+        let labels = [L10n.t("usage.period.today"), L10n.t("usage.period.7d"), L10n.t("usage.period.30d"), L10n.t("usage.period.all")]
+        for (idx, lbl) in labels.enumerated() where idx < period.segmentCount {
+            period.setLabel(lbl, forSegment: idx)
+        }
+        refreshButton.title = L10n.t("common.refresh")
+        refreshButton.invalidateIntrinsicContentSize()
+        refreshButton.setAccessibilityLabel(
+            refreshButton.isBusy
+                ? L10n.t("design.inline_refresh.busy", ["title": refreshButton.title], fallback: "\(refreshButton.title)，刷新中")
+                : refreshButton.title
+        )
+        exportButton.title = L10n.t("usage.export_btn")
+        previous.title = L10n.t("usage_log.prev_page")
+        next.title = L10n.t("usage_log.next_page")
+        closeButtonRef.title = L10n.t("usage_log.done")
+        clearFiltersButton.title = L10n.t("usage_log.clear_filters")
+        clearFiltersButton.setAccessibilityLabel(L10n.t("usage_log.clear_filters_a11y"))
+        pageNumber.setAccessibilityLabel(L10n.t("usage_log.page_a11y"))
+        let pages = max(1, (total + 199) / 200)
+        pageCount.stringValue = L10n.t("usage_log.page_count", ["pages": InterfaceText.formatInteger(pages)])
+        if loading {
+            status.stringValue = L10n.t("usage_log.loading")
+        } else {
+            status.stringValue = pageStatus()
+        }
+        table.reloadData()
     }
     func show(in window: NSWindow, onDismiss: @escaping () -> Void) {
         self.onDismiss = onDismiss

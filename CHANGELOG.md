@@ -6,7 +6,7 @@
 
 ## [Unreleased]
 
-## [1.1.1] - 2026-11-15
+## [1.1.1] - 2026-11-16
 
 ### Added
 - **Full App Localization (`简体中文` / `English`)**：新增 GravityBox 自身原生 Swift AppKit 界面（`native/L10n.swift`）、Node 后端（`src/i18n.ts`）与 IDE 会话状态栏（`runtime/hud-i18n.js`）完整中英双语支持，基于外置语言包 `assets/i18n/en.json` 与 `assets/i18n/zh-Hans.json` 实现零重启实时切换。
@@ -14,12 +14,14 @@
 
 ### Changed
 - **Unified Language Lifecycle**：融合 Antigravity 界面汉化开关与全局语言偏好，语言切换实时联动原生窗口、菜单栏面板、后端状态消息与嵌入式 Telemetry HUD，并同步更新版本标识、截图脚本与发布文档至 `1.1.1`。
-- **CI & Release Hardening**：收窄 `.github/workflows/ci.yml` 变更豁免清单以覆盖 `assets/i18n/`、`model-catalog.json`、`pricing-feed.json` 与 `ui-extraction-manifest.json` 门禁；强化 `tools/check-docs.mjs`、`tools/release-integrity.mjs` 与 `tools/package-mac.mjs` 的校验规则与打包产物洁净度。
+- **Modular Refactor & Bundle Hygiene**：将超大源码拆分为职责内聚的子模块（`DesignControls`、`SidebarComponents`、`LiveStatus`、`Badges`、`Charts`、`MaintenanceComponents`、`MaintenancePopover`、`MaintenanceSheetController` 与 `pricing-catalog-runtime`），精简 `package.json` 重复版本脚本并清理未引用遗留脚本与双份打包资源副本。
+- **CI & Release Hardening**：收窄 `.github/workflows/ci.yml` 变更豁免清单以覆盖 `assets/i18n/`、`model-catalog.json`、`pricing-feed.json`、`ui-extraction-manifest.json` 门禁，并将 `test/pricing-catalog-sync.test.mjs` 纳入 `pricing-watch.yml`；强化 `tools/check-docs.mjs`、`tools/release-integrity.mjs` 与 `tools/package-mac.mjs` 的校验规则与打包产物洁净度。
 
 ### Fixed
 - **macOS 15.1 Motion Crash (`#15`)**：修复 `DesignMotion.cancel()` 在 `CADisplayLink.invalidate()` 后冗余调用 `remove(from:forMode:)` 导致 macOS 15.1 主线程 `EXC_BAD_ACCESS` (`SIGSEGV`) 闪退的问题，并为 `CADisplayLink` 引入弱引用 Target 代理与生命周期回归测试。
-- **Cross-End Bilingual & UI Lifecycle**：修复 `controller.ts` `backend.*` 键名前缀双写、`resume`/`reapply` 从英文切回中文未持久写回、英文 HUD 流式测速误显 `0 tok/s`、收起状态菜单栏面板滞留旧语言、活动模态 Sheet 宿主重建失活、`en.json` 删号提示语意倒置、`L10n` 多线程并发读取锁、结构化 `pricing_warning_codes` 过滤与 HUD/术语规范统一问题。
-- **Usage, Pricing & Security Boundaries**：修复 `lockedCost` 与大账本分页 `ledgerEventPage` 零占位锁及 `cacheWrite` 单价校验、`mergePricingEntries` 时序边界继承、`protobuf` 负长度与越界保护，以及切号未提交异常回滚分支 `journal` 脱敏。
+- **Cross-End Bilingual & UI Lifecycle**：修复 `controller.ts` `backend.*` 键名前缀双写、`resume`/`reapply` 从英文切回中文未持久写回、英文 HUD 流式测速误显 `0 tok/s`、收起状态菜单栏面板滞留旧语言、活动模态 Sheet（含 `AccountPolicySheet`、`AddAccountSheet`、`UsageLogController`、`PricingSyncSheetController`、`MaintenancePopover`）实时语言同步与 OAuth 取消回收、`DesignButton` 无拷贝矢量图标着色、`SidebarLaunchButton` 英文宽度约束冲突及全应用零 Tooltip 约束。
+- **HUD Telemetry & Dictionary Accuracy**：修复后端重启后 HUD `metricsSequence` 归零卡死、多模型切换 `gen_metadata` 串借、子代理缓存驱逐与 `render_info > 64KB` 截断丢失、中止会话 `status=6/7` 计时器空转、上下文基线步序错位及紧凑断点对齐问题；清理 `dict/base.json` 6 个全局虚词与半句漏译，解耦设置页上下文识别，统一「侧边提问」与「对战模式」术语。
+- **Usage, Pricing, Quota & Security Boundaries**：修复 `resolveDatabaseModelFullName` 别名优先级与无锚点前缀匹配、`loadRateLocksOnce`/`UsageLedger` 瞬时错误保护、Worker 线程同步 `remote_pricing.json` 元数据、防降级/防跳转/流式限流远端价格同步、缺失 `cacheWrite` 锁自愈/重估守卫与跨 inode 事件归并；修正 `mergeGroupSets` 多端点优先级、`paidTier`/`AI Premium` 解析与重授权状态复位；补强 `BackendBridge` `NSLock` 并发安全与 `main.ts` 优雅退出等待及 Socket/状态目录前置校验。
 
 ## [1.1.0] - 2026-11-14
 

@@ -27,6 +27,7 @@ function resolveI18nDirectory(): string | null {
   const candidates = [
     join(here, '../assets/i18n'),
     join(here, '../../assets/i18n'),
+    join(here, '../../i18n'),
     join(process.cwd(), 'assets/i18n'),
   ];
   for (const dir of candidates) {

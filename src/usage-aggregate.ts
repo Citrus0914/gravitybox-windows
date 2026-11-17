@@ -3,7 +3,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import type { TokenUsageSummary, TokenUsagePeriod, AvailableAccountUsageOption } from './usage.js';
 import { resolveDatabaseModelFullName } from './usage-types.js';
-import { MODEL_PRICE_ALIASES } from './model-catalog.js';
+import { getEffectiveModelAliasKeys } from './model-catalog.js';
 import { normalizeModelId } from './model-identity.js';
 import { DEFAULT_API_PRICES, resolveContextTierPricing, resolvePricingForTimestamp, matchPricingKeys, calculateEstimatedUsd, priceStatus, type ApiPricing, type ApiPricingEntry } from './pricing.js';
 import { bt } from './i18n.js';
@@ -91,7 +91,13 @@ export function aggregateLedger(db: DatabaseSync, options: AggregateOptions): To
     let changedRateMinSeq = Number.POSITIVE_INFINITY;
     let healedUnpricedCount = 0;
     const firstSequence = dryRunLocks ? null : db.prepare('SELECT MIN(seq) AS seq FROM event_revisions WHERE event_key=?');
-    if (!dryRunLocks) db.exec('BEGIN IMMEDIATE');
+    let writeTxOpened = false;
+    const ensureWriteTx = () => {
+        if (!dryRunLocks && !writeTxOpened) {
+            db.exec('BEGIN IMMEDIATE');
+            writeTxOpened = true;
+        }
+    };
     try {
         for (const row of db.prepare('SELECT e.payload,l.unit_price,l.usd FROM events e LEFT JOIN rate_locks l ON l.event_key=e.event_key LEFT JOIN event_aliases a ON a.legacy_key=e.event_key WHERE a.legacy_key IS NULL').iterate()) {
             const event = JSON.parse(String(row.payload)) as LedgerEvent;
@@ -157,6 +163,7 @@ export function aggregateLedger(db: DatabaseSync, options: AggregateOptions): To
                         if (dryRunLocks) {
                             dryRunLocks.set(event.event_key, { unit_price: compactJson, usd: cost });
                         } else {
+                            ensureWriteTx();
                             saveLock!.run(event.event_key, compactJson, cost);
                             if (!rawLock || zeroSentinel || lockedMissingCw)
                                 changedRateMinSeq = Math.min(changedRateMinSeq, Number(firstSequence!.get(event.event_key)?.seq ?? 0));
@@ -206,14 +213,14 @@ export function aggregateLedger(db: DatabaseSync, options: AggregateOptions): To
                     addTrend(hourly, `${day} ${String(date.getHours()).padStart(2, '0')}:00`, 'hour');
             }
         }
-        if (!dryRunLocks) {
+        if (writeTxOpened) {
             if (Number.isFinite(changedRateMinSeq))
                 db.prepare('INSERT INTO rate_changes VALUES((SELECT COALESCE(MAX(version),0)+1 FROM rate_changes),?)').run(changedRateMinSeq);
             db.exec('COMMIT');
         }
     }
     catch (error) {
-        if (!dryRunLocks) db.exec('ROLLBACK');
+        if (writeTxOpened) db.exec('ROLLBACK');
         throw error;
     }
     for (let index = 0; index < 4; index++) {
@@ -270,6 +277,23 @@ export function aggregateLedger(db: DatabaseSync, options: AggregateOptions): To
         databases_scanned: 0, generations_scanned: 0, skipped_large_records: 0, generated_at: now, snapshot_id: hash,
         availability: unknownCount ? 'partial' : 'complete', ledger_snapshot: snapshot, healed_unpriced_count: healedUnpricedCount };
 }
+export function createModelQueryMatcher(rawQuery: string): (candidate: string) => boolean {
+    const qLower = rawQuery.trim().toLowerCase();
+    const qNorm = qLower ? normalizeModelId(rawQuery) : '';
+    const qCleanNorm = qNorm.replace(/(?:-(?:extra-high|extra-low|xhigh|high|medium|low|max|thinking|latest))+$/, '');
+    return (candidate: string): boolean => {
+        if (!qLower) return true;
+        const candLower = candidate.toLowerCase();
+        const resolvedLower = resolveDatabaseModelFullName(candidate, null).toLowerCase();
+        const candNorm = normalizeModelId(candidate);
+        const resolvedNorm = normalizeModelId(resolvedLower);
+        if (candLower.includes(qLower) || resolvedLower.includes(qLower)) return true;
+        if (qNorm && (candNorm.includes(qNorm) || resolvedNorm.includes(qNorm))) return true;
+        if (qCleanNorm && (candNorm.includes(qCleanNorm) || resolvedNorm.includes(qCleanNorm))) return true;
+        return false;
+    };
+}
+
 export function ledgerEventPage(db: DatabaseSync, options: {
     snapshot: LedgerSnapshot;
     period: string;
@@ -296,20 +320,10 @@ export function ledgerEventPage(db: DatabaseSync, options: {
     const qLower = rawQuery.trim().toLowerCase();
     const qNorm = qLower ? normalizeModelId(rawQuery) : '';
     const qCleanNorm = qNorm.replace(/(?:-(?:extra-high|extra-low|xhigh|high|medium|low|max|thinking|latest))+$/, '');
-    const modelMatchesQuery = (candidate: string): boolean => {
-        if (!qLower) return true;
-        const candLower = candidate.toLowerCase();
-        const resolvedLower = resolveDatabaseModelFullName(candidate, null).toLowerCase();
-        const candNorm = normalizeModelId(candidate);
-        const resolvedNorm = normalizeModelId(resolvedLower);
-        if (candLower.includes(qLower) || resolvedLower.includes(qLower)) return true;
-        if (qNorm && (candNorm.includes(qNorm) || resolvedNorm.includes(qNorm))) return true;
-        if (qCleanNorm && (candNorm.includes(qCleanNorm) || resolvedNorm.includes(qCleanNorm))) return true;
-        return false;
-    };
+    const modelMatchesQuery = createModelQueryMatcher(rawQuery);
     const aliasMatchSet = new Set<string>();
     if (qLower) {
-        for (const candidate of [...Object.keys(MODEL_PRICE_ALIASES), ...Object.keys(DEFAULT_API_PRICES)]) {
+        for (const candidate of [...getEffectiveModelAliasKeys(), ...Object.keys(DEFAULT_API_PRICES)]) {
             if (modelMatchesQuery(candidate)) {
                 aliasMatchSet.add(candidate.toLowerCase());
                 aliasMatchSet.add(resolveDatabaseModelFullName(candidate, null).toLowerCase());

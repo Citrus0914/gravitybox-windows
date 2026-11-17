@@ -1022,11 +1022,19 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
         cacheSaved: sr.querySelector('#val-cache-saved').textContent,
         context: sr.querySelector('#pop-ctx-pct').textContent,
         ctxCapacity: sr.querySelector('#pop-ctx-capacity').textContent,
+        segMsgExists: Boolean(sr.querySelector('#seg-msg')),
+        lblSegSysHasDot: Boolean(sr.querySelector('#lbl-seg-sys')?.closest('.hud-popover-label')?.querySelector('.hud-legend-dot')),
+        lblSegToolHasDot: Boolean(sr.querySelector('#lbl-seg-tool')?.closest('.hud-popover-label')?.querySelector('.hud-legend-dot')),
+        lblSegMsgHasDot: Boolean(sr.querySelector('#lbl-seg-msg')?.closest('.hud-popover-label')?.querySelector('.hud-legend-dot')),
       };
     })()`);
-    assert.equal(precision.speed, '90.13 tok/s');
+    assert.equal(precision.speed, '90.1 tok/s');
     assert.equal(precision.latestTtft, '2.35 秒');
-    assert.equal(precision.latestSpeed, '107.14 tok/s');
+    assert.equal(precision.latestSpeed, '107 tok/s');
+    assert.equal(precision.segMsgExists, true);
+    assert.equal(precision.lblSegSysHasDot, true);
+    assert.equal(precision.lblSegToolHasDot, true);
+    assert.equal(precision.lblSegMsgHasDot, false, '#lbl-seg-msg 旁不得显示误导性绿色圆点');
     assert.equal(precision.hasDashedDivider, true);
     assert.equal(precision.hasTokensDashedDivider, true);
     assert.equal(precision.turnDuration, '18秒');
@@ -1377,6 +1385,114 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     assert.equal(dualBrowserCheck.stageCount, 2);
     assert.match(dualBrowserCheck.stageTexts[0], /规划 · Carbon.*90\.2% · 462K \/ 512K/);
     assert.match(dualBrowserCheck.stageTexts[1], /执行 · Hydrogen.*当前.*91\.4% · 468K \/ 512K/);
+
+    // 6b. 312px 上下文卡片真实布局校验：验证通用执行阶段、本对话曾用模型分组、简化模型名与长模型名下 .hud-stage-badge 零裁切/零重叠
+    const checkLongStageLayout = async (modelDisplayName) => {
+      await main.evaluate(`(() => {
+        const mgr = globalThis.__GRAVITYBOX_HUD_V1__?.manager;
+        const inst = mgr ? [...mgr.instances.values()][0] : null;
+        if (!inst) return;
+        mgr.dispatchMetrics({
+          conversationId: inst.getCurrentConvId(),
+          sessionRevision: inst.getSessionRevision(),
+          metricsSequence: (inst.lastMetricsSequence || 0) + 1,
+          updatedAt: Date.now(),
+          availability: 'ready',
+          isStreaming: false,
+          session: { turns: 4, steps: 22, compactionCount: 0, modelDurationSeconds: 10, toolDurationSeconds: 5, averageTtftSeconds: 1.2, outputTps: 80, outputTpsFormatted: '80 tok/s', currentTurnDurationSeconds: 5, currentTurnDurationCompactZh: '本轮 5s' },
+          tokens: { totalTokens: 1200000, totalTokensCompact: '1.2M tok', cacheHitRate: 0.9, cacheHitRateFormatted: '90%' },
+          context: {
+            hasUsageData: true,
+            modelId: 'gemini-4-hydrogen',
+            modelDisplayName: ${JSON.stringify(modelDisplayName)},
+            modelShortLabel: 'Hydrogen',
+            modelCompactLabel: 'H',
+            isMultiModel: true,
+            isOrchestrator: true,
+            usedTokens: 468000,
+            usedTokensCompact: '468K',
+            peakContextTokens: 468000,
+            capacityTokens: 512000,
+            capacityTokensCompact: '512K',
+            isFallbackCapacity: false,
+            usedRatio: 468000 / 512000,
+            usedRatioFormatted: '91.4%',
+            breakdown: { cachedContextTokens: 465000, cachedContextRatio: 90.8, uncachedContextTokens: 3000, uncachedContextRatio: 0.6, latestOutputTokens: 3730 },
+            modelStages: [
+              { slotKey: 'orchestrator:carbon', role: 'planner', section: 'primary', modelId: 'gemini-4-carbon', modelDisplayName: 'Orchestrator (Carbon)', shortLabel: 'Carbon', compactLabel: 'C', hasUsageData: true, isActive: false, usedTokens: 256000, peakContextTokens: 256000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 0.5, usedRatioFormatted: '50%' },
+              { slotKey: 'orchestrator:executor_pending', role: 'executor', section: 'primary', modelId: 'pending', modelDisplayName: '', shortLabel: '', compactLabel: '', hasUsageData: false, isActive: false, usedTokens: 0, peakContextTokens: 0, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 0, usedRatioFormatted: '0%' },
+              { slotKey: 'model:gemini-4-hydrogen', role: 'model', section: 'history', modelId: 'gemini-4-hydrogen', modelDisplayName: ${JSON.stringify(modelDisplayName)}, shortLabel: 'Hydrogen', compactLabel: 'H', hasUsageData: true, isActive: true, usedTokens: 468000, peakContextTokens: 468000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 468000 / 512000, usedRatioFormatted: '91.4%' }
+            ]
+          }
+        });
+        const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
+        const popCtx = sr.querySelector('#hud-popover-context');
+        if (popCtx.hasAttribute('hidden')) {
+          sr.querySelector('.capsule-context').click();
+        }
+      })()`, ctx.executionContextId);
+      await until(async () => await main.evaluate(`(() => {
+        const sr = document.querySelector('#__gravitybox_hud_host__')?.shadowRoot;
+        const pop = sr?.querySelector('#hud-popover-context');
+        const activeLabel = sr?.querySelector('#hud-ctx-stages-list .hud-stage-item.is-active .hud-stage-label');
+        if (!pop || pop.hasAttribute('hidden') || !activeLabel) return false;
+        return Math.round(pop.getBoundingClientRect().width) === 312;
+      })()`));
+      return await main.evaluate(`(() => {
+        const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
+        const popCtx = sr.querySelector('#hud-popover-context');
+        const activeItem = sr.querySelector('#hud-ctx-stages-list .hud-stage-item.is-active');
+        const nameEl = activeItem?.querySelector('.hud-stage-name');
+        const labelEl = activeItem?.querySelector('.hud-stage-label');
+        const badgeEl = activeItem?.querySelector('.hud-stage-badge');
+        const valEl = activeItem?.querySelector('.hud-stage-val');
+        const historyTitle = sr.querySelector('#hud-ctx-stages-list .hud-ctx-history-title');
+        const pendingItem = sr.querySelector('#hud-ctx-stages-list .hud-stage-item.is-pending');
+        const popRect = popCtx.getBoundingClientRect();
+        const nameRect = nameEl.getBoundingClientRect();
+        const badgeRect = badgeEl.getBoundingClientRect();
+        const valRect = valEl.getBoundingClientRect();
+        return {
+          popWidth: Math.round(popRect.width),
+          stagesTitle: sr.querySelector('#lbl-ctx-stages')?.textContent,
+          historyTitle: historyTitle?.textContent,
+          pendingText: pendingItem?.textContent.replace(/\\s+/g, ' ').trim(),
+          labelText: labelEl?.textContent,
+          badgeText: badgeEl?.textContent,
+          badgeWidth: badgeRect.width,
+          badgeRight: badgeRect.right,
+          nameRight: nameRect.right,
+          valLeft: valRect.left,
+        };
+      })()`);
+    };
+
+    const layoutStd = await checkLongStageLayout('Gemini 4 Hydrogen (High)');
+    assert.equal(layoutStd.popWidth, 312);
+    assert.equal(layoutStd.stagesTitle, '双阶段上下文');
+    assert.equal(layoutStd.historyTitle, '本对话曾用模型');
+    assert.match(layoutStd.pendingText, /执行阶段.*待介入/);
+    assert.equal(layoutStd.labelText, 'Hydrogen (High)');
+    assert.equal(layoutStd.badgeText, '当前');
+    assert.ok(layoutStd.badgeWidth > 0, '当前徽章宽度必须大于 0');
+    assert.ok(layoutStd.badgeRight <= layoutStd.nameRight + 0.5, `当前徽章不得超出 .hud-stage-name 右边界 (${layoutStd.badgeRight} <= ${layoutStd.nameRight})`);
+    assert.ok(layoutStd.badgeRight <= layoutStd.valLeft, `当前徽章不得与右侧数值重叠 (${layoutStd.badgeRight} <= ${layoutStd.valLeft})`);
+
+    const layoutLong = await checkLongStageLayout('Gemini 4 Very Long Hydrogen Preview (High Thinking)');
+    assert.equal(layoutLong.popWidth, 312);
+    assert.equal(layoutLong.labelText, 'Very Long Hydrogen Preview (High Thinking)');
+    assert.equal(layoutLong.badgeText, '当前');
+    assert.ok(layoutLong.badgeWidth > 0, '长模型名下当前徽章宽度必须大于 0');
+    assert.ok(layoutLong.badgeRight <= layoutLong.nameRight + 0.5, `长模型名下当前徽章不得被裁切 (${layoutLong.badgeRight} <= ${layoutLong.nameRight})`);
+    assert.ok(layoutLong.badgeRight <= layoutLong.valLeft, `长模型名下当前徽章不得与右侧数值重叠 (${layoutLong.badgeRight} <= ${layoutLong.valLeft})`);
+
+    await main.evaluate(`(() => {
+      const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
+      const popCtx = sr.querySelector('#hud-popover-context');
+      if (!popCtx.hasAttribute('hidden')) {
+        sr.querySelector('.capsule-context').click();
+      }
+    })()`);
 
     // 7. 缩窄至 400px（<= 440px 紧凑态）：验证模型标签自动切换为单字母徽标 H 且不折行
     await main.evaluate(`document.querySelector('#hud-e2e-fixture').style.width = '400px'`);

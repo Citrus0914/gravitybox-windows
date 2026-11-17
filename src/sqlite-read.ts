@@ -149,7 +149,7 @@ export class SqliteReadSnapshot {
       }
     }
     this.detachListeners();
-    void this.worker.terminate();
+    await this.worker.terminate().catch(() => {});
   }
   private detachListeners() {
     this.worker.removeListener('exit', this.onExit);

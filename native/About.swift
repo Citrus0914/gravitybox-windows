@@ -196,7 +196,10 @@ final class AboutPage: NSObject {
         refreshUpdateState()
     }
 
+    private var cachedBuildSummary: String?
+
     private func resolvedBuildSummary() -> String {
+        if let cachedBuildSummary { return cachedBuildSummary }
         var buildStr = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if buildStr.lowercased().hasPrefix("build ") {
             buildStr = String(buildStr.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -210,10 +213,14 @@ final class AboutPage: NSObject {
                let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let rev = (info["revision"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !rev.isEmpty {
-                return buildStr.isEmpty || buildStr == rev ? rev : "\(buildStr) · \(rev)"
+                let resolved = buildStr.isEmpty || buildStr == rev ? rev : "\(buildStr) · \(rev)"
+                cachedBuildSummary = resolved
+                return resolved
             }
         }
-        return buildStr.isEmpty ? app.updateManager.currentBuildDisplay : buildStr
+        let fallback = buildStr.isEmpty ? app.updateManager.currentBuildDisplay : buildStr
+        cachedBuildSummary = fallback
+        return fallback
     }
 
     private func resolvedAntigravityDisplay() -> String {
@@ -310,7 +317,11 @@ final class AboutPage: NSObject {
             updateStatusIcon.contentTintColor = Design.blue
             updateStatusLabel.textColor = .labelColor
             updateStatusLabel.stringValue = L10n.t("about.status.downloading", ["tag": release.tagName], fallback: "正在下载 \(release.tagName) 更新包…")
-            updateMetaLabel.stringValue = L10n.t("about.status.downloading_meta", fallback: "下载中")
+            if let pct = app.updateManager.downloadProgressPercent, pct > 0 {
+                updateMetaLabel.stringValue = L10n.t("about.status.downloading_progress", ["pct": pct], fallback: "下载中 \(pct)%")
+            } else {
+                updateMetaLabel.stringValue = L10n.t("about.status.downloading_meta", fallback: "下载中")
+            }
             updateMetaLabel.isHidden = false
             checkUpdateBtn.isHidden = true
             installNowBtn.isHidden = true
@@ -379,6 +390,7 @@ final class AboutPage: NSObject {
     }
 
     @objc func cancelActiveDownload() {
+        cancelDownloadBtn.isEnabled = false
         app.updateManager.cancelDownload()
     }
 

@@ -1,7 +1,8 @@
-import { compactDecimal, compactNumber, compactPercent, durationText, formatTurnDurationCompact } from '../dist/metric-format.js';
+import { compactBarNumber, compactDecimal, compactNumber, compactPercent, compactRate, compactUsd, durationText, formatTurnDurationCompact } from '../dist/metric-format.js';
 import { hudText, normalizeHudLocale } from './hud-i18n.js';
 import { HUD_STYLES_CSS } from './hud-styles.js';
 import {
+  resolveVisibleHorizontalBounds,
   computeUpwardPopoverPosition,
   applyPopoverGeometry,
   resetPopoverGeometryCache,
@@ -38,18 +39,33 @@ function trimFallbackTrailingZeros(text) {
  */
 function formatDetailCompactNumber(value, sig = 3) { return compactNumber(value, sig); }
 
-function formatCompactCount(value, fallback = '0') {
+function formatBarCompactCount(value, fallback = '0') {
   if (isRawNumber(value)) {
-    return formatDetailCompactNumber(value, 3);
+    return compactBarNumber(value);
   }
   if (!fallback) return '0';
   if (fallback === '—') return '—';
   const cleanedText = String(fallback).replace(/[,~\s]|tok$/gi, '');
   const parsedValue = Number(cleanedText);
   if (Number.isFinite(parsedValue) && parsedValue >= 0) {
-    return formatDetailCompactNumber(parsedValue, 3);
+    return compactBarNumber(parsedValue);
   }
   return trimFallbackTrailingZeros(cleanedText || fallback);
+}
+
+function formatBarTokenCount(value, fallback) {
+  if (isRawNumber(value)) {
+    return `${compactBarNumber(value)} tok`;
+  }
+  if (!fallback) return '0 tok';
+  if (fallback === '—') return '—';
+  const cleanedText = String(fallback).replace(/[,~\s]|tok$/gi, '');
+  const parsedValue = Number(cleanedText);
+  if (Number.isFinite(parsedValue) && parsedValue >= 0) {
+    return `${compactBarNumber(parsedValue)} tok`;
+  }
+  const normalized = trimFallbackTrailingZeros(cleanedText);
+  return normalized.endsWith('tok') ? normalized : `${normalized} tok`;
 }
 
 function formatTokenCount(value, fallback) {
@@ -72,10 +88,27 @@ function formatMetric(value, formatted, digits, suffix) {
   return `${digits === 0 ? Math.round(value) : compactDecimal(value, digits)}${suffix}`;
 }
 
-/** 弹窗百分比：3 位有效数字并去尾零（94.15 → 94.2、42.00 → 42、5.25 → 5.25、100 → 100）。 */
+function formatRateMetric(value, formatted, suffix) {
+  if (formatted === '—' || !isRawNumber(value)) return '—';
+  return `${compactRate(value)}${suffix}`;
+}
+
+/** 弹窗百分比：国际简明格式（>=99.95% 取整，>=1% 最多 1 位小数，<1% 最多 2 位小数并去尾零）。 */
 function formatPopoverPercent(value, formatted) {
   if (formatted === '—' || !isRawNumber(value)) return '—';
   return compactPercent(value);
+}
+
+function formatConciseStageModelName(rawName) {
+  const text = String(rawName || '').trim();
+  if (!text) return '—';
+  const g4Match = text.match(/^Gemini\s+4\s+(.+)$/i);
+  if (g4Match) return g4Match[1];
+  const gVerMatch = text.match(/^Gemini\s+(\d+(?:\.\d+)?\s+.+)$/i);
+  if (gVerMatch) return gVerMatch[1];
+  const claudeMatch = text.match(/^Claude\s+(.+)$/i);
+  if (claudeMatch) return claudeMatch[1];
+  return text;
 }
 
 function escapeHudHtml(value) {
@@ -362,6 +395,9 @@ export class HudInstance {
       this.lastAppliedUpdatedAt = 0;
       this.pinnedPopoverId = null;
       this.lastMetrics = createDefaultMetrics(newConvId, this.sessionRevision);
+      if (this.shadow) {
+        this.applyMetricsToDom(this.lastMetrics);
+      }
       this.renderSkeleton();
       this.syncStreamingClass();
       this.emitBridgeEvent('SESSION_ATTACHED');
@@ -384,9 +420,14 @@ export class HudInstance {
     return this.sessionRevision;
   }
 
-  computeMergedActivityPhase() {
-    // 当前分栏前台模型未处于流式轮次时，即使仍有后台工具或独立子智能体运行，小圆点也必须保持灰色 idle
-    if (!this.domIsStreaming) return 'idle';
+  computeMergedActivityPhase(metricsOverride = null) {
+    const refMetrics = metricsOverride || this.lastMetrics;
+    const subpaneDbActive =
+      Boolean(this.isSubpane || refMetrics?.session?.isSubagentTrajectory) &&
+      ((refMetrics?.session?.activeModelStepCount || 0) > 0 ||
+        (refMetrics?.session?.activeToolStepCount || 0) > 0);
+    // 当前分栏前台模型未处于流式轮次时（除非是独立子智能体分栏且底层数据库实锤存在活跃步），小圆点保持灰色 idle
+    if (!this.domIsStreaming && !subpaneDbActive) return 'idle';
     if (this.domActivityPhase === 'executing' || this.backendActivityPhase === 'executing') {
       return 'executing';
     }
@@ -628,7 +669,7 @@ export class HudInstance {
       metrics.activityPhase === 'idle'
         ? metrics.activityPhase
         : null;
-    this.activityPhase = this.computeMergedActivityPhase();
+    this.activityPhase = this.computeMergedActivityPhase(metrics);
     this.lastMetrics = {
       ...metrics,
       isStreaming: this.isStreaming,
@@ -663,13 +704,14 @@ export class HudInstance {
     if (typeof document === 'undefined') return '';
     const bodyCls = document.body?.className || '';
     const htmlCls = document.documentElement?.className || '';
+    const htmlStyle = document.documentElement?.getAttribute?.('style') || '';
     const bodyDataTheme = document.body?.getAttribute?.('data-theme') || '';
     const htmlDataTheme = document.documentElement?.getAttribute?.('data-theme') || '';
     const sysDark =
       typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)')?.matches
         ? '1'
         : '0';
-    return `${bodyCls}|${htmlCls}|${bodyDataTheme}|${htmlDataTheme}|${sysDark}`;
+    return `${bodyCls}|${htmlCls}|${htmlStyle}|${bodyDataTheme}|${htmlDataTheme}|${sysDark}`;
   }
 
   syncTheme() {
@@ -761,11 +803,44 @@ export class HudInstance {
     }
   }
 
+  syncHorizontalBounds(targetComposer = this.targetComposer) {
+    if (!targetComposer) return 0;
+    const composerRect =
+      typeof targetComposer.getBoundingClientRect === 'function'
+        ? targetComposer.getBoundingClientRect()
+        : null;
+    const rawWidth = composerRect?.width ?? targetComposer.clientWidth ?? 0;
+    const boundsFn =
+      typeof resolveVisibleHorizontalBounds === 'function'
+        ? resolveVisibleHorizontalBounds
+        : globalThis.__GRAVITYBOX_HUD_POPOVER__?.resolveVisibleHorizontalBounds;
+    if (!this.host || !composerRect || !(rawWidth > 0) || typeof boundsFn !== 'function') {
+      return rawWidth;
+    }
+    const bounds = boundsFn(targetComposer);
+    const visibleLeft = Math.max(composerRect.left, bounds.left);
+    const visibleRight = Math.min(composerRect.right, bounds.right);
+    const obstructedRight = composerRect.right - visibleRight > 1;
+    const obstructedLeft = visibleLeft - composerRect.left > 1;
+    if (visibleRight > visibleLeft && (obstructedRight || obstructedLeft)) {
+      const clampedWidth = Math.max(110, Math.floor(visibleRight - visibleLeft));
+      this.host.style.maxWidth = `${clampedWidth}px`;
+      this.host.style.alignSelf = obstructedRight && !obstructedLeft ? 'flex-start' : 'center';
+      this.host.style.marginLeft = obstructedLeft ? `${Math.round(visibleLeft - composerRect.left)}px` : '0px';
+      return clampedWidth;
+    }
+    if (this.host.style.maxWidth !== '100%') this.host.style.maxWidth = '100%';
+    if (this.host.style.alignSelf) this.host.style.alignSelf = '';
+    if (this.host.style.marginLeft && this.host.style.marginLeft !== '0px') this.host.style.marginLeft = '0px';
+    return rawWidth;
+  }
+
   syncVerticalCentering() {
     if (!this.host || !this.targetComposer) return;
     // Own only our box. Never rewrite the host application's ancestor padding.
     this.host.style.marginTop = '4px';
     this.host.style.marginBottom = '4px';
+    this.syncHorizontalBounds(this.targetComposer);
     const win = typeof window !== 'undefined' ? window : globalThis.window;
     if (typeof this.host.getBoundingClientRect !== 'function') return;
     const composer = this.targetComposer.getBoundingClientRect?.();
@@ -779,9 +854,11 @@ export class HudInstance {
       if (bottomGap >= 0 && bottomGap < 48) {
         const previous = parseFloat(this.host.style.getPropertyValue?.('--hud-offset') || '0') || 0;
         const offset = Math.max(-8, Math.min(8, previous + (bottomGap - topGap) / 2));
-        this.host.style.setProperty?.('--hud-offset', `${offset}px`);
-        this.host.style.translate = `0 var(--hud-offset, 0px)`;
-        return;
+        if (Math.abs(offset) >= 0.5) {
+          this.host.style.setProperty?.('--hud-offset', `${offset}px`);
+          this.host.style.translate = `0 var(--hud-offset, 0px)`;
+          return;
+        }
       }
     }
     this.host.style.setProperty?.('--hud-offset', '0px');
@@ -810,6 +887,8 @@ export class HudInstance {
       justifyContent: 'center',
       alignItems: 'center',
       width: '100%',
+      maxWidth: '100%',
+      minWidth: '0',
       height: '24px',
       marginTop: '4px',
       marginBottom: '0px',
@@ -844,7 +923,7 @@ export class HudInstance {
       typeof targetComposer.getBoundingClientRect === 'function'
         ? targetComposer.getBoundingClientRect()
         : null;
-    const initialWidth = initialRect?.width ?? targetComposer.clientWidth ?? 0;
+    const initialWidth = this.syncHorizontalBounds(targetComposer);
     const vh =
       Number((typeof window !== 'undefined' ? window : globalThis.window)?.innerHeight) || 0;
     this.lastCenteringSig = `${Math.round(initialWidth)}:${Math.round(initialRect?.top ?? 0)}:${Math.round(initialRect?.bottom ?? 0)}:${vh}`;
@@ -876,7 +955,7 @@ export class HudInstance {
       typeof targetComposer.getBoundingClientRect === 'function'
         ? targetComposer.getBoundingClientRect()
         : null;
-    const width = rect?.width ?? targetComposer.clientWidth ?? 0;
+    const width = this.syncHorizontalBounds(targetComposer);
     const vh =
       Number((typeof window !== 'undefined' ? window : globalThis.window)?.innerHeight) || 0;
     const centerSig = `${Math.round(width)}:${Math.round(rect?.top ?? 0)}:${Math.round(rect?.bottom ?? 0)}:${vh}`;
@@ -904,7 +983,7 @@ export class HudInstance {
           <button type="button" class="capsule capsule-session" data-capsule-id="session" aria-haspopup="dialog" aria-expanded="false" aria-label="${this.t('capsuleSessionLabel')}">
             <span class="hud-status-dot" aria-hidden="true"></span>
             <span class="capsule-text" id="hud-txt-session">
-              <span class="hud-turns">${this.t('turnsUnit', { count: 0 })}</span><span class="hud-turn-dur"><span class="hud-turn-dot">· </span><span class="hud-turn-text">${this.t('turnCompactDefault')}</span></span><span class="hud-speed"> · —</span><span class="hud-subagent-tag"></span>
+              <span class="hud-turns">${this.t('turnsUnit', { count: 0 })}</span><span class="hud-turn-dur"><span class="hud-turn-dot">· </span><span class="hud-turn-text">${this.t('turnCompactDefault')}</span></span><span class="hud-speed"> · —</span><span class="hud-subagent-tag" hidden><span class="hud-subagent-sep" aria-hidden="true"> · </span><svg class="hud-subagent-icon" viewBox="0 0 12 12" aria-hidden="true"><circle cx="3" cy="3" r="1.5" fill="currentColor"/><circle cx="9.2" cy="3.8" r="1.35" fill="currentColor"/><circle cx="9.2" cy="8.8" r="1.35" fill="currentColor"/><path d="M4.3 3.2H5.8C6.5 3.2 7 3.7 7 4.4M5.8 3.2V7.6C5.8 8.3 6.3 8.8 7 8.8H7.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="hud-subagent-count"></span></span>
             </span>
           </button>
 
@@ -1084,7 +1163,6 @@ export class HudInstance {
             </div>
             <div class="hud-popover-row">
               <span class="hud-popover-label">
-                <span class="hud-legend-dot" style="background-color: var(--hud-seg-msg-color)"></span>
                 <span id="lbl-seg-msg">${this.t('lblSegMsg')}</span>
               </span>
               <span class="hud-popover-val" id="val-seg-msg">0 tok</span>
@@ -1227,33 +1305,22 @@ export class HudInstance {
     };
     if (sessionCapsule && sessionCapsule.classList) {
       applyPhaseClasses(sessionCapsule);
-      if (this.isSubagentRunning) {
-        sessionCapsule.classList.add('is-subagent-active');
-      } else {
-        sessionCapsule.classList.remove('is-subagent-active');
-      }
     }
     applyPhaseClasses(sessionPopover);
 
-    const subagentTagEl = this.getShadowEl('#hud-txt-session .hud-subagent-tag');
     const subagentRow = this.getShadowEl('#row-subagent-status');
     const lblSubEl = this.getShadowEl('#lbl-subagent-status');
     const valSubEl = this.getShadowEl('#val-subagent-status');
     const activeSubagents = Math.max(1, this.runningSubagentCount || 1);
-    const activeSubagentsBar = formatCompactCount(activeSubagents);
+    const activeSubagentsBar = formatBarCompactCount(activeSubagents);
     const activeSubagentsPop = formatDetailCompactNumber(activeSubagents);
     const subStepsCount = Math.max(0, Number(this.lastMetrics?.session?.subagentSteps) || 0);
     const subStepsPop = formatDetailCompactNumber(subStepsCount);
     const subStepSuffix =
       subStepsCount > 0 ? this.t('subStepsSuffix', { steps: subStepsPop }) : '';
 
+    this.syncSubagentTagElement(this.isSubagentRunning, activeSubagentsBar, activeSubagents);
     if (this.isSubagentRunning) {
-      if (subagentTagEl) {
-        subagentTagEl.textContent =
-          activeSubagents > 1
-            ? this.t('subagentTagPlural', { count: activeSubagentsBar })
-            : this.t('subagentTagSingle');
-      }
       if (subagentRow) {
         subagentRow.removeAttribute('hidden');
       }
@@ -1264,9 +1331,6 @@ export class HudInstance {
         valSubEl.textContent = this.t('subRunning', { count: activeSubagentsPop, suffix: subStepSuffix });
       }
     } else {
-      if (subagentTagEl) {
-        subagentTagEl.textContent = '';
-      }
       const totalSubagents = Math.max(0, Number(this.lastMetrics?.session?.subagentCount) || 0);
       if (totalSubagents > 0) {
         if (subagentRow) subagentRow.removeAttribute('hidden');
@@ -1279,6 +1343,52 @@ export class HudInstance {
         subagentRow.setAttribute('hidden', '');
       }
     }
+  }
+
+  syncSubagentTagElement(isRunning, activeSubagentsBar = '1', activeSubagents = 1) {
+    const subagentTagEl = this.getShadowEl('#hud-txt-session .hud-subagent-tag');
+    if (!subagentTagEl) return;
+    const countEl =
+      this.getShadowEl('#hud-txt-session .hud-subagent-count') ||
+      subagentTagEl.querySelector?.('.hud-subagent-count') ||
+      null;
+    if (isRunning) {
+      subagentTagEl.removeAttribute?.('hidden');
+      subagentTagEl.setAttribute?.('data-subagent-active', 'true');
+      subagentTagEl.setAttribute?.('data-subagent-count', String(activeSubagents));
+      if (countEl) {
+        const nextCount = activeSubagents > 1 ? String(activeSubagentsBar) : '';
+        if (countEl.textContent !== nextCount) countEl.textContent = nextCount;
+      } else {
+        const fallbackGlyph = activeSubagents > 1 ? ` · ⑂${activeSubagentsBar}` : ' · ⑂';
+        if (subagentTagEl.textContent !== fallbackGlyph) subagentTagEl.textContent = fallbackGlyph;
+      }
+    } else {
+      subagentTagEl.setAttribute?.('hidden', '');
+      subagentTagEl.removeAttribute?.('data-subagent-active');
+      subagentTagEl.removeAttribute?.('data-subagent-count');
+      if (countEl) {
+        if (countEl.textContent !== '') countEl.textContent = '';
+      } else if (subagentTagEl.textContent !== '') {
+        subagentTagEl.textContent = '';
+      }
+    }
+  }
+
+  buildSessionReadoutForAria(subagentRunning = false, activeSubagents = 1) {
+    const turnsTxt = (this.getShadowEl('#hud-txt-session .hud-turns')?.textContent || '').trim();
+    const turnDurTxt = (this.getShadowEl('#hud-txt-session .hud-turn-dur')?.textContent || '').replace(/\s+/g, ' ').trim();
+    const speedTxt = (this.getShadowEl('#hud-txt-session .hud-speed')?.textContent || '').replace(/\s+/g, ' ').trim();
+    const baseReadout = `${turnsTxt}${turnsTxt && turnDurTxt ? ' ' : ''}${turnDurTxt}${speedTxt ? ` ${speedTxt}` : ''}`
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!subagentRunning) return baseReadout;
+    const countBar = formatBarCompactCount(Math.max(1, activeSubagents));
+    const subAria =
+      activeSubagents > 1
+        ? this.t('subagentTagPlural', { count: countBar })
+        : this.t('subagentTagSingle');
+    return `${baseReadout}${subAria}`.replace(/\s+/g, ' ').trim();
   }
 
   formatCompactTurnDuration(sec, locale = this.locale) {
@@ -1445,8 +1555,7 @@ export class HudInstance {
     if (!this.turnClockAnchor) {
       const sameTurnResumeFloor =
         this.turnHighWaterMark &&
-        this.turnHighWaterMark.turns === turns &&
-        this.turnHighWaterMark.hasSubagent
+        this.turnHighWaterMark.turns === turns
           ? this.turnHighWaterMark.seconds
           : 0;
       const startSec = Math.max(backendSec, sameTurnResumeFloor, frozenTurnFloor);
@@ -1555,10 +1664,10 @@ export class HudInstance {
           `turns=${rawTurns}; steps=${rawSteps}; modelSec=${liveModel.toFixed(2)}; toolSec=${liveTool.toFixed(2)}; ttftSec=${Number(s.averageTtftSeconds || 0).toFixed(2)}; tps=${Number(s.outputTps || 0).toFixed(2)}`
         );
       }
-      const baseModelTotal = Number(s.modelDurationSeconds || 0);
-      const baseToolTotal = Number(s.toolDurationSeconds || 0);
-      const liveTurnModel = Math.max(0, Number(s.currentTurnModelDurationSeconds || 0) + Math.max(0, liveModel - baseModelTotal));
-      const liveTurnTool = Math.max(0, Number(s.currentTurnToolDurationSeconds || 0) + Math.max(0, liveTool - baseToolTotal));
+      const baseModelSnap = Number(s.modelDurationSeconds || 0) + Number(s.inFlightModelDurationSeconds || 0);
+      const baseToolSnap = Number(s.toolDurationSeconds || 0) + Number(s.inFlightToolDurationSeconds || 0);
+      const liveTurnModel = Math.max(0, Number(s.currentTurnModelDurationSeconds || 0) + Math.max(0, liveModel - baseModelSnap));
+      const liveTurnTool = Math.max(0, Number(s.currentTurnToolDurationSeconds || 0) + Math.max(0, liveTool - baseToolSnap));
       this.getShadowEl('#val-turn-dur')?.setAttribute(
         'aria-description',
         this.t('turnBreakdownDesc', {
@@ -1586,6 +1695,24 @@ export class HudInstance {
       if (valTurnDurEl.textContent !== nextCardText) {
         valTurnDurEl.textContent = nextCardText;
       }
+    }
+    const capSession = this.getShadowEl('.capsule-session');
+    if (capSession) {
+      const phase =
+        this.activityPhase === 'generating' || this.activityPhase === 'executing'
+          ? this.activityPhase
+          : 'idle';
+      const phaseText = phase === 'generating'
+        ? this.t('phaseGenerating')
+        : phase === 'executing'
+        ? this.t('phaseExecuting')
+        : this.t('phaseIdle');
+      const activeSubs = Math.max(1, this.runningSubagentCount || 1);
+      const sessionReadout = this.buildSessionReadoutForAria(this.isSubagentRunning, activeSubs);
+      capSession.setAttribute(
+        'aria-label',
+        this.t('ariaSessionSummary', { phase: phaseText, readout: sessionReadout })
+      );
     }
   }
 
@@ -1635,27 +1762,34 @@ export class HudInstance {
     const subagentTagEl = q('#hud-txt-session .hud-subagent-tag');
     const rawTurns = isRawNumber(s.turns) ? s.turns : 0;
     const rawSteps = isRawNumber(s.steps) ? s.steps : 0;
-    const turnsBarCount = formatCompactCount(rawTurns);
+    const turnsBarCount = formatBarCompactCount(rawTurns);
     const turnsPopCount = formatDetailCompactNumber(rawTurns);
     const stepsPopCount = formatDetailCompactNumber(rawSteps);
-    const activeSubagentsBar = formatCompactCount(activeSubagents);
+    const activeSubagentsBar = formatBarCompactCount(activeSubagents);
     const isWorkingNow = Boolean(this.hasActiveWork || this.isStreaming || this.isSubagentRunning);
-    const clockActive = isWorkingNow && !unavailable;
+    const clockActive = isWorkingNow && !unavailable && metrics.availability !== 'cached';
     this.syncTurnClock(metrics, clockActive);
     const clockNowMs = Date.now();
-    const subagentTurnFloor =
+    const rawBackendTurnSec = isRawNumber(s.currentTurnDurationSeconds) ? Math.max(0, s.currentTurnDurationSeconds) : null;
+    const highWaterCandidate =
       !isWorkingNow &&
       this.turnHighWaterMark &&
-      this.turnHighWaterMark.turns === rawTurns &&
-      this.turnHighWaterMark.hasSubagent
+      this.turnHighWaterMark.turns === rawTurns
         ? this.turnHighWaterMark.seconds
         : 0;
-    const rawBackendTurnSec = isRawNumber(s.currentTurnDurationSeconds) ? Math.max(0, s.currentTurnDurationSeconds) : null;
+    const sameTurnFloor =
+      highWaterCandidate > 0 &&
+      (this.turnHighWaterMark?.hasSubagent ||
+        s.turnAborted === true ||
+        rawBackendTurnSec === null ||
+        highWaterCandidate - rawBackendTurnSec > 1.5)
+        ? highWaterCandidate
+        : 0;
     const effectiveIdleTurnSec =
       rawBackendTurnSec !== null
-        ? Math.max(rawBackendTurnSec, subagentTurnFloor)
-        : subagentTurnFloor > 0
-        ? subagentTurnFloor
+        ? Math.max(rawBackendTurnSec, sameTurnFloor)
+        : sameTurnFloor > 0
+        ? sameTurnFloor
         : null;
     const liveElapsedSec = clockActive && this.turnClockAnchor
       ? Math.max(
@@ -1695,10 +1829,14 @@ export class HudInstance {
       s.outputTpsFormatted === 'Calculating...' ||
       s.outputTpsFormatted === 'Measuring…' ||
       (isWorkingNow && !(Number(s.samples?.timed) > 0) && s.outputTpsFormatted === '—');
-    const tpsText = (digits) =>
-      isPendingTps
-        ? this.t('tpsMeasuring')
-        : formatMetric(s.outputTps, s.outputTpsFormatted, digits, ' tok/s');
+    const barSpeedText = isPendingTps
+      ? this.t('tpsMeasuring')
+      : s.outputTpsFormatted === '—' || !isRawNumber(s.outputTps)
+      ? '—'
+      : `${compactBarNumber(Math.round(s.outputTps))} tok/s`;
+    const popTpsText = isPendingTps
+      ? this.t('tpsMeasuring')
+      : formatRateMetric(s.outputTps, s.outputTpsFormatted, ' tok/s');
 
     const isSubagentSession = Boolean(this.isSubpane || s.isSubagentTrajectory);
     if (turnsEl) {
@@ -1709,7 +1847,7 @@ export class HudInstance {
     }
     if (turnDurEl) {
       let compactDur;
-      if (liveElapsedSec !== null && (isWorkingNow || subagentTurnFloor > (rawBackendTurnSec ?? 0))) {
+      if (liveElapsedSec !== null && (isWorkingNow || sameTurnFloor > (rawBackendTurnSec ?? 0))) {
         compactDur = this.formatCompactTurnDuration(liveElapsedSec, locale);
       } else {
         compactDur = isZh
@@ -1718,17 +1856,9 @@ export class HudInstance {
       }
       this.setTurnDurationText(compactDur, Boolean(turnsEl?.textContent));
     }
-    setElText(speedEl, ` · ${tpsText(0)}`);
-    if (subagentTagEl) {
-      if (subagentRunning) {
-        subagentTagEl.textContent =
-          activeSubagents > 1
-            ? this.t('subagentTagPlural', { count: activeSubagentsBar })
-            : this.t('subagentTagSingle');
-      } else {
-        subagentTagEl.textContent = '';
-      }
-    }
+    setElText(speedEl, ` · ${barSpeedText}`);
+    void subagentTagEl;
+    this.syncSubagentTagElement(subagentRunning, activeSubagentsBar, activeSubagents);
 
     // 2. 更新分段 2 (Token 用量)
     const tokTotalEl = q('#hud-txt-tokens .hud-tok-total');
@@ -1737,7 +1867,7 @@ export class HudInstance {
     const cacheValEl = q('#hud-txt-tokens .hud-cache-val');
     setElText(
       tokTotalEl,
-      formatTokenCount(t.totalTokens, t.totalTokensCompact)
+      formatBarTokenCount(t.totalTokens, t.totalTokensCompact)
     );
     if (cachePrefixEl) cachePrefixEl.textContent = this.t('cachePrefix');
     if (cacheLabelEl) cacheLabelEl.textContent = this.t('cacheLabel');
@@ -1758,14 +1888,16 @@ export class HudInstance {
       compBadgeEl.classList?.remove('is-compaction-low', 'is-compaction-warn', 'is-compaction-danger');
       if (compCount >= 1) {
         const compTier = compCount >= 3 ? 'danger' : compCount === 2 ? 'warn' : 'low';
-        const compBarText = formatCompactCount(compCount);
+        const compBarText = formatBarCompactCount(compCount);
         compBadgeEl.textContent = compBarText;
         compBadgeEl.removeAttribute('hidden');
         compBadgeEl.setAttribute('data-compaction-tier', compTier);
         compBadgeEl.classList?.add(`is-compaction-${compTier}`);
         compBadgeEl.setAttribute(
           'aria-label',
-          this.t('compactionAria', { count: compBarText })
+          !isZh && compCount === 1
+            ? 'Compacted once'
+            : this.t('compactionAria', { count: compBarText })
         );
         ctxCapsule?.classList?.add('has-compaction');
       } else {
@@ -1818,11 +1950,15 @@ export class HudInstance {
 
     // 4. 更新 Popover 1 (会话统计 - 采用紧凑数字表示法)
     setTxt('#pop-session-title', this.t('popSessionTitle'));
-    setTxt(
-      '#pop-session-badge',
+    const rawPopSessionBadge =
       isSubagentSession && rawTurns === 0 && rawSteps > 0
         ? this.t('popSessionBadge', { turns: 0, steps: stepsPopCount }).replace(/^0\s*(?:轮|turns)\s*/i, '')
-        : this.t('popSessionBadge', { turns: turnsPopCount, steps: stepsPopCount })
+        : this.t('popSessionBadge', { turns: turnsPopCount, steps: stepsPopCount });
+    setTxt(
+      '#pop-session-badge',
+      isZh
+        ? rawPopSessionBadge
+        : rawPopSessionBadge.replace(/\b1 turns\b/g, '1 turn').replace(/\b1 steps\b/g, '1 step')
     );
     setTxt('#lbl-model-dur', this.t('lblModelDur'));
     setTxt(
@@ -1837,19 +1973,19 @@ export class HudInstance {
     setTxt('#lbl-ttft', this.t('lblTtft'));
     setTxt(
       '#val-ttft',
-      formatMetric(s.averageTtftSeconds, s.averageTtftFormatted, 2, this.t('secSuffix'))
+      formatRateMetric(s.averageTtftSeconds, s.averageTtftFormatted, this.t('secSuffix'))
     );
     setTxt('#lbl-tps', this.t('lblTps'));
-    setTxt('#val-tps', tpsText(2));
+    setTxt('#val-tps', popTpsText);
     setTxt('#lbl-turn-dur', this.t('lblTurnDur'));
-    const cardTurnSec = liveElapsedSec !== null && (isWorkingNow || subagentTurnFloor > (rawBackendTurnSec ?? 0))
+    const cardTurnSec = liveElapsedSec !== null && (isWorkingNow || sameTurnFloor > (rawBackendTurnSec ?? 0))
       ? liveElapsedSec
       : s.currentTurnDurationSeconds;
     const turnDurFormatted = isZh
-      ? (isRawNumber(cardTurnSec) && (isWorkingNow || subagentTurnFloor > (rawBackendTurnSec ?? 0) || s.currentTurnDurationFormatted !== '—')
+      ? (isRawNumber(cardTurnSec) && (isWorkingNow || sameTurnFloor > (rawBackendTurnSec ?? 0) || s.currentTurnDurationFormatted !== '—')
         ? durationText(cardTurnSec, locale)
         : (s.currentTurnDurationFormatted || '—'))
-      : (isRawNumber(cardTurnSec) && (isWorkingNow || subagentTurnFloor > (rawBackendTurnSec ?? 0) || s.currentTurnDurationFormattedEn !== '—')
+      : (isRawNumber(cardTurnSec) && (isWorkingNow || sameTurnFloor > (rawBackendTurnSec ?? 0) || s.currentTurnDurationFormattedEn !== '—')
         ? durationText(cardTurnSec, locale)
         : (s.currentTurnDurationFormattedEn || '—'));
     setTxt('#val-turn-dur', turnDurFormatted);
@@ -1861,7 +1997,7 @@ export class HudInstance {
       Boolean(latestStepTtftRawFormatted) &&
       latestStepTtftRawFormatted !== '—';
     const latestStepTtftText = hasLatestStepTtft
-      ? formatMetric(s.latestStepTtftSeconds, latestStepTtftRawFormatted, 2, this.t('secSuffix'))
+      ? formatRateMetric(s.latestStepTtftSeconds, latestStepTtftRawFormatted, this.t('secSuffix'))
       : '—';
     setTxt('#val-ttft-latest', latestStepTtftText);
     setTxt('#lbl-tps-latest', this.t('lblTpsLatest'));
@@ -1871,11 +2007,23 @@ export class HudInstance {
       Boolean(s.latestStepOutputTpsFormatted) &&
       s.latestStepOutputTpsFormatted !== '—';
     const latestStepTpsText = hasLatestStepTps
-      ? formatMetric(s.latestStepOutputTps, s.latestStepOutputTpsFormatted, 2, ' tok/s')
+      ? formatRateMetric(s.latestStepOutputTps, s.latestStepOutputTpsFormatted, ' tok/s')
       : '—';
     setTxt('#val-tps-latest', latestStepTpsText);
-    const modelTurnSec = durationText(Number(s.currentTurnModelDurationSeconds || 0), locale);
-    const toolTurnSec = durationText(Number(s.currentTurnToolDurationSeconds || 0), locale);
+    const baseModelSnap = Number(s.modelDurationSeconds || 0) + Number(s.inFlightModelDurationSeconds || 0);
+    const baseToolSnap = Number(s.toolDurationSeconds || 0) + Number(s.inFlightToolDurationSeconds || 0);
+    const liveTurnModel = Math.max(
+      0,
+      Number(s.currentTurnModelDurationSeconds || 0) +
+        Math.max(0, Number(liveModelSec || 0) - baseModelSnap)
+    );
+    const liveTurnTool = Math.max(
+      0,
+      Number(s.currentTurnToolDurationSeconds || 0) +
+        Math.max(0, Number(liveToolSec || 0) - baseToolSnap)
+    );
+    const modelTurnSec = durationText(liveTurnModel, locale);
+    const toolTurnSec = durationText(liveTurnTool, locale);
     q('#val-turn-dur')?.setAttribute(
       'aria-description',
       this.t('turnBreakdownDesc', { model: modelTurnSec, tool: toolTurnSec })
@@ -1973,11 +2121,19 @@ export class HudInstance {
     }
 
     const formatUsdDisplay = (usd, formatted) => {
-      if (unavailable) return '—';
-      if (typeof formatted === 'string' && formatted && formatted !== '—') return formatted;
-      if (isRawNumber(usd) && usd >= 0) {
-        if (usd === 0) return '~$0.00';
-        return usd < 0.01 ? `~$${usd.toFixed(4)}` : `~$${usd.toFixed(2)}`;
+      if (unavailable || formatted === '—') return '—';
+      if (isRawNumber(usd)) return compactUsd(usd);
+      if (typeof formatted === 'string') {
+        const trimmed = formatted.trim();
+        if (!trimmed) return '—';
+        const numericMatch = trimmed.replace(/,/g, '').match(/^~?\$\s*([0-9]+(?:\.[0-9]+)?)$/);
+        if (numericMatch) {
+          const parsed = Number(numericMatch[1]);
+          if (Number.isFinite(parsed) && parsed >= 0) {
+            return compactUsd(parsed);
+          }
+        }
+        return trimmed;
       }
       return '—';
     };
@@ -2086,7 +2242,7 @@ export class HudInstance {
     const capSession = q('.capsule-session');
     const capTokens = q('.capsule-tokens');
     const capContext = q('.capsule-context');
-    const sessionReadout = (q('#hud-txt-session')?.textContent || '').replace(/\s+/g, ' ').trim();
+    const sessionReadout = this.buildSessionReadoutForAria(subagentRunning, activeSubagents);
     const tokensReadout = (q('#hud-txt-tokens')?.textContent || '').replace(/\s+/g, ' ').trim();
     const contextReadout = pctText;
     if (capSession) {
@@ -2107,7 +2263,9 @@ export class HudInstance {
         : '';
       const compNote =
         compCount >= 1
-          ? this.t('ariaContextCompNote', { count: formatCompactCount(compCount) })
+          ? !isZh && compCount === 1
+            ? ', Compacted once'
+            : this.t('ariaContextCompNote', { count: formatBarCompactCount(compCount) })
           : '';
       capContext.setAttribute(
         'aria-label',
@@ -2122,7 +2280,7 @@ export class HudInstance {
       popSession.setAttribute('aria-label', this.t('popoverSessionAria'));
       popSession.setAttribute(
         'data-exact-summary',
-        `turns=${rawTurns}; steps=${rawSteps}; modelSec=${Number(s.modelDurationSeconds || 0).toFixed(2)}; toolSec=${Number(s.toolDurationSeconds || 0).toFixed(2)}; ttftSec=${Number(s.averageTtftSeconds || 0).toFixed(2)}; tps=${Number(s.outputTps || 0).toFixed(2)}`
+        `turns=${rawTurns}; steps=${rawSteps}; modelSec=${Number(liveModelSec || 0).toFixed(2)}; toolSec=${Number(liveToolSec || 0).toFixed(2)}; ttftSec=${Number(s.averageTtftSeconds || 0).toFixed(2)}; tps=${Number(s.outputTps || 0).toFixed(2)}`
       );
     }
     if (popTokens) {
@@ -2192,9 +2350,21 @@ export class HudInstance {
     );
     const nodes = [];
     const htmlParts = [];
+    let renderedHistoryHeader = false;
 
     for (const stage of stages) {
       if (!stage || typeof stage !== 'object') continue;
+      if (stage.section === 'history' && !renderedHistoryHeader) {
+        renderedHistoryHeader = true;
+        if (useDomNodes) {
+          const historyTitle = doc.createElement('div');
+          historyTitle.className = 'hud-ctx-history-title';
+          historyTitle.textContent = this.t('lblStageSectionHistory');
+          nodes.push(historyTitle);
+        } else {
+          htmlParts.push(`<div class="hud-ctx-history-title">${escapeHudHtml(this.t('lblStageSectionHistory'))}</div>`);
+        }
+      }
       const isPending = stage.hasUsageData !== true;
       const isActive = Boolean(stage.isActive);
       const shortModel = String(stage.shortLabel || stage.modelDisplayName || stage.modelId || '—');
@@ -2202,8 +2372,10 @@ export class HudInstance {
         stage.role === 'planner'
           ? this.t('stageRolePlanner', { model: shortModel })
           : stage.role === 'executor'
-          ? this.t('stageRoleExecutor', { model: shortModel })
-          : String(stage.modelDisplayName || shortModel);
+          ? !stage.shortLabel
+            ? this.t('stageRoleExecutorPending')
+            : this.t('stageRoleExecutor', { model: String(stage.shortLabel) })
+          : formatConciseStageModelName(stage.modelDisplayName || shortModel);
 
       let valText;
       let ratioClamped = 0;
@@ -2251,6 +2423,7 @@ export class HudInstance {
         nameEl.appendChild(dot);
 
         const labelSpan = doc.createElement('span');
+        labelSpan.className = 'hud-stage-label';
         labelSpan.textContent = stageTitle;
         nameEl.appendChild(labelSpan);
 
@@ -2288,7 +2461,7 @@ export class HudInstance {
         htmlParts.push(
           `<div class="${itemClasses}" data-stage-slot="${escapeHudHtml(stage.slotKey || '')}">` +
             `<div class="hud-stage-head">` +
-              `<span class="hud-stage-name"><span class="hud-stage-dot" aria-hidden="true"></span><span>${escapeHudHtml(stageTitle)}</span>${badgeHtml}</span>` +
+              `<span class="hud-stage-name"><span class="hud-stage-dot" aria-hidden="true"></span><span class="hud-stage-label">${escapeHudHtml(stageTitle)}</span>${badgeHtml}</span>` +
               `<span class="hud-stage-val">${escapeHudHtml(valText)}</span>` +
             `</div>` +
             `<div class="hud-stage-bar-track"><div class="hud-stage-bar-fill" data-stage-ratio="${ratioClamped}" style="width:${barWidthPct}%;background-color:${barColor}"></div></div>` +
@@ -2326,7 +2499,20 @@ export class HudInstance {
         },
         { signal }
       );
+      const mql = win.matchMedia?.('(prefers-color-scheme: dark)');
+      mql?.addEventListener?.('change', () => this.syncTheme(), { signal });
     }
+    const doc = typeof document !== 'undefined' ? document : null;
+    doc?.addEventListener?.(
+      'visibilitychange',
+      () => {
+        if (doc.visibilityState === 'visible') {
+          this.syncTheme();
+          if (this.turnClockAnchor) this.tickTurnClock();
+        }
+      },
+      { signal }
+    );
 
     if (this.shadow && typeof this.shadow.querySelectorAll === 'function') {
       const capsules = this.shadow.querySelectorAll('.capsule');
@@ -2374,14 +2560,29 @@ export class HudInstance {
 
     if (typeof ResizeObserver === 'function' && targetComposer) {
       this.resizeObserver = new ResizeObserver((entries) => {
-        for (const entry of entries) {
-          const width = entry.contentRect?.width ?? targetComposer.clientWidth ?? 0;
-          if (width > 0) this.handleContainerResize(width);
+        const boundedWidth = this.syncHorizontalBounds(targetComposer);
+        if (boundedWidth > 0) {
+          this.handleContainerResize(boundedWidth);
+        } else {
+          for (const entry of entries) {
+            const width = entry.contentRect?.width ?? targetComposer.clientWidth ?? 0;
+            if (width > 0) this.handleContainerResize(width);
+          }
         }
         this.syncVerticalCentering();
       });
       try {
         this.resizeObserver.observe(targetComposer);
+        const convPane = targetComposer.closest?.(
+          '[data-testid="conversation-view"], [data-media-drop-scope="subpane"]'
+        );
+        if (convPane && convPane !== targetComposer) {
+          this.resizeObserver.observe(convPane);
+        }
+        const splitRoot = targetComposer.closest?.('[data-split-root="true"]');
+        if (splitRoot && splitRoot !== targetComposer && splitRoot !== convPane) {
+          this.resizeObserver.observe(splitRoot);
+        }
       } catch {}
     }
   }
@@ -2392,20 +2593,24 @@ export class HudInstance {
     if (!container || !container.classList) return;
 
     let nextTier = 'full';
-    if (width > 0 && width < 360) {
+    if (width > 0 && width < 260) {
+      nextTier = 'micro';
+      container.classList.add('is-ultra-compact', 'is-micro-compact');
+      container.classList.remove('is-compact', 'is-mid-compact');
+    } else if (width >= 260 && width < 360) {
       nextTier = 'ultra';
       container.classList.add('is-ultra-compact');
-      container.classList.remove('is-compact', 'is-mid-compact');
+      container.classList.remove('is-compact', 'is-mid-compact', 'is-micro-compact');
     } else if (width >= 360 && width <= 440) {
       nextTier = 'compact';
       container.classList.add('is-compact');
-      container.classList.remove('is-ultra-compact', 'is-mid-compact');
+      container.classList.remove('is-ultra-compact', 'is-mid-compact', 'is-micro-compact');
     } else if (width > 440 && width <= 510) {
       nextTier = 'mid';
       container.classList.add('is-mid-compact');
-      container.classList.remove('is-compact', 'is-ultra-compact');
+      container.classList.remove('is-compact', 'is-ultra-compact', 'is-micro-compact');
     } else {
-      container.classList.remove('is-compact', 'is-ultra-compact', 'is-mid-compact');
+      container.classList.remove('is-compact', 'is-ultra-compact', 'is-mid-compact', 'is-micro-compact');
     }
 
     this.lastContainerWidthTier = nextTier;
@@ -2419,12 +2624,9 @@ export class HudInstance {
   handleWindowResize() {
     this.syncVerticalCentering();
     if (this.targetComposer) {
-      const rect =
-        typeof this.targetComposer.getBoundingClientRect === 'function'
-          ? this.targetComposer.getBoundingClientRect()
-          : null;
-      if (rect && rect.width > 0) {
-        this.handleContainerResize(rect.width);
+      const width = this.syncHorizontalBounds(this.targetComposer);
+      if (width > 0) {
+        this.handleContainerResize(width);
       }
     }
     if (this.activePopoverId) {
@@ -2569,10 +2771,10 @@ export class HudInstance {
         : globalThis.__GRAVITYBOX_HUD_POPOVER__?.applyPopoverGeometry;
 
     if (typeof calcFn === 'function') {
-      const measuredHeight =
-        typeof popover.scrollHeight === 'number' && popover.scrollHeight > 40
-          ? Math.min(popover.scrollHeight, 480)
-          : 195;
+      const inner = this.getShadowEl(`#hud-popover-${id} .hud-popover-inner`);
+      const innerHeight = typeof inner?.scrollHeight === 'number' && inner.scrollHeight > 40 ? inner.scrollHeight : 0;
+      const rawHeight = innerHeight || (typeof popover.scrollHeight === 'number' && popover.scrollHeight > 40 ? popover.scrollHeight : 0);
+      const measuredHeight = rawHeight > 40 ? Math.min(rawHeight, 480) : 195;
       const pos = calcFn(capsule, standardWidth, measuredHeight, 12, 8, 12);
       if (typeof applyFn === 'function') {
         applyFn(popover, arrow, pos, { force });

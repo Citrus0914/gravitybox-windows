@@ -33,7 +33,6 @@ final class PreferencesController: NSObject {
         languagePopup.action = #selector(languageChanged)
         languagePopup.setAccessibilityLabel(L10n.t("settings.language.title", fallback: "显示语言"))
         languagePopup.translatesAutoresizingMaskIntoConstraints = false
-        languagePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 148).isActive = true
 
         hudSwitch.controlSize = .small
         hudSwitch.state = app.effectiveHudEnabled() ? .on : .off
@@ -60,7 +59,6 @@ final class PreferencesController: NSObject {
         refresh.selectItem(at: Self.refreshIntervals.firstIndex(of: app.configuration.value.quotaRefreshMinutes) ?? 0)
         refresh.target = self; refresh.action = #selector(refreshChanged); refresh.setAccessibilityLabel(L10n.t("settings.refresh.title", fallback: "配额刷新间隔"))
         refresh.translatesAutoresizingMaskIntoConstraints = false
-        refresh.widthAnchor.constraint(greaterThanOrEqualToConstant: 142).isActive = true
 
         pricingSyncSwitch.controlSize = .small
         pricingSyncSwitch.state = app.configuration.value.autoPricingSyncEnabled ? .on : .off
@@ -191,7 +189,7 @@ final class PreferencesController: NSObject {
         if safeBytes > 0 && statefulBytes > 0 {
             let safeStr = ByteCountFormatter.string(fromByteCount: safeBytes, countStyle: .file)
             let statefulStr = ByteCountFormatter.string(fromByteCount: statefulBytes, countStyle: .file)
-            storageSubtitleLabel.stringValue = L10n.t("settings.storage.detail_subtitle", ["safe": safeStr, "stateful": statefulStr], fallback: "运行缓存 \(safeStr)，另有 \(statefulStr) 早期日志可按需释放")
+            storageSubtitleLabel.stringValue = L10n.t("settings.storage.detail_subtitle", ["safe": safeStr, "stateful": statefulStr], fallback: "运行缓存 \(safeStr)，另有 \(statefulStr) 后台日志可按需释放")
         } else {
             storageSubtitleLabel.stringValue = Self.defaultStorageSubtitle
         }
@@ -219,22 +217,33 @@ final class PreferencesController: NSObject {
         L10n.t("settings.language.subtitle", fallback: "同时决定 GravityBox 与 Antigravity 的界面语言，不改动官方应用")
     }
 
+    private var renderedLanguagePopupKey = ""
+
     private func rebuildLanguagePopup() {
-        languagePopup.removeAllItems()
-        let systemTitle = L10n.t("language.system", fallback: "跟随系统")
-        languagePopup.addItem(withTitle: systemTitle)
-        languagePopup.lastItem?.representedObject = "system"
-        languagePopup.menu?.addItem(.separator())
-        for meta in L10n.shared.supportedLocales {
-            languagePopup.addItem(withTitle: meta.nativeName)
-            languagePopup.lastItem?.representedObject = meta.code
-        }
         let configured = app.effectiveConfiguredLanguage()
+        let localesKey = ([L10n.shared.currentLocale] + L10n.shared.supportedLocales.map(\.code)).joined(separator: "|")
+        if renderedLanguagePopupKey != localesKey {
+            renderedLanguagePopupKey = localesKey
+            languagePopup.removeAllItems()
+            let systemTitle = L10n.t("language.system", fallback: "跟随系统")
+            languagePopup.addItem(withTitle: systemTitle)
+            languagePopup.lastItem?.representedObject = "system"
+            languagePopup.menu?.addItem(.separator())
+            for meta in L10n.shared.supportedLocales {
+                languagePopup.addItem(withTitle: meta.nativeName)
+                languagePopup.lastItem?.representedObject = meta.code
+            }
+            if languagePopup.cell is DesignPopUpCell {
+                Design.syncPopUpWidth(languagePopup)
+            } else {
+                languagePopup.invalidateIntrinsicContentSize()
+            }
+        }
         if let idx = languagePopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == configured }) {
-            languagePopup.selectItem(at: idx)
+            if languagePopup.indexOfSelectedItem != idx { languagePopup.selectItem(at: idx) }
         } else if let idx = languagePopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == L10n.shared.currentLocale }) {
-            languagePopup.selectItem(at: idx)
-        } else {
+            if languagePopup.indexOfSelectedItem != idx { languagePopup.selectItem(at: idx) }
+        } else if languagePopup.indexOfSelectedItem != 0 {
             languagePopup.selectItem(at: 0)
         }
     }
@@ -298,7 +307,8 @@ final class PreferencesController: NSObject {
                         self?.pricingSheet = nil
                     }
                 } else {
-                    let count = (payload["prices"] as? [String: Any])?.count ?? (payload["count"] as? Int ?? 0)
+                    let count = (payload["status"] as? [String: Any])?["modelCount"] as? Int
+                        ?? ((payload["prices"] as? [String: Any])?.count ?? (payload["count"] as? Int ?? 0))
                     let ok = payload["synced"] as? Bool == true
                     let errStr = payload["error"] as? String ?? L10n.t("settings.pricing_sync.default_error", fallback: "未能同步远端价格")
                     self.app.showMessage(ok ? L10n.t("settings.pricing_sync.synced", ["count": count], fallback: "价格基准已同步（生效 \(count) 款模型）") : L10n.t("settings.pricing_sync.check_failed", ["error": errStr], fallback: "检查提示：\(errStr)"), error: !ok)

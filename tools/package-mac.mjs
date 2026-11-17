@@ -96,11 +96,8 @@ async function main() {
     await mkdir(join(dest, '..'), { recursive: true });
     await copyFile(join(root, 'dist', name), dest);
   }
-  await mkdir(join(resources,'core/assets'),{recursive:true});
-  await copyFile(join(root,'assets/model-catalog.json'),join(resources,'core/assets/model-catalog.json'));
   await copyFile(join(root,'assets/model-catalog.json'),join(resources,'model-catalog.json'));
   const filterPackagedAsset = source => includePackagedAssetPath(relative(join(root, 'assets'), source));
-  await cp(join(root, 'assets/i18n'), join(resources, 'core/assets/i18n'), { recursive: true, filter: filterPackagedAsset });
   await cp(join(root, 'assets/i18n'), join(resources, 'i18n'), { recursive: true, filter: filterPackagedAsset });
   const i18nFiles = (await readdir(join(root, 'assets/i18n'))).filter(n => n.endsWith('.json')).sort();
   const bundleLocalizations = [];

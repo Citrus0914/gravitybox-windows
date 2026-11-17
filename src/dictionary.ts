@@ -7,9 +7,21 @@ import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { atomicJson } from './files.js';
 import { SUPPORTED_BUNDLES, normalizeText as normalize } from './bundle.js';
-import { bt } from './i18n.js';
+import { bt, getActiveLocale } from './i18n.js';
 
-export type Dictionary = { schema: 1; version: string; entries: Record<string, string> };
+export type DeclarativeTemplateRule = {
+  key: string;
+  pattern: string;
+  flags?: string;
+  replacement: string;
+  inlineOnly?: boolean;
+};
+export type Dictionary = {
+  schema: 1;
+  version: string;
+  entries: Record<string, string>;
+  templateRules?: DeclarativeTemplateRule[];
+};
 export type LayerCounts = { builtin:number; incremental:number; personal:number };
 export function sourceCategory(source:string):keyof LayerCounts { return source.endsWith('个人覆盖.json') ? 'personal' : source.includes('增量补全') ? 'incremental' : (source.startsWith('内置') || source.startsWith('Built-in') || source.startsWith(bt('dictionary.source.builtin'))) ? 'builtin' : 'personal'; }
 export type LayeredDictionary = {
@@ -314,7 +326,7 @@ export function compareLayers(a: string, b: string): number {
   }
   return na.localeCompare(nb);
 }
-const PLACEHOLDER_TOKEN_RE = /\{\{?\w+\}?\}|\$\d+|%[sd]/g;
+const PLACEHOLDER_TOKEN_RE = /\{\{?[a-zA-Z0-9_.-]+\}?\}|\$\{[^}]+\}|\$\d+|%(?:\d+\$)?[sdifu]/g;
 const placeholderSignature = (s: string): string =>
   (s.includes('{') || s.includes('$') || s.includes('%'))
     ? (s.match(PLACEHOLDER_TOKEN_RE)?.sort().join('|') ?? '')
@@ -336,9 +348,89 @@ export function validateEntries(data: unknown, file = bt('dictionary.default_fil
   return entries;
 }
 
-export function dictionaryFromEntries(entries: Record<string, string>): Dictionary {
+function isRepeatableBraceQuantifier(tail: string): boolean {
+  const m = tail.match(/^\{(\d+)(?:,(\d*))?\}/);
+  if (!m) return false;
+  if (m[2] === undefined) return Number(m[1]) >= 2;
+  if (m[2] === '') return true;
+  return Number(m[2]) >= 2;
+}
+
+export function hasNestedQuantifiedGroup(pattern: string): boolean {
+  const groupHasQuantifier: boolean[] = [];
+  let inCharClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === '\\') { i++; continue; }
+    if (ch === '[') { inCharClass = true; continue; }
+    if (ch === ']' && inCharClass) { inCharClass = false; continue; }
+    if (inCharClass) continue;
+    if (ch === '(') {
+      groupHasQuantifier.push(false);
+    } else if (ch === ')') {
+      const innerQuantified = groupHasQuantifier.pop() ?? false;
+      const next = pattern[i + 1] ?? '';
+      const outerRepeats =
+        next === '+' ||
+        next === '*' ||
+        (next === '{' && isRepeatableBraceQuantifier(pattern.slice(i + 1)));
+      const outerOptional = next === '?';
+      if (innerQuantified && (outerRepeats || outerOptional)) return true;
+      if ((innerQuantified || outerRepeats) && groupHasQuantifier.length > 0) {
+        groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+      }
+    } else if (
+      (ch === '+' || ch === '*' || (ch === '{' && isRepeatableBraceQuantifier(pattern.slice(i))))
+      && groupHasQuantifier.length > 0
+    ) {
+      groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+    }
+  }
+  return false;
+}
+
+export function validateTemplateRules(data: unknown): DeclarativeTemplateRule[] {
+  const rawList = Array.isArray(data)
+    ? data
+    : data && typeof data === 'object' && Array.isArray((data as { rules?: unknown }).rules)
+    ? (data as { rules: unknown[] }).rules
+    : [];
+  const out: DeclarativeTemplateRule[] = [];
+  for (const item of rawList) {
+    if (!item || typeof item !== 'object') continue;
+    const candidate = item as Record<string, unknown>;
+    const key = typeof candidate.key === 'string' ? normalize(candidate.key) : '';
+    const pattern = typeof candidate.pattern === 'string' ? candidate.pattern : '';
+    const flags = typeof candidate.flags === 'string' ? candidate.flags : 'i';
+    const replacement = typeof candidate.replacement === 'string' ? candidate.replacement : '';
+    if (!key || key.length > 240 || !pattern || pattern.length > 320 || !pattern.startsWith('^') || !replacement || replacement.length > 400) continue;
+    if (!/^[iu]*$/.test(flags)) continue;
+    if (hasNestedQuantifiedGroup(pattern) || /(\([^)]*[+*][^)]*\))[+*?]/.test(pattern)) continue;
+    try {
+      new RegExp(pattern, flags);
+      out.push({
+        key,
+        pattern,
+        flags,
+        replacement,
+        ...(typeof candidate.inlineOnly === 'boolean' ? { inlineOnly: candidate.inlineOnly } : {}),
+      });
+      if (out.length >= 256) break;
+    } catch {}
+  }
+  return out;
+}
+
+export function dictionaryFromEntries(entries: Record<string, string>, templateRules?: DeclarativeTemplateRule[]): Dictionary {
   const sorted = Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b)));
-  return { schema: 1, version: createHash('sha256').update(JSON.stringify(sorted)).digest('hex').slice(0, 16), entries: sorted };
+  const cleanRules = templateRules && templateRules.length > 0 ? templateRules : undefined;
+  const hashPayload = cleanRules ? JSON.stringify({ entries: sorted, templateRules: cleanRules }) : JSON.stringify(sorted);
+  return {
+    schema: 1,
+    version: createHash('sha256').update(hashPayload).digest('hex').slice(0, 16),
+    entries: sorted,
+    ...(cleanRules ? { templateRules: cleanRules } : {}),
+  };
 }
 
 /**
@@ -349,6 +441,7 @@ export function dictionaryFromEntries(entries: Record<string, string>): Dictiona
  * 整份词典加载失败、新词一条都不生效"。覆盖是预期行为，因此这里允许覆盖，
  * 但把每一次覆盖记进 `overrode`，让覆盖率报告与发布门禁能核对，而不是静默吞掉。
  */
+const TEMPLATE_RULES_FILE = 'template-rules.json';
 const MAX_LAYER_FILE_CACHE_ENTRIES = 32;
 const layerFileCache = new Map<string, { mtimeMs: number; size: number; validated: Record<string, string> }>();
 
@@ -363,6 +456,7 @@ function setLayerFileCacheEntry(filePath: string, entry: { mtimeMs: number; size
 
 export async function loadDictionaryLayers(baseDir: string, userDir?: string,targetVersion?:string): Promise<LayeredDictionary> {
   const entries: Record<string, string> = Object.create(null);
+  const templateRuleByKey = new Map<string, DeclarativeTemplateRule>();
   const owner = new Map<string, { file: string; dir: string }>();
   const overrode: { key: string; from: string; to: string }[] = [];
   const files: string[] = [];
@@ -371,6 +465,18 @@ export async function loadDictionaryLayers(baseDir: string, userDir?: string,tar
   for (const dir of userDir ? [baseDir, userDir] : [baseDir]) {
     const names = (await readdir(dir)).filter(name => name.endsWith('.json')).sort(compareLayers);
     for (const file of names) {
+      if (file.toLowerCase() === TEMPLATE_RULES_FILE) {
+        const ruleContent = await readFile(join(dir, file), 'utf8');
+        if (ruleContent.length > 512_000) throw new Error(bt('dictionary.err.size_limit', { file }));
+        let ruleData: unknown;
+        try { ruleData = JSON.parse(ruleContent); } catch { throw new Error(bt('dictionary.err.invalid_json', { file })); }
+        for (const rule of validateTemplateRules(ruleData)) {
+          templateRuleByKey.delete(rule.key);
+          templateRuleByKey.set(rule.key, rule);
+        }
+        files.push(file);
+        continue;
+      }
       const version=file.match(/^(?:增量补全-)?(\d+\.\d+\.\d+)\.json$/)?.[1];
       if(targetVersion&&version&&compareLayers(version+'.json',targetVersion+'.json')>0)continue;
       const filePath = join(dir, file);
@@ -410,7 +516,8 @@ export async function loadDictionaryLayers(baseDir: string, userDir?: string,tar
     }
   }
   for(const key of Object.keys(entries)){const context=decodeScopedKey(key);if(context&&personalGlobals.has(context.key.toLowerCase())&&!sources[key]?.endsWith('个人覆盖.json')){delete entries[key];delete sources[key];}}
-  return { dictionary: dictionaryFromEntries(entries), overrode, files, sources };
+  const mergedRules = templateRuleByKey.size > 0 ? [...templateRuleByKey.values()] : undefined;
+  return { dictionary: dictionaryFromEntries(entries, mergedRules), overrode, files, sources };
 }
 
 export async function resolveDictionaryForLocale(baseDir: string, locale: string): Promise<{ baseDir: string; hasTargetDictionary: boolean }> {
@@ -494,10 +601,13 @@ export class DictionaryStore extends EventEmitter {
     if(this.lastError)throw new Error(bt('dictionary.err.reload_failed', { error: this.lastError }));
   }
   private chain: Promise<void> = Promise.resolve();
+  private sourceLocale = getActiveLocale();
   constructor(baseDir: string, readonly userDir?: string) { super(); this.baseDir = baseDir; }
   async setBaseDir(nextBaseDir: string): Promise<void> {
-    if (nextBaseDir === this.baseDir) return;
+    const activeLocale = getActiveLocale();
+    if (nextBaseDir === this.baseDir && activeLocale === this.sourceLocale) return;
     this.baseDir = nextBaseDir;
+    this.sourceLocale = activeLocale;
     await this.reload();
   }
   async start(fallback?: Dictionary) {
@@ -505,7 +615,11 @@ export class DictionaryStore extends EventEmitter {
     try { const layered=await loadDictionaryLayers(this.baseDir,this.userDir,this.targetVersion); this.current=layered.dictionary; this.acceptLayers(layered); }
     catch (error) {
       if (!fallback) throw error;
-      this.current = dictionaryFromEntries(validateEntries(fallback.entries, bt('dictionary.label.valid_cache')));
+      const validRules = fallback.templateRules ? validateTemplateRules(fallback.templateRules) : undefined;
+      this.current = dictionaryFromEntries(
+        validateEntries(fallback.entries, bt('dictionary.label.valid_cache')),
+        validRules
+      );
       this.lastError = (error as Error).message;
       const fakeSources: Record<string, string> = Object.create(null);
       for (const k of Object.keys(this.current.entries)) fakeSources[k] = bt('dictionary.source.cache_entry');

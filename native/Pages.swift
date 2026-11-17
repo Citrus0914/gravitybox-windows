@@ -597,7 +597,7 @@ final class DashboardPage: NSObject {
             return
         }
         let hasDashboardBentoData = (lastSuccessfulSummary?["usage"] as? [String: Any])?["todayByModel"] != nil
-        if !hasDashboardBentoData {
+        if lastSuccessfulSummary != nil && !hasDashboardBentoData {
             app.fetchUsageSummary(period: "today", force: force) { [weak self] _ in
                 self?.updateReadinessMatrix()
             }

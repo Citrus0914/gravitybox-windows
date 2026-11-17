@@ -7,7 +7,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir } from 'node:os';
-import { atomicJson, commitAccountAndIndex, recoverAccountCommit, commitFileSet, recoverFileSet } from './files.js';
+import { atomicJson, commitAccountAndIndex, recoverAccountCommit, commitFileSet, recoverFileSet, sanitizeError } from './files.js';
 import { ReentrantMutex } from './mutex.js';
 import { validateAccountPolicy } from './account-policy.js';
 import { withProcessLease } from './process-lock.js';
@@ -26,6 +26,7 @@ import {
   cloudProviderContextFromCommand,
   extractTopicDataString,
   localRpcFetch,
+  mergeSubscriptionTier,
   probeLiveLanguageServerOnce,
   readAntigravityStateDb,
   validCachedCloudProviderContext,
@@ -87,8 +88,6 @@ import {
   fetchCloudQuotaForAccount,
   getGoogleClientId,
   getGoogleClientSecret,
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET,
 } from './account-cloud.js';
 
 export {
@@ -100,6 +99,7 @@ export {
   cloudOriginFromCommand,
   cloudProviderContextFromCommand,
   localRpcFetch,
+  mergeSubscriptionTier,
   validCachedCloudProviderContext,
   type CloudProviderContext,
   accountCredentialReadiness,
@@ -143,8 +143,6 @@ export {
   QUOTA_SUMMARY_ENDPOINTS,
   getGoogleClientId,
   getGoogleClientSecret,
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET,
 };
 
 const execFileAsync = promisify(execFile);
@@ -216,7 +214,7 @@ export class AccountsManager {
     if(this.inFlightProviderContext)return await this.inFlightProviderContext;
     const task=(async():Promise<CloudProviderContext>=>{
       const candidate = this.target;
-      const text=(await execFileAsync('/bin/ps',['-ax','-ww','-o','args='])).stdout;
+      const text=(await execFileAsync('/bin/ps',['-ax','-ww','-o','args='],{timeout:3000})).stdout;
       let version = '';
       try {
         version = (await inspectBundle(candidate.appPath)).version;
@@ -532,6 +530,7 @@ export class AccountsManager {
           created_at: diskAccount.created_at,
           quota: account.quota,
           quota_refresh_error: account.quota_refresh_error,
+          quota_refresh_error_code: account.quota_refresh_error_code ?? null,
         };
       }
 
@@ -626,6 +625,7 @@ export class AccountsManager {
 
       if (existingSummary) {
         const existing = (await this.getAccount(existingSummary.id))!;
+        const hasNewCreds = Boolean(refreshToken || (accessToken && accessToken !== 'pending_refresh'));
         account = {
           ...existing,
           name: name !== undefined ? name : existing.name,
@@ -633,6 +633,14 @@ export class AccountsManager {
           disabled: false,
           disabled_reason: null,
           disabled_at: null,
+          ...(hasNewCreds ? {
+            quota_refresh_error: null,
+            quota_refresh_error_code: null,
+            validation_blocked: false,
+            validation_blocked_until: null,
+            validation_blocked_reason: null,
+            validation_url: null,
+          } : {}),
           token: {
             ...existing.token,
             refresh_token: refreshToken || existing.token.refresh_token,
@@ -992,10 +1000,10 @@ export class AccountsManager {
       if (acc) candidates.push(acc);
     }
 
-    // Filter valid & precompute remaining/tierRank once per candidate (避免排序中重复构建配额视图)
+    // Filter valid & precompute remaining/tierRank once per candidate (避免对 Pro/Ultra 候选错用 Free/受限账号降级后的 monitoredModel)
     const allValidScored: Array<{ acc: Account; rem: number; tierRank: number }> = [];
     for (const acc of candidates) {
-      const rem = this.getAccountRemaining(acc, effectiveModel);
+      const rem = this.getAccountRemaining(acc, cfg.monitored_model);
       if (rem === null || rem < cfg.candidate_min_percentage || rem <= 0) continue;
       if (accountCredentialReadiness(acc).state === 'needs_authorization') continue;
       allValidScored.push({ acc, rem, tierRank: this.subscriptionTierRank(acc) });
@@ -1199,16 +1207,27 @@ export class AccountsManager {
         const stateRows = await readAntigravityStateDb(vscdbPath, [
           'antigravityUnifiedStateSync.oauthToken',
           'antigravityUnifiedStateSync.userStatus',
+          'antigravityUnifiedStateSync.enterprisePreferences',
         ]);
         if (stateRows.size === 0) continue;
         const oauthRawB64 = extractTopicDataString(stateRows.get('antigravityUnifiedStateSync.oauthToken'));
         const userStatusB64 = extractTopicDataString(stateRows.get('antigravityUnifiedStateSync.userStatus'));
+        const entPrefB64 = extractTopicDataString(stateRows.get('antigravityUnifiedStateSync.enterprisePreferences'));
+        let entProjectId: string | null = null;
+        if (entPrefB64) {
+          const entBuf = decodeTopicRow(entPrefB64, 'enterpriseGcpProjectId');
+          if (entBuf) {
+            entProjectId = ProtobufReader.findString(entBuf, 3) || null;
+          }
+        }
 
         if (!extractedToken && oauthRawB64) {
           const payloadBuf = decodeTopicRow(oauthRawB64, 'oauthTokenInfoSentinelKey');
           if (payloadBuf) {
             const accessToken = ProtobufReader.findString(payloadBuf, 1) || '';
             const refreshToken = ProtobufReader.findString(payloadBuf, 3) || '';
+            const idToken = ProtobufReader.findString(payloadBuf, 5) || null;
+            const gcpTosFlag = ProtobufReader.findVarint(payloadBuf, 6);
             let expirySec = Math.floor(Date.now() / 1000) + 3600;
             const timeBuf = ProtobufReader.findField(payloadBuf, 4);
             if (timeBuf) {
@@ -1224,10 +1243,14 @@ export class AccountsManager {
                 expiry_timestamp: expirySec,
                 token_type: 'Bearer',
                 email: null,
-                is_gcp_tos: false,
+                project_id: entProjectId,
+                is_gcp_tos: Boolean(gcpTosFlag && gcpTosFlag > 0),
+                id_token: idToken,
               };
             }
           }
+        } else if (extractedToken && !extractedToken.project_id && entProjectId) {
+          extractedToken.project_id = entProjectId;
         }
 
         if (!extractedEmail && userStatusB64 && oauthRawB64 && extractedToken?.refresh_token === ProtobufReader.findString(decodeTopicRow(oauthRawB64, 'oauthTokenInfoSentinelKey') ?? Buffer.alloc(0), 3)) {
@@ -1268,6 +1291,8 @@ export class AccountsManager {
       accessToken: extractedToken.access_token,
       expiresIn: Math.max(60, extractedToken.expiry_timestamp - Math.floor(Date.now() / 1000)),
       projectId: extractedToken.project_id || undefined,
+      isGcpTos: extractedToken.is_gcp_tos,
+      idToken: extractedToken.id_token || undefined,
     });
 
     if (liveQuota) {
@@ -1302,6 +1327,7 @@ export class AccountsManager {
       token: account.token,
       quota: account.quota,
       quota_refresh_error: account.quota_refresh_error,
+      quota_refresh_error_code: account.quota_refresh_error_code ?? null,
     };
     this.refreshSaveMeta.set(toSave, { expectedRefreshToken: expectedRefresh, isRefreshUpdate: true });
     signal?.throwIfAborted();
@@ -1322,7 +1348,26 @@ export class AccountsManager {
 
     const inFlight = this.inFlightRefreshes.get(targetId);
     if (inFlight) {
-      return await inFlight;
+      const sig = options?.signal;
+      if (!sig) return await inFlight;
+      return await new Promise<Account>((resolve, reject) => {
+        const onAbort = () => reject(sig.reason instanceof Error ? sig.reason : new DOMException('Aborted', 'AbortError'));
+        if (sig.aborted) {
+          onAbort();
+          return;
+        }
+        sig.addEventListener('abort', onAbort, { once: true });
+        inFlight.then(
+          val => {
+            sig.removeEventListener('abort', onAbort);
+            resolve(val);
+          },
+          err => {
+            sig.removeEventListener('abort', onAbort);
+            reject(err);
+          }
+        );
+      });
     }
 
     const job = (async () => {
@@ -1351,7 +1396,13 @@ export class AccountsManager {
             }
             account.quota={models:[],quota_groups:[],last_updated:0,is_forbidden:false,subscription_tier:account.quota?.subscription_tier,model_forwarding_rules:{},source:'cloud',quota_warnings:['UNVERIFIED_CLOUD_SCOPE: '+error.message]};
           }
-          account.quota_refresh_error = error instanceof Error ? error.message : bt('accounts.err.refresh_failed_retry');
+          const rawMsg = error instanceof Error ? error.message : bt('accounts.err.refresh_failed_retry');
+          account.quota_refresh_error = sanitizeError(rawMsg, [
+            account.token?.access_token,
+            account.token?.refresh_token,
+            account.token?.id_token,
+          ]);
+          account.quota_refresh_error_code = accountErrorCode(error);
           await this.saveRefreshedAccount(account);
         }
         throw error;
@@ -1386,9 +1437,10 @@ export class AccountsManager {
     if (lsStatus && account.email && lsStatus.email && lsStatus.email.trim().toLowerCase() === account.email.trim().toLowerCase() && (lsStatus.quota.models?.length ?? 0) > 0 && !canFallbackToCloud) {
       const fresh = lsStatus.quota;
       const old = account.quota;
-      const resolvedTier = (fresh.subscription_tier && fresh.subscription_tier !== 'FREE')
-        ? fresh.subscription_tier
-        : (old?.subscription_tier || fresh.subscription_tier);
+      const allowFreeDowngrade = lsStatus.accountType !== 'enterprise_vertex' && !liveSummaryFailed;
+      const resolvedTier = mergeSubscriptionTier(fresh.subscription_tier, old?.subscription_tier, {
+        allowFreeDowngrade,
+      });
       const freshWithTier: QuotaData = { ...fresh, subscription_tier: resolvedTier };
       const freshState = this.getAccountQuotaOverview({ quota: freshWithTier }).refreshState;
       const { groups, staleGroups } = mergeGroupsWithPrevious(
@@ -1407,6 +1459,7 @@ export class AccountsManager {
           missingWindows, carriedGroups: staleGroups.length, carriedModels: carriedCount },
       };
       account.quota_refresh_error = null;
+      account.quota_refresh_error_code = null;
       if (lsStatus.name && !account.name) account.name = lsStatus.name;
       signal?.throwIfAborted();
       await this.saveRefreshedAccount(account, account.token.refresh_token, signal);

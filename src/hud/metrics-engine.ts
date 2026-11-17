@@ -1,4 +1,4 @@
-import { compactDecimal, compactNumber, compactPercent, durationText, formatTurnDurationCompact } from '../metric-format.js';
+import { compactNumber, compactPercent, compactRate, compactUsd, durationText, formatTurnDurationCompact } from '../metric-format.js';
 export { formatTurnDurationCompact };
 import { bt } from '../i18n.js';
 import { lstat, readdir } from 'node:fs/promises';
@@ -15,6 +15,7 @@ import type {
   ParsedGenMetadata,
 } from './types.js';
 import { resolveModelCapacity } from './model-catalog.js';
+import { resetAndRegisterRemoteModelMetadata } from '../model-catalog.js';
 import {
   DEFAULT_API_PRICES,
   isTemporalPricingEntry,
@@ -39,7 +40,7 @@ const SUBAGENT_TOOL_NAMES = new Set([
   'start_subagent',
   'spawn_subagent',
 ]);
-const MAX_CACHED_CONVERSATIONS = 24;
+const MAX_CACHED_CONVERSATIONS = 128;
 const ACTIVE_DB_RECENCY_MS = 60 * 60 * 1000;
 const INLINE_BLOB_LIMIT_BYTES = 65_536;
 const UTF8_DECODER = new TextDecoder('utf-8');
@@ -213,6 +214,124 @@ function extractUuidsFromBlob(buf: Uint8Array | null | undefined, maxBytes = 655
   return [...found];
 }
 
+const EXACT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function walkStrictProtobufFields(
+  buf: Uint8Array,
+  onLengthDelimited: (fieldNum: number, subBuf: Uint8Array) => void
+): boolean {
+  if (!buf || buf.length === 0) return false;
+  const cursor = { pos: 0 };
+  const pending: Array<{ fieldNum: number; subBuf: Uint8Array }> = [];
+  while (cursor.pos < buf.length) {
+    let tagNum: number;
+    try {
+      tagNum = Number(decodeVarint64(buf, cursor));
+    } catch {
+      return false;
+    }
+    if (!tagNum) return false;
+    const fieldNum = tagNum >>> 3;
+    const wireType = tagNum & 0x07;
+    if (fieldNum < 1 || fieldNum > 16384) return false;
+    if (wireType === 2) {
+      let len: number;
+      try {
+        len = Number(decodeVarint64(buf, cursor));
+      } catch {
+        return false;
+      }
+      if (!Number.isSafeInteger(len) || len < 0 || cursor.pos + len > buf.length) return false;
+      pending.push({ fieldNum, subBuf: buf.subarray(cursor.pos, cursor.pos + len) });
+      cursor.pos += len;
+    } else if (wireType === 0 || wireType === 1 || wireType === 5) {
+      if (!skipProtobufField(buf, cursor, wireType)) return false;
+    } else {
+      return false;
+    }
+  }
+  if (cursor.pos !== buf.length) return false;
+  for (const item of pending) {
+    onLengthDelimited(item.fieldNum, item.subBuf);
+  }
+  return true;
+}
+
+function extractAgentRefConversationId(agentRefBuf: Uint8Array): string | null {
+  let foundUuid: string | null = null;
+  const valid = walkStrictProtobufFields(agentRefBuf, (fieldNum, subBuf) => {
+    if (fieldNum === 1 && subBuf.length === 36 && !foundUuid) {
+      const candidate = UTF8_DECODER.decode(subBuf);
+      if (EXACT_UUID_RE.test(candidate)) {
+        foundUuid = candidate.toLowerCase();
+      }
+    }
+  });
+  return valid ? foundUuid : null;
+}
+
+/**
+ * 从 StepRenderInfo (exa.cortex_pb.StepRenderInfo) 中结构化提取并行子智能体 AgentRef.conversation_id：
+ * - field 9: title_parts (TitlePart.field 5 -> AgentRef.field 1)
+ * - field 10: content_blocks (ContentBlock.field 4 -> AgentRef.field 1, ContentBlock.field 5 -> StepBlock.field 1 -> StepRenderInfo)
+ * 严格验证完整 Protobuf 边界与精确 36 字节 UUID，对 run_command 等普通工具的纯文本/JSON 载荷零误判。
+ */
+function collectAgentRefsFromStepRenderInfo(
+  renderInfoBuf: Uint8Array,
+  out: Set<string>,
+  depth = 0
+): void {
+  if (depth > 4 || !renderInfoBuf || renderInfoBuf.length === 0) return;
+  walkStrictProtobufFields(renderInfoBuf, (fieldNum, subBuf) => {
+    if (fieldNum === 9) {
+      walkStrictProtobufFields(subBuf, (partField, partSub) => {
+        if (partField === 5) {
+          const uuid = extractAgentRefConversationId(partSub);
+          if (uuid) out.add(uuid);
+        }
+      });
+    } else if (fieldNum === 10) {
+      walkStrictProtobufFields(subBuf, (blockField, blockSub) => {
+        if (blockField === 4) {
+          const uuid = extractAgentRefConversationId(blockSub);
+          if (uuid) out.add(uuid);
+        } else if (blockField === 5) {
+          walkStrictProtobufFields(blockSub, (stepBlockField, nestedRenderInfo) => {
+            if (stepBlockField === 1) {
+              collectAgentRefsFromStepRenderInfo(nestedRenderInfo, out, depth + 1);
+            }
+          });
+        }
+      });
+    }
+  });
+}
+
+function collectAgentRefsFromStepPayloadOrData(blob: Uint8Array, out: Set<string>): void {
+  if (!blob || blob.length === 0) return;
+  const beforeSize = out.size;
+  collectAgentRefsFromStepRenderInfo(blob, out, 0);
+  if (out.size > beforeSize) return;
+  // CortexStepGeneric: field 2 (GenericStepResult) -> field 3 (StepRenderInfo)，或外层 oneof 包装
+  walkStrictProtobufFields(blob, (outerField, outerSub) => {
+    if (outerField === 3) {
+      collectAgentRefsFromStepRenderInfo(outerSub, out, 0);
+    } else if (outerField === 2 || outerField >= 10) {
+      walkStrictProtobufFields(outerSub, (innerField, innerSub) => {
+        if (innerField === 3) {
+          collectAgentRefsFromStepRenderInfo(innerSub, out, 0);
+        } else if (innerField === 2) {
+          walkStrictProtobufFields(innerSub, (resField, resSub) => {
+            if (resField === 3) {
+              collectAgentRefsFromStepRenderInfo(resSub, out, 0);
+            }
+          });
+        }
+      });
+    }
+  });
+}
+
 function parentReferences(buf: Uint8Array): Set<string> {
   const references = new Set<string>();
   const cursor = { pos: 0 };
@@ -273,7 +392,7 @@ export function parseStepMetadataBlob(
     reasoningTokens: 0,
     candidateTokens: 0,
     hasUsage: false,
-    isSubagentStep: stepType === 127,
+    isSubagentStep: stepType === 85 || stepType === 127,
   };
 
   const childIds = new Set<string>();
@@ -373,6 +492,26 @@ export function parseStepMetadataBlob(
         result.startTimeSeconds = field32StartedTs;
       } else {
         result.startTimeSeconds = field1CreatedTs ?? field32StartedTs;
+      }
+    }
+  }
+
+  // 对 step_type = 85 / 127 / 132（含并行子智能体审计团队 GENERIC 步骤）结构化提取 StepRenderInfo.AgentRef
+  if (stepType === 85 || stepType === 127 || stepType === 132) {
+    const agentRefIds = new Set<string>();
+    if (extraSubagentBlobs && extraSubagentBlobs.length > 0) {
+      for (const extra of extraSubagentBlobs) {
+        if (!extra || extra.length === 0) continue;
+        collectAgentRefsFromStepPayloadOrData(extra, agentRefIds);
+      }
+    }
+    if (dataBlob && dataBlob.length > 0) {
+      collectAgentRefsFromStepPayloadOrData(dataBlob, agentRefIds);
+    }
+    if (agentRefIds.size > 0) {
+      result.isSubagentStep = true;
+      for (const cid of agentRefIds) {
+        childIds.add(cid);
       }
     }
   }
@@ -499,7 +638,7 @@ export function parseLatestGenMetadataBlob(
                 out.streamingDurationSeconds = streamSec;
               }
             } else if (fn1 === 9) {
-              // ChatStartMetadata -> field 10: ContextWindowMetadata
+              // ChatStartMetadata -> field 4: started_at (Timestamp), field 10: ContextWindowMetadata
               const startBuf = fieldSlice;
               const cStart = { pos: 0 };
               while (cStart.pos < startBuf.length) {
@@ -507,7 +646,15 @@ export function parseLatestGenMetadataBlob(
                 if (!tS) break;
                 const fnS = tS >>> 3;
                 const wtS = tS & 0x07;
-                if (wtS === 2 && fnS === 10) {
+                if (wtS === 2 && fnS === 4) {
+                  const lTs = Number(decodeVarint64(startBuf, cStart));
+                  if (!Number.isSafeInteger(lTs) || lTs < 0 || cStart.pos + lTs > startBuf.length) break;
+                  const tsSec = parseProtobufTimestamp(startBuf.subarray(cStart.pos, cStart.pos + lTs));
+                  if (tsSec >= 946684800 && Number.isFinite(tsSec)) {
+                    out.startedAtSeconds = tsSec;
+                  }
+                  cStart.pos += lTs;
+                } else if (wtS === 2 && fnS === 10) {
                   const lS = Number(decodeVarint64(startBuf, cStart));
                   if (!Number.isSafeInteger(lS) || lS < 0 || cStart.pos + lS > startBuf.length) break;
                   const cwBuf = startBuf.subarray(cStart.pos, cStart.pos + lS);
@@ -522,56 +669,6 @@ export function parseLatestGenMetadataBlob(
                       const val = Number(decodeVarint64(cwBuf, cCw));
                       if (fnCw === 1 && val > 0) out.estimatedTokensUsed = val;
                       else if (fnCw === 4 && val > 0) out.maxContextTokens = val;
-                    } else if (wtCw === 2 && fnCw === 3) {
-                      // TokenBreakdown -> repeated field 1: TopLevelTokenGroup (field 2: type, field 4: num_tokens)
-                      const lTb = Number(decodeVarint64(cwBuf, cCw));
-                      if (!Number.isSafeInteger(lTb) || lTb < 0 || cCw.pos + lTb > cwBuf.length) break;
-                      const tbBuf = cwBuf.subarray(cCw.pos, cCw.pos + lTb);
-                      cCw.pos += lTb;
-                      const cTb = { pos: 0 };
-                      let sysTok = 0;
-                      let toolTok = 0;
-                      let msgTok = 0;
-                      while (cTb.pos < tbBuf.length) {
-                        const tTb = Number(decodeVarint64(tbBuf, cTb));
-                        if (!tTb) break;
-                        const fnTb = tTb >>> 3;
-                        const wtTb = tTb & 0x07;
-                        if (wtTb === 2 && fnTb === 1) {
-                          const lGrp = Number(decodeVarint64(tbBuf, cTb));
-                          if (!Number.isSafeInteger(lGrp) || lGrp < 0 || cTb.pos + lGrp > tbBuf.length) break;
-                          const grpBuf = tbBuf.subarray(cTb.pos, cTb.pos + lGrp);
-                          cTb.pos += lGrp;
-                          const cGrp = { pos: 0 };
-                          let gType = 0;
-                          let gTokens = 0;
-                          while (cGrp.pos < grpBuf.length) {
-                            const tG = Number(decodeVarint64(grpBuf, cGrp));
-                            if (!tG) break;
-                            const fnG = tG >>> 3;
-                            const wtG = tG & 0x07;
-                            if (wtG === 0) {
-                              const vG = Number(decodeVarint64(grpBuf, cGrp));
-                              if (fnG === 2) gType = vG;
-                              else if (fnG === 4 && vG > 0) gTokens = vG;
-                            } else {
-                              if (!skipProtobufField(grpBuf, cGrp, wtG)) break;
-                            }
-                          }
-                          if (gTokens > 0) {
-                            if (gType === 1 || gType === 3) sysTok += gTokens; // SYSTEM_PROMPT / RULES
-                            else if (gType === 2 || gType === 4 || gType === 5 || gType === 6) toolTok += gTokens; // TOOLS / MCP / SKILLS / SUBAGENTS
-                            else if (gType === 7) msgTok += gTokens; // CHAT_MESSAGES
-                          }
-                        } else {
-                          if (!skipProtobufField(tbBuf, cTb, wtTb)) break;
-                        }
-                      }
-                      if (sysTok + toolTok + msgTok > 0) {
-                        out.systemTokens = sysTok;
-                        out.toolTokens = toolTok;
-                        out.messageTokens = msgTok;
-                      }
                     } else {
                       if (!skipProtobufField(cwBuf, cCw, wtCw)) break;
                     }
@@ -630,52 +727,6 @@ export function parseLatestGenMetadataBlob(
 }
 
 /**
- * 级联独立裁剪数学模型 (保留纯数学导出以兼容边界测试套件)
- * 严格保证 T_i >= 0, W_i >= 0, sum(T_i) === U, sum(W_i) === Ratio_total
- * @deprecated 生产环境 HUD Popover 3 已切换为真实 cachedRead / uncachedInput / output 上下文明细，仅保留供数学边界契约测试使用。
- */
-export function computeCascadeContextBreakdown(
-  usedTokens: number,
-  capacityLimit: number,
-  K_sys: number = 1900,
-  K_tool: number = 7600
-): {
-  T_sys: number;
-  T_tool: number;
-  T_msg: number;
-  W_sys: number;
-  W_tool: number;
-  W_msg: number;
-  Ratio_total: number;
-  sumT: number;
-  sumW: number;
-} {
-  const U = Math.max(0, Math.floor(Number.isFinite(usedTokens) ? usedTokens : 0));
-  const C_limit = Math.max(1, Math.floor(Number.isFinite(capacityLimit) ? capacityLimit : 1));
-
-  const T_sys = Math.min(U, K_sys);
-  const T_tool = Math.min(Math.max(0, U - T_sys), K_tool);
-  const T_msg = Math.max(0, U - T_sys - T_tool);
-
-  const W_sys = (T_sys / C_limit) * 100;
-  const W_tool = (T_tool / C_limit) * 100;
-  const W_msg = (T_msg / C_limit) * 100;
-  const Ratio_total = (Math.min(U, C_limit) / C_limit) * 100;
-
-  return {
-    T_sys,
-    T_tool,
-    T_msg,
-    W_sys,
-    W_tool,
-    W_msg,
-    Ratio_total,
-    sumT: T_sys + T_tool + T_msg,
-    sumW: W_sys + W_tool + W_msg,
-  };
-}
-
-/**
  * 有效输出速度：只对匹配的 Token 与完整正耗时计算，保留未舍入结果。
  */
 export function computeTps(
@@ -701,7 +752,7 @@ export function computeTps(
     status: 'calculated',
     rawTps,
     outputTps: rawTps,
-    formatted: `${compactDecimal(rawTps, 2)} tok/s`,
+    formatted: `${compactRate(rawTps)} tok/s`,
   };
 }
 
@@ -734,13 +785,10 @@ export function formatTurnDurationCard(seconds: number, lang: 'zh' | 'en' = 'zh'
 }
 
 /**
- * 格式化 HUD 卡片美元估算金额（>= $0.01 保留 2 位小数；(0, $0.01) 保留 4 位小数避免微额误显 ~$0.00）
+ * 格式化 HUD 卡片美元估算金额（0 显示 $0；微额至多 4/6 位小数去尾零；常规至多 2 位小数去尾零；>= $1000 进位）
  */
 export function formatHudUsd(usd: number): string {
-  if (!Number.isFinite(usd) || usd < 0) return '—';
-  if (usd === 0) return '~$0.00';
-  if (usd < 0.01) return `~$${usd.toFixed(4)}`;
-  return `~$${usd.toFixed(2)}`;
+  return compactUsd(usd);
 }
 
 
@@ -767,6 +815,11 @@ export interface ComputeHudMetricsInput {
   modelCapacity?: number;
   pricingTable?: Record<string, ApiPricingEntry>;
   genMetadata?: ParsedGenMetadata;
+  extraUsageGenerations?: Array<{
+    generation: ParsedGenMetadata;
+    isChildStep?: boolean;
+    timestampSeconds?: number | null;
+  }>;
   contextSteps?: ComputeHudMetricsInput['steps'];
   steps: Array<{
     idx?: number;
@@ -1045,10 +1098,28 @@ function classifyContextModelSlot(params: {
   };
 }
 
+function createPendingExecutorSlot(
+  capacityTokens: number,
+  isFallbackModel: boolean
+): ClassifiedContextSlot {
+  return {
+    slotKey: 'orchestrator:executor_pending',
+    role: 'executor',
+    modelId: 'pending',
+    displayName: '',
+    shortLabel: '',
+    compactLabel: '',
+    capacityTokens,
+    isFallbackModel,
+    hasExplicitEvidence: false,
+  };
+}
+
 function createStageSnapshot(
   acc: StageAccumulator,
   isActive: boolean,
-  inheritedExplicitCapacity?: number
+  inheritedExplicitCapacity?: number,
+  section?: 'primary' | 'history'
 ): HudModelContextStage {
   const hasUsageData = Boolean(acc.latestStep);
   const effectiveExplicitCap = acc.explicitCapacity ?? inheritedExplicitCapacity;
@@ -1066,6 +1137,7 @@ function createStageSnapshot(
   return {
     slotKey: acc.slot.slotKey,
     role: acc.slot.role,
+    ...(section ? { section } : {}),
     modelId: acc.slot.modelId,
     modelDisplayName: acc.slot.displayName,
     shortLabel: acc.slot.shortLabel,
@@ -1088,7 +1160,7 @@ function createStageSnapshot(
 }
 
 function resolveContextStagesAndActiveSlot(
-  usageContextEntries: ReadonlyArray<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number }>,
+  usageContextEntries: ReadonlyArray<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number; turnIndex?: number }>,
   input: ComputeHudMetricsInput
 ): {
   latestStep?: ComputeHudMetricsInput['steps'][number];
@@ -1144,11 +1216,17 @@ function resolveContextStagesAndActiveSlot(
       } else {
         pair.push(emptyAcc);
         if (emptySlot.shortLabel !== 'Hydrogen') {
-          const execSlot = classifyContextModelSlot({ modelEnum: 1669, modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)' });
-          pair.push({ slot: execSlot, latestPrompt: 0, peakContextTokens: 0, explicitCapacity: emptyExplicitCap });
+          pair.push({
+            slot: createPendingExecutorSlot(emptySlot.capacityTokens, emptySlot.isFallbackModel),
+            latestPrompt: 0,
+            peakContextTokens: 0,
+            explicitCapacity: emptyExplicitCap,
+          });
         }
       }
-      const stages = pair.map((acc) => createStageSnapshot(acc, acc.slot.slotKey === emptySlot.slotKey, emptyExplicitCap));
+      const stages = pair.map((acc) =>
+        createStageSnapshot(acc, acc.slot.slotKey === emptySlot.slotKey, emptyExplicitCap, 'primary')
+      );
       const activeStage = stages.find((s) => s.isActive) ?? stages[0]!;
       return {
         latestStep: undefined,
@@ -1175,8 +1253,8 @@ function resolveContextStagesAndActiveSlot(
     };
   }
 
-  const stageMap = new Map<string, StageAccumulator>();
-  let hasPriorOrchestrator = false;
+  const stageMap = new Map<string, StageAccumulator & { lastSeenSeq: number }>();
+  const orchestratorTurns = new Set<number>();
   let sessionPeakContextTokens = 0;
   let latestEntry!: {
     step: ComputeHudMetricsInput['steps'][number];
@@ -1186,6 +1264,7 @@ function resolveContextStagesAndActiveSlot(
 
   for (let i = 0; i < usageContextEntries.length; i++) {
     const entry = usageContextEntries[i]!;
+    const turnIndex = entry.turnIndex ?? 0;
     const isGlobalLatest = i === usageContextEntries.length - 1;
     const stepGenMeta = entry.step.generation ?? (isGlobalLatest ? input.genMetadata : undefined);
     const slot = classifyContextModelSlot({
@@ -1195,10 +1274,10 @@ function resolveContextStagesAndActiveSlot(
       stepModelName: entry.step.modelName,
       modelEnum: stepGenMeta?.modelEnum,
       fallbackInputModelId: trimmedInputModel,
-      hasPriorOrchestrator,
+      hasPriorOrchestrator: orchestratorTurns.has(turnIndex),
     });
     if (slot.role === 'planner' || slot.role === 'executor') {
-      hasPriorOrchestrator = true;
+      orchestratorTurns.add(turnIndex);
     }
     const stepExplicitCap = [inputExplicitCapacity, stepGenMeta?.maxContextTokens, entry.step.modelMaxTokens].find(
       (v): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0
@@ -1210,6 +1289,7 @@ function resolveContextStagesAndActiveSlot(
       latestPrompt: entry.prompt,
       peakContextTokens: Math.max(prev?.peakContextTokens ?? 0, entry.prompt),
       explicitCapacity: stepExplicitCap ?? prev?.explicitCapacity,
+      lastSeenSeq: i,
     });
     sessionPeakContextTokens = Math.max(sessionPeakContextTokens, entry.prompt);
     latestEntry = { step: entry.step, slot, genMeta: stepGenMeta };
@@ -1219,10 +1299,23 @@ function resolveContextStagesAndActiveSlot(
   const activeAcc = stageMap.get(activeSlotKey)!;
   const activeStage = createStageSnapshot(activeAcc, true);
   const allAccs = [...stageMap.values()];
-  const isOrchestrator = hasPriorOrchestrator || inputIsOrchestrator;
+  const isOrchestrator =
+    latestEntry.slot.role === 'planner' ||
+    latestEntry.slot.role === 'executor' ||
+    inputIsOrchestrator;
 
-  let orderedAccs: StageAccumulator[];
+  let orderedEntries: Array<{ acc: StageAccumulator; section: 'primary' | 'history' }>;
   let inheritedOrchCap: number | undefined;
+  const hasPendingInputSlot = (accs: ReadonlyArray<StageAccumulator>): boolean =>
+    Boolean(
+      inputAsStandaloneSlot &&
+      inputAsStandaloneSlot.hasExplicitEvidence &&
+      inputAsStandaloneSlot.modelId !== 'unknown' &&
+      !accs.some(
+        (a) => a.slot.slotKey === inputAsStandaloneSlot.slotKey || a.slot.modelId === inputAsStandaloneSlot.modelId
+      )
+    );
+
   if (isOrchestrator) {
     const planners = allAccs.filter((a) => a.slot.role === 'planner');
     const executors = allAccs.filter((a) => a.slot.role === 'executor');
@@ -1239,49 +1332,77 @@ function resolveContextStagesAndActiveSlot(
         latestPrompt: 0,
         peakContextTokens: 0,
         explicitCapacity: inheritedOrchCap ?? inputExplicitCapacity,
+        lastSeenSeq: -1,
       });
     }
     const primaryPlanner = planners[0]!;
     if (executors.length === 0 && primaryPlanner.slot.shortLabel !== 'Hydrogen') {
-      const defaultExecSlot = classifyContextModelSlot({
-        modelEnum: 1669,
-        modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
-      });
       executors.push({
-        slot: defaultExecSlot,
+        slot: createPendingExecutorSlot(
+          primaryPlanner.slot.capacityTokens,
+          primaryPlanner.slot.isFallbackModel
+        ),
         latestPrompt: 0,
         peakContextTokens: 0,
         explicitCapacity: inheritedOrchCap ?? inputExplicitCapacity,
+        lastSeenSeq: -1,
       });
     }
-    orderedAccs = [...planners, ...executors, ...others];
+
+    const activePeModelIds = new Set(
+      [...planners, ...executors]
+        .filter((pe) => Boolean(pe.latestStep))
+        .map((pe) => pe.slot.modelId)
+    );
+    const filteredOthers = others.filter(
+      (other) => Boolean(other.latestStep) && !activePeModelIds.has(other.slot.modelId)
+    );
+
+    const primaryAccs: StageAccumulator[] = [...planners, ...executors];
+    if (hasPendingInputSlot([...primaryAccs, ...filteredOthers]) && inputAsStandaloneSlot) {
+      primaryAccs.push({
+        slot: inputAsStandaloneSlot,
+        latestPrompt: 0,
+        peakContextTokens: 0,
+        explicitCapacity: inputExplicitCapacity,
+      });
+    }
+    orderedEntries = [
+      ...primaryAccs.map((acc) => ({ acc, section: 'primary' as const })),
+      ...filteredOthers.map((acc) => ({ acc, section: 'history' as const })),
+    ];
   } else {
-    orderedAccs = [...allAccs];
+    const dedupByModelId = new Map<string, StageAccumulator & { lastSeenSeq: number }>();
+    for (const acc of allAccs) {
+      const key = acc.slot.modelId || acc.slot.slotKey;
+      const existing = dedupByModelId.get(key);
+      if (!existing || acc.lastSeenSeq > existing.lastSeenSeq) {
+        dedupByModelId.set(key, acc);
+      }
+    }
+    const orderedAccs: StageAccumulator[] = [...dedupByModelId.values()].sort(
+      (a, b) => a.lastSeenSeq - b.lastSeenSeq
+    );
+    if (hasPendingInputSlot(orderedAccs) && inputAsStandaloneSlot) {
+      orderedAccs.push({
+        slot: inputAsStandaloneSlot,
+        latestPrompt: 0,
+        peakContextTokens: 0,
+        explicitCapacity: inputExplicitCapacity,
+      });
+    }
+    const finalAccs = orderedAccs.length > 3 ? orderedAccs.slice(-3) : orderedAccs;
+    orderedEntries = finalAccs.map((acc) => ({ acc, section: 'primary' as const }));
   }
 
-  if (
-    inputAsStandaloneSlot &&
-    inputAsStandaloneSlot.hasExplicitEvidence &&
-    inputAsStandaloneSlot.modelId !== 'unknown' &&
-    !orderedAccs.some((a) => a.slot.slotKey === inputAsStandaloneSlot.slotKey)
-  ) {
-    orderedAccs.push({
-      slot: inputAsStandaloneSlot,
-      latestPrompt: 0,
-      peakContextTokens: 0,
-      explicitCapacity: inputExplicitCapacity,
-    });
-  }
-
-  const finalAccs = orderedAccs.length > 3 && !isOrchestrator ? orderedAccs.slice(-3) : orderedAccs;
-  const isMultiModel = finalAccs.length >= 2;
+  const isMultiModel = orderedEntries.length >= 2;
   const modelStages = isMultiModel
-    ? finalAccs.map((acc) => {
+    ? orderedEntries.map(({ acc, section }) => {
         const inheritCap =
           !acc.latestStep && isOrchestrator && (acc.slot.role === 'planner' || acc.slot.role === 'executor')
             ? inheritedOrchCap
             : undefined;
-        return createStageSnapshot(acc, acc.slot.slotKey === activeSlotKey, inheritCap);
+        return createStageSnapshot(acc, acc.slot.slotKey === activeSlotKey, inheritCap, section);
       })
     : undefined;
 
@@ -1411,10 +1532,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       if (complete && ttft !== null) {
         validTtftSum += ttft;
         validTtftCount++;
+        const ttftText = compactRate(ttft);
         const ttftSnapshot = {
           seconds: ttft,
-          formatted: bt('metrics.ttft_seconds', { value: compactDecimal(ttft, 2) }),
-          formattedEn: `${compactDecimal(ttft, 2)}s`,
+          formatted: bt('metrics.ttft_seconds', { value: ttftText }),
+          formattedEn: `${ttftText}s`,
         };
         if (!isChildStep) {
           latestForegroundStepTtft = ttftSnapshot;
@@ -1426,6 +1548,46 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       if (hasInterval && !ACTIVE_STEP_STATUSES.has(rawStatus)) {
         completedToolIntervals.push([start!, end!]);
       }
+    }
+  }
+  if (Array.isArray(input.extraUsageGenerations) && input.extraUsageGenerations.length > 0) {
+    for (const extra of input.extraUsageGenerations) {
+      const u = extra?.generation?.usage;
+      if (!u) continue;
+      const rawInput = safeTokens(u.rawInputTokens);
+      const cached = safeTokens(u.cachedReadTokens);
+      const written = safeTokens(u.cacheWriteTokens);
+      const output = safeTokens(u.outputTokens);
+      if (rawInput + cached + written + output <= 0) continue;
+      usageSampleCount++;
+      uncachedInputTokens += rawInput;
+      cachedReadTokens += cached;
+      cacheWriteTokens += written;
+      outputTokens += output;
+      reasoningTokens += safeTokens(u.reasoningTokens);
+      candidateTokens += safeTokens(u.candidateTokens);
+      const ts = validSeconds(extra.timestampSeconds) && extra.timestampSeconds > 0
+        ? extra.timestampSeconds
+        : validSeconds(extra.generation.startedAtSeconds) && extra.generation.startedAtSeconds > 0
+        ? extra.generation.startedAtSeconds
+        : null;
+      usageStepsForCost.push({
+        step: {
+          stepType: 15,
+          hasUsage: true,
+          startTimeSeconds: ts,
+          rawInputTokens: rawInput,
+          cachedReadTokens: cached,
+          cacheWriteTokens: written,
+          outputTokens: output,
+          generation: extra.generation,
+        },
+        isChildStep: Boolean(extra.isChildStep),
+        rawInput,
+        cached,
+        written,
+        output,
+      });
     }
   }
   const mainCompletedAnchoredTotal = mergeDurationIntervals(mainCompletedModelIntervals);
@@ -1442,7 +1604,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const modelDurationSeconds = mainCompletedModelDuration + childCompletedModelDuration;
   const toolDurationSeconds = mergeDurationIntervals(completedToolIntervals);
 
-  const usageContextEntries: Array<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number }> = [];
+  const usageContextEntries: Array<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number; turnIndex: number }> = [];
   let turns = 0;
   let compactionCount = 0;
   for (const step of contextSteps) {
@@ -1454,7 +1616,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     const prompt = safeTokens(step.rawInput ?? step.rawInputTokens) +
       safeTokens(step.cachedTokens ?? step.cachedReadTokens) + safeTokens(step.cacheWriteTokens);
     if (step.hasUsage === true || prompt > 0) {
-      usageContextEntries.push({ step, prompt });
+      usageContextEntries.push({ step, prompt, turnIndex: turns });
     }
   }
   const {
@@ -1483,7 +1645,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const uncachedBarRatio = stepUncached / denominator * 100;
   const latestOutput = safeTokens(latestStep?.outputTokens);
   let latestActiveForegroundKind: 'model' | 'tool' | null = null;
-  if (input.allowDbActiveStepInference !== false) {
+  const lastCtx = contextSteps[contextSteps.length - 1];
+  const lastCtxType = lastCtx ? (lastCtx.step_type ?? lastCtx.stepType ?? 0) : 0;
+  const lastCtxStatus = lastCtx?.status ?? 3;
+  const lastTurnAborted = Boolean(!input.isStreaming && lastCtx && lastCtxType !== 14 && (lastCtxStatus === 6 || lastCtxStatus === 7));
+  if (input.allowDbActiveStepInference !== false && !lastTurnAborted) {
     let turnFinished = false;
     for (let index = contextSteps.length - 1; index >= 0; index--) {
       const candidate = contextSteps[index]!;
@@ -1517,10 +1683,10 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const isSubagentRunning = Boolean(input.isSubagentRunning || runningSubagentCount > 0);
   const dbForegroundActive = input.allowDbActiveStepInference === true && latestActiveForegroundKind !== null;
   const isStreaming = Boolean(input.isStreaming || isSubagentRunning || dbForegroundActive);
-  // 小圆点活动阶段严格绑定当前分栏前台模型状态（input.isStreaming）：
-  // 前台模型停止或等待审批时，即使仍有后台工具或独立子智能体运行，小圆点也保持 idle（灰色），同时保留 isStreaming 维持 300ms 轮询与计时。
+  // 小圆点活动阶段默认绑定当前分栏前台流式状态（input.isStreaming）；
+  // 独立子智能体轨迹分栏因宿主 DOM 常无内部停止按钮，允许由底层数据库实锤的前台活跃步骤驱动状态圆点。
   let activityPhase: HudActivityPhase = 'idle';
-  if (input.isStreaming) {
+  if (input.isStreaming || (input.isSubagentTrajectory === true && dbForegroundActive)) {
     if (input.activityPhase === 'executing' || latestActiveForegroundKind === 'tool') {
       activityPhase = 'executing';
     } else {
@@ -1633,7 +1799,12 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   let hasActiveStepInTurn = false;
   let hasSubagentStepInTurn = false;
   const nowSeconds = nowMs / 1000;
-  const allowActiveInference = input.allowDbActiveStepInference !== false;
+  const allowActiveInference = availability !== 'cached' && input.allowDbActiveStepInference !== false;
+  const lastTurnStep = turnSteps[turnSteps.length - 1];
+  const lastTurnStepAborted =
+    lastTurnStep !== undefined &&
+    (lastTurnStep.status === 4 || lastTurnStep.status === 6 || lastTurnStep.status === 7);
+  const allowForegroundActiveInTurn = allowActiveInference && !(!input.isStreaming && lastTurnStepAborted);
 
   const trackWallStart = (ts: number | null | undefined) => {
     if (validSeconds(ts)) {
@@ -1663,12 +1834,17 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       hasSubagentStepInTurn = true;
     }
     const complete = isStepCompleted(step);
-    const activeNow = isStepActiveNow(step, isStreaming, allowActiveInference);
+    const activeNow = availability !== 'cached' && isStepActiveNow(step, isStreaming, allowForegroundActiveInTurn);
     const hasInterval = validSeconds(start) && validSeconds(end) && end > start;
     if (complete) {
       trackWallEnd(end ?? step.finishedGeneratingSeconds ?? step.completedAtSeconds ?? start);
     } else if (activeNow) {
       hasActiveStepInTurn = true;
+    } else if (rawStatus === 4 || rawStatus === 6 || rawStatus === 7) {
+      const terminalEndedTs = end ?? step.completedAtSeconds ?? step.finishedGeneratingSeconds;
+      if (validSeconds(terminalEndedTs) && (!validSeconds(start) || terminalEndedTs >= start)) {
+        trackWallEnd(terminalEndedTs);
+      }
     }
 
     if (stepType === 15) {
@@ -1737,20 +1913,56 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   });
   for (const childStep of childStepsInTurn) {
     const stepType = childStep.step_type ?? childStep.stepType ?? 0;
+    const rawStatus = childStep.status ?? 3;
     const start = childStep.t_start ?? childStep.startTimeSeconds ?? childStep.createdAtSeconds;
     const end = childStep.t_end ?? childStep.endTimeSeconds ?? childStep.finishedGeneratingSeconds ?? childStep.completedAtSeconds;
     const rawStart = childStep.t_start ?? childStep.startTimeSeconds;
     const rawEnd = childStep.t_end ?? childStep.endTimeSeconds;
+    const hasInterval = validSeconds(rawStart) && validSeconds(rawEnd) && rawEnd > rawStart;
     trackWallStart(start);
-    if (stepType !== 14 && isStepActiveNow(childStep, isStreaming, allowActiveInference)) {
+    if (availability !== 'cached' && stepType !== 14 && isStepActiveNow(childStep, isStreaming, allowActiveInference)) {
       hasActiveStepInTurn = true;
       if (validSeconds(rawStart)) {
-        turnChildIntervals.push([rawStart, Math.max(rawStart, nowSeconds)]);
+        const activeInterval: readonly [number, number] = [rawStart, Math.max(rawStart, nowSeconds)];
+        turnChildIntervals.push(activeInterval);
+        if (stepType === 15) {
+          turnModelIntervals.push(activeInterval);
+        } else if (!NON_TOOL_STEP_TYPES.has(stepType)) {
+          turnToolIntervals.push(activeInterval);
+        }
       }
-    } else {
-      trackWallEnd(end ?? start);
-      if (stepType !== 14 && validSeconds(rawStart) && validSeconds(rawEnd) && rawEnd > rawStart) {
-        turnChildIntervals.push([rawStart, rawEnd]);
+    } else if (stepType !== 14) {
+      const childCompleted =
+        stepType === 15
+          ? isStepCompleted(childStep)
+          : (rawStatus === 3 || rawStatus === 5 || !ACTIVE_STEP_STATUSES.has(rawStatus)) && rawStatus !== 4 && rawStatus !== 6 && rawStatus !== 7;
+      if (childCompleted) {
+        trackWallEnd(end ?? start);
+        if (stepType === 15) {
+          const gen = childStep.generation;
+          const rawTtft = gen?.timeToFirstTokenSeconds;
+          const rawStreaming = gen?.streamingDurationSeconds;
+          const duration = validSeconds(rawTtft) && validSeconds(rawStreaming) && rawTtft + rawStreaming > 0
+            ? rawTtft + rawStreaming
+            : hasInterval ? rawEnd! - rawStart! : null;
+          if (duration !== null) {
+            if (validSeconds(rawStart)) {
+              const modelInterval: readonly [number, number] = [rawStart, rawStart + duration];
+              turnModelIntervals.push(modelInterval);
+              turnChildIntervals.push(modelInterval);
+            } else {
+              unanchoredTurnModelDuration += duration;
+            }
+          } else if (hasInterval) {
+            turnChildIntervals.push([rawStart!, rawEnd!]);
+          }
+        } else if (hasInterval) {
+          const toolInterval: readonly [number, number] = [rawStart!, rawEnd!];
+          turnChildIntervals.push(toolInterval);
+          if (!NON_TOOL_STEP_TYPES.has(stepType)) {
+            turnToolIntervals.push(toolInterval);
+          }
+        }
       }
     }
   }
@@ -1760,19 +1972,36 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const activeToolIntervals: Array<readonly [number, number]> = [];
   let activeModelStepCount = 0;
   let activeToolStepCount = 0;
-  for (const step of [...turnSteps, ...childStepsInTurn]) {
-    const stepType = step.step_type ?? step.stepType ?? 0;
-    if (stepType === 14) continue;
-    const start = step.t_start ?? step.startTimeSeconds;
-    if (!validSeconds(start)) continue;
-    if (!isStepActiveNow(step, isStreaming, allowActiveInference)) continue;
-    const interval: readonly [number, number] = [start, Math.max(start, nowSeconds)];
-    if (stepType === 15) {
-      activeModelIntervals.push(interval);
-      activeModelStepCount++;
-    } else if (!NON_TOOL_STEP_TYPES.has(stepType)) {
-      activeToolIntervals.push(interval);
-      activeToolStepCount++;
+  if (availability !== 'cached') {
+    for (const step of turnSteps) {
+      const stepType = step.step_type ?? step.stepType ?? 0;
+      if (stepType === 14) continue;
+      const start = step.t_start ?? step.startTimeSeconds;
+      if (!validSeconds(start)) continue;
+      if (!isStepActiveNow(step, isStreaming, allowForegroundActiveInTurn)) continue;
+      const interval: readonly [number, number] = [start, Math.max(start, nowSeconds)];
+      if (stepType === 15) {
+        activeModelIntervals.push(interval);
+        activeModelStepCount++;
+      } else if (!NON_TOOL_STEP_TYPES.has(stepType)) {
+        activeToolIntervals.push(interval);
+        activeToolStepCount++;
+      }
+    }
+    for (const step of childStepsInTurn) {
+      const stepType = step.step_type ?? step.stepType ?? 0;
+      if (stepType === 14) continue;
+      const start = step.t_start ?? step.startTimeSeconds;
+      if (!validSeconds(start)) continue;
+      if (!isStepActiveNow(step, isStreaming, allowActiveInference)) continue;
+      const interval: readonly [number, number] = [start, Math.max(start, nowSeconds)];
+      if (stepType === 15) {
+        activeModelIntervals.push(interval);
+        activeModelStepCount++;
+      } else if (!NON_TOOL_STEP_TYPES.has(stepType)) {
+        activeToolIntervals.push(interval);
+        activeToolStepCount++;
+      }
     }
   }
   const inFlightModelDurationSeconds = Math.max(
@@ -1800,9 +2029,6 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     const completedWallSpan = turnCompletedEnd !== null && turnCompletedEnd > turnWallStart
       ? turnCompletedEnd - turnWallStart
       : 0;
-    const lastTurnStep = turnSteps[turnSteps.length - 1];
-    const lastTurnStepAborted =
-      lastTurnStep !== undefined && (lastTurnStep.status === 6 || lastTurnStep.status === 7);
     // 前台流式中但末步已被中止/取消时视为轮次已终止，不再按挂钟累加；
     // 主库处于错误回退缓存态 (availability === 'cached') 时快照已冻结，不再把旧轮起始时间外推到当前时刻。
     const wallClockRunning =
@@ -1829,6 +2055,17 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     currentTurnTimedSamples > 0 ? currentTurnTpsInfo.formatted : isStreaming ? bt('metrics.calculating') : '—';
   const lastContextStep = contextSteps.length > 0 ? contextSteps[contextSteps.length - 1] : undefined;
   const lastContextStepType = lastContextStep ? (lastContextStep.step_type ?? lastContextStep.stepType ?? 0) : 0;
+  const lastContextStepStatus = lastContextStep?.status ?? 3;
+  const lastContextToolCompleted =
+    Boolean(lastContextStep) &&
+    !NON_TOOL_STEP_TYPES.has(lastContextStepType) &&
+    (lastContextStepStatus === 3 ||
+      lastContextStepStatus === 5 ||
+      (!ACTIVE_STEP_STATUSES.has(lastContextStepStatus) &&
+        lastContextStepStatus !== 4 &&
+        lastContextStepStatus !== 6 &&
+        lastContextStepStatus !== 7 &&
+        validSeconds(lastContextStep!.t_end ?? lastContextStep!.endTimeSeconds)));
   const awaitingFirstTurnStep = Boolean(
     input.isStreaming &&
       !isSubagentRunning &&
@@ -1836,7 +2073,9 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       activeToolStepCount === 0 &&
       (contextSteps.length === 0 ||
         lastTurnStartIndex === contextSteps.length - 1 ||
-        (lastContextStepType === 2 && (lastContextStep?.status ?? 3) === 3))
+        ((lastContextStepType === 2 || lastContextStepType === 23) &&
+          (lastContextStepStatus === 3 || lastContextStepStatus === 5)) ||
+        lastContextToolCompleted)
   );
   const currentTurnDurationCompactZh = hasTurnDuration
     ? formatTurnDurationCompact(currentTurnDurationSeconds, 'zh')
@@ -1844,6 +2083,14 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const currentTurnDurationCompactEn = hasTurnDuration
     ? formatTurnDurationCompact(currentTurnDurationSeconds, 'en')
     : formatTurnDurationCompact(0, 'en');
+
+  const resolvedSubagentSteps =
+    input.subagentSteps ?? (input.contextSteps ? Math.max(0, steps.length - contextSteps.length) : 0);
+  const resolvedTotalSteps =
+    input.totalStepsOverride ??
+    (input.contextSteps
+      ? contextSteps.length + Math.max(steps.length - contextSteps.length, resolvedSubagentSteps)
+      : steps.length + Math.max(0, resolvedSubagentSteps));
 
   return {
     conversationId: input.conversationId || 'default',
@@ -1863,7 +2110,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     runningSubagentCount,
     session: {
       turns,
-      steps: input.totalStepsOverride ?? steps.length + Math.max(0, input.subagentSteps ?? 0),
+      steps: resolvedTotalSteps,
       modelSteps,
       samples: { usage: usageSampleCount,
         timed: timedOutputCount, ttft: validTtftCount },
@@ -1871,8 +2118,9 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       compactionCount,
       subagentCount: Math.max(input.subagentCount ?? detectedSubagents, runningSubagentCount),
       runningSubagentCount,
-      subagentSteps: input.subagentSteps ?? 0,
+      subagentSteps: resolvedSubagentSteps,
       hasSubagentInTurn,
+      ...(lastTurnStepAborted ? { turnAborted: true } : {}),
       ...(input.isSubagentTrajectory ? { isSubagentTrajectory: true } : {}),
       ...(awaitingFirstTurnStep ? { awaitingFirstTurnStep: true } : {}),
       modelDurationSeconds,
@@ -1882,8 +2130,8 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       toolDurationFormatted: formatDurationSeconds(toolDurationSeconds, 'zh'),
       toolDurationFormattedEn: formatDurationSeconds(toolDurationSeconds, 'en'),
       averageTtftSeconds,
-      averageTtftFormatted: validTtftCount > 0 ? bt('metrics.ttft_seconds', { value: compactDecimal(averageTtftSeconds, 2) }) : '—',
-      averageTtftFormattedEn: validTtftCount > 0 ? `${compactDecimal(averageTtftSeconds, 2)}s` : '—',
+      averageTtftFormatted: validTtftCount > 0 ? bt('metrics.ttft_seconds', { value: compactRate(averageTtftSeconds) }) : '—',
+      averageTtftFormattedEn: validTtftCount > 0 ? `${compactRate(averageTtftSeconds)}s` : '—',
       outputTps: tpsInfo.outputTps,
       outputTpsFormatted,
       outputTpsPending,
@@ -2024,6 +2272,10 @@ interface CachedConversationState {
   verifiedSniffedChildren: Set<string>;
   genMetadata?: ParsedGenMetadata;
   generations: Map<number, ParsedGenMetadata>;
+  unmatchedUsageGenerations: Array<{
+    generation: ParsedGenMetadata;
+    timestampSeconds: number | null;
+  }>;
 }
 
 /**
@@ -2035,10 +2287,16 @@ export class ConversationMetricsEngine {
   private readonly remotePricingCachePath: string | null;
   private readonly pricingCachePath: string | null;
   private cachedPricingTable: { key: string; table: Record<string, ApiPricingEntry> } | null = null;
+  private pricingResolveInFlight: Promise<Record<string, ApiPricingEntry>> | null = null;
   private readonly cache = new Map<string, CachedConversationState>();
   private readonly pendingReads = new Map<string, Promise<CachedConversationState | null>>();
-  private sniffDirCache: { at: number; dirMtimeMs: number; recentIds: string[] } | null = null;
+  private readonly verifiedSniffedChildrenByDb = new Map<string, { fileId: string; stepCount: number; children: Set<string> }>();
+  private readonly recentActiveChildUntilByDb = new Map<string, number>();
+  private readonly coldSniffedByDb = new Map<string, { fileId: string; stepCount: number }>();
+  private readonly rejectedSniffMtimeByKey = new Map<string, number>();
+  private sniffDirCache: { at: number; dirMtimeMs: number; allEntries: Array<{ id: string; mtimeMs: number }> } | null = null;
   private sniffDirListCache: { dirMtimeMs: number; dbEntries: Array<{ file: string; id: string }> } | null = null;
+  private sniffInFlight: Promise<Array<{ id: string; mtimeMs: number }>> | null = null;
 
   constructor(options?: { geminiDir?: string; conversationsDir?: string; stateDir?: string }) {
     const baseGemini = options?.geminiDir ?? join(homedir(), '.gemini');
@@ -2055,25 +2313,32 @@ export class ConversationMetricsEngine {
     if (!this.remotePricingCachePath || !this.pricingCachePath) {
       return DEFAULT_API_PRICES;
     }
-    const [remoteStat, customStat] = await Promise.all([
-      lstat(this.remotePricingCachePath).catch(() => null),
-      lstat(this.pricingCachePath).catch(() => null),
-    ]);
-    const key = `${remoteStat ? `${remoteStat.mtimeMs}:${remoteStat.size}` : 'none'}|${customStat ? `${customStat.mtimeMs}:${customStat.size}` : 'none'}`;
-    if (key === 'none|none') {
-      this.cachedPricingTable = null;
-      return DEFAULT_API_PRICES;
-    }
-    if (this.cachedPricingTable?.key === key) {
-      return this.cachedPricingTable.table;
-    }
-    try {
-      const { merged } = await loadRawPricingTable(this.remotePricingCachePath, this.pricingCachePath);
-      this.cachedPricingTable = { key, table: merged };
-      return merged;
-    } catch {
-      return DEFAULT_API_PRICES;
-    }
+    return (this.pricingResolveInFlight ??= (async () => {
+      try {
+        const [remoteStat, customStat] = await Promise.all([
+          lstat(this.remotePricingCachePath!).catch(() => null),
+          lstat(this.pricingCachePath!).catch(() => null),
+        ]);
+        const key = `${remoteStat ? `${remoteStat.mtimeMs}:${remoteStat.size}` : 'none'}|${customStat ? `${customStat.mtimeMs}:${customStat.size}` : 'none'}`;
+        if (key === 'none|none') {
+          if (this.cachedPricingTable !== null) {
+            this.cachedPricingTable = null;
+            resetAndRegisterRemoteModelMetadata({});
+          }
+          return DEFAULT_API_PRICES;
+        }
+        if (this.cachedPricingTable?.key === key) {
+          return this.cachedPricingTable.table;
+        }
+        const { merged } = await loadRawPricingTable(this.remotePricingCachePath!, this.pricingCachePath!);
+        this.cachedPricingTable = { key, table: merged };
+        return merged;
+      } catch {
+        return DEFAULT_API_PRICES;
+      } finally {
+        this.pricingResolveInFlight = null;
+      }
+    })());
   }
 
   public resolveDbPath(conversationId: string): string {
@@ -2241,12 +2506,10 @@ export class ConversationMetricsEngine {
       const selfTrajLower = trajectoryId?.toLowerCase() ?? '';
 
       const parseStepRow = (row: HudWorkerRawStepRow): ParsedConversationStep => {
-        const extraBlobs =
-          row.render_info && row.render_info.length > 0
-            ? [row.render_info]
-            : row.step_payload && row.step_payload.length > 0
-            ? [row.step_payload]
-            : undefined;
+        const extraList = [row.render_info, row.step_payload].filter(
+          (b): b is Uint8Array => Boolean(b && b.length > 0)
+        );
+        const extraBlobs = extraList.length > 0 ? extraList : undefined;
         const parsed = parseStepMetadataBlob(
           Number(row.idx),
           Number(row.step_type),
@@ -2292,22 +2555,68 @@ export class ConversationMetricsEngine {
       }
 
       const stepByIndex = new Map(baseSteps.map(step => [step.idx, step]));
-      for (const generation of generations.values()) {
-        const linked = [...new Set(generation.stepIndices ?? [])]
+      const sortedGenerations = [...generations.entries()].sort((a, b) => a[0] - b[0]);
+      const claimedUsageStepIdxs = new Set<number>();
+      const matchedGenIdxs = new Set<number>();
+      const resolveCandidate15Steps = (generation: ParsedGenMetadata): ParsedConversationStep[] => {
+        const fromIndices = [...new Set(generation.stepIndices ?? [])]
           .map(index => stepByIndex.get(index))
           .filter((step): step is ParsedConversationStep => step?.stepType === 15);
-        if (linked.length === 1 && generation.usage && generation.executionId) {
-          const step = linked[0]!;
-          if (step.hasUsage && step.executionId === generation.executionId) {
-            const usageKeys = ['rawInputTokens', 'outputTokens', 'cachedReadTokens', 'cacheWriteTokens',
-              'reasoningTokens', 'candidateTokens'] as const;
-            if (usageKeys.every(key => step[key] === generation.usage![key])) {
-              step.generation = generation;
+        if (fromIndices.length > 0) return fromIndices;
+        if (generation.executionId && (!generation.stepIndices || generation.stepIndices.length === 0)) {
+          return baseSteps.filter(step => step.stepType === 15 && step.executionId === generation.executionId);
+        }
+        return [];
+      };
+
+      const stripTimingFromGeneration = (gen: ParsedGenMetadata): ParsedGenMetadata => {
+        const { timeToFirstTokenSeconds: _ttft, streamingDurationSeconds: _stream, ...rest } = gen;
+        return rest;
+      };
+      const canAttachAuthoritativeTiming = (
+        gen: ParsedGenMetadata,
+        candidate15Count: number,
+        step: ParsedConversationStep
+      ): boolean =>
+        candidate15Count === 1 &&
+        Boolean(gen.executionId) &&
+        Boolean(step.executionId) &&
+        step.executionId === gen.executionId;
+
+      // 第 1 遍：精确对齐 steps.metadata.field 9 与 gen_metadata.usage 一致的模型步（1:1 认领，防止同轮多次 API 调用被误吞）
+      for (const [genIdx, generation] of sortedGenerations) {
+        const linked = resolveCandidate15Steps(generation);
+        if (generation.usage) {
+          const u = generation.usage;
+          const uTotal = u.rawInputTokens + u.cachedReadTokens + u.cacheWriteTokens + u.outputTokens;
+          if (uTotal > 0) {
+            const exactMatch = linked.find(
+              step =>
+                !claimedUsageStepIdxs.has(step.idx) &&
+                step.hasUsage &&
+                (!generation.executionId || !step.executionId || step.executionId === generation.executionId) &&
+                step.rawInputTokens === u.rawInputTokens &&
+                step.outputTokens === u.outputTokens &&
+                step.cachedReadTokens === u.cachedReadTokens &&
+                step.cacheWriteTokens === u.cacheWriteTokens
+            );
+            if (exactMatch) {
+              if (exactMatch.reasoningTokens === 0 && u.reasoningTokens > 0) {
+                exactMatch.reasoningTokens = u.reasoningTokens;
+              }
+              if (exactMatch.candidateTokens === 0 && u.candidateTokens > 0) {
+                exactMatch.candidateTokens = u.candidateTokens;
+              }
+              exactMatch.generation = canAttachAuthoritativeTiming(generation, linked.length, exactMatch)
+                ? generation
+                : stripTimingFromGeneration(generation);
+              claimedUsageStepIdxs.add(exactMatch.idx);
+              matchedGenIdxs.add(genIdx);
               continue;
             }
           }
         }
-        if (linked.length > 1 && generation.executionId && (generation.responseModel || generation.modelDisplayName || generation.plannerModelName || generation.modelEnum || generation.maxContextTokens)) {
+        if (linked.length >= 1 && (generation.responseModel || generation.modelDisplayName || generation.plannerModelName || generation.modelEnum || generation.maxContextTokens)) {
           const modelOnlyGen: ParsedGenMetadata = {
             ...(generation.responseModel ? { responseModel: generation.responseModel } : {}),
             ...(generation.modelDisplayName ? { modelDisplayName: generation.modelDisplayName } : {}),
@@ -2316,17 +2625,108 @@ export class ConversationMetricsEngine {
             ...(generation.maxContextTokens ? { maxContextTokens: generation.maxContextTokens } : {}),
           };
           for (const step of linked) {
-            if (!step.generation && step.executionId === generation.executionId) {
+            if (!step.generation && (!generation.executionId || !step.executionId || step.executionId === generation.executionId)) {
               step.generation = modelOnlyGen;
             }
           }
         }
       }
+
+      // 第 2 遍：回填缺失内联 field 9 / cacheWriteTokens 的 stepType=15，并收集压缩步 (step_type=23)、重试/中断等独立计费 gen_metadata
+      const unmatchedUsageGenerations: Array<{ generation: ParsedGenMetadata; timestampSeconds: number | null }> = [];
+      const genCountByStepIdx = new Map<number, number>();
+      for (const [, generation] of sortedGenerations) {
+        const u = generation.usage;
+        if (!u || u.rawInputTokens + u.cachedReadTokens + u.cacheWriteTokens + u.outputTokens <= 0) continue;
+        for (const step of resolveCandidate15Steps(generation)) {
+          genCountByStepIdx.set(step.idx, (genCountByStepIdx.get(step.idx) ?? 0) + 1);
+        }
+      }
+      for (const [genIdx, generation] of sortedGenerations) {
+        if (matchedGenIdxs.has(genIdx) || !generation.usage) continue;
+        const u = generation.usage;
+        const uTotal = u.rawInputTokens + u.cachedReadTokens + u.cacheWriteTokens + u.outputTokens;
+        if (uTotal <= 0) continue;
+        const linked = resolveCandidate15Steps(generation);
+        const missingUsageStep = linked.find(
+          step =>
+            !claimedUsageStepIdxs.has(step.idx) &&
+            !step.hasUsage &&
+            (!generation.executionId || !step.executionId || step.executionId === generation.executionId)
+        );
+        if (missingUsageStep) {
+          missingUsageStep.hasUsage = true;
+          missingUsageStep.rawInputTokens = u.rawInputTokens;
+          missingUsageStep.outputTokens = u.outputTokens;
+          missingUsageStep.cacheWriteTokens = u.cacheWriteTokens;
+          missingUsageStep.cachedReadTokens = u.cachedReadTokens;
+          missingUsageStep.reasoningTokens = u.reasoningTokens;
+          missingUsageStep.candidateTokens = u.candidateTokens;
+          missingUsageStep.generation = canAttachAuthoritativeTiming(generation, linked.length, missingUsageStep)
+            ? generation
+            : stripTimingFromGeneration(generation);
+          claimedUsageStepIdxs.add(missingUsageStep.idx);
+          matchedGenIdxs.add(genIdx);
+          continue;
+        }
+        if (linked.length === 1) {
+          const soleStep = linked[0]!;
+          if (
+            !claimedUsageStepIdxs.has(soleStep.idx) &&
+            (genCountByStepIdx.get(soleStep.idx) ?? 0) === 1 &&
+            soleStep.hasUsage &&
+            (!generation.executionId || !soleStep.executionId || soleStep.executionId === generation.executionId)
+          ) {
+            if (
+              soleStep.rawInputTokens === u.rawInputTokens &&
+              soleStep.outputTokens === u.outputTokens &&
+              soleStep.cachedReadTokens === u.cachedReadTokens &&
+              soleStep.cacheWriteTokens === 0 &&
+              u.cacheWriteTokens > 0
+            ) {
+              soleStep.cacheWriteTokens = u.cacheWriteTokens;
+              if (soleStep.reasoningTokens === 0 && u.reasoningTokens > 0) soleStep.reasoningTokens = u.reasoningTokens;
+              if (soleStep.candidateTokens === 0 && u.candidateTokens > 0) soleStep.candidateTokens = u.candidateTokens;
+              soleStep.generation = canAttachAuthoritativeTiming(generation, linked.length, soleStep)
+                ? generation
+                : stripTimingFromGeneration(generation);
+              claimedUsageStepIdxs.add(soleStep.idx);
+              matchedGenIdxs.add(genIdx);
+              continue;
+            }
+            if (Boolean(generation.executionId) && soleStep.executionId === generation.executionId) {
+              claimedUsageStepIdxs.add(soleStep.idx);
+              matchedGenIdxs.add(genIdx);
+              continue;
+            }
+          }
+        }
+        let fallbackStepTs: number | null = generation.startedAtSeconds ?? null;
+        if (fallbackStepTs === null && generation.stepIndices?.length) {
+          for (const sIdx of generation.stepIndices) {
+            const anyStep = stepByIndex.get(sIdx);
+            const ts = anyStep?.startTimeSeconds ?? anyStep?.createdAtSeconds ?? anyStep?.completedAtSeconds ?? null;
+            if (ts !== null && ts > 0) {
+              fallbackStepTs = ts;
+              break;
+            }
+          }
+        }
+        unmatchedUsageGenerations.push({ generation, timestampSeconds: fallbackStepTs });
+      }
       const latestModelStep = [...baseSteps].reverse().find(step => step.stepType === 15 && step.hasUsage);
       let genMetadata = latestModelStep?.generation;
       if (!genMetadata && generations.size > 0) {
         const fallbackGens = [...generations.entries()].sort((a, b) => a[0] - b[0]);
-        genMetadata = fallbackGens[fallbackGens.length - 1]?.[1];
+        const lastGen = fallbackGens[fallbackGens.length - 1]?.[1];
+        const indices = lastGen?.stepIndices;
+        const compatible = !latestModelStep
+          ? true
+          : (!indices?.length || indices.includes(latestModelStep.idx)) &&
+            (!lastGen?.executionId || !latestModelStep.executionId || lastGen.executionId === latestModelStep.executionId);
+        if (lastGen && compatible) {
+          genMetadata = lastGen;
+        }
       }
       for (const step of baseSteps) {
         for (const childId of step.childConversationIds ?? []) {
@@ -2334,10 +2734,18 @@ export class ConversationMetricsEngine {
         }
       }
 
-      const timelineShrunk = existing && baseSteps.length < existing.steps.length;
+      const persistedSniff = this.verifiedSniffedChildrenByDb.get(dbPath);
+      const timelineShrunk =
+        (existing && baseSteps.length < existing.steps.length) ||
+        (persistedSniff && (persistedSniff.fileId !== dbStat.fileId || baseSteps.length < persistedSniff.stepCount));
       const verifiedSniffedChildren = new Set<string>(
-        timelineShrunk ? [] : existing?.verifiedSniffedChildren ?? []
+        timelineShrunk ? [] : (persistedSniff?.children ?? existing?.verifiedSniffedChildren ?? [])
       );
+      if (timelineShrunk) {
+        this.verifiedSniffedChildrenByDb.delete(dbPath);
+      } else if (persistedSniff) {
+        persistedSniff.stepCount = Math.max(persistedSniff.stepCount, baseSteps.length);
+      }
 
       const nowMs = Date.now();
       const observedAt = Math.max(Math.round(dbStat.mtimeMs), Math.round(walMtimeMs)) || nowMs;
@@ -2371,6 +2779,7 @@ export class ConversationMetricsEngine {
         verifiedSniffedChildren,
         genMetadata,
         generations,
+        unmatchedUsageGenerations,
       };
       this.setCachedState(dbPath, nextState);
       return nextState;
@@ -2434,15 +2843,22 @@ export class ConversationMetricsEngine {
     const mainIdLower = conversationId.toLowerCase();
     const mainTrajLower = mainState.trajectoryId?.toLowerCase() ?? '';
 
-    let combinedSteps = mainState.steps;
+    let descendants: ParsedConversationStep[] = [];
+    const childUnmatchedGenerations: Array<{ generation: ParsedGenMetadata; isChildStep: true; timestampSeconds: number | null }> = [];
     let totalSubagentSteps = 0;
     let activeChildSubagents = 0;
     let failedChildCount = 0;
     const verifiedChildIds = new Set<string>();
 
+    const persistedSniffEntry = this.verifiedSniffedChildrenByDb.get(dbPath);
     const candidateChildIds = new Set<string>(mainState.childConversationIds);
     for (const persistedChild of mainState.verifiedSniffedChildren) {
       candidateChildIds.add(persistedChild);
+    }
+    if (persistedSniffEntry && persistedSniffEntry.fileId === mainState.fileId) {
+      for (const persistedChild of persistedSniffEntry.children) {
+        candidateChildIds.add(persistedChild);
+      }
     }
     if (Array.isArray(domHintChildIds)) {
       for (const rawHint of domHintChildIds) {
@@ -2454,66 +2870,115 @@ export class ConversationMetricsEngine {
       }
     }
 
-    // 反向子会话嗅探 (异步无阻塞，同时检查 .db 与 -wal 修改时间，1s 目录下钻缓存)
-    const hasActiveSubagentStep = mainState.steps.some(
+    // 反向子会话嗅探 (异步无阻塞，同时检查 .db 与 -wal 修改时间，2.5s 目录下钻缓存 + in-flight 去重；
+    // 同时覆盖实时运行期 5 分钟窗口与冷启动历史会话首次打开时的同周期反向嗅探)
+    const hasActiveSubagentStep = mainIsRecent && mainState.steps.some(
       (s) =>
         (s.isSubagentStep || (s.toolCallName && SUBAGENT_TOOL_NAMES.has(s.toolCallName))) &&
         ACTIVE_STEP_STATUSES.has(s.status)
     );
-    if (!dbPathOverride && (isSubagentRunning || hasActiveSubagentStep)) {
+    const hasSubagentEvidenceInMain = mainState.steps.some(
+      (s) =>
+        s.isSubagentStep ||
+        s.stepType === 132 ||
+        Boolean(s.toolCallName && SUBAGENT_TOOL_NAMES.has(s.toolCallName))
+    );
+    const coldSniffRec = this.coldSniffedByDb.get(dbPath);
+    const needsColdHistoricalSniff =
+      !dbPathOverride &&
+      !(isSubagentRunning || hasActiveSubagentStep) &&
+      hasSubagentEvidenceInMain &&
+      candidateChildIds.size === 0 &&
+      (!coldSniffRec || coldSniffRec.fileId !== mainState.fileId || coldSniffRec.stepCount !== mainState.steps.length);
+    if (!dbPathOverride && (isSubagentRunning || hasActiveSubagentStep || needsColdHistoricalSniff)) {
       try {
-        const dirStat = await lstat(this.conversationsDir).catch(() => null);
-        const dirMtimeMs = dirStat?.mtimeMs ?? -1;
-        let recentIds: string[];
-        if (
-          this.sniffDirCache &&
-          nowMs - this.sniffDirCache.at < 2500 &&
-          this.sniffDirCache.dirMtimeMs === dirMtimeMs
-        ) {
-          recentIds = this.sniffDirCache.recentIds;
+        const allEntries = await (this.sniffInFlight ??= (async () => {
+          try {
+            const dirStat = await lstat(this.conversationsDir).catch(() => null);
+            const dirMtimeMs = dirStat?.mtimeMs ?? -1;
+            const checkNow = Date.now();
+            if (
+              this.sniffDirCache &&
+              checkNow - this.sniffDirCache.at < 2500 &&
+              this.sniffDirCache.dirMtimeMs === dirMtimeMs
+            ) {
+              return this.sniffDirCache.allEntries;
+            }
+            let dbEntries: Array<{ file: string; id: string }>;
+            if (dirStat && this.sniffDirListCache && this.sniffDirListCache.dirMtimeMs === dirStat.mtimeMs) {
+              dbEntries = this.sniffDirListCache.dbEntries;
+            } else {
+              const files = await readdir(this.conversationsDir).catch(() => [] as string[]);
+              dbEntries = [];
+              for (const file of files) {
+                if (!file.endsWith('.db') || file.length < 39) continue;
+                const potentialChildId = file.slice(0, -3).toLowerCase();
+                if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(potentialChildId)) {
+                  dbEntries.push({ file, id: potentialChildId });
+                }
+              }
+              if (dirStat) {
+                this.sniffDirListCache = { dirMtimeMs: dirStat.mtimeMs, dbEntries };
+              }
+            }
+            const found: Array<{ id: string; mtimeMs: number }> = [];
+            for (let i = 0; i < dbEntries.length; i += 48) {
+              const batch = dbEntries.slice(i, i + 48);
+              await Promise.all(batch.map(async ({ file, id: potentialChildId }) => {
+                const fullChildPath = join(this.conversationsDir, file);
+                const [st, walSt] = await Promise.all([
+                  lstat(fullChildPath).catch(() => null),
+                  lstat(`${fullChildPath}-wal`).catch(() => null),
+                ]);
+                if (!st || !st.isFile() || st.isSymbolicLink()) return;
+                const latestMtime = Math.max(st.mtimeMs, walSt?.mtimeMs ?? 0);
+                found.push({ id: potentialChildId, mtimeMs: latestMtime });
+              }));
+            }
+            this.sniffDirCache = { at: checkNow, dirMtimeMs, allEntries: found };
+            return found;
+          } finally {
+            this.sniffInFlight = null;
+          }
+        })());
+        let candidateEntries: Array<{ id: string; mtimeMs: number }>;
+        if (isSubagentRunning || hasActiveSubagentStep) {
+          candidateEntries = allEntries.filter((e) => nowMs - e.mtimeMs <= 300_000);
         } else {
-          let dbEntries: Array<{ file: string; id: string }>;
-          if (dirStat && this.sniffDirListCache && this.sniffDirListCache.dirMtimeMs === dirStat.mtimeMs) {
-            dbEntries = this.sniffDirListCache.dbEntries;
-          } else {
-            const files = await readdir(this.conversationsDir).catch(() => [] as string[]);
-            dbEntries = [];
-            for (const file of files) {
-              if (!file.endsWith('.db') || file.length < 39) continue;
-              const potentialChildId = file.slice(0, -3).toLowerCase();
-              if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(potentialChildId)) {
-                dbEntries.push({ file, id: potentialChildId });
+          if (this.coldSniffedByDb.size >= MAX_CACHED_CONVERSATIONS && !this.coldSniffedByDb.has(dbPath)) {
+            const oldestCold = this.coldSniffedByDb.keys().next().value;
+            if (oldestCold !== undefined) this.coldSniffedByDb.delete(oldestCold);
+          }
+          this.coldSniffedByDb.set(dbPath, { fileId: mainState.fileId, stepCount: mainState.steps.length });
+          const mainLatestMs = Math.max(mainState.mtimeMs, mainState.walMtimeMs);
+          let minEpochSec = Number.POSITIVE_INFINITY;
+          let maxEpochSec = 0;
+          for (const stp of mainState.steps) {
+            for (const ts of [stp.startTimeSeconds, stp.createdAtSeconds, stp.endTimeSeconds, stp.completedAtSeconds, stp.finishedGeneratingSeconds]) {
+              if (typeof ts === 'number' && Number.isFinite(ts) && ts >= 946_684_800) {
+                if (ts < minEpochSec) minEpochSec = ts;
+                if (ts > maxEpochSec) maxEpochSec = ts;
               }
             }
-            if (dirStat) {
-              this.sniffDirListCache = { dirMtimeMs: dirStat.mtimeMs, dbEntries };
-            }
           }
-          const found: string[] = [];
-          for (let i = 0; i < dbEntries.length; i += 48) {
-            const batch = dbEntries.slice(i, i + 48);
-            await Promise.all(batch.map(async ({ file, id: potentialChildId }) => {
-              const fullChildPath = join(this.conversationsDir, file);
-              const [st, walSt] = await Promise.all([
-                lstat(fullChildPath).catch(() => null),
-                lstat(`${fullChildPath}-wal`).catch(() => null),
-              ]);
-              if (!st || !st.isFile() || st.isSymbolicLink()) return;
-              const latestMtime = Math.max(st.mtimeMs, walSt?.mtimeMs ?? 0);
-              if (nowMs - latestMtime <= 30_000) {
-                found.push(potentialChildId);
-              }
-            }));
-          }
-          recentIds = found;
-          this.sniffDirCache = { at: nowMs, dirMtimeMs, recentIds: found };
+          const windowStartMs = Number.isFinite(minEpochSec)
+            ? Math.min(minEpochSec * 1000, mainLatestMs) - 120_000
+            : mainLatestMs - 3_600_000;
+          const windowEndMs = (maxEpochSec > 0 ? Math.max(maxEpochSec * 1000, mainLatestMs) : mainLatestMs) + 900_000;
+          candidateEntries = allEntries
+            .filter((e) => e.mtimeMs >= windowStartMs && e.mtimeMs <= windowEndMs)
+            .sort((a, b) => Math.abs(a.mtimeMs - mainLatestMs) - Math.abs(b.mtimeMs - mainLatestMs))
+            .slice(0, 32);
         }
-        for (const potentialChildId of recentIds) {
+        for (const { id: potentialChildId, mtimeMs: candidateMtime } of candidateEntries) {
           if (
             potentialChildId !== mainIdLower &&
             potentialChildId !== mainTrajLower &&
             !candidateChildIds.has(potentialChildId)
           ) {
+            const rejectKey = `${mainIdLower}::${mainTrajLower}::${potentialChildId}`;
+            const rejectedMtime = this.rejectedSniffMtimeByKey.get(rejectKey);
+            if (rejectedMtime !== undefined && rejectedMtime >= candidateMtime) continue;
             candidateChildIds.add(potentialChildId);
           }
         }
@@ -2527,7 +2992,6 @@ export class ConversationMetricsEngine {
         explicit: mainState.childConversationIds.has(childId),
         sniffed: !mainState.childConversationIds.has(childId),
       }));
-      const descendants: ParsedConversationStep[] = [];
       const processedEdges = new Set<string>();
       const SUBAGENT_READ_CONCURRENCY = 4;
       while (pendingChildren.length > 0) {
@@ -2537,17 +3001,23 @@ export class ConversationMetricsEngine {
           childDbPath: string;
         }> = [];
         const waveChildIds = new Set<string>();
+        const deferredEdges: typeof pendingChildren = [];
         while (wave.length < SUBAGENT_READ_CONCURRENCY && pendingChildren.length > 0) {
-          const edge = pendingChildren[0]!;
+          const edge = pendingChildren.shift()!;
           const childId = edge.childId.toLowerCase();
-          if (waveChildIds.has(childId)) break;
-          pendingChildren.shift();
+          if (waveChildIds.has(childId)) {
+            deferredEdges.push(edge);
+            continue;
+          }
           const edgeKey = `${edge.parentId}::${childId}`;
           if (processedEdges.has(edgeKey) || verifiedChildIds.has(childId) ||
               childId === mainIdLower || childId === mainTrajLower) continue;
           processedEdges.add(edgeKey);
           waveChildIds.add(childId);
           wave.push({ edge, childId, childDbPath: this.resolveDbPath(childId) });
+        }
+        if (deferredEdges.length > 0) {
+          pendingChildren.unshift(...deferredEdges);
         }
         if (wave.length === 0) continue;
         const results = await Promise.all(wave.map(async (item) => {
@@ -2589,26 +3059,78 @@ export class ConversationMetricsEngine {
             continue;
           }
           if (childState.hasParentMetadataBlob) {
-            if (!belongsToParent) continue;
+            if (!belongsToParent) {
+              if (edge.sniffed) {
+                const rejectKey = `${mainIdLower}::${mainTrajLower}::${childId}`;
+                const latestChildMtime = Math.max(childState.mtimeMs, childState.walMtimeMs);
+                if (this.rejectedSniffMtimeByKey.size >= 1024 && !this.rejectedSniffMtimeByKey.has(rejectKey)) {
+                  const oldestReject = this.rejectedSniffMtimeByKey.keys().next().value;
+                  if (oldestReject !== undefined) this.rejectedSniffMtimeByKey.delete(oldestReject);
+                }
+                this.rejectedSniffMtimeByKey.set(rejectKey, latestChildMtime);
+              }
+              continue;
+            }
           } else if (!edge.explicit || childState.hasTrajectoryMeta) {
             continue;
           }
           verifiedChildIds.add(childId);
           if (edge.sniffed) {
             mainState.verifiedSniffedChildren.add(childId);
+            let sniffRecord = this.verifiedSniffedChildrenByDb.get(dbPath);
+            if (!sniffRecord || sniffRecord.fileId !== mainState.fileId) {
+              sniffRecord = { fileId: mainState.fileId, stepCount: mainState.steps.length, children: new Set() };
+              if (this.verifiedSniffedChildrenByDb.size >= MAX_CACHED_CONVERSATIONS) {
+                const oldestSniffKey = this.verifiedSniffedChildrenByDb.keys().next().value;
+                if (oldestSniffKey !== undefined) this.verifiedSniffedChildrenByDb.delete(oldestSniffKey);
+              }
+            } else {
+              this.verifiedSniffedChildrenByDb.delete(dbPath);
+            }
+            sniffRecord.children.add(childId);
+            this.verifiedSniffedChildrenByDb.set(dbPath, sniffRecord);
           }
           totalSubagentSteps += childState.steps.length;
-          const recent = nowMs - Math.max(childState.mtimeMs, childState.walMtimeMs) <= ACTIVE_DB_RECENCY_MS;
+          const latestChildMtime = Math.max(childState.mtimeMs, childState.walMtimeMs);
+          const recent = nowMs - latestChildMtime <= ACTIVE_DB_RECENCY_MS;
           if (recent) {
             let childActive = false;
+            let childTurnTerminated = false;
             for (let idx = childState.steps.length - 1; idx >= 0; idx--) {
               const step = childState.steps[idx]!;
               if (step.stepType === 14) break;
-              if (step.stepType === 2 && step.status === 3) break;
+              if (step.stepType === 2 && (step.status === 3 || step.status === 5)) {
+                childTurnTerminated = true;
+                break;
+              }
+              if (idx === childState.steps.length - 1 && (step.status === 4 || step.status === 6 || step.status === 7)) {
+                childTurnTerminated = true;
+                break;
+              }
               if (ACTIVE_STEP_STATUSES.has(step.status)) {
                 childActive = true;
                 break;
               }
+            }
+            if (childActive) {
+              if (
+                this.recentActiveChildUntilByDb.size >= MAX_CACHED_CONVERSATIONS * 2 &&
+                !this.recentActiveChildUntilByDb.has(item.childDbPath)
+              ) {
+                const oldestActiveKey = this.recentActiveChildUntilByDb.keys().next().value;
+                if (oldestActiveKey !== undefined) this.recentActiveChildUntilByDb.delete(oldestActiveKey);
+              }
+              this.recentActiveChildUntilByDb.set(item.childDbPath, nowMs + 12_000);
+            } else if (!childTurnTerminated && childState.steps.length > 0) {
+              const holdUntil = this.recentActiveChildUntilByDb.get(item.childDbPath) ?? 0;
+              const childMidStepTransition =
+                nowMs - latestChildMtime <= 15_000 &&
+                (isSubagentRunning || hasActiveSubagentStep);
+              if (holdUntil > nowMs || childMidStepTransition) {
+                childActive = true;
+              }
+            } else if (childTurnTerminated) {
+              this.recentActiveChildUntilByDb.delete(item.childDbPath);
             }
             if (childActive) {
               activeChildSubagents++;
@@ -2631,12 +3153,21 @@ export class ConversationMetricsEngine {
               descendants.push(cStep);
             }
           }
+          for (const extraGen of childState.unmatchedUsageGenerations) {
+            childUnmatchedGenerations.push({
+              generation: extraGen.generation,
+              isChildStep: true,
+              timestampSeconds: extraGen.timestampSeconds,
+            });
+          }
           for (const nested of childState.childConversationIds) {
             pendingChildren.push({ childId: nested, parentId: childId, explicit: true, sniffed: false });
           }
         }
       }
-      combinedSteps = [...mainState.steps, ...descendants];
+      if (!mainState.fromErrorFallback && this.cache.has(dbPath)) {
+        this.setCachedState(dbPath, mainState);
+      }
     }
 
     const normalizedContextSteps =
@@ -2654,6 +3185,7 @@ export class ConversationMetricsEngine {
             return step;
           })
         : mainState.steps;
+    const combinedSteps = dbPathOverride ? normalizedContextSteps : [...normalizedContextSteps, ...descendants];
 
     const effectiveRunningSubagents = Math.max(runningSubagentCount, activeChildSubagents);
     const effectiveSubagentRunning = Boolean(isSubagentRunning || effectiveRunningSubagents > 0);
@@ -2686,6 +3218,14 @@ export class ConversationMetricsEngine {
       modelId,
       pricingTable,
       genMetadata: mainState.genMetadata,
+      extraUsageGenerations: [
+        ...mainState.unmatchedUsageGenerations.map(item => ({
+          generation: item.generation,
+          isChildStep: false,
+          timestampSeconds: item.timestampSeconds,
+        })),
+        ...(dbPathOverride ? [] : childUnmatchedGenerations),
+      ],
       contextSteps: normalizedContextSteps,
       steps: combinedSteps,
     });
@@ -2695,8 +3235,14 @@ export class ConversationMetricsEngine {
 
   public clearCache(): void {
     this.cache.clear();
+    this.verifiedSniffedChildrenByDb.clear();
+    this.recentActiveChildUntilByDb.clear();
+    this.coldSniffedByDb.clear();
+    this.rejectedSniffMtimeByKey.clear();
     this.sniffDirCache = null;
     this.sniffDirListCache = null;
+    this.sniffInFlight = null;
     this.cachedPricingTable = null;
+    this.pricingResolveInFlight = null;
   }
 }

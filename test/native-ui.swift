@@ -243,6 +243,10 @@ import Cocoa
                 policy.monitoredScopeChanged()
             }
             check(policy.strategyPopup.frame.width == policy.modelPopup.frame.width, "Policy popups must share uniform width")
+            check(policy.modelPopup.frame.width >= 150 && policy.modelPopup.frame.width <= 195, "Pro policy popups must tightly fit longest option without 220pt bloat (got \(policy.modelPopup.frame.width))")
+            check(policy.modelPopup.frame.width >= Design.fittedPopUpWidth(policy.modelPopup) - 0.5 && policy.strategyPopup.frame.width >= Design.fittedPopUpWidth(policy.strategyPopup) - 0.5, "Policy popups must never truncate longest option")
+            check((policy.window.contentView?.frame.height ?? 999) < 395, "Policy sheet content height must hug content instead of 436pt excess gap (got \(policy.window.contentView?.frame.height ?? -1))")
+            check(policy.fieldsCard.frame.height <= (groupStack(policy.fieldsCard)?.fittingSize.height ?? 0) + 34, "Policy fields card must not leave blank space below 候选准入下限 (cardH=\(policy.fieldsCard.frame.height), stackFitH=\(groupStack(policy.fieldsCard)?.fittingSize.height ?? 0))")
             var dynamicAccount = accounts[0]
             dynamicAccount["standaloneModels"] = [
                 ["key":"argon","displayName":"Gemini 4 Argon","availability":"available","quotaState":"known","period":"weekly","remaining":0.008],
@@ -297,7 +301,22 @@ import Cocoa
             maintSheet.cachePage.fetch(force: true); pump()
             maintSheet.sheet.contentView?.layoutSubtreeIfNeeded(); pump()
             check(maintSheet.sheet.frame.width == MaintenanceSheetController.sheetWidth, "Maintenance sheet must use compact 620pt width")
-            check(maintSheet.cachePage.retentionPopup.itemTitles == ["7 天前", "30 天前", "全部非活跃"], "Maintenance sheet must expose 3 inline retention window choices")
+            check(maintSheet.cachePage.retentionPopup.itemTitles == ["清理 7 天前", "清理 30 天前", "清理全部非活跃"], "Maintenance sheet must expose 3 inline retention window choices")
+            check(maintSheet.cachePage.retentionPopup.fittingSize.width <= 126 && maintSheet.cachePage.retentionPopup.fittingSize.width >= Design.fittedPopUpWidth(maintSheet.cachePage.retentionPopup) - 0.5, "Maintenance retentionPopup must tightly fit longest option without excess width (got \(maintSheet.cachePage.retentionPopup.fittingSize.width), expected ~\(Design.fittedPopUpWidth(maintSheet.cachePage.retentionPopup)))")
+            check(maintSheet.cachePage.historySubtitleLabel.stringValue.contains("保留近 7 天"), "Maintenance 7d retention must disclose 7-day preservation: \(maintSheet.cachePage.historySubtitleLabel.stringValue)")
+            maintSheet.cachePage.retentionPopup.selectItem(at: 1)
+            maintSheet.cachePage.retentionWindowChanged(); pump()
+            maintSheet.sheet.contentView?.layoutSubtreeIfNeeded()
+            check(maintSheet.cachePage.historySubtitleLabel.stringValue.contains("保留近 30 天"), "Maintenance 30d retention must dynamically disclose 30-day preservation: \(maintSheet.cachePage.historySubtitleLabel.stringValue)")
+            maintSheet.cachePage.retentionPopup.selectItem(at: 2)
+            maintSheet.cachePage.retentionWindowChanged(); pump()
+            maintSheet.sheet.contentView?.layoutSubtreeIfNeeded()
+            check(maintSheet.cachePage.historySubtitleLabel.stringValue.contains("清理所有非活跃对话"), "Maintenance 0d retention must dynamically explain all inactive cleanup: \(maintSheet.cachePage.historySubtitleLabel.stringValue)")
+            let zeroDayNatW = (maintSheet.cachePage.historySubtitleLabel.stringValue as NSString).size(withAttributes: [.font: maintSheet.cachePage.historySubtitleLabel.font!]).width
+            check(maintSheet.cachePage.historySubtitleLabel.bounds.width + 1.5 >= floor(zeroDayNatW), "Maintenance 0d historySubtitleLabel must not truncate (\(maintSheet.cachePage.historySubtitleLabel.stringValue)): \(maintSheet.cachePage.historySubtitleLabel.bounds.width) < \(zeroDayNatW)")
+            maintSheet.cachePage.retentionPopup.selectItem(at: 0)
+            maintSheet.cachePage.retentionWindowChanged(); pump()
+            maintSheet.sheet.contentView?.layoutSubtreeIfNeeded()
             check(maintSheet.cachePage.runtimeCacheSwitch.state == .on && maintSheet.cachePage.historyLogsSwitch.state == .off, "Maintenance default switches must enable runtime cache and keep history logs off")
             check(maintSheet.cachePage.selectedScopes == ["runtime_cache"], "Maintenance default selectedScopes must contain runtime_cache only")
             check(maintSheet.cachePage.clearButton.isEnabled && maintSheet.cachePage.clearButton.title == "一键清理", "Maintenance primary CTA must display 一键清理")
@@ -368,7 +387,7 @@ import Cocoa
         liveCache.historyInfoButton.performClick(nil); pump()
         check(liveCache.activePopoverKind == .history && liveCache.historyInfoButton.isActivePopover, "Clicking historyInfoButton must open history logs popover")
         let histPopTexts = allTextValues(liveCache.detailPopover!.contentViewController!.view)
-        check(histPopTexts.contains { $0.contains("早期后台运行日志明细") } && histPopTexts.contains("历史子智能体轨迹库") && histPopTexts.contains { $0.contains("账单保护") }, "History popover must disclose subagent DBs and billing archive guard: \(histPopTexts)")
+        check(histPopTexts.contains { $0.contains("后台运行日志明细") } && histPopTexts.contains("历史子智能体轨迹库") && histPopTexts.contains { $0.contains("账单保护") }, "History popover must disclose subagent DBs and billing archive guard: \(histPopTexts)")
         liveCache.recoveryTriggerView.performClick(nil); pump()
         check(liveCache.activePopoverKind == .snapshot && liveCache.recoveryTriggerView.isActivePopover, "Clicking recoveryTriggerView with restorable snapshot must open snapshot audit popover")
         let snapPopTexts = allTextValues(liveCache.detailPopover!.contentViewController!.view)
@@ -925,6 +944,21 @@ import Cocoa
             check(PillBadge.isNeutralOrInactiveTint(c, in: darkApp), "Neutral/inactive tint must be recognized in Dark mode")
         }
         check(!PillBadge.isNeutralOrInactiveTint(Design.blue, in: lightApp), "Active blue tint must not be treated as neutral/inactive")
+        for scale in [TierBadge.Scale.regular, .compact] {
+            check(scale.iconSize(for: .free) == 0, "FREE TierBadge must not reserve icon space for a bullseye")
+            check(scale.iconSize(for: .pro) > 0, "PRO TierBadge must retain single-sparkle icon space")
+            check(scale.iconSize(for: .ultra) > scale.iconSize(for: .pro), "ULTRA TierBadge must retain twin-sparkle icon space")
+            let freeBadge = TierBadge("FREE", scale: scale)
+            let proBadge = TierBadge("PRO", scale: scale)
+            freeBadge.frame = NSRect(origin: .zero, size: freeBadge.intrinsicContentSize)
+            freeBadge.layoutSubtreeIfNeeded()
+            if let freeLbl = freeBadge.subviews.compactMap({ $0 as? NSTextField }).first {
+                let leftGap = freeLbl.frame.minX
+                let rightGap = freeBadge.bounds.width - freeLbl.frame.maxX
+                check(abs(leftGap - rightGap) <= 1.0, "FREE TierBadge text must sit symmetrically centered without leading bullseye offset (left=\(leftGap), right=\(rightGap))")
+            }
+            check(proBadge.intrinsicContentSize.width > 0 && freeBadge.intrinsicContentSize.width > 0, "TierBadge intrinsic width must be positive")
+        }
 
         // Capture Overview in idle (0 active models, 0 hourly tokens) to verify unified inactive capsules
         assistant.selectPage(0); window.setFrame(NSRect(origin: window.frame.origin, size: NSSize(width: 960, height: 640)), display: true); pump()
@@ -1016,6 +1050,8 @@ import Cocoa
         check(stableSettings.languagePopup.isEnabled == true, "languagePopup must be enabled for supported Antigravity")
         check((stableSettings.hudSwitch as AnyObject) is DesignSwitch && (stableAccounts.autoSwitchToggle as AnyObject) is DesignSwitch, "Switches must use DesignSwitch to stay blue when window is unfocused")
         check(stableSettings.languagePopup.cell is DesignPopUpCell, "languagePopup must use DesignPopUpCell")
+        check(stableSettings.languagePopup.fittingSize.width <= 110 && stableSettings.languagePopup.fittingSize.width >= Design.fittedPopUpWidth(stableSettings.languagePopup) - 0.5, "Chinese languagePopup must tightly fit longest option (got \(stableSettings.languagePopup.fittingSize.width))")
+        check(stableSettings.refresh.fittingSize.width <= 112 && stableSettings.refresh.fittingSize.width >= Design.fittedPopUpWidth(stableSettings.refresh) - 0.5, "Chinese refresh popup must tightly fit longest option (got \(stableSettings.refresh.fittingSize.width))")
         check(stableSettings.languagePopup.itemArray.compactMap { $0.representedObject as? String } == ["system", "zh-Hans", "en"], "languagePopup must expose system, zh-Hans, and en options")
         check((stableSettings.languagePopup.selectedItem?.representedObject as? String) == "zh-Hans", "languagePopup must select zh-Hans when configuredLanguage=zh-Hans")
         check(stableSettings.languagePopup.toolTip == nil && stableSettings.hudSwitch.toolTip == nil, "Settings language/hud controls must not display hover tooltips")
@@ -1099,6 +1135,8 @@ import Cocoa
         assistant.selectPage(3); pump()
         let enSettings = assistant.preferencesController!
         check((enSettings.languagePopup.selectedItem?.representedObject as? String) == "en", "English Settings languagePopup must select en")
+        check(enSettings.languagePopup.fittingSize.width <= 136 && enSettings.languagePopup.fittingSize.width >= Design.fittedPopUpWidth(enSettings.languagePopup) - 0.5, "English languagePopup must tightly fit longest option (got \(enSettings.languagePopup.fittingSize.width))")
+        check(enSettings.refresh.fittingSize.width <= 128 && enSettings.refresh.fittingSize.width >= Design.fittedPopUpWidth(enSettings.refresh) - 0.5, "English refresh popup must tightly fit longest option (got \(enSettings.refresh.fittingSize.width))")
         let hanPattern = "[\\u4E00-\\u9FFF]"
         let allowedNativeNames = Set(L10n.shared.supportedLocales.map(\.nativeName))
         let localizedViews: [(String, NSView)] = [("Settings", enSettings.view!), ("About", assistant.aboutPage!.view)]
@@ -1309,6 +1347,7 @@ import Cocoa
                 "pricingStatus": ["gemini-3.8-flash": "confirmed", "gemini-4-hydrogen": "confirmed"],
             ])
             check(pricingSheet.sheet.contentView != nil, "PricingSyncSheetController must populate native sheet view")
+            check(hasNonEmptyTooltip(pricingSheet.sheet.contentView!) == nil, "PricingSyncSheetController must have zero hover tooltips even with sourceUrl")
             func allPricingButtons(_ v: NSView) -> [NSButton] { (v as? NSButton).map { [$0] } ?? v.subviews.flatMap { allPricingButtons($0) } }
             check(!allPricingButtons(pricingSheet.sheet.contentView!).contains { $0.title == "复制价格表" }, "PricingSyncSheetController must remove 复制价格表 button")
             check(pricingSheet.closeBtn.title == "完成", "PricingSyncSheetController exit button must be titled 完成")
@@ -1328,6 +1367,98 @@ import Cocoa
             ])
             check(!pricingSheet.subtitleLabel.isHidden && pricingSheet.subtitleLabel.stringValue == "检查提示：offline", "PricingSyncSheetController must show concise failure reason without unit suffix")
             check(pricingSheet.summaryPill.title.hasSuffix("· 1 款"), "PricingSyncSheetController pill must display failed check time and active count: \(pricingSheet.summaryPill.title)")
+
+            // Real-time active / tier-aware / unpriced live / collapsible retired section assertions (zh-Hans)
+            let tierPricingPayload: [String: Any] = [
+                "synced": true,
+                "version": "2026-11-16",
+                "status": ["lastCheckAt": 1794539910722.0, "modelCount": 6],
+                "unpricedLiveModels": [
+                    ["key": "gemini-4.5-live", "displayName": "Gemini 4.5 Live", "disabled": false],
+                    ["key": "gemini-4.5-locked", "displayName": "Gemini 4.5 Locked", "disabled": true]
+                ],
+                "prices": [
+                    "gemini-4-other": ["input": 1.2, "output": 6.0, "cached": 0.12],
+                    "gemini-4-carbon": ["input": 2.0, "output": 10.0, "cached": 0.2],
+                    "gemini-4-argon": ["input": 1.5, "output": 7.5, "cached": 0.15],
+                    "gemini-3.8-flash": ["input": 0.75, "output": 3.75, "cached": 0.075]
+                ],
+                "retiredPrices": [
+                    "gemini-2.5-pro": ["input": 1.25, "output": 10.0, "cached": 0.31],
+                    "claude-3.5-sonnet": ["input": 3.0, "output": 15.0, "cached": 0.3]
+                ],
+                "pricingStatus": [
+                    "gemini-3.8-flash": "confirmed",
+                    "gemini-4-argon": "confirmed",
+                    "gemini-4-carbon": "confirmed",
+                    "gemini-4-other": "confirmed",
+                    "gemini-2.5-pro": "historical",
+                    "claude-3.5-sonnet": "confirmed"
+                ],
+                "modelCatalogState": [
+                    "gemini-4.5-live": ["availability": "unpriced_live", "displayName": "Gemini 4.5 Live"],
+                    "gemini-4.5-locked": ["availability": "unpriced_live", "displayName": "Gemini 4.5 Locked"],
+                    "gemini-3.8-flash": ["availability": "available", "displayName": "Gemini 3.8 Flash", "activeTier": "PRO"],
+                    "gemini-4-argon": ["availability": "tier_locked", "displayName": "Gemini 4 Argon", "activeTier": "FREE"],
+                    "gemini-4-carbon": ["availability": "other_tier_only", "displayName": "Gemini 4 Carbon", "availableInTiers": ["ULTRA"], "activeTier": "PRO"],
+                    "gemini-4-other": ["availability": "other_tier_only", "displayName": "Gemini 4 Other", "availableInTiers": []],
+                    "gemini-2.5-pro": ["availability": "retired", "displayName": "Gemini 2.5 Pro"],
+                    "claude-3.5-sonnet": ["availability": "retired", "displayName": "Claude 3.5 Sonnet"]
+                ]
+            ]
+            pricingSheet.retiredExpanded = true
+            pricingSheet.show(in: testParentWindow, payload: tierPricingPayload)
+            pump()
+            check(pricingSheet.retiredExpanded == false, "PricingSyncSheetController.show must reset retiredExpanded to false")
+            check(pricingSheet.summaryPill.title.hasSuffix("· 6 款"), "summaryPill must count only active + unpriced live (6), excluding retired: \(pricingSheet.summaryPill.title)")
+            check(pricingSheet.renderedSummaryLines.count == 6, "renderedSummaryLines must contain 6 active/unpriced entries (got \(pricingSheet.renderedSummaryLines.count))")
+            check(pricingSheet.renderedSummaryLines[0].contains("gemini-4.5-live [新上线 · 待同步费率]"), "First card must be unpriced live model: \(pricingSheet.renderedSummaryLines)")
+            check(pricingSheet.renderedSummaryLines[1].contains("gemini-4.5-locked [新上线 · 待同步费率]") && pricingSheet.renderedSummaryLines[1].contains("当前套餐未解锁"), "Disabled unpriced live model must include tier_locked badge")
+            check(pricingSheet.renderedSummaryLines[2].hasPrefix("gemini-3.8-flash [已核对]"), "Available rank must precede tier_locked: \(pricingSheet.renderedSummaryLines)")
+            check(pricingSheet.renderedSummaryLines[3].hasPrefix("gemini-4-argon [已核对]") && pricingSheet.renderedSummaryLines[3].contains("当前套餐未解锁"), "tier_locked rank must follow available")
+            check(pricingSheet.renderedSummaryLines[4].hasPrefix("gemini-4-carbon [已核对]") && pricingSheet.renderedSummaryLines[4].contains("其他套餐可用 (ULTRA)"), "other_tier_only must sort alphabetically and include named tiers")
+            check(pricingSheet.renderedSummaryLines[5].hasPrefix("gemini-4-other [已核对]") && pricingSheet.renderedSummaryLines[5].contains("其他套餐可用"), "other_tier_only with empty availableInTiers must use generic badge")
+            check(!pricingSheet.renderedSummaryLines.contains { $0.contains("gemini-2.5-pro") || $0.contains("claude-3.5-sonnet") }, "retiredPrices must be absent from renderedSummaryLines")
+            check(pricingSheet.retiredToggleBtn?.isBordered == false && pricingSheet.retiredToggleBtn?.title == "▸ 已下架模型（2 款 · 仅用于历史账单核算）", "Collapsed retiredToggleBtn must show collapsed count title: \(pricingSheet.retiredToggleBtn?.title ?? "nil")")
+            check(pricingSheet.retiredListStack?.isHidden == true, "retiredListStack must be hidden by default")
+            check(pricingSheet.renderedRetiredSummaryLines.count == 2 && pricingSheet.renderedRetiredSummaryLines[0].contains("claude-3.5-sonnet [已核对]") && pricingSheet.renderedRetiredSummaryLines[1].contains("gemini-2.5-pro [历史基准]"), "renderedRetiredSummaryLines must track retired models sorted by key")
+            let visibleSheetTexts = allTextValues(pricingSheet.sheet.contentView!)
+            check(visibleSheetTexts.contains("Gemini 4 Argon") && visibleSheetTexts.contains("Gemini 4.5 Live") && visibleSheetTexts.contains("已在 Antigravity 检测到该模型，等待公开价格表补充单价"), "Sheet must render displayName and unpriced live description")
+            func findPricingScrollView(_ v: NSView) -> NSScrollView? {
+                if let sv = v as? NSScrollView { return sv }
+                for sub in v.subviews { if let found = findPricingScrollView(sub) { return found } }
+                return nil
+            }
+            var preExpandScrollY: CGFloat?
+            if let sv = findPricingScrollView(pricingSheet.sheet.contentView!) {
+                let docH = sv.documentView?.bounds.height ?? 0
+                let clipH = sv.contentView.bounds.height
+                let targetY = min(30.0, max(0.0, docH - clipH))
+                sv.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+                sv.reflectScrolledClipView(sv.contentView)
+                preExpandScrollY = sv.contentView.bounds.origin.y
+            }
+            pricingSheet.retiredToggleBtn?.performClick(nil); pump()
+            check(pricingSheet.retiredExpanded == true && pricingSheet.retiredListStack?.isHidden == false, "Clicking retiredToggleBtn must expand retiredListStack")
+            check(pricingSheet.retiredToggleBtn?.title == "▾ 已下架模型（2 款 · 仅用于历史账单核算）", "Expanded retiredToggleBtn must show expanded count title: \(pricingSheet.retiredToggleBtn?.title ?? "nil")")
+            if let beforeY = preExpandScrollY, let sv = findPricingScrollView(pricingSheet.sheet.contentView!) {
+                let afterY = sv.contentView.bounds.origin.y
+                check(abs(afterY - beforeY) <= 1.0, "Expanding retired section must not jump scroll to bottom (before=\(beforeY), after=\(afterY))")
+            }
+            pricingSheet.retiredToggleBtn?.performClick(nil); pump()
+            check(pricingSheet.retiredExpanded == false && pricingSheet.retiredListStack?.isHidden == true, "Clicking retiredToggleBtn again must collapse retiredListStack")
+            pricingSheet.closeSheet(); pump()
+
+            // Retired-only payload must show toggle button without empty-state message
+            pricingSheet.apply(payload: [
+                "synced": true,
+                "prices": [:],
+                "retiredPrices": ["gemini-2.5-pro": ["input": 1.25, "output": 10.0, "cached": 0.31]],
+                "pricingStatus": ["gemini-2.5-pro": "historical"],
+                "modelCatalogState": ["gemini-2.5-pro": ["availability": "retired", "displayName": "Gemini 2.5 Pro"]],
+                "status": ["modelCount": 0]
+            ])
+            check(pricingSheet.retiredToggleBtn != nil && !allTextValues(pricingSheet.sheet.contentView!).contains("暂无可用的模型价格基准记录"), "Retired-only payload must not show empty-state label")
             var checks = 0
             let manager = isolated.updateManager
             manager.checkTransport = { request, completion in
@@ -1690,6 +1821,56 @@ import Cocoa
                 targetCache.dismissDetailPopover()
             }
 
+            // English pricing sheet localization & live language switch coverage
+            let enPricingHost = Assistant(state: state.appendingPathComponent("en-pricing-sheet"))
+            enPricingHost.configuration = try ConfigurationStore(state: enPricingHost.state)
+            enPricingHost.bridge = BackendBridge(resources: state, state: enPricingHost.state)
+            let enPricingPayload: [String: Any] = [
+                "synced": true,
+                "status": ["lastCheckAt": 1794539910722.0, "modelCount": 4],
+                "unpricedLiveModels": [
+                    ["key": "gemini-4.5-live", "displayName": "Gemini 4.5 Live", "disabled": false]
+                ],
+                "prices": [
+                    "gemini-3.8-flash": ["input": 0.75, "output": 3.75, "cached": 0.075],
+                    "gemini-4-argon": ["input": 1.5, "output": 7.5, "cached": 0.15],
+                    "gemini-4-carbon": ["input": 2.0, "output": 10.0, "cached": 0.2]
+                ],
+                "retiredPrices": [
+                    "claude-3.5-sonnet": ["input": 3.0, "output": 15.0, "cached": 0.3],
+                    "gemini-2.5-pro": ["input": 1.25, "output": 10.0, "cached": 0.31]
+                ],
+                "pricingStatus": [
+                    "gemini-3.8-flash": "confirmed",
+                    "gemini-4-argon": "confirmed",
+                    "gemini-4-carbon": "confirmed",
+                    "claude-3.5-sonnet": "confirmed",
+                    "gemini-2.5-pro": "historical"
+                ],
+                "modelCatalogState": [
+                    "gemini-4.5-live": ["availability": "unpriced_live", "displayName": "Gemini 4.5 Live"],
+                    "gemini-3.8-flash": ["availability": "available", "displayName": "Gemini 3.8 Flash"],
+                    "gemini-4-argon": ["availability": "tier_locked", "displayName": "Gemini 4 Argon"],
+                    "gemini-4-carbon": ["availability": "other_tier_only", "displayName": "Gemini 4 Carbon", "availableInTiers": ["ULTRA"]],
+                    "claude-3.5-sonnet": ["availability": "retired", "displayName": "Claude 3.5 Sonnet"],
+                    "gemini-2.5-pro": ["availability": "retired", "displayName": "Gemini 2.5 Pro"]
+                ]
+            ]
+            assistant.setGlobalLanguage("zh-Hans"); pump()
+            let enPricingSheet = PricingSyncSheetController(app: enPricingHost)
+            enPricingSheet.show(in: window, payload: enPricingPayload)
+            pump()
+            check(enPricingSheet.retiredToggleBtn?.title == "▸ 已下架模型（2 款 · 仅用于历史账单核算）", "Live switch test starts in zh-Hans before switching to en")
+            assistant.setGlobalLanguage("en"); pump()
+            check(enPricingSheet.retiredToggleBtn?.title == "▸ Deprecated Models (2 · Historical Ledger Only)", "Live setGlobalLanguage(\"en\") must localize collapsed toggle title: \(enPricingSheet.retiredToggleBtn?.title ?? "nil")")
+            enPricingSheet.retiredToggleBtn?.performClick(nil); pump()
+            check(enPricingSheet.retiredToggleBtn?.title == "▾ Deprecated Models (2 · Historical Ledger Only)", "Expanded English toggle title must match spec: \(enPricingSheet.retiredToggleBtn?.title ?? "nil")")
+            let enPricingTexts = allTextValues(enPricingSheet.sheet.contentView!)
+            check(enPricingTexts.contains("New · Rate Pending") && enPricingTexts.contains("Locked on Current Plan") && enPricingTexts.contains("Active on ULTRA") && enPricingTexts.contains("Deprecated") && enPricingTexts.contains("Detected in Antigravity; awaiting public pricing feed rate"), "English pricing sheet must localize all new badges and descriptions: \(enPricingTexts)")
+            let enPricingCjkLeaks = enPricingTexts.filter { $0.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) != nil }
+            check(enPricingCjkLeaks.isEmpty, "English pricing sheet must not leak Chinese characters: \(enPricingCjkLeaks)")
+            enPricingSheet.closeSheet(); pump()
+
             assistant.setGlobalLanguage("zh-Hans"); pump()
 
             // Dynamic per-tier quotaGroups across Overview, Accounts, MenuPanel, and ModelIcons
@@ -1946,8 +2127,12 @@ import Cocoa
             dynAccountsPage.fetchPolicy(); pump()
             check(dynAccountsPage.policySubtitleLabel.stringValue == "监测 Gemini · 剩余 ≤ 10% 时推荐候选（≥ 30%）", "Ultra active account must display pooled Gemini summary even if saved policy says argon")
             let ultraScopedPolicy = AccountPolicySheet(app: dynAccountsHost, config: ["strategy": "priority", "monitored_model": "argon", "reserve_percentage": 10, "candidate_min_percentage": 30], saved: {})
+            ultraScopedPolicy.window.contentView?.layoutSubtreeIfNeeded()
             check((ultraScopedPolicy.modelPopup.menu?.items ?? []).filter { !$0.isSeparatorItem }.map(\.title) == ["全部可用模型", "Gemini", "Claude/GPT"], "Ultra active account policy popup must not leak standby Pro account's Gemini 4 Argon")
             check(ultraScopedPolicy.modelPopup.selectedItem?.title == "Gemini", "Ultra active account policy popup must remap argon selection to Gemini")
+            check(ultraScopedPolicy.strategyPopup.frame.width == ultraScopedPolicy.modelPopup.frame.width, "Ultra policy popups must share uniform width")
+            check(ultraScopedPolicy.modelPopup.frame.width <= 130 && ultraScopedPolicy.modelPopup.frame.width >= Design.fittedPopUpWidth(ultraScopedPolicy.modelPopup) - 0.5, "Ultra policy popups must shrink tightly to longest option without 220pt bloat (got \(ultraScopedPolicy.modelPopup.frame.width))")
+            check((ultraScopedPolicy.window.contentView?.frame.height ?? 999) < 395 && ultraScopedPolicy.fieldsCard.frame.height <= (groupStack(ultraScopedPolicy.fieldsCard)?.fittingSize.height ?? 0) + 34, "Ultra policy sheet must hug content without bottom blank space (contentH=\(ultraScopedPolicy.window.contentView?.frame.height ?? -1), cardH=\(ultraScopedPolicy.fieldsCard.frame.height))")
             check(ultraScopedPolicy.monitoredSubLabel.stringValue == "Ultra 套餐已将 Argon 与 Carbon 并入此共享池，一并监测", "Ultra policy popup explains Argon/Carbon inclusion")
             if let ultraCardBox = dynAccountsPage.cardsStack.arrangedSubviews.first {
                 let ultraExpandedTexts = allTextValues(ultraCardBox)

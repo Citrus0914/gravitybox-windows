@@ -15,6 +15,7 @@ env:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   pricing-audit:
@@ -43,18 +44,45 @@ jobs:
           node --test \
             test/pricing-contracts.test.mjs \
             test/pricing-intervals.test.mjs \
-            test/pricing-tiers-and-merge.test.mjs
+            test/pricing-tiers-and-merge.test.mjs \
+            test/pricing-catalog-sync.test.mjs
 
-      - name: Audit Expiring Promotional Intervals & Source Reachability
+      - name: Audit Promotional Horizons, Official Sources & Structured Rate Drift
+        id: audit
         shell: bash
         run: |
           node --input-type=module -e '
-            import { readFile } from "node:fs/promises";
+            import { appendFile, readFile, writeFile } from "node:fs/promises";
             const catalog = JSON.parse(await readFile("assets/model-catalog.json", "utf8"));
             const nowMs = Date.now();
             const warnHorizonMs = 14 * 24 * 60 * 60 * 1000;
             const expiring = [];
             const sources = new Set();
+
+            const VENDOR_CONTENT_ANCHORS = [
+              { match: /cloud\.google\.com|ai\.google\.dev/i, anchor: /gemini|token|pricing/i, vendor: "Google" },
+              { match: /anthropic\.com/i, anchor: /claude|million\s+tokens|mtok|pricing/i, vendor: "Anthropic" },
+              { match: /openai\.com/i, anchor: /gpt|token|pricing/i, vendor: "OpenAI" },
+            ];
+
+            function resolveCurrentRate(entry) {
+              if (Array.isArray(entry)) {
+                return entry.find(iv => {
+                  const f = iv?.validFrom ? Date.parse(iv.validFrom) : -Infinity;
+                  const u = iv?.validUntil ? Date.parse(iv.validUntil) : Infinity;
+                  return nowMs >= f && nowMs < u;
+                }) ?? entry[entry.length - 1];
+              }
+              if (Array.isArray(entry?.intervals) && entry.intervals.length > 0) {
+                const matched = entry.intervals.find(iv => {
+                  const f = iv?.validFrom ? Date.parse(iv.validFrom) : -Infinity;
+                  const u = iv?.validUntil ? Date.parse(iv.validUntil) : Infinity;
+                  return nowMs >= f && nowMs < u;
+                });
+                if (matched) return matched;
+              }
+              return entry;
+            }
 
             for (const [key, entry] of Object.entries(catalog.prices ?? {})) {
               const items = Array.isArray(entry) ? entry : [entry, ...(entry.intervals ?? [])];
@@ -79,17 +107,190 @@ jobs:
               console.log(`::warning file=assets/model-catalog.json::Model ${item.key} has validUntil=${item.validUntil} without an open-ended successor interval.`);
             }
 
+            const probeRows = [];
+            const pageAlerts = [];
             for (const url of sources) {
+              const rule = VENDOR_CONTENT_ANCHORS.find(r => r.match.test(url));
+              const vendor = rule?.vendor ?? "Upstream";
               try {
                 const res = await fetch(url, {
-                  method: "HEAD",
+                  method: "GET",
                   redirect: "follow",
-                  signal: AbortSignal.timeout(8000),
+                  headers: {
+                    "User-Agent": "GravityBox-PricingWatch/1.1 (+https://github.com/Enzoo404/gravitybox)",
+                    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+                  },
+                  signal: AbortSignal.timeout(10000),
                 });
-                console.log(`[source-probe] ${res.status} ${url}`);
+                const body = res.ok ? await res.text() : "";
+                const anchorMatched = !rule ? res.ok : (res.ok && rule.anchor.test(body));
+                if (!res.ok) {
+                  console.log(`::warning::[${vendor}] Official pricing source returned HTTP ${res.status}: ${url}`);
+                  pageAlerts.push(`[${vendor}] HTTP ${res.status}: ${url}`);
+                } else if (!anchorMatched) {
+                  console.log(`::warning::[${vendor}] Official pricing page structure changed (expected pricing anchor missing): ${url}`);
+                  pageAlerts.push(`[${vendor}] Anchor missing: ${url}`);
+                }
+                console.log(`[source-probe] ${res.status} anchor=${anchorMatched ? "ok" : "missing"} ${url}`);
+                probeRows.push(`| ${vendor} | \`${res.status}\` | ${anchorMatched ? "Anchored" : "Drift / Check"} | ${url} |`);
               } catch (err) {
-                console.log(`::notice::Upstream source probe skipped/unreachable for ${url}: ${err?.message ?? err}`);
+                const reason = err?.message ?? String(err);
+                console.log(`::notice::Upstream source probe skipped/unreachable for ${url}: ${reason}`);
+                probeRows.push(`| ${vendor} | \`ERR\` | Unreachable | ${url} |`);
               }
             }
-            console.log(`Audited ${Object.keys(catalog.prices ?? {}).length} priced models across ${sources.size} official pricing URLs.`);
+
+            // Structured machine-readable rate signal cross-check (LiteLLM + OpenRouter public model feeds)
+            const upstreamRates = new Map();
+            try {
+              const litellmRes = await fetch(
+                "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+                { signal: AbortSignal.timeout(12000) }
+              );
+              if (litellmRes.ok) {
+                const data = await litellmRes.json();
+                for (const [rawKey, spec] of Object.entries(data ?? {})) {
+                  if (!spec || typeof spec !== "object") continue;
+                  const cleanKey = rawKey.replace(/^(?:vertex_ai|gemini|anthropic|openai)\//i, "").toLowerCase();
+                  const inPerM = Number(spec.input_cost_per_token) * 1_000_000;
+                  const outPerM = Number(spec.output_cost_per_token) * 1_000_000;
+                  if (Number.isFinite(inPerM) && inPerM > 0 && Number.isFinite(outPerM) && outPerM > 0 && !upstreamRates.has(cleanKey)) {
+                    upstreamRates.set(cleanKey, { input: Math.round(inPerM * 1e4) / 1e4, output: Math.round(outPerM * 1e4) / 1e4, source: "litellm" });
+                  }
+                }
+              }
+            } catch (err) {
+              console.log(`::notice::LiteLLM structured feed unreachable: ${err?.message ?? err}`);
+            }
+
+            try {
+              const orRes = await fetch("https://openrouter.ai/api/v1/models", { signal: AbortSignal.timeout(12000) });
+              if (orRes.ok) {
+                const payload = await orRes.json();
+                for (const item of payload?.data ?? []) {
+                  const id = String(item?.id ?? "").replace(/^(?:google|anthropic|openai)\//i, "").toLowerCase();
+                  const inPerM = Number(item?.pricing?.prompt) * 1_000_000;
+                  const outPerM = Number(item?.pricing?.completion) * 1_000_000;
+                  if (id && Number.isFinite(inPerM) && inPerM > 0 && Number.isFinite(outPerM) && outPerM > 0 && !upstreamRates.has(id)) {
+                    upstreamRates.set(id, { input: Math.round(inPerM * 1e4) / 1e4, output: Math.round(outPerM * 1e4) / 1e4, source: "openrouter" });
+                  }
+                }
+              }
+            } catch (err) {
+              console.log(`::notice::OpenRouter structured feed unreachable: ${err?.message ?? err}`);
+            }
+
+            const rateDrifts = [];
+            const activeSet = new Set(catalog.activeModels ?? Object.keys(catalog.prices ?? {}));
+            for (const key of activeSet) {
+              const entry = catalog.prices?.[key];
+              if (!entry) continue;
+              const local = resolveCurrentRate(entry);
+              const upstream = upstreamRates.get(key.toLowerCase());
+              if (!local || !upstream) continue;
+              const inDiff = Math.abs(local.input - upstream.input) / Math.max(0.01, local.input);
+              const outDiff = Math.abs(local.output - upstream.output) / Math.max(0.01, local.output);
+              if (inDiff > 0.02 || outDiff > 0.02) {
+                rateDrifts.push({
+                  key,
+                  localIn: local.input,
+                  localOut: local.output,
+                  upIn: upstream.input,
+                  upOut: upstream.output,
+                  source: upstream.source,
+                });
+                console.log(`::warning file=assets/model-catalog.json::Rate drift detected for ${key}: catalog ($${local.input}/$${local.output}) vs ${upstream.source} ($${upstream.upIn ?? upstream.input}/$${upstream.upOut ?? upstream.output}).`);
+              }
+            }
+
+            const driftRows = rateDrifts.map(
+              d => `| \`${d.key}\` | $${d.localIn} / $${d.localOut} | $${d.upIn} / $${d.upOut} | ${d.source} |`
+            );
+
+            const summaryLines = [
+              "### Pricing Watch Audit Summary",
+              "",
+              `- **Priced catalog models**: ${Object.keys(catalog.prices ?? {}).length}`,
+              `- **Upstream structured models indexed**: ${upstreamRates.size}`,
+              `- **Expiring promotional intervals (<=14d without successor)**: ${expiring.length}`,
+              `- **Structured rate drifts (>2%)**: ${rateDrifts.length}`,
+              "",
+              "| Vendor | HTTP | Content Anchor | Source URL |",
+              "| :--- | :--- | :--- | :--- |",
+              ...probeRows,
+              "",
+              ...(driftRows.length > 0
+                ? [
+                    "#### Detected Rate Drift Signals",
+                    "",
+                    "| Model Key | Catalog (In / Out per 1M) | Upstream Signal (In / Out per 1M) | Signal Source |",
+                    "| :--- | :--- | :--- | :--- |",
+                    ...driftRows,
+                    "",
+                  ]
+                : []),
+              ...(expiring.length > 0
+                ? [
+                    "#### Expiring Promotional Intervals",
+                    "",
+                    ...expiring.map(e => `- \`${e.key}\`: validUntil \`${e.validUntil}\``),
+                    "",
+                  ]
+                : []),
+            ];
+
+            if (process.env.GITHUB_STEP_SUMMARY) {
+              await appendFile(process.env.GITHUB_STEP_SUMMARY, summaryLines.join("\n") + "\n", "utf8");
+            }
+
+            const hasAlert = expiring.length > 0 || rateDrifts.length > 0;
+            await writeFile(
+              "pricing-watch-alert.json",
+              JSON.stringify({ hasAlert, expiring, rateDrifts, pageAlerts, summaryMarkdown: summaryLines.join("\n") }, null, 2),
+              "utf8"
+            );
+            if (process.env.GITHUB_OUTPUT) {
+              await appendFile(process.env.GITHUB_OUTPUT, `has_alert=${hasAlert ? "true" : "false"}\n`, "utf8");
+            }
+
+            console.log(`Audited ${Object.keys(catalog.prices ?? {}).length} priced models (${rateDrifts.length} rate drifts, ${expiring.length} expiring intervals).`);
           '
+
+      - name: Open or Update Pricing Drift Alert Issue
+        if: steps.audit.outputs.has_alert == 'true' && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('pricing-watch-alert.json', 'utf8'));
+            const title = '[Pricing Watch] Upstream model rate drift or promotional expiry detected';
+            const body = [
+              'Automated weekly pricing watch detected model rate drift or upcoming promotional interval expiration.',
+              '',
+              report.summaryMarkdown,
+              '',
+              'Please verify against official vendor pricing pages and run `node tools/sync-pricing-feed.mjs --write` after updating `assets/model-catalog.json`.',
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 30,
+            });
+            const match = existing.data.find(issue => issue.title === title);
+            if (match) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: match.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+            }

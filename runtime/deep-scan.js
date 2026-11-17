@@ -7,6 +7,7 @@
   const blocked='script,style,[data-gravitybox-protect],[data-message-id],[data-message-author-role],[data-testid*="conversation-row"],[data-testid*="message"],[data-testid="project-header"],.gravitybox-project-name,.markdown,.prose,pre,code,.monaco-editor,.xterm';
   const ids=['history','marketplace','installed','settings-open','settings-general','settings-app','settings-appearance','settings-models','settings-shortcuts','settings-close','automations','model-open','model-usage','model-close'];
   const text=e=>(e?.getAttribute('aria-label')||e?.textContent||'').replace(/\s+/g,' ').trim();
+  const foldKey=s=>String(s).toLowerCase().replace(/[\u2018\u2019]/g,"'");
   let cachedDictSource=null,foldedDictEntries=new Map();
   const lookupDict=name=>{
     const entries=globalThis.__GRAVITYBOX_BOOT__?.dictionary?.entries;
@@ -14,12 +15,16 @@
     if(entries[name]!==undefined)return entries[name];
     if(entries!==cachedDictSource){
       cachedDictSource=entries;
-      foldedDictEntries=new Map(Object.entries(entries).map(([k,v])=>[k.toLowerCase(),v]));
+      foldedDictEntries=new Map(Object.entries(entries).map(([k,v])=>[foldKey(k),v]));
     }
-    return foldedDictEntries.get(name.toLowerCase());
+    return foldedDictEntries.get(foldKey(name));
   };
   const namesFor=names=>[...new Set(names.flatMap(name=>[name,lookupDict(name)]).filter(value=>typeof value==='string'))];
-  const isEn=()=>String(engine.getLanguageMode?.()||globalThis.__GRAVITYBOX_BOOT__?.locale||'zh').toLowerCase().startsWith('en');
+  const isEn=()=>{
+    const bootLoc=globalThis.__GRAVITYBOX_BOOT__?.locale;
+    if(typeof bootLoc==='string'&&bootLoc.trim())return bootLoc.trim().toLowerCase().startsWith('en');
+    return String(engine.getLanguageMode?.()||'zh').toLowerCase().startsWith('en');
+  };
   const msg=(zh,en)=>isEn()?en:zh;
   const visible=e=>!!e?.getClientRects().length&&getComputedStyle(e).visibility!=='hidden';
   const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -80,7 +85,7 @@
     const paths={history:'/history',marketplace:'/customizations',installed:'/customizations/installed'};
     if(paths[id])return location.pathname===paths[id];
     if(id==='settings-open')return settingsVisible();
-    if(id.startsWith('settings-')){const patterns={'settings-general':/^(General|通用)$/,'settings-app':/^(Application|应用设置)$/,'settings-appearance':/^(Appearance|外观)$/,'settings-models':/Models.*Usage|模型与(?:用量|使用量)/i,'settings-shortcuts':/Keyboard|Keybindings|快捷键/};return settingsVisible()&&[...document.querySelectorAll('h2,[role="heading"][aria-level="2"]')].some(e=>visible(e)&&patterns[id]?.test(text(e)));}
+    if(id.startsWith('settings-')){const patterns={'settings-general':/^(General|通用)$/,'settings-app':/^(App|Application|应用|应用设置)$/,'settings-appearance':/^(Appearance|外观)$/,'settings-models':/Models.*Usage|模型与(?:用量|使用量)/i,'settings-shortcuts':/Keyboard|Keybindings|快捷键/i};return settingsVisible()&&[...document.querySelectorAll('h2,[role="heading"][aria-level="2"]')].some(e=>visible(e)&&patterns[id]?.test(text(e)));}
     if(id==='automations')return [...document.querySelectorAll('h1,[role="heading"]')].some(e=>visible(e)&&['Automations','自动化'].includes(text(e)));
     if(id==='model-open')return visible(document.querySelector('[data-testid="model-selector-panel"]'));
     if(id==='model-usage')return /Weekly Limit Remaining|每周剩余限额/.test(document.querySelector('[data-testid="model-selector-panel"]')?.textContent??'');
@@ -132,7 +137,7 @@
       else if(id==='settings-close'){const ok=await closeSettings();if(ok)current.settingsOwned=false;return{ok,message:ok?msg('设置已关闭','Settings closed'):msg('设置关闭入口不可用','Settings close control unavailable')};}
       else if(id.startsWith('settings-')){
         if(!current.settingsOwned||!settingsVisible())return{ok:false,message:msg('设置未打开，已跳过','Settings not open; skipped')};
-        const labels={'settings-general':['General','通用'],'settings-app':['Application','应用设置'],'settings-appearance':['Appearance','外观'],'settings-models':['Models','模型','驱动模型','模型与用量'],'settings-shortcuts':['Keyboard Shortcuts','Keybindings','快捷键']}[id];
+        const labels={'settings-general':['General','通用'],'settings-app':['App','Application','应用','应用设置'],'settings-appearance':['Appearance','外观'],'settings-models':['Models','Models & Usage','模型','模型与使用量','模型与用量','驱动模型'],'settings-shortcuts':['Keyboard Shortcuts','Keyboard shortcuts','Keybindings','快捷键','键盘快捷键','键盘快捷方式']}[id];
         const navigation=settingsNavigation();if(labels&&navigation)element=choose('button',labels,navigation);
       }else if(id==='automations'){const side=sidebar();if(side)element=choose('button',['Automations','自动化'],side);}
       else if(id==='model-open'){element=document.querySelector('[data-testid="model-selector-trigger"]');if(element&&visible(element))current.modelOwned=true;else element=null;}

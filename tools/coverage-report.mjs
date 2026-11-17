@@ -31,7 +31,7 @@ import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { loadDictionaryLayers, compareLayers } from '../dist/dictionary.js';
-import { SUPPORTED_BUNDLES, extractUiStrings, normalizeText as normalized } from '../dist/bundle.js';
+import { SUPPORTED_BUNDLES, extractUiStrings, foldDictionaryKey, normalizeText as normalized } from '../dist/bundle.js';
 import { verifyExtractionSnapshot } from './extraction-snapshot.mjs';
 import { extractUiStringsAst } from './extract-ui-ast.mjs';
 import { PROPER_NOUNS } from '../dist/coverage.js';
@@ -216,14 +216,14 @@ export function reconcile(uiStrings, entries, bundleSource) {
   const foldedEntries = new Map();
   const scopedExact = new Set();
   for (const candidate of entries.keys()) {
-    const lc = candidate.toLowerCase();
+    const lc = foldDictionaryKey(candidate);
     if (!foldedEntries.has(lc)) foldedEntries.set(lc, candidate);
     if (candidate.startsWith('@ui:')) {
       const parts = candidate.slice(4).split('|');
       if (parts.length >= 3) {
         const rawKey = parts.slice(2).join('|');
         scopedExact.add(rawKey);
-        const rawLc = rawKey.toLowerCase();
+        const rawLc = foldDictionaryKey(rawKey);
         if (!foldedEntries.has(rawLc)) foldedEntries.set(rawLc, candidate);
       }
     }
@@ -236,7 +236,7 @@ export function reconcile(uiStrings, entries, bundleSource) {
     if (item.kinds?.includes('fragment')) { fragments.push({ text: item.text, count: item.count }); continue; }
     if (entries.has(key) || scopedExact.has(key)) { covered.push(key); continue; }
     // 大小写/结尾标点不同：引擎现在大小写不敏感，能命中，但键本身不规范
-    const foldedHit = foldedEntries.get(key.toLowerCase());
+    const foldedHit = foldedEntries.get(foldDictionaryKey(key));
     if (foldedHit !== undefined) {
       caseOnly.push({ text: item.text, dictKey: foldedHit });
     } else {
@@ -244,7 +244,7 @@ export function reconcile(uiStrings, entries, bundleSource) {
     }
   }
   const uiSet = new Set((uiStrings.strings ?? []).map(s => normalized(s.text)));
-  const uiFolded = new Set([...uiSet].map(s => s.toLowerCase()));
+  const uiFolded = new Set([...uiSet].map(s => foldDictionaryKey(s)));
   /* 词典词条不在本次提取结果里有两种完全不同的含义：
      - 键在整个界面包里都找不到  => 真的失效（应用已改文案），应从词典清理
      - 键在包里能找到但没被提取到 => 提取器的召回问题，词典仍然有效，不该当成死词条

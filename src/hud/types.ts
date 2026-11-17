@@ -11,6 +11,7 @@ export type HudContextStageRole = 'planner' | 'executor' | 'model';
 export interface HudModelContextStage {
   slotKey: string;
   role: HudContextStageRole;
+  section?: 'primary' | 'history';
   modelId: string;
   modelDisplayName: string;
   shortLabel: string;
@@ -82,8 +83,10 @@ export interface ConversationHudMetrics {
     hasSubagentInTurn?: boolean;
     /** 当前会话是否为独立子智能体轨迹 */
     isSubagentTrajectory?: boolean;
-    /** 前台流式轮次是否处于等待首步落库的起始阶段（非工具审批暂停） */
+    /** 前台流式轮次是否处于等待下一步落库的衔接阶段（非工具审批暂停） */
     awaitingFirstTurnStep?: boolean;
+    /** 当前轮次末步是否因用户停止或异常而终止 */
+    turnAborted?: boolean;
     /** 模型累计总用时 (秒) */
     modelDurationSeconds: number;
     /** 模型用时中文格式化展示 (如 "22 分 28 秒") */
@@ -347,6 +350,8 @@ export interface ParsedGenMetadata {
   systemTokens?: number;
   toolTokens?: number;
   messageTokens?: number;
+  /** ChatStartMetadata.field 4 started_at (秒) */
+  startedAtSeconds?: number;
   /** ChatModelMetadata.field 11 time_to_first_token (秒) */
   timeToFirstTokenSeconds?: number;
   /** ChatModelMetadata.field 12 streaming_duration (秒) */

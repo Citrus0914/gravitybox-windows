@@ -51,7 +51,6 @@ final class UsagePage: NSObject {
     private var restoreScroll = true
     var lastFetchTime: Date = .distantPast
     var modelRows: [[String: Any]] = []
-    private static let scanDateFormatter: DateFormatter = InterfaceText.shortDateTimeFormatter
     let periods = ["today", "7d", "30d", "all"]
     let palette: [NSColor] = [
         Design.color(0x2563EB, 0x3B82F6),

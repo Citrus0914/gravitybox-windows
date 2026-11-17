@@ -1,0 +1,634 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { createConnection } from 'node:net';
+import { spawn } from 'node:child_process';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  DEFAULT_API_PRICES,
+  isInternalNonChatModelId,
+  matchPricingKeys,
+  normalizeCatalogTierLabel,
+  resolvePricingCatalogSnapshot,
+} from '../dist/pricing.js';
+import {
+  ACTIVE_MODEL_KEYS,
+  FEED_MODEL_KEYS,
+  getEffectiveActiveModelKeys,
+  registerRemoteModelMetadata,
+  resetAndRegisterRemoteModelMetadata,
+  sanitizeRemoteModelMetadata,
+} from '../dist/model-catalog.js';
+import { UsageStatsManager } from '../dist/usage.js';
+import { AccountsManager } from '../dist/accounts.js';
+import {
+  readInstalledAppBundleVersion,
+  readValidLiveIdeModelsSnapshot,
+  sanitizeLiveIdeModelsSnapshot,
+} from '../dist/main.js';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function rpc(directory, payload, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(join(directory, 'control.sock'));
+    let value = '';
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('IPC 超时'));
+    }, timeoutMs);
+    const finish = (err) => {
+      clearTimeout(timer);
+      socket.destroy();
+      if (err) reject(err);
+      else resolve(JSON.parse(value.split('\n')[0]));
+    };
+    socket.on('connect', () => socket.write(JSON.stringify(payload) + '\n'));
+    socket.on('data', (chunk) => {
+      value += chunk;
+      if (value.includes('\n')) finish();
+    });
+    socket.on('error', finish);
+  });
+}
+
+async function startBackend(directory, appPath) {
+  const child = spawn(
+    process.execPath,
+    [
+      fileURLToPath(new URL('../dist/main.js', import.meta.url)),
+      '--state-dir', directory,
+      '--app', appPath,
+      '--profile', join(directory, 'profile'),
+      '--home-dir', join(directory, 'home'),
+      '--app-support-dir', join(directory, 'appsupport'),
+      '--gemini-dir', join(directory, 'gemini'),
+    ],
+    {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, GRAVITYBOX_PROBE_LS: 'false' },
+    }
+  );
+  let stderr = '';
+  child.stderr.on('data', (b) => { stderr += String(b); });
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await rpc(directory, { command: 'status', includeTasks: false }, 2000);
+      if (res.ok) return { child, stderr: () => stderr };
+    } catch {}
+    await sleep(80);
+  }
+  child.kill();
+  throw new Error(`后台启动超时: ${stderr.slice(0, 400)}`);
+}
+
+test('资产与别名映射：ACTIVE_MODEL_KEYS 为 7 款，新增 orchestrator-argon 与 M681 别名及内部模型过滤', () => {
+  assert.deepEqual([...ACTIVE_MODEL_KEYS], [
+    'gemini-4-carbon',
+    'gemini-4-argon',
+    'gemini-4-hydrogen',
+    'gemini-3.8-flash',
+    'claude-opus-5-5',
+    'claude-sonnet-5-5',
+    'gpt-oss-120b',
+  ]);
+  assert.equal(FEED_MODEL_KEYS.length, 18);
+  assert.equal(matchPricingKeys('gemini-pro-orchestrator-argon'), 'gemini-4-argon');
+  assert.equal(matchPricingKeys('MODEL_PLACEHOLDER_M681'), 'gemini-4-argon');
+
+  for (const internalId of [
+    'chat_20706',
+    'tab_flash_lite_preview',
+    'gemini-3.1-flash-lite',
+    'gemini-3.8-flash-exp-a',
+    'gemini-3.7-flash-safety-le',
+    'gemini-4-argon-trial',
+    'gemini-3.8-flash-control',
+    'gemini-3.8-flash-tiered',
+    'gemini-2.5-flash-image',
+  ]) {
+    assert.equal(isInternalNonChatModelId(internalId), true, `${internalId} 必须判定为内部非对话模型`);
+  }
+  assert.equal(isInternalNonChatModelId('gemini-4-argon'), false);
+  assert.equal(isInternalNonChatModelId('claude-opus-5-5'), false);
+
+  assert.equal(normalizeCatalogTierLabel('Google AI Ultra'), 'ULTRA');
+  assert.equal(normalizeCatalogTierLabel('Enterprise'), 'ENTERPRISE');
+  assert.equal(normalizeCatalogTierLabel('Google Workspace Business'), 'TEAM');
+  assert.equal(normalizeCatalogTierLabel('Google AI Plus'), 'PLUS');
+  assert.equal(normalizeCatalogTierLabel('Google AI Pro'), 'PRO');
+  assert.equal(normalizeCatalogTierLabel('Starter'), 'FREE');
+  assert.equal(normalizeCatalogTierLabel('unknown-tier'), '');
+});
+
+test('Live ULTRA：7 款活跃模型 + 11 款已下架模型 + orchestrator-argon 别名归并，严禁泄露内部实验键', () => {
+  const snap = resolvePricingCatalogSnapshot({
+    rawPricingTable: DEFAULT_API_PRICES,
+    live: {
+      tier: 'Google AI Ultra',
+      models: [
+        { model_id: 'gemini-4-carbon', display_name: 'Gemini 4 Carbon', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-4-argon', display_name: 'Gemini 4 Argon', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-pro-orchestrator-argon', display_name: 'Orchestrator (Argon)', disabled: false, quota_source: 'live' },
+        { model_id: 'MODEL_PLACEHOLDER_M681', display_name: 'Orchestrator Placeholder', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-4-hydrogen-xhigh', display_name: 'Gemini 4 Hydrogen', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-3.8-flash', display_name: 'Gemini 3.8 Flash', disabled: false, quota_source: 'live' },
+        { model_id: 'claude-opus-5-5-thinking', display_name: 'Claude Opus 5.5', disabled: false, quota_source: 'live' },
+        { model_id: 'claude-sonnet-5-5', display_name: 'Claude Sonnet 5.5', disabled: false, quota_source: 'live' },
+        { model_id: 'gpt-oss-120b', display_name: 'GPT-OSS 120B', disabled: false, quota_source: 'live' },
+        { model_id: 'chat_20706', disabled: false, quota_source: 'live' },
+        { model_id: 'tab_flash_lite_preview', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-3.8-flash-exp-a', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-3.7-flash-safety-le', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-4-argon-trial', disabled: false, quota_source: 'live' },
+      ],
+    },
+  });
+
+  assert.equal(Object.keys(snap.prices).length, 7);
+  assert.equal(Object.keys(snap.retiredPrices).length, 11);
+  assert.deepEqual(snap.unpricedLiveModels, []);
+  for (const activeKey of ACTIVE_MODEL_KEYS) {
+    assert.ok(snap.prices[activeKey], `prices 应包含 ${activeKey}`);
+    assert.equal(snap.retiredPrices[activeKey], undefined, `retiredPrices 不得重复包含 ${activeKey}`);
+    assert.equal(snap.modelCatalogState[activeKey]?.availability, 'available');
+    assert.equal(snap.modelCatalogState[activeKey]?.activeTier, 'ULTRA');
+  }
+  assert.equal(snap.modelCatalogState['gemini-4-argon']?.displayName, 'Gemini 4 Argon');
+
+  for (const retiredKey of Object.keys(snap.retiredPrices)) {
+    assert.equal(snap.modelCatalogState[retiredKey]?.availability, 'retired');
+  }
+  for (const forbidden of ['gemini-3.8-flash-exp-a', 'gemini-3.7-flash-safety-le', 'gemini-4-argon-trial', 'chat_20706', 'tab_flash_lite_preview']) {
+    assert.equal(snap.prices[forbidden], undefined);
+    assert.equal(snap.retiredPrices[forbidden], undefined);
+    assert.equal(snap.modelCatalogState[forbidden], undefined);
+  }
+  const allPriceKeys = [...Object.keys(snap.prices), ...Object.keys(snap.retiredPrices)];
+  assert.equal(Object.keys(snap.pricingStatus).length, allPriceKeys.length);
+  assert.equal(Object.keys(snap.modelCatalogState).length, allPriceKeys.length);
+});
+
+test('PRO 套餐：gemini-4-carbon-disabled 归类为 tier_locked；account_cloud 缺失活跃模型同样判定 tier_locked', () => {
+  const livePro = resolvePricingCatalogSnapshot({
+    rawPricingTable: DEFAULT_API_PRICES,
+    live: {
+      tier: 'PRO',
+      models: [
+        { model_id: 'gemini-4-carbon-disabled', display_name: 'Gemini 4 Carbon', disabled: true, quota_source: 'live' },
+        { model_id: 'gemini-4-argon', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-4-hydrogen', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-3.8-flash', disabled: false, quota_source: 'live' },
+        { model_id: 'claude-opus-5-5', disabled: false, quota_source: 'live' },
+        { model_id: 'claude-sonnet-5-5', disabled: false, quota_source: 'live' },
+        { model_id: 'gpt-oss-120b', disabled: false, quota_source: 'live' },
+      ],
+    },
+  });
+  assert.equal(Object.keys(livePro.prices).length, 7);
+  assert.equal(livePro.modelCatalogState['gemini-4-carbon']?.availability, 'tier_locked');
+  assert.equal(livePro.modelCatalogState['gemini-4-carbon']?.activeTier, 'PRO');
+  assert.equal(livePro.modelCatalogState['gemini-4-argon']?.availability, 'available');
+
+  const cloudPro = resolvePricingCatalogSnapshot({
+    rawPricingTable: DEFAULT_API_PRICES,
+    activeAccount: {
+      source: 'cloud',
+      tier: 'Google AI Pro',
+      models: [
+        { name: 'gemini-4-argon', disabled: false, quota_source: 'cloud' },
+        { name: 'gemini-4-hydrogen', disabled: false, quota_source: 'cloud' },
+        { name: 'gemini-3.8-flash', disabled: false, quota_source: 'cloud' },
+        { name: 'claude-opus-5-5', disabled: false, quota_source: 'cloud' },
+        { name: 'claude-sonnet-5-5', disabled: false, quota_source: 'cloud' },
+        { name: 'gpt-oss-120b', disabled: false, quota_source: 'cloud' },
+      ],
+    },
+  });
+  assert.equal(cloudPro.modelCatalogState['gemini-4-carbon']?.availability, 'tier_locked');
+  assert.equal(cloudPro.modelCatalogState['gemini-4-carbon']?.activeTier, 'PRO');
+  assert.equal(cloudPro.modelCatalogState['gemini-4-argon']?.availability, 'available');
+});
+
+test('多账号池：ULTRA 当前 + FREE 备用补充 claude-opus-4-6 / claude-sonnet-4-6 为 other_tier_only 并剔除云端噪声与 carried/stale', () => {
+  const snap = resolvePricingCatalogSnapshot({
+    rawPricingTable: DEFAULT_API_PRICES,
+    live: {
+      tier: 'ULTRA',
+      models: ACTIVE_MODEL_KEYS.map((id) => ({ model_id: id, disabled: false, quota_source: 'live' })),
+    },
+    poolAccounts: [
+      {
+        source: 'cloud',
+        tier: 'Free',
+        models: [
+          { name: 'gemini-3.8-flash', disabled: false, quota_source: 'cloud' },
+          { name: 'gemini-4-hydrogen', disabled: false, quota_source: 'cloud' },
+          { name: 'claude-opus-4-6', disabled: false, quota_source: 'cloud' },
+          { name: 'claude-sonnet-4-6', disabled: false, quota_source: 'cloud' },
+          // 云端噪声：同账号已有启用 gemini-* 活跃模型时，gemini-2.5-pro 必须被剔除
+          { name: 'gemini-2.5-pro', disabled: false, quota_source: 'cloud' },
+          // 内部非对话模型噪声
+          { name: 'chat_20706', disabled: false, quota_source: 'cloud' },
+          { name: 'tab_flash_lite_preview', disabled: false, quota_source: 'cloud' },
+          { name: 'gemini-3.1-flash-lite', disabled: false, quota_source: 'cloud' },
+          // stale 与 carried 必须严格跳过
+          { name: 'gemini-3.8-pro', disabled: false, stale: true, quota_source: 'cloud' },
+          { name: 'claude-3-5-sonnet', disabled: false, quota_source: 'carried' },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(Object.keys(snap.prices).length, 9);
+  assert.equal(Object.keys(snap.retiredPrices).length, 9);
+  for (const extra of ['claude-opus-4-6', 'claude-sonnet-4-6']) {
+    assert.ok(snap.prices[extra], `${extra} 应通过 FREE 备用池进入 prices`);
+    assert.equal(snap.modelCatalogState[extra]?.availability, 'other_tier_only');
+    assert.deepEqual(snap.modelCatalogState[extra]?.availableInTiers, ['FREE']);
+    assert.equal(snap.modelCatalogState[extra]?.activeTier, 'ULTRA');
+    assert.equal(snap.retiredPrices[extra], undefined);
+  }
+  for (const noise of ['gemini-2.5-pro', 'gemini-3.8-pro', 'claude-3-5-sonnet']) {
+    assert.equal(snap.prices[noise], undefined, `噪声/陈旧模型 ${noise} 不得进入 active prices`);
+    assert.ok(snap.retiredPrices[noise], `${noise} 应保留在 retiredPrices`);
+  }
+  for (const internalNoise of ['chat_20706', 'tab_flash_lite_preview', 'gemini-3.1-flash-lite']) {
+    assert.equal(snap.prices[internalNoise], undefined);
+    assert.equal(snap.retiredPrices[internalNoise], undefined);
+  }
+});
+
+test('全新未定价实时模型 unpricedLiveModels 与 UsageStatsManager.modelCount 同步计数', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-unpriced-live-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const snap = resolvePricingCatalogSnapshot({
+    rawPricingTable: DEFAULT_API_PRICES,
+    live: {
+      tier: 'ULTRA',
+      models: [
+        ...ACTIVE_MODEL_KEYS.map((id) => ({ model_id: id, disabled: false, quota_source: 'live' })),
+        { model_id: 'gemini-5-nova', display_name: 'Gemini 5 Nova', disabled: false, quota_source: 'live' },
+        { model_id: 'claude-next-alpha-disabled', display_name: 'Claude Next Alpha', disabled: true, quota_source: 'live' },
+      ],
+    },
+  });
+
+  assert.equal(Object.keys(snap.prices).length, 7);
+  assert.equal(snap.unpricedLiveModels.length, 2);
+  assert.deepEqual(snap.unpricedLiveModels, [
+    { key: 'gemini-5-nova', displayName: 'Gemini 5 Nova', disabled: false },
+    { key: 'claude-next-alpha', displayName: 'Claude Next Alpha', disabled: true },
+  ]);
+  assert.equal(snap.modelCatalogState['gemini-5-nova']?.availability, 'unpriced_live');
+  assert.equal(snap.modelCatalogState['claude-next-alpha']?.availability, 'unpriced_live');
+  assert.equal(snap.pricingStatus['gemini-5-nova'], undefined);
+
+  const manager = new UsageStatsManager({ stateDir: dir, geminiDir: join(dir, 'gemini') });
+  manager.setActiveOfficialModels(
+    Object.keys(snap.prices),
+    snap.unpricedLiveModels.map((m) => m.key)
+  );
+  const status = await manager.getPricingSyncStatus();
+  assert.equal(status.modelCount, Object.keys(snap.prices).length + snap.unpricedLiveModels.length);
+  assert.equal(status.modelCount, 9);
+});
+
+test('远端缓存与用户自定义价格追踪 publicPricingKeys，同时屏蔽内部实验键', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-public-keys-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  await writeFile(
+    join(dir, 'remote_pricing.json'),
+    JSON.stringify({
+      version: 1,
+      feedVersion: '2026-11-16',
+      prices: {
+        'remote-retired-model': { model: 'remote-retired-model', input: 1.1, output: 4.4, cached: 0.11 },
+        'gemini-3.8-flash-exp-a': { model: 'gemini-3.8-flash-exp-a', input: 0.75, output: 3.75, cached: 0.075 },
+      },
+    })
+  );
+
+  const manager = new UsageStatsManager({ stateDir: dir, geminiDir: join(dir, 'gemini') });
+  await manager.savePricingTable({
+    'my-custom-retired': {
+      model: 'my-custom-retired',
+      input: 2.2,
+      output: 8.8,
+      cached: 0.22,
+      provenance: { verification: 'user' },
+    },
+    'gemini-4-argon-trial': { model: 'gemini-4-argon-trial', input: 2.0, output: 10.0, cached: 0.1 },
+  });
+
+  const { raw, publicKeys } = await manager.getRawPricingCatalog();
+  assert.ok(publicKeys.has('remote-retired-model'));
+  assert.ok(publicKeys.has('my-custom-retired'));
+
+  const snap = resolvePricingCatalogSnapshot({
+    rawPricingTable: raw,
+    publicPricingKeys: publicKeys,
+  });
+  assert.equal(Object.keys(snap.prices).length, 7);
+  assert.ok(snap.retiredPrices['remote-retired-model']);
+  assert.ok(snap.retiredPrices['my-custom-retired']);
+  assert.equal(snap.pricingStatus['my-custom-retired'], 'user');
+  assert.equal(snap.retiredPrices['gemini-3.8-flash-exp-a'], undefined);
+  assert.equal(snap.retiredPrices['gemini-4-argon-trial'], undefined);
+});
+
+test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js IPC 端到端契约', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-catalog-ipc-'));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+
+  const appDir = join(dir, 'MockAntigravity.app');
+  await mkdir(join(appDir, 'Contents'), { recursive: true });
+  await mkdir(join(dir, '词典'), { recursive: true });
+  await mkdir(join(dir, 'profile'), { recursive: true });
+  await mkdir(join(dir, 'home'), { recursive: true });
+  await mkdir(join(dir, 'appsupport'), { recursive: true });
+  await mkdir(join(dir, 'gemini'), { recursive: true });
+
+  const writePlist = (ver) =>
+    writeFile(
+      join(appDir, 'Contents', 'Info.plist'),
+      `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>${ver}</string></dict></plist>`
+    );
+  await writePlist('2.32.1');
+  assert.equal(await readInstalledAppBundleVersion(appDir), '2.32.1');
+
+  // 1) 验证 sanitizeLiveIdeModelsSnapshot 不含 email / name / token 等敏感字段
+  const sanitized = sanitizeLiveIdeModelsSnapshot(
+    {
+      email: 'secret-user@example.invalid',
+      name: 'Secret Name',
+      tier: 'PRO',
+      quota: {
+        last_updated: Math.floor(Date.now() / 1000),
+        is_forbidden: false,
+        subscription_tier: 'PRO',
+        model_forwarding_rules: {},
+        models: [
+          { name: 'gemini-4-carbon-disabled', model_id: 'gemini-4-carbon-disabled', display_name: 'Gemini 4 Carbon', disabled: true, percentage: 0, reset_time: '', quota_source: 'live', stale: false },
+          { name: 'gemini-4-argon', model_id: 'gemini-4-argon', display_name: 'Gemini 4 Argon', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
+          { name: 'gemini-4-hydrogen', model_id: 'gemini-4-hydrogen', display_name: 'Gemini 4 Hydrogen', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
+          { name: 'gemini-3.8-flash', model_id: 'gemini-3.8-flash', display_name: 'Gemini 3.8 Flash', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
+          { name: 'claude-opus-5-5', model_id: 'claude-opus-5-5', display_name: 'Claude Opus 5.5', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
+          { name: 'claude-sonnet-5-5', model_id: 'claude-sonnet-5-5', display_name: 'Claude Sonnet 5.5', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
+          { name: 'gpt-oss-120b', model_id: 'gpt-oss-120b', display_name: 'GPT-OSS 120B', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
+          { name: 'gemini-5-nova', model_id: 'gemini-5-nova', display_name: 'Gemini 5 Nova', model_or_alias: 'MODEL_PLACEHOLDER_M700', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
+        ],
+      },
+    },
+    '2.32.1'
+  );
+  assert.ok(sanitized);
+  const serialized = JSON.stringify(sanitized);
+  assert.equal(serialized.includes('secret-user@example.invalid'), false);
+  assert.equal(serialized.includes('Secret Name'), false);
+  assert.equal(sanitized.schema, 1);
+  assert.equal(sanitized.appVersion, '2.32.1');
+  assert.equal(sanitized.tier, 'PRO');
+
+  const snapshotPath = join(dir, 'live-ide-models.json');
+  await writeFile(snapshotPath, serialized);
+  assert.ok(await readValidLiveIdeModelsSnapshot(snapshotPath, '2.32.1'));
+  assert.equal(await readValidLiveIdeModelsSnapshot(snapshotPath, '2.33.0'), null);
+  assert.equal(await readValidLiveIdeModelsSnapshot(snapshotPath, ''), null);
+
+  // 2) 配置本地多账号池（ULTRA 主账号 + FREE 备用账号）与本地 mock 价格源
+  const accMgr = new AccountsManager(dir);
+  const ultraAcc = await accMgr.upsertAccount({
+    email: 'ultra@example.invalid',
+    refreshToken: 'rt-ultra',
+    accessToken: 'at-ultra',
+    expiresIn: 3600,
+  });
+  ultraAcc.quota = {
+    source: 'cloud',
+    subscription_tier: 'ULTRA',
+    last_updated: Math.floor(Date.now() / 1000),
+    is_forbidden: false,
+    model_forwarding_rules: {},
+    models: ACTIVE_MODEL_KEYS.map((id) => ({
+      name: id,
+      model_id: id,
+      percentage: 90,
+      reset_time: '',
+      disabled: false,
+      quota_source: 'cloud',
+    })),
+  };
+  await accMgr.saveAccount(ultraAcc);
+
+  const freeAcc = await accMgr.upsertAccount({
+    email: 'free@example.invalid',
+    refreshToken: 'rt-free',
+    accessToken: 'at-free',
+    expiresIn: 3600,
+  });
+  freeAcc.quota = {
+    source: 'cloud',
+    subscription_tier: 'FREE',
+    last_updated: Math.floor(Date.now() / 1000),
+    is_forbidden: false,
+    model_forwarding_rules: {},
+    models: [
+      { name: 'gemini-3.8-flash', model_id: 'gemini-3.8-flash', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
+      { name: 'claude-opus-4-6', model_id: 'claude-opus-4-6', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
+      { name: 'claude-sonnet-4-6', model_id: 'claude-sonnet-4-6', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
+      { name: 'gemini-2.5-pro', model_id: 'gemini-2.5-pro', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
+      { name: 'chat_20706', model_id: 'chat_20706', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
+    ],
+  };
+  await accMgr.saveAccount(freeAcc);
+  await accMgr.setCurrentAccount(ultraAcc.id, 'app');
+
+  const feedServer = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        version: '2026-11-16',
+        prices: {
+          'gemini-4-carbon': { model: 'gemini-4-carbon', input: 2.0, output: 10.0, cached: 0.1 },
+        },
+      })
+    );
+  });
+  await new Promise((resolve) => feedServer.listen(0, '127.0.0.1', resolve));
+  const port = feedServer.address().port;
+
+  const backend = await startBackend(dir, appDir);
+  try {
+    // 2a) appVersion=2.32.1 时命中 live-ide-models.json（PRO + gemini-4-carbon tier_locked + gemini-5-nova unpricedLive）
+    const resMatch = await rpc(dir, { command: 'api_pricing_get' });
+    assert.equal(resMatch.ok, true);
+    assert.equal(Object.keys(resMatch.prices).length, 9); // 7 live + 2 FREE other_tier_only
+    assert.equal(resMatch.modelCatalogState['gemini-4-carbon']?.availability, 'tier_locked');
+    assert.equal(resMatch.modelCatalogState['claude-opus-4-6']?.availability, 'other_tier_only');
+    assert.deepEqual(resMatch.modelCatalogState['claude-opus-4-6']?.availableInTiers, ['FREE']);
+    assert.equal(resMatch.unpricedLiveModels.length, 1);
+    assert.equal(resMatch.unpricedLiveModels[0].key, 'gemini-5-nova');
+    assert.equal(resMatch.status.modelCount, Object.keys(resMatch.prices).length + resMatch.unpricedLiveModels.length);
+    assert.equal(resMatch.status.modelCount, 10);
+
+    // 2b) 模拟 Antigravity 升级至 2.33.0：旧版 2.32.1 快照必须立即失效并回退到当前保存账号 ULTRA + FREE 池
+    await writePlist('2.33.0');
+    const resUpgraded = await rpc(dir, { command: 'pricing_sync_check', feedUrl: `http://127.0.0.1:${port}/feed.json` });
+    assert.equal(resUpgraded.ok, true);
+    assert.equal(resUpgraded.synced, true);
+    assert.deepEqual(resUpgraded.unpricedLiveModels, []);
+    assert.equal(Object.keys(resUpgraded.prices).length, 9);
+    assert.equal(resUpgraded.modelCatalogState['gemini-4-carbon']?.availability, 'available');
+    assert.equal(resUpgraded.modelCatalogState['gemini-4-carbon']?.activeTier, 'ULTRA');
+    assert.equal(resUpgraded.modelCatalogState['claude-opus-4-6']?.availability, 'other_tier_only');
+    assert.deepEqual(resUpgraded.modelCatalogState['claude-opus-4-6']?.availableInTiers, ['FREE']);
+    assert.equal(resUpgraded.prices['gemini-2.5-pro'], undefined);
+    assert.ok(resUpgraded.retiredPrices['gemini-2.5-pro']);
+    assert.equal(resUpgraded.status.modelCount, 9);
+
+    const syncStatusRes = await rpc(dir, { command: 'pricing_sync_status' });
+    assert.equal(syncStatusRes.ok, true);
+    assert.equal(syncStatusRes.status.modelCount, 9);
+    assert.equal(backend.stderr(), '');
+
+    await rpc(dir, { command: 'stop' });
+    await new Promise((resolve) => {
+      if (backend.child.exitCode !== null) resolve();
+      else backend.child.once('exit', resolve);
+    });
+  } finally {
+    if (backend.child.exitCode === null) backend.child.kill('SIGTERM');
+    await new Promise((resolve) => feedServer.close(resolve));
+  }
+});
+
+test('sanitizeRemoteModelMetadata 与 registerRemoteModelMetadata 安全校验 activeModels 并在 !onlyNewEntries 时生效', () => {
+  const sanitized = sanitizeRemoteModelMetadata({
+    activeModels: ['  gemini-4-carbon  ', '__proto__', 'constructor', '', 'x'.repeat(129), 'gemini-4-argon', 'gemini-4-carbon'],
+  });
+  assert.deepEqual(sanitized.activeModels, ['gemini-4-carbon', 'gemini-4-argon']);
+
+  // onlyNewEntries: true 不得覆盖 activeModels
+  registerRemoteModelMetadata({ activeModels: ['gemini-3.8-flash'] }, { onlyNewEntries: true });
+  assert.deepEqual([...getEffectiveActiveModelKeys()], [...ACTIVE_MODEL_KEYS]);
+
+  // onlyNewEntries: false 更新 getEffectiveActiveModelKeys()
+  registerRemoteModelMetadata({ activeModels: ['gemini-4-carbon', 'gemini-5-aurora'] }, { onlyNewEntries: false });
+  assert.deepEqual([...getEffectiveActiveModelKeys()], ['gemini-4-carbon', 'gemini-5-aurora']);
+  resetAndRegisterRemoteModelMetadata({});
+});
+
+test('P1-1: account_cloud 支持 OpenAI 官方模型族过滤，且远端 activeModels 可显式提升含 lite/exp 后缀的正式模型', (t) => {
+  t.after(() => {
+    resetAndRegisterRemoteModelMetadata({});
+  });
+
+  resetAndRegisterRemoteModelMetadata({
+    activeModels: [...ACTIVE_MODEL_KEYS, 'gemini-4.5-flash-lite', 'gpt-5.1-codex'],
+    models: {
+      'gemini-4.5-flash-lite': { displayName: 'Gemini 4.5 Flash Lite', capacityTokens: 1048576 },
+      'gpt-5.1-codex': { displayName: 'GPT-5.1 Codex', capacityTokens: 400000 },
+    },
+  });
+
+  const customRawPricing = {
+    ...DEFAULT_API_PRICES,
+    'gemini-4.5-flash-lite': { model: 'gemini-4.5-flash-lite', input: 0.1, output: 0.4, cached: 0.025 },
+    'gpt-5.1-codex': { model: 'gpt-5.1-codex', input: 1.5, output: 6.0, cached: 0.375 },
+    'gpt-4o': { model: 'gpt-4o', input: 2.5, output: 10.0, cached: 1.25 },
+  };
+
+  const snap = resolvePricingCatalogSnapshot({
+    rawPricingTable: customRawPricing,
+    publicPricingKeys: new Set(['gemini-4.5-flash-lite', 'gpt-5.1-codex', 'gpt-4o']),
+    activeAccount: {
+      source: 'cloud',
+      tier: 'Google AI Ultra',
+      models: [
+        ...ACTIVE_MODEL_KEYS.map((name) => ({ name, disabled: false, quota_source: 'cloud' })),
+        { name: 'gemini-4.5-flash-lite', disabled: false, quota_source: 'cloud' },
+        { name: 'gpt-5.1-codex', disabled: false, quota_source: 'cloud' },
+        // 同账号已有启用的 OpenAI 活跃模型 gpt-5.1-codex 时，历史 gpt-4o 应归入 retiredPrices 而非混入活跃价格
+        { name: 'gpt-4o', disabled: false, quota_source: 'cloud' },
+        // 未被列入 activeModels 的内部噪声仍严格屏蔽
+        { name: 'tab_flash_lite_preview', disabled: false, quota_source: 'cloud' },
+      ],
+    },
+  });
+
+  assert.ok(snap.prices['gemini-4.5-flash-lite'], '远端显式列入 activeModels 的 flash-lite 正式模型不得被内部正则误杀');
+  assert.equal(snap.modelCatalogState['gemini-4.5-flash-lite']?.availability, 'available');
+  assert.ok(snap.prices['gpt-5.1-codex'], 'account_cloud 下 OpenAI 官方新模型应正常识别为活跃模型');
+  assert.equal(snap.modelCatalogState['gpt-5.1-codex']?.availability, 'available');
+  assert.equal(snap.prices['gpt-4o'], undefined, '已有新一代 OpenAI 活跃模型时，旧款 gpt-4o 不得进入活跃列表');
+  assert.ok(snap.retiredPrices['gpt-4o'], '旧款已定价 gpt-4o 应保留在 retiredPrices');
+  assert.equal(snap.prices['tab_flash_lite_preview'], undefined);
+  assert.equal(snap.retiredPrices['tab_flash_lite_preview'], undefined);
+});
+
+test('P1-10 & P1-11 & P2-20: 云端新未定价模型透出、IDE 可见 trial/flash-lite 新模型放行与同日热修价格版本比较', async () => {
+  const { compareDatedFeedVersion } = await import('../dist/usage-pricing.js');
+
+  // P2-20: 同日修订号自然序比较
+  assert.ok(compareDatedFeedVersion('2026-11-16.1', '2026-11-16') > 0);
+  assert.ok(compareDatedFeedVersion('2026-11-16-r2', '2026-11-16.1') > 0);
+  assert.ok(compareDatedFeedVersion('2026-11-17', '2026-11-16-r9') > 0);
+  assert.equal(compareDatedFeedVersion('2026-11-16.2', '2026-11-16-r2'), 0);
+  assert.equal(compareDatedFeedVersion('custom-ver', '2026-11-16'), null);
+
+  // P1-10: IDE 未打开时，activeAccount(cloud) 与 poolAccounts(cloud) 发现的全新未定价模型正常进入 unpricedLiveModels
+  const cloudNewSnap = resolvePricingCatalogSnapshot({
+    rawPricingTable: DEFAULT_API_PRICES,
+    activeAccount: {
+      source: 'cloud',
+      tier: 'Google AI Pro',
+      models: [
+        ...ACTIVE_MODEL_KEYS.filter(k => k !== 'gemini-4-carbon').map(name => ({ name, disabled: false, quota_source: 'cloud' })),
+        { name: 'gemini-5-hyperion', display_name: 'Gemini 5 Hyperion', disabled: false, quota_source: 'cloud' },
+      ],
+    },
+    poolAccounts: [
+      {
+        source: 'cloud',
+        tier: 'Google AI Ultra',
+        models: [
+          { name: 'claude-opus-6-0', display_name: 'Claude Opus 6.0', disabled: false, quota_source: 'cloud' },
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(
+    cloudNewSnap.unpricedLiveModels.map(m => m.key),
+    ['gemini-5-hyperion', 'claude-opus-6-0']
+  );
+  assert.equal(cloudNewSnap.modelCatalogState['gemini-5-hyperion']?.availability, 'unpriced_live');
+  assert.equal(cloudNewSnap.modelCatalogState['claude-opus-6-0']?.availability, 'unpriced_live');
+
+  // P1-11: IDE live 列表中带真实用户可见 display_name 的全新 -trial / flash-lite 对话模型保留，无显示名内部探针仍拦截
+  const livePreviewSnap = resolvePricingCatalogSnapshot({
+    rawPricingTable: DEFAULT_API_PRICES,
+    live: {
+      tier: 'ULTRA',
+      models: [
+        ...ACTIVE_MODEL_KEYS.map(id => ({ model_id: id, display_name: id, disabled: false, quota_source: 'live' })),
+        { model_id: 'gemini-5-neon-trial', display_name: 'Gemini 5 Neon (Trial)', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-4.2-flash-lite', display_name: 'Gemini 4.2 Flash Lite', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-4-argon-trial', disabled: false, quota_source: 'live' },
+        { model_id: 'tab_flash_lite_preview', display_name: 'Tab Flash Lite', disabled: false, quota_source: 'live' },
+      ],
+    },
+  });
+  assert.deepEqual(
+    livePreviewSnap.unpricedLiveModels.map(m => m.key),
+    ['gemini-5-neon-trial', 'gemini-4.2-flash-lite']
+  );
+  assert.equal(livePreviewSnap.modelCatalogState['gemini-4-argon-trial'], undefined);
+  assert.equal(livePreviewSnap.modelCatalogState['tab_flash_lite_preview'], undefined);
+});

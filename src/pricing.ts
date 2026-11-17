@@ -1,5 +1,12 @@
-import { normalizeModelId } from './model-identity.js';
-import { MODEL_PRICES, getEffectiveModelPriceAlias, FEED_MODEL_KEYS, CATALOG_PRICING_VERSION } from './model-catalog.js';
+import { normalizeModelId, stripModelProviderPrefix } from './model-identity.js';
+import {
+  MODEL_PRICES,
+  getEffectiveModelPriceAlias,
+  FEED_MODEL_KEYS,
+  CATALOG_PRICING_VERSION,
+  getEffectiveActiveModelKeys,
+  getEffectiveModelDisplayName,
+} from './model-catalog.js';
 import { bt, getActiveLocale } from './i18n.js';
 
 export interface ApiPricingContextTier {
@@ -361,7 +368,8 @@ export function mergePricingEntries(
   merged: Record<string, ApiPricingEntry>,
   entries: object,
   warningPrefix: string,
-  warnings: string[]
+  warnings: string[],
+  acceptedKeys?: Set<string>
 ): void {
   for (const [key, value] of Object.entries(entries)) {
     try {
@@ -388,10 +396,20 @@ export function mergePricingEntries(
         }
       }
       Object.assign(merged, validated);
+      if (acceptedKeys) acceptedKeys.add(key);
     } catch {
       warnings.push(warningPrefix + key);
     }
   }
+}
+
+export function isInternalNonChatModelId(rawId: string): boolean {
+  const id = stripModelProviderPrefix(String(rawId ?? '')).trim();
+  if (!id) return false;
+  return (
+    /^(?:chat_|tab_)/i.test(id) ||
+    /(?:^|[-_])(?:image|flash[-_]lite|tiered|safety[-_]le|control|exp[-_][a-z0-9]+|trial)(?:$|[-_])/i.test(id)
+  );
 }
 
 export function canonicalActivePricingKeys(
@@ -399,19 +417,490 @@ export function canonicalActivePricingKeys(
   extraPricingKeys?: Iterable<string>
 ): Set<string> {
   const source = modelIds ? Array.from(modelIds) : [];
+  const effectiveActive = new Set(Array.from(getEffectiveActiveModelKeys(), (k) => normalizeModelId(k)));
   const keys = new Set<string>();
   for (const rawId of source) {
     const trimmed = String(rawId).trim();
     if (!trimmed) continue;
-    const baseId = trimmed.replace(/(?:^|[-_])disabled$/i, '').trim() || trimmed;
+    const baseId = trimmed.replace(/(?:^|[-_])disabled$/i, '').trim();
+    const normBase = normalizeModelId(baseId);
+    if (!baseId || (!effectiveActive.has(normBase) && isInternalNonChatModelId(baseId))) continue;
     const matched = matchPricingKeys(baseId, extraPricingKeys);
     if (matched) keys.add(matched);
-    keys.add(normalizeModelId(baseId));
   }
   if (keys.size === 0) {
-    for (const key of FEED_MODEL_KEYS) keys.add(key);
+    for (const key of getEffectiveActiveModelKeys()) keys.add(key);
   }
   return keys;
+}
+
+export type ModelAvailabilityKind =
+  | 'available'
+  | 'tier_locked'
+  | 'other_tier_only'
+  | 'unpriced_live'
+  | 'retired';
+
+export interface ModelCatalogEntryMeta {
+  availability: ModelAvailabilityKind;
+  displayName: string;
+  availableInTiers?: string[];
+  activeTier?: string;
+}
+
+export interface UnpricedLiveModelEntry {
+  key: string;
+  displayName: string;
+  disabled: boolean;
+}
+
+export interface PricingCatalogModelInput {
+  id?: string | null;
+  name?: string | null;
+  model_id?: string | null;
+  displayName?: string | null;
+  display_name?: string | null;
+  modelOrAlias?: string | null;
+  model_or_alias?: string | null;
+  disabled?: boolean | null;
+  stale?: boolean | null;
+  quota_source?: string | null;
+}
+
+export interface PricingCatalogSourceInput {
+  tier?: string | null;
+  source?: string | null;
+  models?: readonly PricingCatalogModelInput[] | null;
+}
+
+export interface ResolvePricingCatalogSnapshotInput {
+  rawPricingTable?: Record<string, ApiPricingEntry>;
+  timestampSeconds?: number;
+  nowMs?: number;
+  locale?: string;
+  publicPricingKeys?: Iterable<string>;
+  activeModelKeys?: Iterable<string>;
+  live?: PricingCatalogSourceInput | null;
+  snapshot?: PricingCatalogSourceInput | null;
+  activeAccount?: PricingCatalogSourceInput | null;
+  poolAccounts?: readonly PricingCatalogSourceInput[] | null;
+}
+
+export interface PricingCatalogSnapshotResult {
+  prices: Record<string, ApiPricing>;
+  retiredPrices: Record<string, ApiPricing>;
+  pricingStatus: Record<string, 'confirmed' | 'historical' | 'expired' | 'user'>;
+  modelCatalogState: Record<string, ModelCatalogEntryMeta>;
+  unpricedLiveModels: UnpricedLiveModelEntry[];
+}
+
+const FORBIDDEN_CATALOG_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const CATALOG_TIER_ORDER: Record<string, number> = {
+  ULTRA: 0,
+  ENTERPRISE: 1,
+  TEAM: 2,
+  PRO: 3,
+  PLUS: 4,
+  FREE: 5,
+};
+
+export function normalizeCatalogTierLabel(rawTier: unknown): string {
+  const text = typeof rawTier === 'string' ? rawTier.trim() : '';
+  if (!text) return '';
+  if (/ultra/i.test(text)) return 'ULTRA';
+  if (/enterprise/i.test(text)) return 'ENTERPRISE';
+  if (/\b(?:team|teams|business|workspace)\b/i.test(text)) return 'TEAM';
+  if (/\bplus\b/i.test(text)) return 'PLUS';
+  if (/pro/i.test(text)) return 'PRO';
+  if (/\b(?:free|starter|trial)\b/i.test(text)) return 'FREE';
+  return '';
+}
+
+function compareCatalogTiers(a: string, b: string): number {
+  const ra = CATALOG_TIER_ORDER[a] ?? 99;
+  const rb = CATALOG_TIER_ORDER[b] ?? 99;
+  return ra !== rb ? ra - rb : a.localeCompare(b);
+}
+
+function resolveCatalogDisplayName(
+  key: string,
+  observedDisplayName?: string,
+  previousDisplayName?: string
+): string {
+  const catalogName = getEffectiveModelDisplayName(key);
+  if (catalogName && catalogName !== key) return catalogName;
+  if (observedDisplayName && observedDisplayName.toLowerCase() !== key.toLowerCase()) {
+    return observedDisplayName;
+  }
+  if (previousDisplayName) return previousDisplayName;
+  return observedDisplayName || key;
+}
+
+type CatalogSourceKind = 'live' | 'snapshot' | 'account_live' | 'account_cloud';
+
+interface ExtractedCatalogCandidate {
+  canonicalKey: string;
+  resolvedPricing: ApiPricing | null;
+  displayName: string;
+  disabled: boolean;
+}
+
+const LEGACY_INTERNAL_TRIAL_LITE_IDS = new Set([
+  'gemini-3.1-flash-lite',
+  'gemini-4-argon-trial',
+]);
+
+function isUserVisiblePreviewChatModel(
+  sourceKind: CatalogSourceKind,
+  baseId: string,
+  normBase: string,
+  rawDisplayName: string,
+  feedModelSet: Set<string>
+): boolean {
+  if (sourceKind === 'account_cloud') return false;
+  if (!normBase || feedModelSet.has(normBase) || LEGACY_INTERNAL_TRIAL_LITE_IDS.has(normBase)) {
+    return false;
+  }
+  const id = stripModelProviderPrefix(baseId).trim();
+  if (!id) return false;
+  if (
+    /^(?:chat_|tab_|model_placeholder_)/i.test(id) ||
+    /(?:^|[-_])(?:image|tiered|safety[-_]le|control|exp[-_][a-z0-9]+)(?:$|[-_])/i.test(id)
+  ) {
+    return false;
+  }
+  const label = rawDisplayName.trim();
+  if (!label || /^model_placeholder_/i.test(label) || label.toLowerCase() === id.toLowerCase()) {
+    return false;
+  }
+  return /(?:^|[-_])(?:flash[-_]lite|trial)(?:$|[-_])/i.test(id);
+}
+
+function extractCatalogModels(
+  sourceKind: CatalogSourceKind,
+  rawModels: readonly PricingCatalogModelInput[] | null | undefined,
+  rawPricingTable: Record<string, ApiPricingEntry>,
+  extraKeys: Set<string>,
+  effectiveActiveSet: Set<string>,
+  feedModelSet: Set<string>,
+  timestampSeconds: number
+): ExtractedCatalogCandidate[] {
+  if (!Array.isArray(rawModels) || rawModels.length === 0) return [];
+  const parsed: ExtractedCatalogCandidate[] = [];
+  for (const m of rawModels) {
+    if (!m || typeof m !== 'object') continue;
+    if (m.stale === true || m.quota_source === 'carried') continue;
+    const rawId = String(m.model_id ?? m.id ?? m.name ?? m.model_or_alias ?? m.modelOrAlias ?? '').trim();
+    if (!rawId) continue;
+    const hasDisabledSuffix = /(?:^|[-_])disabled$/i.test(rawId);
+    const baseId = rawId.replace(/(?:^|[-_])disabled$/i, '').trim();
+    if (!baseId || baseId.includes('未知模型') || baseId.toLowerCase() === 'unknown') continue;
+    const normBase = normalizeModelId(baseId);
+    const rawDisplayName = typeof (m.display_name ?? m.displayName) === 'string'
+      ? String(m.display_name ?? m.displayName).trim()
+      : '';
+    if (
+      !effectiveActiveSet.has(normBase) &&
+      isInternalNonChatModelId(baseId) &&
+      !isUserVisiblePreviewChatModel(sourceKind, baseId, normBase, rawDisplayName, feedModelSet)
+    ) {
+      continue;
+    }
+    const disabled = m.disabled === true || hasDisabledSuffix;
+
+    const foundPricing = lookupPricingEntry(rawPricingTable, baseId);
+    const resolvedPricing = foundPricing
+      ? resolvePricingForTimestamp(foundPricing.entry, timestampSeconds, foundPricing.key)
+      : null;
+    const canonicalKey = foundPricing?.key || matchPricingKeys(baseId, extraKeys) || normBase;
+    if (!canonicalKey || FORBIDDEN_CATALOG_KEYS.has(canonicalKey)) continue;
+
+    parsed.push({
+      canonicalKey,
+      resolvedPricing,
+      displayName: rawDisplayName,
+      disabled,
+    });
+  }
+
+  if (sourceKind !== 'account_cloud') {
+    return parsed;
+  }
+
+  const isOpenAiFamily = (key: string): boolean =>
+    key.startsWith('gpt-') || /^o[134](?:$|[-_])/.test(key);
+  const hasEnabledActiveClaude = parsed.some(
+    (c) => !c.disabled && c.canonicalKey.startsWith('claude-') && effectiveActiveSet.has(c.canonicalKey)
+  );
+  const hasEnabledActiveGemini = parsed.some(
+    (c) => !c.disabled && c.canonicalKey.startsWith('gemini-') && effectiveActiveSet.has(c.canonicalKey)
+  );
+  const hasEnabledActiveOpenAi = parsed.some(
+    (c) => !c.disabled && isOpenAiFamily(c.canonicalKey) && effectiveActiveSet.has(c.canonicalKey)
+  );
+
+  return parsed.filter((c) => {
+    if (effectiveActiveSet.has(c.canonicalKey)) return true;
+    // 未出现在官方历史下架名录中的全新模型（如未来新增的 gemini-* / claude-* / gpt-*）在非禁用时直接放行，避免被历史前缀过滤误杀
+    if (!feedModelSet.has(c.canonicalKey)) {
+      return !c.disabled;
+    }
+    if (c.canonicalKey.startsWith('claude-')) {
+      return !c.disabled && !hasEnabledActiveClaude;
+    }
+    if (c.canonicalKey.startsWith('gemini-')) {
+      return !c.disabled && !hasEnabledActiveGemini;
+    }
+    if (isOpenAiFamily(c.canonicalKey)) {
+      return !c.disabled && !hasEnabledActiveOpenAi;
+    }
+    return !c.disabled;
+  });
+}
+
+export function resolvePricingCatalogSnapshot(
+  input: ResolvePricingCatalogSnapshotInput = {}
+): PricingCatalogSnapshotResult {
+  const rawPricingTable = input.rawPricingTable ?? DEFAULT_API_PRICES;
+  const effectiveNowMs = input.nowMs ?? (input.timestampSeconds !== undefined ? input.timestampSeconds * 1000 : Date.now());
+  const timestampSeconds = input.timestampSeconds ?? Math.floor(effectiveNowMs / 1000);
+  const locale = input.locale ?? getActiveLocale();
+
+  const publicCandidateKeys = new Set<string>(FEED_MODEL_KEYS);
+  if (input.publicPricingKeys) {
+    for (const rawKey of input.publicPricingKeys) {
+      const k = String(rawKey).trim();
+      if (k && !FORBIDDEN_CATALOG_KEYS.has(k)) publicCandidateKeys.add(k);
+    }
+  }
+
+  const extraKeys = new Set<string>(publicCandidateKeys);
+  for (const k of Object.keys(rawPricingTable)) {
+    if (k && !FORBIDDEN_CATALOG_KEYS.has(k)) extraKeys.add(k);
+  }
+
+  const effectiveActiveList = Array.from(input.activeModelKeys ?? getEffectiveActiveModelKeys())
+    .map((k) => String(k).trim())
+    .filter((k) => Boolean(k) && !FORBIDDEN_CATALOG_KEYS.has(k));
+  const effectiveActiveSet = new Set<string>(effectiveActiveList);
+  const feedModelSet = new Set<string>(FEED_MODEL_KEYS);
+
+  let primaryKind: CatalogSourceKind | null = null;
+  let primaryTier = '';
+  let primaryCandidates: ExtractedCatalogCandidate[] = [];
+
+  const liveModelsCount = Array.isArray(input.live?.models) ? input.live.models.length : 0;
+  if (liveModelsCount > 0) {
+    const extracted = extractCatalogModels(
+      'live',
+      input.live?.models,
+      rawPricingTable,
+      extraKeys,
+      effectiveActiveSet,
+      feedModelSet,
+      timestampSeconds
+    );
+    if (extracted.length > 0) {
+      primaryKind = 'live';
+      primaryTier = normalizeCatalogTierLabel(input.live?.tier);
+      primaryCandidates = extracted;
+    }
+  }
+
+  if (!primaryKind && Array.isArray(input.snapshot?.models) && input.snapshot.models.length > 0) {
+    const extracted = extractCatalogModels(
+      'snapshot',
+      input.snapshot.models,
+      rawPricingTable,
+      extraKeys,
+      effectiveActiveSet,
+      feedModelSet,
+      timestampSeconds
+    );
+    if (extracted.length > 0) {
+      primaryKind = 'snapshot';
+      primaryTier = normalizeCatalogTierLabel(input.snapshot.tier);
+      primaryCandidates = extracted;
+    }
+  }
+
+  if (!primaryKind && Array.isArray(input.activeAccount?.models) && input.activeAccount.models.length > 0) {
+    const accKind: CatalogSourceKind = input.activeAccount.source === 'live' || input.activeAccount.source === 'account_live'
+      ? 'account_live'
+      : 'account_cloud';
+    const extracted = extractCatalogModels(
+      accKind,
+      input.activeAccount.models,
+      rawPricingTable,
+      extraKeys,
+      effectiveActiveSet,
+      feedModelSet,
+      timestampSeconds
+    );
+    if (extracted.length > 0 || accKind === 'account_cloud') {
+      primaryKind = accKind;
+      primaryTier = normalizeCatalogTierLabel(input.activeAccount.tier);
+      primaryCandidates = extracted;
+    }
+  }
+
+  const primaryPricedMap = new Map<string, { pricing: ApiPricing; enabled: boolean; displayName: string }>();
+  const unpricedMap = new Map<string, UnpricedLiveModelEntry>();
+
+  if (primaryKind) {
+    const allowUnpricedLive = primaryKind === 'live' || primaryKind === 'snapshot' || primaryKind === 'account_live';
+    for (const c of primaryCandidates) {
+      if (c.resolvedPricing) {
+        const existing = primaryPricedMap.get(c.canonicalKey);
+        primaryPricedMap.set(c.canonicalKey, {
+          pricing: existing?.pricing ?? c.resolvedPricing,
+          enabled: (existing?.enabled ?? false) || !c.disabled,
+          displayName: resolveCatalogDisplayName(c.canonicalKey, c.displayName, existing?.displayName),
+        });
+      } else if (
+        allowUnpricedLive ||
+        (primaryKind === 'account_cloud' && !c.disabled && !feedModelSet.has(c.canonicalKey))
+      ) {
+        const existing = unpricedMap.get(c.canonicalKey);
+        unpricedMap.set(c.canonicalKey, {
+          key: c.canonicalKey,
+          displayName: resolveCatalogDisplayName(c.canonicalKey, c.displayName, existing?.displayName),
+          disabled: existing ? (existing.disabled && c.disabled) : c.disabled,
+        });
+      }
+    }
+
+    if (primaryKind === 'account_cloud') {
+      for (const activeKey of effectiveActiveSet) {
+        if (primaryPricedMap.has(activeKey)) continue;
+        const found = lookupPricingEntry(rawPricingTable, activeKey);
+        const resolved = found ? resolvePricingForTimestamp(found.entry, timestampSeconds, found.key) : null;
+        if (resolved) {
+          primaryPricedMap.set(activeKey, {
+            pricing: resolved,
+            enabled: false,
+            displayName: resolveCatalogDisplayName(activeKey),
+          });
+        }
+      }
+    }
+  }
+
+  const otherTierMap = new Map<string, { pricing: ApiPricing; displayName: string; tiers: Set<string> }>();
+  for (const acc of input.poolAccounts ?? []) {
+    if (!acc || !Array.isArray(acc.models) || acc.models.length === 0) continue;
+    const accKind: CatalogSourceKind = acc.source === 'live' || acc.source === 'account_live'
+      ? 'account_live'
+      : 'account_cloud';
+    const accTier = normalizeCatalogTierLabel(acc.tier);
+    const extracted = extractCatalogModels(
+      accKind,
+      acc.models,
+      rawPricingTable,
+      extraKeys,
+      effectiveActiveSet,
+      feedModelSet,
+      timestampSeconds
+    );
+    for (const c of extracted) {
+      if (c.disabled || primaryPricedMap.has(c.canonicalKey)) continue;
+      if (!c.resolvedPricing) {
+        if (!feedModelSet.has(c.canonicalKey)) {
+          const existingUnpriced = unpricedMap.get(c.canonicalKey);
+          unpricedMap.set(c.canonicalKey, {
+            key: c.canonicalKey,
+            displayName: resolveCatalogDisplayName(c.canonicalKey, c.displayName, existingUnpriced?.displayName),
+            disabled: false,
+          });
+        }
+        continue;
+      }
+      let bucket = otherTierMap.get(c.canonicalKey);
+      if (!bucket) {
+        bucket = {
+          pricing: c.resolvedPricing,
+          displayName: resolveCatalogDisplayName(c.canonicalKey, c.displayName),
+          tiers: new Set<string>(),
+        };
+        otherTierMap.set(c.canonicalKey, bucket);
+      }
+      if (accTier) bucket.tiers.add(accTier);
+    }
+  }
+
+  // Cold-start fallback when neither Primary nor standby pool has any models
+  if (!primaryKind && otherTierMap.size === 0) {
+    for (const activeKey of effectiveActiveSet) {
+      const found = lookupPricingEntry(rawPricingTable, activeKey);
+      const resolved = found ? resolvePricingForTimestamp(found.entry, timestampSeconds, found.key) : null;
+      if (resolved) {
+        primaryPricedMap.set(activeKey, {
+          pricing: resolved,
+          enabled: true,
+          displayName: resolveCatalogDisplayName(activeKey),
+        });
+      }
+    }
+  }
+
+  const rawActivePrices: Record<string, ApiPricing> = {};
+  const rawRetiredPrices: Record<string, ApiPricing> = {};
+  const pricingStatus: Record<string, 'confirmed' | 'historical' | 'expired' | 'user'> = {};
+  const modelCatalogState: Record<string, ModelCatalogEntryMeta> = {};
+
+  for (const [key, info] of primaryPricedMap.entries()) {
+    rawActivePrices[key] = info.pricing;
+    pricingStatus[key] = priceStatus(info.pricing, effectiveNowMs);
+    modelCatalogState[key] = {
+      availability: info.enabled ? 'available' : 'tier_locked',
+      displayName: info.displayName,
+      ...(primaryTier ? { activeTier: primaryTier } : {}),
+    };
+  }
+
+  for (const [key, info] of otherTierMap.entries()) {
+    rawActivePrices[key] = info.pricing;
+    pricingStatus[key] = priceStatus(info.pricing, effectiveNowMs);
+    const tiers = [...info.tiers].sort(compareCatalogTiers);
+    modelCatalogState[key] = {
+      availability: 'other_tier_only',
+      displayName: info.displayName,
+      ...(tiers.length > 0 ? { availableInTiers: tiers } : {}),
+      ...(primaryTier ? { activeTier: primaryTier } : {}),
+    };
+  }
+
+  const unpricedLiveModels = Array.from(unpricedMap.values());
+  for (const u of unpricedLiveModels) {
+    modelCatalogState[u.key] = {
+      availability: 'unpriced_live',
+      displayName: u.displayName,
+      ...(primaryTier ? { activeTier: primaryTier } : {}),
+    };
+  }
+
+  for (const key of publicCandidateKeys) {
+    if (!key || FORBIDDEN_CATALOG_KEYS.has(key) || (!effectiveActiveSet.has(key) && isInternalNonChatModelId(key))) continue;
+    if (Object.hasOwn(rawActivePrices, key)) continue;
+    const entry = Object.hasOwn(rawPricingTable, key) ? rawPricingTable[key] : lookupPricingEntry(rawPricingTable, key)?.entry;
+    if (!entry) continue;
+    const resolved = resolvePricingForTimestamp(entry, timestampSeconds, key);
+    if (!resolved) continue;
+    rawRetiredPrices[key] = resolved;
+    pricingStatus[key] = priceStatus(resolved, effectiveNowMs);
+    modelCatalogState[key] = {
+      availability: 'retired',
+      displayName: getEffectiveModelDisplayName(key),
+    };
+  }
+
+  return {
+    prices: localizePricingTable(rawActivePrices, locale),
+    retiredPrices: localizePricingTable(rawRetiredPrices, locale),
+    pricingStatus,
+    modelCatalogState,
+    unpricedLiveModels,
+  };
 }
 
 export function lookupPricingEntry(

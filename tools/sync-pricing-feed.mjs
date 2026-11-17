@@ -18,6 +18,16 @@ export function buildPricingFeed(catalog) {
       };
     }
   }
+  const hasActiveModels = Array.isArray(catalog.activeModels) && catalog.activeModels.length > 0;
+  const feedModelSet = new Set(Array.isArray(catalog.feedModels) ? catalog.feedModels : []);
+  if (hasActiveModels) {
+    for (const key of catalog.activeModels) {
+      if (!Object.hasOwn(catalog.prices ?? {}, key)) throw Error('活跃模型列表引用了不存在的模型：' + key);
+      if (feedModelSet.size > 0 && !feedModelSet.has(key)) {
+        throw Error('活跃模型列表引用了未包含在 feedModels 中的模型：' + key);
+      }
+    }
+  }
   const hasAliases = Boolean(catalog.aliases && typeof catalog.aliases === 'object' && Object.keys(catalog.aliases).length > 0);
   const hasModels = Object.keys(models).length > 0;
   return {
@@ -26,6 +36,7 @@ export function buildPricingFeed(catalog) {
     updatedAt: catalog.pricingUpdatedAt,
     source: 'https://raw.githubusercontent.com/Enzoo404/gravitybox/main/assets/pricing-feed.json',
     ...(hasAliases ? { aliases: catalog.aliases } : {}),
+    ...(hasActiveModels ? { activeModels: catalog.activeModels } : {}),
     ...(hasModels ? { models } : {}),
     prices,
   };

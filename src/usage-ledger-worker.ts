@@ -6,6 +6,8 @@ import { join, dirname } from 'node:path';
 import type { LedgerEvent } from './usage-ledger.js';
 import { aggregateLedger, ledgerEventPage } from './usage-aggregate.js';
 import { revalueLedger } from './usage-revalue.js';
+import { resetAndRegisterRemoteModelMetadata } from './model-catalog.js';
+import { PRICING_METADATA } from './pricing.js';
 import { bt, setActiveLocale } from './i18n.js';
 export function validLedgerEvent(event: unknown): event is LedgerEvent {
     if (!event || typeof event !== 'object')
@@ -41,6 +43,118 @@ interface LegacyBaselineCache {
     events: LedgerEvent[];
 }
 let cachedLegacyBaseline: LegacyBaselineCache | null = null;
+const importedRatesStamps = new Map<string, string>();
+const importedLegacyStamps = new Map<string, string>();
+
+let cachedWorkerRemoteMeta: {
+    path: string;
+    dev: number;
+    ino: number;
+    size: number;
+    mtimeMs: number;
+} | null = null;
+
+function syncWorkerRemoteMetadata(ledgerPath: string): void {
+    const remotePath = join(dirname(ledgerPath), 'remote_pricing.json');
+    if (!existsSync(remotePath)) {
+        if (cachedWorkerRemoteMeta) {
+            cachedWorkerRemoteMeta = null;
+            resetAndRegisterRemoteModelMetadata({});
+        }
+        return;
+    }
+    try {
+        regular(remotePath);
+        const stat = lstatSync(remotePath);
+        if (stat.size > 2 * 1024 * 1024) return;
+        if (
+            cachedWorkerRemoteMeta &&
+            cachedWorkerRemoteMeta.path === remotePath &&
+            cachedWorkerRemoteMeta.dev === stat.dev &&
+            cachedWorkerRemoteMeta.ino === stat.ino &&
+            cachedWorkerRemoteMeta.size === stat.size &&
+            cachedWorkerRemoteMeta.mtimeMs === stat.mtimeMs
+        ) {
+            return;
+        }
+        const parsed = JSON.parse(readFileSync(remotePath, 'utf8'));
+        const remoteVer = typeof parsed?.feedVersion === 'string' ? parsed.feedVersion.trim() : '';
+        const isOlderDatedFeed = /^\d{4}-\d{2}-\d{2}$/.test(remoteVer)
+            && /^\d{4}-\d{2}-\d{2}$/.test(PRICING_METADATA.version)
+            && remoteVer < PRICING_METADATA.version;
+        resetAndRegisterRemoteModelMetadata(parsed, { onlyNewEntries: isOlderDatedFeed });
+        cachedWorkerRemoteMeta = {
+            path: remotePath,
+            dev: stat.dev,
+            ino: stat.ino,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs,
+        };
+    } catch {
+        // 远端缓存可读性异常时降级保留已有静态元数据
+    }
+}
+
+function ensureImportedLegacyBaseline(db: DatabaseSync, dbPath: string, legacyPath: string, legacyEvents: LedgerEvent[]): void {
+    const dbStat = existsSync(dbPath) ? lstatSync(dbPath) : null;
+    const dbIdentity = dbStat ? `${dbPath}|${dbStat.dev}:${dbStat.ino}` : dbPath;
+    const ratesPath = join(dirname(dbPath), 'usage-rate-locks.json');
+    if (existsSync(ratesPath)) {
+        regular(ratesPath);
+        const ratesStat = lstatSync(ratesPath);
+        if (ratesStat.size > 16 * 1024 * 1024)
+            throw Error(bt('ledger.err.legacy_rates_budget'));
+        const ratesStamp = `${ratesStat.dev}:${ratesStat.ino}:${ratesStat.size}:${ratesStat.mtimeMs}`;
+        if (importedRatesStamps.get(dbIdentity) !== ratesStamp) {
+            const rates = JSON.parse(readFileSync(ratesPath, 'utf8'));
+            if (rates.version !== 1 || !rates.entries || typeof rates.entries !== 'object')
+                throw Error(bt('ledger.err.legacy_rates_invalid'));
+            const entries = Object.entries<any>(rates.entries);
+            if (entries.length > 0) {
+                const insertRate = db.prepare('INSERT OR IGNORE INTO rate_locks VALUES(?,?,?)');
+                db.exec('BEGIN IMMEDIATE');
+                try {
+                    for (const [key, item] of entries) {
+                        const price = compactUnitPrice(item.price ?? rates.profiles?.[item.p]);
+                        if (!price || !Number.isFinite(item.usd) || item.usd < 0)
+                            throw Error(bt('ledger.err.legacy_rate_entry_invalid'));
+                        insertRate.run(key, JSON.stringify(price), item.usd);
+                    }
+                    db.exec('COMMIT');
+                }
+                catch (error) {
+                    db.exec('ROLLBACK');
+                    throw error;
+                }
+            }
+            importedRatesStamps.set(dbIdentity, ratesStamp);
+        }
+    }
+    const legacyStamp = cachedLegacyBaseline?.path === legacyPath
+        ? `${cachedLegacyBaseline.dev}:${cachedLegacyBaseline.ino}:${cachedLegacyBaseline.size}:${cachedLegacyBaseline.mtimeMs}`
+        : `len:${legacyEvents.length}`;
+    if (legacyEvents.length > 0 && importedLegacyStamps.get(dbIdentity) !== legacyStamp) {
+        const importable = legacyEvents.filter(event => !isSyntheticRecoveredDb(event.db_file));
+        if (importable.length > 0) {
+            const insert = db.prepare('INSERT OR IGNORE INTO events(event_key,timestamp,account_id,model,payload) VALUES(?,?,?,?,?)');
+            const revision = db.prepare('INSERT INTO event_revisions(event_key,timestamp,payload) VALUES(?,?,?)');
+            db.exec('BEGIN IMMEDIATE');
+            try {
+                for (const event of importable) {
+                    const payload = JSON.stringify({ ...event, account_id: undefined, account_email: undefined, account_confidence: 'legacy' });
+                    if (insert.run(event.event_key!, event.timestamp_seconds, null, event.model, payload).changes)
+                        revision.run(event.event_key!, event.timestamp_seconds, payload);
+                }
+                db.exec('COMMIT');
+            }
+            catch (error) {
+                db.exec('ROLLBACK');
+                throw error;
+            }
+        }
+        importedLegacyStamps.set(dbIdentity, legacyStamp);
+    }
+}
 
 function readValidatedLegacyEvents(legacyPath: string): LedgerEvent[] {
     if (!existsSync(legacyPath)) {
@@ -89,6 +203,7 @@ function runRequest(payload: {
         setActiveLocale(payload.locale);
     }
     const { path, legacyPath, operation, events, options } = payload;
+    syncWorkerRemoteMetadata(path);
     const result = new Map<string, LedgerEvent>();
     // Validate before opening a writable database. Never overwrite or "repair" a damaged baseline.
     const legacyEvents = readValidatedLegacyEvents(legacyPath);
@@ -199,8 +314,10 @@ function runRequest(payload: {
         }
         if (operation === 'count')
             return Number(db.prepare('SELECT COUNT(*) AS count FROM events').get()?.count) + legacyEvents.length;
-        if (operation === 'revalue')
+        if (operation === 'revalue') {
+            ensureImportedLegacyBaseline(db, path, legacyPath, legacyEvents);
             return revalueLedger(db, path, options);
+        }
         if (operation === 'save-locks') {
             const sequence = db.prepare('SELECT MIN(seq) AS seq FROM event_revisions WHERE event_key=?');
             const put = db.prepare('INSERT INTO rate_locks VALUES(?,?,?) ON CONFLICT(event_key) DO UPDATE SET unit_price=excluded.unit_price,usd=excluded.usd');
@@ -242,46 +359,7 @@ function runRequest(payload: {
             return { saved: Object.keys(options.entries).length };
         }
         if (operation === 'aggregate') {
-            const ratesPath = join(dirname(path), 'usage-rate-locks.json');
-            if (existsSync(ratesPath)) {
-                regular(ratesPath);
-                if (lstatSync(ratesPath).size > 16 * 1024 * 1024)
-                    throw Error(bt('ledger.err.legacy_rates_budget'));
-                const rates = JSON.parse(readFileSync(ratesPath, 'utf8'));
-                if (rates.version !== 1 || !rates.entries || typeof rates.entries !== 'object')
-                    throw Error(bt('ledger.err.legacy_rates_invalid'));
-                const insertRate = db.prepare('INSERT OR IGNORE INTO rate_locks VALUES(?,?,?)');
-                db.exec('BEGIN IMMEDIATE');
-                try {
-                    for (const [key, item] of Object.entries<any>(rates.entries)) {
-                        const price = compactUnitPrice(item.price ?? rates.profiles?.[item.p]);
-                        if (!price || !Number.isFinite(item.usd) || item.usd < 0)
-                            throw Error(bt('ledger.err.legacy_rate_entry_invalid'));
-                        insertRate.run(key, JSON.stringify(price), item.usd);
-                    }
-                    db.exec('COMMIT');
-                }
-                catch (error) {
-                    db.exec('ROLLBACK');
-                    throw error;
-                }
-            }
-            const insert = db.prepare('INSERT OR IGNORE INTO events(event_key,timestamp,account_id,model,payload) VALUES(?,?,?,?,?)');
-            const revision = db.prepare('INSERT INTO event_revisions(event_key,timestamp,payload) VALUES(?,?,?)');
-            db.exec('BEGIN IMMEDIATE');
-            try {
-                for (const event of legacyEvents)
-                    if (!isSyntheticRecoveredDb(event.db_file)) {
-                        const payload = JSON.stringify({ ...event, account_id: undefined, account_email: undefined, account_confidence: 'legacy' });
-                        if (insert.run(event.event_key!, event.timestamp_seconds, null, event.model, payload).changes)
-                            revision.run(event.event_key!, event.timestamp_seconds, payload);
-                    }
-                db.exec('COMMIT');
-            }
-            catch (error) {
-                db.exec('ROLLBACK');
-                throw error;
-            }
+            ensureImportedLegacyBaseline(db, path, legacyPath, legacyEvents);
             return { ...aggregateLedger(db, options), ledger_review_records: legacyEvents.filter(event => !event.source_id || isSyntheticRecoveredDb(event.db_file)).length };
         }
         if (!Array.isArray(events) || !events.every(validLedgerEvent))
@@ -290,11 +368,31 @@ function runRequest(payload: {
         const updateObserved = db.prepare('UPDATE events SET observed_at=MAX(observed_at,?) WHERE event_key=?');
         const revision = db.prepare('INSERT INTO event_revisions(event_key,timestamp,payload) VALUES(?,?,?)');
         const previous = db.prepare('SELECT payload,observed_at FROM events WHERE event_key=?');
+        const byTimestamp = db.prepare('SELECT event_key,payload,observed_at FROM events WHERE timestamp=? AND event_key<>?');
+        const copyLock = db.prepare('INSERT OR IGNORE INTO rate_locks(event_key,unit_price,usd) SELECT ?,unit_price,usd FROM rate_locks WHERE event_key=?');
         const alias = db.prepare('INSERT OR REPLACE INTO event_aliases VALUES(?,?)');
         db.exec('BEGIN IMMEDIATE');
         try {
             for (const event of events) {
-                const stored = previous.get(event.event_key!);
+                let stored = previous.get(event.event_key!);
+                if (!stored && event.legacy_event_key) {
+                    // 换机或备份恢复导致文件 inode 变更时，按同时间戳 + legacy_event_key + db_file 归并旧 source_id 记录
+                    const candidates = byTimestamp.all(event.timestamp_seconds, event.event_key!) as Array<{ event_key: string; payload: string; observed_at: number }>;
+                    const matched = candidates.find(candidate => {
+                        try {
+                            const parsed = JSON.parse(String(candidate.payload));
+                            return parsed.legacy_event_key === event.legacy_event_key
+                                && (!event.db_file || !parsed.db_file || parsed.db_file === event.db_file);
+                        } catch {
+                            return false;
+                        }
+                    });
+                    if (matched) {
+                        stored = matched;
+                        alias.run(String(matched.event_key), event.event_key!);
+                        copyLock.run(event.event_key!, String(matched.event_key));
+                    }
+                }
                 if (stored) {
                     if (Number(stored.observed_at) > (event.source_observed_at ?? 0)) continue;
                     const old = JSON.parse(String(stored.payload));

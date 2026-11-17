@@ -11,17 +11,38 @@ export interface RemoteModelMetadataSpec {
   capacityTokens?: number;
 }
 
-const catalog = JSON.parse(readFileSync(new URL('../assets/model-catalog.json', import.meta.url), 'utf8'));
+function loadBundledModelCatalog(): Record<string, any> {
+  const candidates = [
+    new URL('../assets/model-catalog.json', import.meta.url),
+    new URL('../../model-catalog.json', import.meta.url),
+  ];
+  for (const url of candidates) {
+    try {
+      return JSON.parse(readFileSync(url, 'utf8'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+    }
+  }
+  return JSON.parse(readFileSync(candidates[0]!, 'utf8'));
+}
+
+const catalog = loadBundledModelCatalog();
 if (catalog.schema !== 1 || !catalog.names || !catalog.prices) throw Error(bt('model_catalog.err.invalid'));
 
 export const MODEL_NAMES = Object.assign(Object.create(null), catalog.names) as Record<string, string>;
+export const MODEL_CAPACITIES = Object.assign(
+  Object.create(null),
+  catalog.capacities && typeof catalog.capacities === 'object' ? catalog.capacities : {}
+) as Record<string, number>;
 export const MODEL_PRICES = Object.assign(Object.create(null), catalog.prices) as Record<string, ApiPricingEntry>;
 export const MODEL_PRICE_ALIASES = catalog.aliases as Record<string, string>;
 export const FEED_MODEL_KEYS = Object.freeze(Array.isArray(catalog.feedModels) ? [...catalog.feedModels] : []) as readonly string[];
+export const ACTIVE_MODEL_KEYS = Object.freeze(Array.isArray(catalog.activeModels) ? [...catalog.activeModels] : [...FEED_MODEL_KEYS]) as readonly string[];
 export const CATALOG_PRICING_VERSION = typeof catalog.pricingVersion === 'string' ? catalog.pricingVersion : '';
 
 const remoteAliases: Record<string, string> = Object.create(null);
 const remoteModelSpecs: Record<string, RemoteModelMetadataSpec> = Object.create(null);
+let remoteActiveModelKeys: readonly string[] | null = null;
 
 function isSafeCatalogKey(raw: unknown): raw is string {
   return typeof raw === 'string' && raw.length > 0 && raw.length <= 128 && !FORBIDDEN_KEYS.has(raw);
@@ -30,6 +51,7 @@ function isSafeCatalogKey(raw: unknown): raw is string {
 export function sanitizeRemoteModelMetadata(raw: unknown): {
   aliases?: Record<string, string>;
   models?: Record<string, RemoteModelMetadataSpec>;
+  activeModels?: string[];
 } {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const source = raw as Record<string, unknown>;
@@ -67,9 +89,21 @@ export function sanitizeRemoteModelMetadata(raw: unknown): {
       };
     }
   }
+  let activeModelsOut: string[] | undefined;
+  if (Array.isArray(source.activeModels)) {
+    const seen = new Set<string>();
+    for (const item of source.activeModels) {
+      const cleanKey = typeof item === 'string' ? item.trim() : '';
+      if (!isSafeCatalogKey(cleanKey) || seen.has(cleanKey)) continue;
+      seen.add(cleanKey);
+      activeModelsOut ??= [];
+      activeModelsOut.push(cleanKey);
+    }
+  }
   return {
     ...(aliasesOut ? { aliases: aliasesOut } : {}),
     ...(modelsOut ? { models: modelsOut } : {}),
+    ...(activeModelsOut ? { activeModels: activeModelsOut } : {}),
   };
 }
 
@@ -95,6 +129,41 @@ export function registerRemoteModelMetadata(
       };
     }
   }
+  if (sanitized.activeModels && sanitized.activeModels.length > 0 && !onlyNew) {
+    remoteActiveModelKeys = Object.freeze([...sanitized.activeModels]);
+  }
+}
+
+export function resetAndRegisterRemoteModelMetadata(
+  raw: unknown,
+  options?: { onlyNewEntries?: boolean }
+): void {
+  for (const key of Object.keys(remoteAliases)) {
+    delete remoteAliases[key];
+  }
+  for (const key of Object.keys(remoteModelSpecs)) {
+    delete remoteModelSpecs[key];
+  }
+  remoteActiveModelKeys = null;
+  registerRemoteModelMetadata(raw, options);
+}
+
+export function getEffectiveActiveModelKeys(): readonly string[] {
+  return remoteActiveModelKeys ?? ACTIVE_MODEL_KEYS;
+}
+
+export function getEffectiveModelAliasKeys(): string[] {
+  return Array.from(new Set([
+    ...Object.keys(MODEL_NAMES),
+    ...Object.keys(MODEL_PRICE_ALIASES),
+    ...Object.keys(remoteAliases),
+    ...Object.keys(remoteModelSpecs),
+  ]));
+}
+
+export function getEffectiveModelDisplayName(key: string): string {
+  if (!key || FORBIDDEN_KEYS.has(key)) return key;
+  return getRemoteModelSpec(key)?.displayName ?? MODEL_NAMES[key] ?? MODEL_NAMES[key.toLowerCase()] ?? key;
 }
 
 export function getEffectiveModelPriceAlias(key: string): string | undefined {

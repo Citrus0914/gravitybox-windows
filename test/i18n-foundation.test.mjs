@@ -292,7 +292,7 @@ test('macOS 无 LANG 环境或遵循 AppleLanguages 时 system 语言解析与�
   }
 });
 
-test('runtime/hud-i18n.js 与 assets/i18n/*.json#hud 保持 75 键逐字一致，normalizeHudLocale 回退规范严格收敛', async () => {
+test('runtime/hud-i18n.js 与 assets/i18n/*.json#hud 保持 77 键逐字一致，normalizeHudLocale 回退规范严格收敛', async () => {
   const [{ HUD_I18N, normalizeHudLocale }, zhPack, enPack] = await Promise.all([
     import('../runtime/hud-i18n.js'),
     readFile(join(i18nDir, 'zh-Hans.json'), 'utf8').then((raw) => JSON.parse(raw)),
@@ -304,7 +304,7 @@ test('runtime/hud-i18n.js 与 assets/i18n/*.json#hud 保持 75 键逐字一致�
   assert.deepEqual(Object.keys(zhPack.hud).sort(), Object.keys(enPack.hud).sort());
   assert.deepEqual(Object.keys(HUD_I18N['zh-Hans']).sort(), Object.keys(zhPack.hud).sort());
   assert.deepEqual(Object.keys(HUD_I18N.en).sort(), Object.keys(enPack.hud).sort());
-  assert.equal(Object.keys(zhPack.hud).length, 75);
+  assert.equal(Object.keys(zhPack.hud).length, 77);
   assert.deepEqual(HUD_I18N['zh-Hans'], zhPack.hud);
   assert.deepEqual(HUD_I18N.en, enPack.hud);
 
@@ -360,5 +360,69 @@ test('P2 i18n 清理：files.optional_json_read_failed 双语可用，且 12 个
     for (const key of deadBackendKeys) {
       assert.equal(Object.hasOwn(pack.backend, key), false, `backend.${key} 应已移除`);
     }
+  }
+});
+
+test('P1-13 & P1-14 & P2-19: app/backend 命名空间禁绝占位符冲突重名键，中文模式暂停网页翻译时保持状态与深度扫描中文语境', async () => {
+  const [zhPack, enPack] = await Promise.all([
+    readFile(join(i18nDir, 'zh-Hans.json'), 'utf8').then((raw) => JSON.parse(raw)),
+    readFile(join(i18nDir, 'en.json'), 'utf8').then((raw) => JSON.parse(raw)),
+  ]);
+
+  // P1-13: 显式验证历史重名冲突键已彻底解耦，且任何允许共用的 status.* 键必须保持占位符集合 100% 一致
+  const allowedSharedKeys = new Set([
+    'quota.countdown.soon',
+    'status.connected',
+    'status.legacy_blocked',
+    'status.paused',
+    'status.stopped',
+    'status.waiting',
+    'status.waiting_app',
+    'status.waiting_window',
+  ]);
+  for (const [code, pack] of [['en', enPack], ['zh-Hans', zhPack]]) {
+    assert.equal(Object.hasOwn(pack.backend, 'quota.standalone.no_permission'), false, `${code} backend 不得与 app 重名 quota.standalone.no_permission`);
+    assert.equal(Object.hasOwn(pack.backend, 'quota.countdown.passed'), false, `${code} backend 不得与 app 重名 quota.countdown.passed`);
+    assert.equal(typeof pack.backend['quota.standalone.backend_no_permission'], 'string');
+    assert.equal(typeof pack.backend['quota.countdown.overdue'], 'string');
+
+    const overlap = Object.keys(pack.app).filter((k) => Object.hasOwn(pack.backend, k));
+    for (const k of overlap) {
+      assert.ok(allowedSharedKeys.has(k), `${code}.json 出现未授权的 app/backend 重名键: ${k}`);
+      assert.deepEqual(
+        extractPlaceholders(pack.app[k]),
+        extractPlaceholders(pack.backend[k]),
+        `${code}.json 重名键 ${k} 的占位符集合必须严格一致`
+      );
+    }
+  }
+
+  // P2-19: 英文 category(s) 语法修正与深度扫描报告文件名双语键就绪
+  assert.equal(enPack.app['maintenance.simple.confirm_running_detail'].includes('category(s)'), false);
+  assert.equal(enPack.app['maintenance.simple.confirm_running_detail'].includes('categories'), true);
+  assert.equal(zhPack.backend['deep_scan.report_filename'], '界面深度扫描报告.md');
+  assert.equal(enPack.backend['deep_scan.report_filename'], 'UI-Deep-Scan-Report.md');
+
+  // P1-14: Controller 在 zh-Hans 环境下暂停网页翻译时，status.locale 与文案仍保持中文，不强切为英文
+  const { Controller } = await import('../dist/controller.js');
+  const { dictionaryFromEntries } = await import('../dist/dictionary.js');
+  const ctrl = new Controller({
+    appPath: '/nonexistent',
+    profile: '/nonexistent-profile',
+    dictionary: dictionaryFromEntries({}),
+    hudEnabled: false,
+    locale: 'zh-Hans',
+    configuredLanguage: 'zh-Hans',
+    onStatus() {},
+  });
+  try {
+    await ctrl.pause();
+    const pausedStatus = ctrl.snapshot();
+    assert.equal(pausedStatus.mode, 'paused');
+    assert.equal(pausedStatus.translationEnabled, false);
+    assert.equal(pausedStatus.locale, 'zh-Hans');
+    assert.equal(pausedStatus.message, zhPack.backend['status.paused']);
+  } finally {
+    await ctrl.stop();
   }
 });

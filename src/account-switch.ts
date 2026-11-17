@@ -242,7 +242,7 @@ export class AccountSwitchService {
       new Set([this.target.appPath, '/Applications/Antigravity.app', '/Applications/Antigravity - Insiders.app']),
     ).map(p => p + '/Contents/');
     const running = this.options.isRunning ? await this.options.isRunning() :
-      (await run('/bin/ps', ['-ax', '-o', 'args='])).stdout.split('\n').some(line => {
+      (await run('/bin/ps', ['-ax', '-ww', '-o', 'args='], { timeout: 3000 })).stdout.split('\n').some(line => {
         const trimmed = line.trim();
         return candidatePrefixes.some(prefix => trimmed.startsWith(prefix));
       });

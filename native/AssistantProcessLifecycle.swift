@@ -157,53 +157,6 @@ extension Assistant {
         setGlobalLanguage(code)
     }
 
-    func setTranslationEnabled(_ enable: Bool) {
-        let previousStatus = statusValue
-        translationCommandGeneration += 1
-        let commandGen = translationCommandGeneration
-        pendingTranslationTarget = enable
-        statusValue.translationEnabled = enable
-        if enable {
-            if statusValue.mode == "paused" || statusValue.mode == "error" || statusValue.mode == "starting" {
-                statusValue.mode = "waiting"
-            }
-        } else {
-            statusValue.mode = "paused"
-        }
-        updateViews()
-        let sendCommand = { [weak self] in
-            guard let self, commandGen == self.translationCommandGeneration else { return }
-            self.bridge.send(["command": enable ? "resume" : "pause"]) { [weak self] result in
-                DispatchQueue.main.async {
-                    guard let self, commandGen == self.translationCommandGeneration else { return }
-                    self.pendingTranslationTarget = nil
-                    switch result {
-                    case .success(let value):
-                        if let raw = value["status"] as? [String: Any] {
-                            self.reachable = true
-                            self.recoveryAttempts = 0
-                            self.statusValue = self.mergeStatusSnapshot(raw, previous: self.statusValue)
-                            self.updateViews()
-                        }
-                        self.refresh()
-                    case .failure(let error):
-                        self.statusValue.translationEnabled = previousStatus.translationEnabled
-                        self.statusValue.mode = previousStatus.mode
-                        self.updateViews()
-                        self.showMessage(error.localizedDescription, error: true)
-                        self.refresh()
-                    }
-                }
-            }
-        }
-        if !reachable && !bridge.isOwnedProcessRunning {
-            recoveryAttempts = 0
-            nextRecoveryAt = .distantPast
-            bridge.launch { _ in sendCommand() }
-        } else {
-            sendCommand()
-        }
-    }
     func effectiveHudEnabled() -> Bool {
         if let pending = pendingHudTarget { return pending }
         if let live = statusValue.hudEnabled { return live }
@@ -240,9 +193,6 @@ extension Assistant {
                 }
             }
         }
-    }
-    @objc func toggleTranslation() {
-        setTranslationEnabled(!statusValue.enabled)
     }
     @objc func toggleHud() {
         setHudEnabled(!effectiveHudEnabled())

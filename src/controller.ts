@@ -61,7 +61,11 @@ export class Controller {
   private hasTargetDictionary = true;
   private get dormant() { return this.paused && !this.hudEnabled; }
   private effectiveStatusLocale(): string {
-    return this.paused && this.locale === 'zh-Hans' ? 'en' : this.locale;
+    return this.locale;
+  }
+  private effectiveHudLocale(): string {
+    if (this.options.fixture && this.paused) return 'en';
+    return this.locale;
   }
   private t(key: string, params?: Record<string, string | number | boolean | null | undefined>): string {
     return translate(this.effectiveStatusLocale(), key, params, { namespace: 'backend' });
@@ -242,7 +246,7 @@ export class Controller {
   }
   private boot(url: string) {
     const page = new URL(url);
-    const effectiveHudLocale = this.effectiveStatusLocale();
+    const effectiveHudLocale = this.effectiveHudLocale();
     const languageMode = this.paused ? 'en' : (this.locale === 'zh-Hans' ? 'zh' : this.locale);
     const key = `${page.origin}${page.pathname}:${this.options.dictionary.version}:${this.verifiedBundle()}:${this.hudEnabled}:${this.paused}:${effectiveHudLocale}`;
     const cached = this.bootCache.get(key);
@@ -411,7 +415,7 @@ export class Controller {
       }
       if (state?.version !== this.options.dictionary.version) throw new Error(this.t('controller.err.dict_version_unconfirmed'));
       session.languageMode=state.languageMode??'zh';
-      const effectiveHudLocale = this.effectiveStatusLocale();
+      const effectiveHudLocale = this.effectiveHudLocale();
       if (this.hudEnabled) {
         await session.cdp.evaluate(`(globalThis.__GRAVITYBOX_ATTACH_HUD__?.(), globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(${JSON.stringify(effectiveHudLocale)}), globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true), globalThis.__GRAVITYBOX_HUD_V1__?.syncAllSessions?.())`, session.contextId).catch(() => {});
       } else {
@@ -542,11 +546,17 @@ export class Controller {
   }
   pause(): Promise<void> {
     return this.enqueueControl(async () => {
+      const prevHudLocale = this.effectiveHudLocale();
       this.paused = true;
       this.status.errors = [];
       this.bootCache.clear();
       await this.quiescePages();
-      if (this.hudEnabled) await this.resumeHudOnly();
+      if (this.hudEnabled) {
+        await this.resumeHudOnly();
+        if (this.effectiveHudLocale() !== prevHudLocale) {
+          await this.hudBridge.refreshAllForLocaleChange();
+        }
+      }
       this.publish('paused', this.status.errors.length ? this.t('status.pausedWithErrors') : this.t('status.paused'));
     });
   }
@@ -554,6 +564,7 @@ export class Controller {
     if (this.browser) await this.sync(); else await this.tryConnect();
   }
   private async resumeInternal() {
+    const prevHudLocale = this.effectiveHudLocale();
     // Recreate the isolated runtime so translation starts from the chosen mode.
     if (this.locale === 'en') {
       this.locale = 'zh-Hans';
@@ -573,6 +584,9 @@ export class Controller {
       this.browser = undefined;
       clearTimeout(this.reconnection);
       await this.tryConnect();
+    }
+    if (this.hudEnabled && this.effectiveHudLocale() !== prevHudLocale) {
+      await this.hudBridge.refreshAllForLocaleChange();
     }
   }
   resume(): Promise<void> {
@@ -627,7 +641,7 @@ export class Controller {
       if (options?.dictionary) {
         await this.applyDictionary(options.dictionary);
       }
-      const effectiveHudLocale = this.effectiveStatusLocale();
+      const effectiveHudLocale = this.effectiveHudLocale();
       await Promise.allSettled([...this.pages.values()].map(async session => {
         await this.refreshRegistration(session);
         if (session.contextId !== undefined && !session.detaching) {
@@ -643,8 +657,10 @@ export class Controller {
       this.publish();
     });
   }
+  /** @internal Fixture-only shortcut toggle; no-op in production. */
   configureShortcut(enabled: boolean): Promise<void> {
     return this.enqueueControl(async () => {
+      if (!this.options.fixture) return;
       this.options.shortcutEnabled = enabled;
       this.bootCache.clear();
       await Promise.allSettled([...this.pages.values()].map(async session => {
@@ -677,7 +693,7 @@ export class Controller {
       if (!enabled) {
         this.hudBridge.clearActivePanes();
       }
-      const effectiveHudLocale = this.effectiveStatusLocale();
+      const effectiveHudLocale = this.effectiveHudLocale();
       await Promise.allSettled([...this.pages.values()].map(async session => {
         await this.refreshRegistration(session);
         if (session.contextId !== undefined && !session.detaching) {
@@ -810,7 +826,8 @@ export class Controller {
     const prepared=await this.prepareDeepScan();signal.throwIfAborted();
     const report=await this.coverageReport()??createCoverage([],this.options.dictionary,this.status.appVersion??'unknown',this.status.bundleSha256??'',[]);
     const deep:DeepReport={schema:1,scope:'metadata',startedAt:new Date().toISOString(),finishedAt:new Date().toISOString(),state:'partial',steps:[],plugins:await readPluginCatalog(join(homedir(),'.gemini/config/plugins'),signal),nativeMenus:sanitizeNativeMenus(nativeInput,new Set(prepared.nativeKeys)),notes:[this.t('controller.scan.note_metadata_only'),this.t('controller.scan.note_local_only')]};
-    deep.state=deep.nativeMenus.state==='read'&&!deep.plugins.limited?'complete':'partial';report.deep=deep;signal.throwIfAborted();onCommit?.();const directory=join(this.options.stateDir!,'reports');await atomicJson(join(directory,'coverage.json'),report,signal);await atomicJson(join(directory,'deep-scan.json'),deep,signal);await atomicText(join(directory,'界面深度扫描报告.md'),deepMarkdown(deep),signal);this.coverage=report;this.publish();return{ok:deep.state==='complete',partial:true,message:this.t('controller.scan.summary', { count: deep.plugins.entries.length, menuMessage: deep.nativeMenus.message })};
+    const reportFilename = this.t('deep_scan.report_filename');
+    deep.state=deep.nativeMenus.state==='read'&&!deep.plugins.limited?'complete':'partial';report.deep=deep;signal.throwIfAborted();onCommit?.();const directory=join(this.options.stateDir!,'reports');await atomicJson(join(directory,'coverage.json'),report,signal);await atomicJson(join(directory,'deep-scan.json'),deep,signal);await atomicText(join(directory,reportFilename),deepMarkdown(deep),signal);this.coverage=report;this.publish();return{ok:deep.state==='complete',partial:true,message:this.t('controller.scan.summary', { count: deep.plugins.entries.length, menuMessage: deep.nativeMenus.message })};
   }
   async stop() {
     this.stopped = true; this.closeProfileWatchers(); clearTimeout(this.reconnection); clearTimeout(this.targetTimer);

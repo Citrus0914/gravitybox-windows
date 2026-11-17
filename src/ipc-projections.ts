@@ -14,14 +14,14 @@ export function normalizeSubscriptionTier(value: unknown): string {
   if (upper === 'PRO') return 'PRO';
   if (upper === 'ULTRA') return 'ULTRA';
   if (upper === 'ENTERPRISE') return 'ENTERPRISE';
-  if (upper === 'TEAM' || upper === 'TEAMS' || upper === 'BUSINESS') return 'TEAM';
+  if (upper === 'TEAM' || upper === 'TEAMS' || upper === 'BUSINESS' || upper === 'WORKSPACE') return 'TEAM';
   if (upper === 'PLUS') return 'PLUS';
   if (/\bULTRA\b/i.test(raw)) return 'ULTRA';
   if (/\bENTERPRISE\b/i.test(raw)) return 'ENTERPRISE';
-  if (/\b(?:TEAM|TEAMS|BUSINESS)\b/i.test(raw)) return 'TEAM';
+  if (/\b(?:TEAM|TEAMS|BUSINESS|WORKSPACE)\b/i.test(raw)) return 'TEAM';
   if (/\bPLUS\b/i.test(raw)) return 'PLUS';
-  if (/\bPRO\b/i.test(raw)) return 'PRO';
-  if (/\bFREE\b/i.test(raw) || /starter/i.test(raw)) return 'FREE';
+  if (/\bPRO\b/i.test(raw) || /\bAI\s+PREMIUM\b/i.test(raw)) return 'PRO';
+  if (/\b(?:FREE|STARTER|TRIAL)\b/i.test(raw)) return 'FREE';
   return pending;
 }
 

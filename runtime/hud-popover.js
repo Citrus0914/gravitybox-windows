@@ -4,6 +4,104 @@
  */
 
 /**
+ * 解析当前聊天分栏在视口中的无遮挡水平可见边界 [left, right]：
+ * 当右侧打开编辑器、Diff、Artifact、浏览器视图或 Overview 侧栏导致聊天区缩窄时，
+ * 防止常驻 HUD 条与向上弹出卡片向右穿透分栏分隔线被右侧窗口（z-index: 10 或原生 WebContentsView）覆盖。
+ * @param {HTMLElement | null | undefined} anchorEl
+ * @param {Window | { innerWidth?: number } | null} [winOverride]
+ * @returns {{ left: number, right: number, viewportWidth: number }}
+ */
+export function resolveVisibleHorizontalBounds(anchorEl, winOverride = null) {
+  const win =
+    winOverride ||
+    (typeof window !== 'undefined' ? window : globalThis.window) || {
+      innerWidth: 1024,
+      innerHeight: 768,
+    };
+  const viewportWidth = Number(win.innerWidth) || 1024;
+  let left = 0;
+  let right = viewportWidth;
+
+  if (!anchorEl || typeof anchorEl.closest !== 'function') {
+    return { left, right, viewportWidth };
+  }
+
+  const clampWithPane = (el, subtractPadding = false) => {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return;
+    const r = el.getBoundingClientRect();
+    if (!r || !(r.width > 0)) return;
+    let pLeft = r.left;
+    let pRight = r.right;
+    if (subtractPadding && typeof win.getComputedStyle === 'function') {
+      try {
+        const cs = win.getComputedStyle(el);
+        const padL = parseFloat(cs?.paddingLeft || '0') || 0;
+        const padR = parseFloat(cs?.paddingRight || '0') || 0;
+        if (r.width - padL - padR >= 80) {
+          pLeft += padL;
+          pRight -= padR;
+        }
+      } catch {}
+    }
+    left = Math.max(left, pLeft);
+    right = Math.min(right, pRight);
+  };
+
+  const convView = anchorEl.closest(
+    '[data-testid="conversation-view"], [data-media-drop-scope="subpane"], [data-testid="subagent-tab-conversation"]'
+  );
+  if (convView) {
+    clampWithPane(convView, false);
+  }
+  const overviewHost = anchorEl.closest('[data-testid="overview-panel-host"]');
+  if (overviewHost) {
+    clampWithPane(overviewHost, true);
+  }
+
+  // 遍历外层分栏容器 ([data-split-root="true"])：夹紧到所属分栏槽位，并以右侧分栏/分隔条左边缘为硬上界
+  let splitCursor = anchorEl.closest('[data-split-root="true"]');
+  let guard = 0;
+  while (splitCursor && guard++ < 6) {
+    const children = splitCursor.children ? [...splitCursor.children] : [];
+    const slotIndex = children.findIndex((child) =>
+      typeof child?.contains === 'function' ? child.contains(anchorEl) : false
+    );
+    if (slotIndex >= 0) {
+      const mySlot = children[slotIndex];
+      clampWithPane(mySlot, false);
+      const myRect = typeof mySlot.getBoundingClientRect === 'function' ? mySlot.getBoundingClientRect() : null;
+      for (let i = slotIndex + 1; i < children.length; i++) {
+        const sib = children[i];
+        if (!sib || typeof sib.getBoundingClientRect !== 'function') continue;
+        if (typeof win.getComputedStyle === 'function') {
+          try {
+            const cs = win.getComputedStyle(sib);
+            if (cs?.display === 'none' || cs?.visibility === 'hidden') continue;
+          } catch {}
+        }
+        const sibRect = sib.getBoundingClientRect();
+        if (!sibRect || !(sibRect.width > 0) || !(sibRect.height > 40)) continue;
+        // 仅针对横向并排右侧窗格夹紧（排除上下堆叠布局）
+        const minHorizontalSpan = myRect ? myRect.left + 80 : left + 80;
+        if (sibRect.left >= minHorizontalSpan && sibRect.left < right) {
+          right = Math.min(right, sibRect.left);
+        }
+      }
+    }
+    splitCursor = splitCursor.parentElement?.closest?.('[data-split-root="true"]') || null;
+  }
+
+  if (!(right > left)) {
+    return { left: 0, right: viewportWidth, viewportWidth };
+  }
+  return {
+    left: Math.max(0, left),
+    right: Math.min(viewportWidth, right),
+    viewportWidth,
+  };
+}
+
+/**
  * 计算向上弹出 Popover 的绝对屏幕坐标，实现水平与垂直全向视口防裁切及小三角圆角避障
  * @param {HTMLElement} capsuleEl 触发胶囊 DOM 元素
  * @param {number} popoverWidth Popover 卡片标准宽度 (px)
@@ -22,29 +120,36 @@ export function computeUpwardPopoverPosition(
 ) {
   const rect = capsuleEl.getBoundingClientRect();
   const win = typeof window !== 'undefined' ? window : globalThis.window || { innerWidth: 1024, innerHeight: 768 };
-  const viewportWidth = Number(win.innerWidth) || 1024;
+  const bounds = resolveVisibleHorizontalBounds(capsuleEl, win);
   const viewportHeight = Number(win.innerHeight) || 768;
 
-  // 1. 动态有效宽度计算：当视口宽度不足容纳标准卡片与双向留白时，平滑收缩卡片有效宽度
-  const availableViewportWidth = viewportWidth - 2 * safeMargin;
-  const effectivePopoverWidth = Math.max(120, Math.min(popoverWidth, availableViewportWidth));
+  // 1. 动态有效宽度计算：当分栏或视口可用宽度不足容纳标准卡片与双向留白时，平滑收缩卡片有效宽度
+  const rawSpanWidth = bounds.right - bounds.left;
+  const effectiveMargin = rawSpanWidth < 180 ? Math.max(4, Math.min(safeMargin, Math.floor((rawSpanWidth - 120) / 2))) : safeMargin;
+  const availablePaneWidth = rawSpanWidth - 2 * effectiveMargin;
+  const effectivePopoverWidth = Math.max(120, Math.min(popoverWidth, availablePaneWidth));
 
-  // 2. 胶囊在视口中的绝对水平中心
-  const capsuleCenterX = rect.left + rect.width / 2;
+  // 2. 胶囊在可见分栏中的水平中心（若胶囊自身右侧已被窄栏裁剪，则取可见交集中心）
+  const visibleCapsuleLeft = Math.max(rect.left, bounds.left);
+  const visibleCapsuleRight = Math.min(rect.right, bounds.right);
+  const capsuleCenterX =
+    visibleCapsuleRight > visibleCapsuleLeft
+      ? (visibleCapsuleLeft + visibleCapsuleRight) / 2
+      : Math.max(bounds.left, Math.min(rect.left + rect.width / 2, bounds.right));
 
   // 3. 理想水平坐标 (Popover 中心与胶囊中心对齐)
   const idealLeft = capsuleCenterX - effectivePopoverWidth / 2;
 
-  // 4. 水平边界夹紧约束 (Clamping)，确保右边缘严格不穿出视口
-  const minLeft = safeMargin;
-  const maxLeft = Math.max(minLeft, viewportWidth - effectivePopoverWidth - safeMargin);
+  // 4. 水平边界夹紧约束 (Clamping)，确保左右边缘严格不穿出当前聊天分栏与视口（避免被右侧窗口覆盖）
+  const minLeft = bounds.left + effectiveMargin;
+  const maxLeft = Math.max(minLeft, bounds.right - effectivePopoverWidth - effectiveMargin);
   const clampedLeft = Math.max(minLeft, Math.min(idealLeft, maxLeft));
 
   // 5. 向上/向下垂直坐标与顶部防裁切检查：当上方空间不足容纳最小卡片且下方空间更充裕时自动向下翻转
   const topAvailableSpace = rect.top - verticalGap;
   const bottomAvailableSpace = viewportHeight - rect.bottom - verticalGap;
   const direction =
-    topAvailableSpace < Math.min(popoverHeight, 140) && bottomAvailableSpace > topAvailableSpace
+    topAvailableSpace - safeMargin < popoverHeight && bottomAvailableSpace > topAvailableSpace
       ? 'down'
       : 'up';
   const bottom = Math.round(viewportHeight - rect.top + verticalGap);
@@ -183,6 +288,7 @@ export function applyPopoverGeometry(popoverEl, arrowEl, pos, options = {}) {
 }
 
 globalThis.__GRAVITYBOX_HUD_POPOVER__ = {
+  resolveVisibleHorizontalBounds,
   computeUpwardPopoverPosition,
   applyPopoverGeometry,
   resetPopoverGeometryCache,

@@ -18,6 +18,14 @@ final class AddAccountSheet: NSObject {
     let googleButton = button(L10n.t("add_account.google_btn", fallback: "Google 授权登录…"), target: nil, action: #selector(signIn))
     let cancelButton = button(L10n.t("common.cancel", fallback: "取消"), target: nil, action: #selector(cancel))
     private var feedback: NSStackView!
+    private var languageObserver: NSObjectProtocol?
+    private var headerTitleLabel: NSTextField!
+    private var saveCurrentTitleLabel: NSTextField!
+    private var saveCurrentSubLabel: NSTextField!
+    private var googleTitleLabel: NSTextField!
+    private var googleSubLabel: NSTextField!
+    private var saveEmailCopyTitle: NSTextField?
+    private var didCompleteAuth = false
     var sessionID: String?
     var pollTimer: Timer?
     var requestInFlight = false
@@ -58,7 +66,7 @@ final class AddAccountSheet: NSObject {
             spinner.heightAnchor.constraint(equalToConstant: 16)
         ])
 
-        func choice(_ icon: String, _ title: String, _ subtitle: String, _ action: NSButton) -> NSView {
+        func choice(_ icon: String, _ title: String, _ subtitle: String, _ action: NSButton) -> (view: NSView, titleLbl: NSTextField, subLbl: NSTextField) {
             let titleLbl = text(title, size: 13, weight: .semibold, color: .labelColor)
             let subLbl = text(subtitle, size: 11, color: Design.secondary, wrap: true)
             subLbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -70,6 +78,7 @@ final class AddAccountSheet: NSObject {
                 emailLbl.lineBreakMode = .byTruncatingMiddle
                 emailLbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
                 emailLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                saveEmailCopyTitle = emailLbl
                 textViews.append(emailLbl)
             }
             let textCol = vertical(textViews, spacing: 2.5)
@@ -85,19 +94,26 @@ final class AddAccountSheet: NSObject {
             let badge = iconBadge(icon, tint: Design.blue, size: 30)
             let row = horizontal([badge, textCol, action], spacing: 12)
             row.alignment = .centerY
-            return group([row], inset: 14)
+            return (group([row], inset: 14), titleLbl, subLbl)
         }
 
         feedback = horizontal([spinner, status], spacing: 8)
         feedback.isHidden = true
         let headerBadge = iconBadge("person.badge.plus", tint: Design.blue, size: 32)
         let headerTitle = text(L10n.t("add_account.title", fallback: "添加账号"), size: 16, weight: .semibold, color: .labelColor)
+        headerTitleLabel = headerTitle
         let headerRow = horizontal([headerBadge, headerTitle, flexibleSpace()], spacing: 10)
         headerRow.alignment = .centerY
+        let saveChoice = choice("person.crop.rectangle", L10n.t("add_account.save_current", fallback: "保存当前账号"), L10n.t("add_account.save_current_sub", fallback: "导入当前 Antigravity 登录账号"), currentButton)
+        saveCurrentTitleLabel = saveChoice.titleLbl
+        saveCurrentSubLabel = saveChoice.subLbl
+        let googleChoice = choice("globe", L10n.t("add_account.google_title", fallback: "Google 授权登录"), L10n.t("add_account.google_sub", fallback: "通过浏览器授权，凭据仅存本机"), googleButton)
+        googleTitleLabel = googleChoice.titleLbl
+        googleSubLabel = googleChoice.subLbl
         let root = vertical([
             headerRow,
-            choice("person.crop.rectangle", L10n.t("add_account.save_current", fallback: "保存当前账号"), L10n.t("add_account.save_current_sub", fallback: "导入当前 Antigravity 登录账号"), currentButton),
-            choice("globe", L10n.t("add_account.google_title", fallback: "Google 授权登录"), L10n.t("add_account.google_sub", fallback: "通过浏览器授权，凭据仅存本机"), googleButton),
+            saveChoice.view,
+            googleChoice.view,
             feedback,
             horizontal([flexibleSpace(), cancelButton])
         ], spacing: 12)
@@ -111,17 +127,53 @@ final class AddAccountSheet: NSObject {
         Design.applyControls(surface)
         surface.layoutSubtreeIfNeeded()
         window.setContentSize(NSSize(width: Self.sheetWidth, height: max(Self.collapsedHeight, ceil(content.fittingSize.height))))
+        languageObserver = NotificationCenter.default.addObserver(
+            forName: L10n.didChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            if Thread.isMainThread {
+                self?.syncLocalizedChrome()
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.syncLocalizedChrome() }
+            }
+        }
     }
 
     deinit {
         pollTimer?.invalidate()
+        if let languageObserver {
+            NotificationCenter.default.removeObserver(languageObserver)
+        }
+    }
+
+    private func syncLocalizedChrome() {
+        let title = L10n.t("add_account.title", fallback: "添加账号")
+        window.title = title
+        headerTitleLabel.stringValue = title
+        saveCurrentTitleLabel.stringValue = L10n.t("add_account.save_current", fallback: "保存当前账号")
+        saveCurrentSubLabel.stringValue = L10n.t("add_account.save_current_sub", fallback: "导入当前 Antigravity 登录账号")
+        googleTitleLabel.stringValue = L10n.t("add_account.google_title", fallback: "Google 授权登录")
+        googleSubLabel.stringValue = L10n.t("add_account.google_sub", fallback: "通过浏览器授权，凭据仅存本机")
+        currentButton.title = L10n.t("add_account.save_current", fallback: "保存当前账号")
+        googleButton.title = L10n.t("add_account.google_btn", fallback: "Google 授权登录…")
+        cancelButton.title = L10n.t("common.cancel", fallback: "取消")
+        if let saveEmailCopyTitle {
+            enableTextCopy(saveEmailCopyTitle, title: L10n.t("common.copy_full_email", fallback: "复制完整邮箱"))
+        }
+        window.contentView?.layoutSubtreeIfNeeded()
     }
 
     func show(in parent: NSWindow, onDismiss: @escaping () -> Void) {
         self.onDismiss = onDismiss
         app.presentRetainedSheet(controller: self, sheet: window, in: parent) { [weak self] _ in
-            self?.pollTimer?.invalidate()
-            self?.onDismiss?()
+            if let self {
+                self.pollTimer?.invalidate()
+                if let id = self.sessionID, !self.didCompleteAuth, !self.closing {
+                    self.app.bridge.send(["command": "account_oauth_cancel", "id": id]) { _ in }
+                }
+                self.onDismiss?()
+            }
         }
         // F06: Sheet 成为 key 后再锁定一次初始焦点，避免 AppKit 按视图顺序落到次级按钮。
         DispatchQueue.main.async { [weak self] in
@@ -163,6 +215,7 @@ final class AddAccountSheet: NSObject {
             guard let self else { return }
             switch response {
             case .success:
+                self.didCompleteAuth = true
                 self.saved()
                 self.dismiss()
             case .failure(let error):
@@ -227,6 +280,7 @@ final class AddAccountSheet: NSObject {
                 let phase = value["phase"] as? String ?? "failed"
                 self.cancelButton.isEnabled = phase != "saving"
                 if phase == "succeeded" {
+                    self.didCompleteAuth = true
                     self.pollTimer?.invalidate()
                     self.saved()
                     self.dismiss()

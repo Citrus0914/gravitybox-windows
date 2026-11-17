@@ -40,10 +40,6 @@ export function getGoogleClientId(): string {
 export function getGoogleClientSecret(): string {
   return process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET || '';
 }
-/** @deprecated 静态导入早于 .env 加载时可能为空，运行时逻辑请统一调用 getGoogleClientId() */
-export const GOOGLE_CLIENT_ID = getGoogleClientId();
-/** @deprecated 静态导入早于 .env 加载时可能为空，运行时逻辑请统一调用 getGoogleClientSecret() */
-export const GOOGLE_CLIENT_SECRET = getGoogleClientSecret();
 
 export const CLOUD_CODE_LOAD_PROJECT_ENDPOINTS = [
   'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist',
@@ -75,6 +71,7 @@ export async function fetchCloudQuotaForAccount(params: {
   const endpointSet=(method:string,legacy:string[])=>providerContext?[providerContext.origin+'/v1internal:'+method]:legacy;
   const providerAgent=providerContext?.userAgent??'Antigravity/0.9.0';
   account.quota_refresh_error = null;
+  account.quota_refresh_error_code = null;
   const nowSec = Math.floor(Date.now() / 1000);
   const needTokenRefresh =
     !account.token.access_token ||
@@ -208,11 +205,29 @@ export async function fetchCloudQuotaForAccount(params: {
           account.token.project_id = projectId;
           projectObserved = true;
         }
-        const rawTier = data.paidTier?.name || data.paidTier?.id || data.paid_tier?.name || data.paid_tier?.id ||
-          data.currentTier?.name || data.currentTier?.id || data.current_tier?.name || data.current_tier?.id;
-        if (!tierObserved && typeof rawTier === 'string' && rawTier.trim()) {
-          subscriptionTier = String(rawTier);
-          tierObserved = true;
+        const tierCandidates = [
+          data.paidTier?.name,
+          data.paidTier?.id,
+          data.paid_tier?.name,
+          data.paid_tier?.id,
+          data.userTier?.name,
+          data.userTier?.id,
+          data.user_tier?.name,
+          data.user_tier?.id,
+          data.g1Tier,
+          data.g1_tier,
+          data.currentTier?.name,
+          data.currentTier?.id,
+          data.current_tier?.name,
+          data.current_tier?.id,
+        ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+        const ultraTier = tierCandidates.find(v => /ultra/i.test(v));
+        const rawTier = ultraTier ?? tierCandidates[0];
+        if (typeof rawTier === 'string' && rawTier.trim()) {
+          if (!tierObserved || (ultraTier && !/ultra/i.test(subscriptionTier ?? ''))) {
+            subscriptionTier = String(rawTier);
+            tierObserved = true;
+          }
         }
       }
       return results;
@@ -362,6 +377,7 @@ export async function fetchCloudQuotaForAccount(params: {
 
     const missingLabels = missingFamilies.map(familyLabel);
     account.quota_refresh_error = missingLabels.length > 0 ? bt('account_cloud.refresh_err.missing_families', { labels: missingLabels.join(bt('common.list_separator')) }) : null;
+    account.quota_refresh_error_code = null;
 
     const groupObservations = mergedGroups
       .map(group => group.observed_at)

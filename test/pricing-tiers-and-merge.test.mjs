@@ -185,4 +185,35 @@ test('P1-14: matchPricingKeys 识别 xhigh / extra-high 等思考后缀与远端
   const enProv = localizePricingProvenance(exportedFeed.prices['tiered-feed-model'][0].provenance, 'en');
   assert.equal(enProv?.platform, 'Google Cloud Standard Global API');
   assert.equal(/[\u4e00-\u9fff]/.test(enProv?.conditions ?? ''), false);
+
+  const feedWithActive = buildPricingFeed({
+    pricingVersion: '2026-11-15',
+    pricingUpdatedAt: '2026-11-15T00:00:00Z',
+    feedModels: ['tiered-feed-model', 'retired-feed-model'],
+    activeModels: ['tiered-feed-model'],
+    prices: {
+      'tiered-feed-model': { model: 'tiered-feed-model', input: 1, output: 2, cached: 0.1 },
+      'retired-feed-model': { model: 'retired-feed-model', input: 3, output: 6, cached: 0.3 },
+    },
+  });
+  assert.deepEqual(feedWithActive.activeModels, ['tiered-feed-model']);
+  assert.throws(() => buildPricingFeed({
+    pricingVersion: '2026-11-15',
+    pricingUpdatedAt: '2026-11-15T00:00:00Z',
+    feedModels: ['tiered-feed-model'],
+    activeModels: ['missing-active-model'],
+    prices: {
+      'tiered-feed-model': { model: 'tiered-feed-model', input: 1, output: 2, cached: 0.1 },
+    },
+  }));
+
+  const { canonicalActivePricingKeys } = await import('../dist/pricing.js');
+  const { ACTIVE_MODEL_KEYS } = await import('../dist/model-catalog.js');
+  const mappedOrch = canonicalActivePricingKeys([
+    'gemini-pro-orchestrator',
+    'tab_flash_lite_preview',
+    'gemini-3.8-flash-exp-a',
+  ]);
+  assert.deepEqual([...mappedOrch], ['gemini-4-argon']);
+  assert.deepEqual([...canonicalActivePricingKeys(['chat_20706', 'gemini-4-argon-trial'])], [...ACTIVE_MODEL_KEYS]);
 });

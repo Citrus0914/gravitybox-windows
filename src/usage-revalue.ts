@@ -99,7 +99,7 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
                 continue;
             }
             const eventKey = String(row.event_key);
-            const lock = backupLocks.get(eventKey);
+            const lock = backupLocks.get(eventKey) ?? (event.legacy_event_key ? backupLocks.get(event.legacy_event_key) : undefined);
             const locked = lock ? JSON.parse(lock.unit_price) as ApiPricing : null;
             const cw = event.cache_write_tokens ?? 0;
             const lockedMissingCw = Boolean(
@@ -120,10 +120,16 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
                 event.timestamp_seconds,
                 normalizedModel
             );
-            if (!price) {
+            const effectiveNewPrice = price ? resolveContextTierPricing(price, event.input_tokens + event.cached_tokens + cw) : null;
+            if (!price || !effectiveNewPrice) {
                 unknown++;
                 continue;
             } // Current prices are never invented for an unsupported historical interval.
+            const newPriceMissingCw = cw > 0 && (!Number.isFinite(effectiveNewPrice.cacheWrite) || effectiveNewPrice.cacheWrite! < 0);
+            if (newPriceMissingCw) {
+                unknown++;
+                if (options.mode === 'unpriced_only') continue;
+            }
             const unpriced = !lock || zeroSentinel || lockedMissingCw;
             if (options.mode !== 'unpriced_only' || unpriced) {
                 candidateLocks.delete(eventKey);

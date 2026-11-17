@@ -12,10 +12,12 @@ struct BackendFailure: LocalizedError {
 final class BackendBridge {
     let state: URL
     let resources: URL
-    private var child: Process?
-    private var generation = 0
-    private(set) var isLaunching = false
-    private(set) var isRestarting = false
+    private let stateLock = NSLock()
+    private var _child: Process?
+    private var _generation = 0
+    private var _isLaunching = false
+    private var _isRestarting = false
+    private var _preferredLocale: String?
     private let queue = DispatchQueue(label: "local.gravitybox.bridge", qos: .userInitiated)
     private let controlQueue = DispatchQueue(label:"local.gravitybox.control",qos:.userInitiated,attributes:.concurrent)
     private let controlSemaphore = DispatchSemaphore(value: 4)
@@ -24,9 +26,31 @@ final class BackendBridge {
     var fixtureReply: (([String:Any]) -> [String:Any])?
     #endif
     var onExit: ((String) -> Void)?
-    var preferredLocale: String?
+
+    private var child: Process? {
+        get { stateLock.withLock { _child } }
+        set { stateLock.withLock { _child = newValue } }
+    }
+    private var generation: Int {
+        get { stateLock.withLock { _generation } }
+        set { stateLock.withLock { _generation = newValue } }
+    }
+    private(set) var isLaunching: Bool {
+        get { stateLock.withLock { _isLaunching } }
+        set { stateLock.withLock { _isLaunching = newValue } }
+    }
+    private(set) var isRestarting: Bool {
+        get { stateLock.withLock { _isRestarting } }
+        set { stateLock.withLock { _isRestarting = newValue } }
+    }
+    var preferredLocale: String? {
+        get { stateLock.withLock { _preferredLocale } }
+        set { stateLock.withLock { _preferredLocale = newValue } }
+    }
     var ownedPID: Int32? { child?.processIdentifier }
-    var isOwnedProcessRunning: Bool { isLaunching || child?.isRunning == true }
+    var isOwnedProcessRunning: Bool {
+        stateLock.withLock { _isLaunching || _child?.isRunning == true }
+    }
 
     init(resources: URL, state: URL) { self.resources = resources; self.state = state }
 
@@ -45,25 +69,6 @@ final class BackendBridge {
             }
         }
         #endif
-    }
-
-    /// Restore the old channel's injected UI before opening the new channel's helper.
-    func restart(completion: @escaping (Result<Void, Error>) -> Void) {
-        guard !isRestarting else { return }
-        generation += 1
-        isRestarting = true
-        queue.async { [self] in
-            let result = Result {
-                if let child, child.isRunning {
-                    _ = try request(["command": "stop"])
-                    let deadline = Date().addingTimeInterval(10)
-                    while child.isRunning && Date() < deadline { usleep(50_000) }
-                    guard !child.isRunning else { throw BackendFailure(message: L10n.t("backend.error.old_connection_alive", fallback: "旧连接尚未退出，未连接另一个版本。")) }
-                }
-                try startChildProcess()
-            }
-            DispatchQueue.main.async { self.isRestarting = false; completion(result) }
-        }
     }
 
     /// 读取进程启动参数（KERN_PROCARGS2）。放在 Backend.swift 内，保证本文件可脱离 Assistant.swift 独立编译。
@@ -271,8 +276,9 @@ final class BackendBridge {
         #endif
         let command = payload["command"] as? String ?? ""
         let readOnlyCommands: Set<String> = [
-            "status", "task_list", "task_cancel", "usage_cancel", "ping",
+            "status", "task_list", "task_cancel", "usage_cancel", "ping", "stop",
             "dashboard_summary", "account_list", "account_get", "account_switch_preflight",
+            "account_oauth_status", "account_oauth_cancel", "maintenance_preflight",
             "maintenance_scan", "maintenance_history", "usage_summary", "usage_events",
             "usage_snapshot_release", "usage_ledger_review", "auto_switch_get",
             "account_recovery_info", "api_pricing_get", "pricing_sync_status"
@@ -431,7 +437,10 @@ final class BackendBridge {
             completed = true
             lock.unlock()
             if shouldRun {
-                DispatchQueue.main.async { completion() }
+                DispatchQueue.main.async {
+                    self.isRestarting = false
+                    completion()
+                }
             }
         }
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout + 0.4) {

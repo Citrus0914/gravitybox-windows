@@ -287,7 +287,8 @@ final class MenuSegmentedTabsView: NSView {
             btn.setAccessibilityValue(idx == self.selectedIndex ? 1 : 0)
             if style == .compactToggle {
                 btn.translatesAutoresizingMaskIntoConstraints = false
-                btn.widthAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
+                let titleWidth = (item as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11.5, weight: .medium)]).width
+                btn.widthAnchor.constraint(greaterThanOrEqualToConstant: max(48, ceil(titleWidth) + 14)).isActive = true
             }
             buttons.append(btn)
             stack.addArrangedSubview(btn)
@@ -863,8 +864,9 @@ final class MenuModelUsageItemView: NSView {
     let tokensLabel: NSTextField
     let shareBar = MenuMeterBar()
 
-    init(model: String, tokensText: String, shareFraction: CGFloat) {
-        self.rawModel = model
+    init(model: String, rawModelKey: String? = nil, tokensText: String, shareFraction: CGFloat) {
+        let resolvedRawKey = (rawModelKey?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? model
+        self.rawModel = resolvedRawKey
         let display = model
         self.nameLabel = text(display, size: 12, weight: .semibold, color: .labelColor, wrap: true)
         self.tokensLabel = text(tokensText, size: 12, weight: .semibold, color: .labelColor)
@@ -877,7 +879,7 @@ final class MenuModelUsageItemView: NSView {
         tokensLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
         tokensLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        if let brand = ModelIcons.brands(for: model).first, let image = ModelIcons.image(brand) {
+        if let brand = ModelIcons.brands(for: resolvedRawKey).first, let image = ModelIcons.image(brand) {
             iconView.image = image
             iconView.contentTintColor = ModelIcons.tintColor(for: image)
         }
@@ -910,11 +912,18 @@ final class MenuModelUsageItemView: NSView {
         L10n.shared.isEnglish ? "\(display), \(tokensText) Tokens" : "\(display)，\(tokensText) Token"
     }
 
-    func update(tokensText: String, shareFraction: CGFloat) {
-        if tokensLabel.stringValue != tokensText {
+    func update(displayName: String? = nil, tokensText: String, shareFraction: CGFloat) {
+        let nextDisplay = displayName ?? nameLabel.stringValue
+        let displayChanged = nameLabel.stringValue != nextDisplay
+        let tokensChanged = tokensLabel.stringValue != tokensText
+        if displayChanged {
+            nameLabel.stringValue = nextDisplay
+        }
+        if tokensChanged {
             tokensLabel.stringValue = tokensText
-            let display = rawModel
-            setAccessibilityLabel(Self.accessibilityText(display: display, tokensText: tokensText))
+        }
+        if displayChanged || tokensChanged {
+            setAccessibilityLabel(Self.accessibilityText(display: nextDisplay, tokensText: tokensText))
         }
         shareBar.fraction = max(0.02, min(1.0, shareFraction))
     }

@@ -30,8 +30,8 @@ export const HUD_STYLES_CSS = `
 
   /* Antigravity 原生品牌语义色 (Zenith Blue & Sky Cyan) */
   --hud-accent-blue: #3186FF;
-  --hud-accent-cyan: #0EA5E9;
-  --hud-accent-emerald: #10B981;
+  --hud-breathe-glow: rgba(49, 134, 255, 0.55);
+  --hud-breathe-glow-end: rgba(49, 134, 255, 0);
   --hud-seg-sys-color: #3186FF;
   --hud-seg-tool-color: #38BDF8;
   --hud-seg-msg-color: #10B981;
@@ -57,6 +57,8 @@ export const HUD_STYLES_CSS = `
   justify-content: center;
   align-items: center;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   box-sizing: border-box;
   pointer-events: none;
   user-select: none;
@@ -89,8 +91,8 @@ export const HUD_STYLES_CSS = `
 
   /* Antigravity 原生品牌语义色 (Dark) */
   --hud-accent-blue: #589BFF;
-  --hud-accent-cyan: #38BDF8;
-  --hud-accent-emerald: #34D399;
+  --hud-breathe-glow: rgba(88, 155, 255, 0.55);
+  --hud-breathe-glow-end: rgba(88, 155, 255, 0);
   --hud-seg-sys-color: #589BFF;
   --hud-seg-tool-color: #38BDF8;
   --hud-seg-msg-color: #34D399;
@@ -122,12 +124,12 @@ export const HUD_STYLES_CSS = `
   0%, 100% {
     transform: scale(1.08);
     opacity: 1;
-    box-shadow: 0 0 0 0 rgba(49, 134, 255, 0.55);
+    box-shadow: 0 0 0 0 var(--hud-breathe-glow, rgba(49, 134, 255, 0.55));
   }
   50% {
     transform: scale(0.82);
     opacity: 0.28;
-    box-shadow: 0 0 0 3.5px rgba(49, 134, 255, 0);
+    box-shadow: 0 0 0 3.5px var(--hud-breathe-glow-end, rgba(49, 134, 255, 0));
   }
 }
 
@@ -234,7 +236,8 @@ export const HUD_STYLES_CSS = `
 .capsule.is-skeleton .capsule-donut,
 .capsule.is-skeleton .hud-status-dot,
 .capsule.is-skeleton .hud-compaction-badge,
-.capsule.is-skeleton .hud-ctx-model-tag {
+.capsule.is-skeleton .hud-ctx-model-tag,
+.capsule.is-skeleton .hud-subagent-tag {
   opacity: 0.35;
 }
 
@@ -422,7 +425,7 @@ export const HUD_STYLES_CSS = `
 
 .capsule-session {
   flex-shrink: 1;
-  min-width: 38px;
+  min-width: 28px;
   max-width: 320px;
 }
 
@@ -433,13 +436,44 @@ export const HUD_STYLES_CSS = `
 }
 
 .hud-subagent-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 1.5px;
   color: var(--hud-accent-blue);
-  font-weight: 500;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  vertical-align: -1px;
+}
+
+.hud-subagent-tag[hidden] {
+  display: none !important;
+}
+
+.hud-subagent-sep {
+  color: var(--hud-text-muted);
+  font-weight: 400;
+  white-space: pre;
+}
+
+.hud-subagent-icon {
+  width: 11px;
+  height: 11px;
+  flex-shrink: 0;
+  display: inline-block;
+}
+
+.hud-subagent-count {
+  font-size: 10.5px;
+  line-height: 1;
+}
+
+.hud-subagent-count:empty {
+  display: none;
 }
 
 .capsule-tokens {
   flex-shrink: 2;
-  min-width: 38px;
+  min-width: 28px;
   max-width: 260px;
 }
 
@@ -576,17 +610,22 @@ export const HUD_STYLES_CSS = `
 }
 
 .hud-container.is-ultra-compact .capsule-context {
+  flex-shrink: 1;
   min-width: 0;
-  padding-inline: 6px;
+  padding-inline: 5.5px;
+}
+
+.hud-container.is-ultra-compact .capsule {
+  padding-inline: 5.5px;
 }
 
 .hud-container.is-ultra-compact .capsule-donut {
-  width: 30px;
+  width: 26px;
   margin-right: 4px;
 }
 
 .hud-container.is-ultra-compact .capsule-context.has-compaction {
-  padding-inline: 6px;
+  padding-inline: 5.5px;
 }
 
 .hud-container.is-ultra-compact .hud-compaction-badge {
@@ -594,29 +633,33 @@ export const HUD_STYLES_CSS = `
   height: 11.5px;
   padding: 0 2.5px;
   font-size: 8.5px;
-  margin-right: 4.5px;
+  margin-right: 4px;
 }
 
 .hud-container.is-ultra-compact .capsule-context.has-compaction .capsule-donut,
 .hud-container.is-ultra-compact .capsule-context.has-model-tag .capsule-donut {
-  width: 24px;
-  margin-right: 4px;
+  width: 22px;
+  margin-right: 3.5px;
 }
 
 .hud-container.is-ultra-compact .capsule-context.has-compaction.has-model-tag .capsule-donut {
-  width: 22px;
-  margin-right: 3.5px;
+  width: 20px;
+  margin-right: 3px;
 }
 
 .hud-container.is-ultra-compact .hud-turns,
 .hud-container.is-ultra-compact .hud-turn-dot,
 .hud-container.is-ultra-compact .hud-speed,
-.hud-container.is-ultra-compact .hud-subagent-tag,
 .hud-container.is-ultra-compact .hud-tok-cache {
   display: none !important;
 }
 
-@container hud (max-width: 360px) {
+.hud-container.is-micro-compact .capsule-donut,
+.hud-container.is-micro-compact .hud-subagent-sep {
+  display: none !important;
+}
+
+@container hud (max-width: 359.98px) {
   .hud-ctx-model-tag {
     margin-right: 4px;
   }
@@ -625,38 +668,48 @@ export const HUD_STYLES_CSS = `
     padding: 0 3px;
     font-size: 9px;
   }
+  .capsule {
+    padding-inline: 5.5px;
+  }
   .capsule-context {
+    flex-shrink: 1;
     min-width: 0;
-    padding-inline: 6px;
+    padding-inline: 5.5px;
   }
   .capsule-donut {
-    width: 30px;
+    width: 26px;
     margin-right: 4px;
   }
   .capsule-context.has-compaction {
-    padding-inline: 6px;
+    padding-inline: 5.5px;
   }
   .hud-compaction-badge {
     min-width: 11.5px;
     height: 11.5px;
     padding: 0 2.5px;
     font-size: 8.5px;
-    margin-right: 4.5px;
+    margin-right: 4px;
   }
   .capsule-context.has-compaction .capsule-donut,
   .capsule-context.has-model-tag .capsule-donut {
-    width: 24px;
-    margin-right: 4px;
-  }
-  .capsule-context.has-compaction.has-model-tag .capsule-donut {
     width: 22px;
     margin-right: 3.5px;
+  }
+  .capsule-context.has-compaction.has-model-tag .capsule-donut {
+    width: 20px;
+    margin-right: 3px;
   }
   .hud-turns,
   .hud-turn-dot,
   .hud-speed,
-  .hud-subagent-tag,
   .hud-tok-cache {
+    display: none !important;
+  }
+}
+
+@container hud (max-width: 260px) {
+  .capsule-donut,
+  .hud-subagent-sep {
     display: none !important;
   }
 }
@@ -976,6 +1029,16 @@ export const HUD_STYLES_CSS = `
   line-height: 1.2;
 }
 
+.hud-ctx-history-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--hud-text-muted);
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--hud-divider);
+  line-height: 1.2;
+}
+
 .hud-ctx-stages-list {
   display: flex;
   flex-direction: column;
@@ -1003,6 +1066,13 @@ export const HUD_STYLES_CSS = `
   font-size: 11px;
   font-weight: 500;
   color: var(--hud-text-secondary);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.hud-stage-label {
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1042,6 +1112,7 @@ export const HUD_STYLES_CSS = `
   font-size: 9.5px;
   font-weight: 600;
   line-height: 1.2;
+  flex: 0 0 auto;
   flex-shrink: 0;
 }
 

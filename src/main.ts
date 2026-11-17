@@ -1,9 +1,23 @@
 import { ALLOWED_DATA_DIRECTORY_NAMES, applicationChannel, savedApplicationChannel, applicationTarget, detectInstalledChannels, type ApplicationChannel, type ApplicationTarget } from './application-target.js';
 import { GoogleAccountLogin } from './account-oauth.js';
 import { AccountSwitchService } from './account-switch.js';
-import { AccountsManager, cleanAndLocalizeRefreshError, getGoogleClientId, getGoogleClientSecret, type Account, type QuotaData } from './accounts.js';
+import { AccountsManager, cleanAndLocalizeRefreshError, getGoogleClientId, getGoogleClientSecret, mergeSubscriptionTier, type Account, type QuotaData } from './accounts.js';
 import { UsageStatsManager } from './usage.js';
-import { localizePricingTable, priceStatus } from './pricing.js';
+import {
+  buildPricingCatalogPayloadSnapshot,
+  readInstalledAppBundleVersion,
+  readValidLiveIdeModelsSnapshot,
+  sanitizeLiveIdeModelsSnapshot,
+  type LiveIdeModelSnapshotEntry,
+  type LiveIdeModelsSnapshot,
+} from './pricing-catalog-runtime.js';
+export {
+  readInstalledAppBundleVersion,
+  readValidLiveIdeModelsSnapshot,
+  sanitizeLiveIdeModelsSnapshot,
+  type LiveIdeModelSnapshotEntry,
+  type LiveIdeModelsSnapshot,
+};
 import {
   normalizeSubscriptionTier,
   projectAccountForIpcNormalized as projectAccountNormalizedWithManager,
@@ -11,7 +25,6 @@ import {
   projectUsagePeriodSummary,
 } from './ipc-projections.js';
 export { normalizeSubscriptionTier, projectQuotaContract };
-import { FEED_MODEL_KEYS } from './model-catalog.js';
 import { CacheMaintenance } from './maintenance.js';
 import { mkdir, lstat, chmod, unlink, readFile, readdir, writeFile } from 'node:fs/promises';
 import { realpathSync, readFileSync } from 'node:fs';
@@ -22,7 +35,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DictionaryStore, loadDictionary, dictionaryFromEntries, validateEntries, resolveDictionaryForLocale } from './dictionary.js';
+import { DictionaryStore, loadDictionary, dictionaryFromEntries, validateEntries, validateTemplateRules, resolveDictionaryForLocale } from './dictionary.js';
 import { bt, getActiveLocale, setActiveLocale, resolveInitialRuntimeLanguage, resolveLocale } from './i18n.js';
 import { Controller, type AssistantStatus } from './controller.js';
 import { coverageMetricSnapshot } from './coverage.js';
@@ -75,9 +88,9 @@ function mergeLiveQuotaWithSaved(
     ...liveQuota,
     quota_groups: hasLiveGroups ? liveQuota.quota_groups : (savedQuota.quota_groups ?? []),
     models: (hasLiveGroups || hasKnownLiveModels || !hasSavedModels) ? liveQuota.models : savedQuota.models,
-    subscription_tier: (liveQuota.subscription_tier && liveQuota.subscription_tier !== 'FREE')
-      ? liveQuota.subscription_tier
-      : (savedQuota.subscription_tier || liveQuota.subscription_tier),
+    subscription_tier: mergeSubscriptionTier(liveQuota.subscription_tier, savedQuota.subscription_tier, {
+      allowFreeDowngrade: hasLiveGroups || liveComplete || !savedQuota.subscription_tier,
+    }),
   };
   if (mergedStaleGroups?.length) merged.stale_groups = mergedStaleGroups;
   else delete merged.stale_groups;
@@ -250,6 +263,13 @@ export async function request(command: string): Promise<any> {
   const argv = process.argv.slice(2);
   const targetStateDir = resolve(cliOption(argv, '--state-dir', join(homedir(), 'Library', 'Application Support', 'GravityBox'))!);
   const targetSocketPath = join(targetStateDir, 'control.sock');
+  const sockInfo = await lstat(targetSocketPath).catch((err: NodeJS.ErrnoException) => {
+    if (err?.code === 'ENOENT') throw new Error(bt('main.assistant_not_running'));
+    throw err;
+  });
+  if (!sockInfo.isSocket() || sockInfo.isSymbolicLink() || sockInfo.uid !== process.getuid?.()) {
+    throw new Error(bt('main.socket_mismatch'));
+  }
   return new Promise((resolveReply, reject) => {
     const client = createConnection(targetSocketPath); let buffer = ''; let received = 0;
     const decoder = new StringDecoder('utf8');
@@ -282,22 +302,32 @@ async function run() {
   if (command) { console.log(JSON.stringify(await request(command))); return; }
   if (args.includes('--heal')) throw new Error(bt('main.heal_unsupported'));
   const stateDir = resolve(option('--state-dir', join(homedir(), 'Library', 'Application Support', 'GravityBox'))!);
-  try {
-    process.loadEnvFile?.(join(stateDir, '.env'));
-  } catch (error: any) {
-    if (error?.code !== 'ENOENT') {
-      // ignore
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  const stateInfo = await lstat(stateDir);
+  if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink() || stateInfo.uid !== process.getuid?.()) throw new Error(bt('main.state_dir_mismatch'));
+  await chmod(stateDir, 0o700);
+  const envPath = join(stateDir, '.env');
+  const envInfo = await lstat(envPath).catch(() => null);
+  if (envInfo && envInfo.isFile() && !envInfo.isSymbolicLink() && envInfo.uid === process.getuid?.()) {
+    try {
+      process.loadEnvFile?.(envPath);
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        // ignore
+      }
     }
   }
   const socketPath = join(stateDir, 'control.sock');
   let configuredChannel: unknown;
   let configuredHudEnabled: unknown;
   let configuredAppLanguage: unknown;
+  let configuredAutoPricingSync: unknown;
   try {
     const parsedCfg = JSON.parse(readFileSync(join(stateDir, 'config.json'), 'utf8'));
     configuredChannel = parsedCfg.applicationChannel;
     configuredHudEnabled = parsedCfg.hudEnabled;
     configuredAppLanguage = parsedCfg.appLanguage;
+    configuredAutoPricingSync = parsedCfg.autoPricingSyncEnabled;
   }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(bt('main.channel_config_unreadable')); }
   const explicitLocaleArg = option('--locale');
@@ -326,8 +356,31 @@ async function run() {
   const geminiDir = option('--gemini-dir', process.env.GRAVITYBOX_GEMINI_DIR || process.env.GEMINI_DIR || join(homedir(), '.gemini'))!;
   const cacheMaintenance = new CacheMaintenance(profile, join(homedir(), '.Trash'), undefined, { stateDir: channelStateDir, geminiDir, appPath });
   const accountsManager = new AccountsManager(stateDir, { target });
-  function probeLiveCached() {
-    return accountsManager.probeLiveLanguageServer();
+  const liveIdeModelsPath = join(stateDir, 'live-ide-models.json');
+  let liveSnapshotWriteChain = Promise.resolve();
+  let lastLiveSnapshotDedupKey = '';
+  async function persistLiveIdeModelsIfPresent(live: Parameters<typeof sanitizeLiveIdeModelsSnapshot>[0]): Promise<void> {
+    if (!live?.quota?.models?.length) return;
+    const appVersion = await readInstalledAppBundleVersion(target.appPath);
+    const snapshot = sanitizeLiveIdeModelsSnapshot(live, appVersion);
+    if (!snapshot) return;
+    const dedupKey = JSON.stringify({
+      appVersion: snapshot.appVersion,
+      tier: snapshot.tier,
+      models: snapshot.models,
+    });
+    if (dedupKey === lastLiveSnapshotDedupKey) return;
+    lastLiveSnapshotDedupKey = dedupKey;
+    liveSnapshotWriteChain = liveSnapshotWriteChain
+      .catch(() => {})
+      .then(() => atomicJson(liveIdeModelsPath, snapshot))
+      .catch(() => {});
+    await liveSnapshotWriteChain;
+  }
+  async function probeLiveCached() {
+    const live = await accountsManager.probeLiveLanguageServer();
+    await persistLiveIdeModelsIfPresent(live);
+    return live;
   }
   const accountLogin = new GoogleAccountLogin((token, signal) => accountsManager.addAccountFromOAuth(token, signal));
   const homeDir = option('--home-dir', process.env.GRAVITYBOX_HOME_DIR || homedir())!;
@@ -370,39 +423,23 @@ async function run() {
     })().finally(() => { accountSyncInFlight = null; });
     return accountSyncInFlight;
   }
+  const buildPricingCatalogPayload = () =>
+    buildPricingCatalogPayloadSnapshot({
+      appPath: target.appPath,
+      liveIdeModelsPath,
+      probeLiveCached,
+      usageManager,
+      accountsManager,
+    });
+
   async function syncActiveOfficialModelsToUsageManager(): Promise<void> {
     try {
-      const extractModelIds = (models: any): string[] => {
-        if (!Array.isArray(models)) return [];
-        return models
-          .filter(m => m && typeof m === 'object')
-          .map(m => String(m.model_id ?? m.name ?? '').trim())
-          .filter(Boolean);
-      };
-      const union = new Set<string>(FEED_MODEL_KEYS);
-      const live = await probeLiveCached().catch(() => null);
-      for (const id of extractModelIds(live?.quota?.models)) {
-        union.add(id);
-      }
-      if (union.size === FEED_MODEL_KEYS.length) {
-        const listRes = await accountsManager.listAccounts().catch(() => null);
-        if (listRes?.accounts?.length) {
-          const preferred = listRes.active_account
-            ?? [...listRes.accounts].sort((a, b) => (b.quota_last_updated ?? 0) - (a.quota_last_updated ?? 0))[0];
-          const saved = preferred ? await accountsManager.getAccount(preferred.id).catch(() => null) : null;
-          const savedQuota = saved?.quota ?? preferred?.quota;
-          if (savedQuota?.source === 'live') {
-            for (const id of extractModelIds(savedQuota.models)) {
-              union.add(id);
-            }
-          }
-        }
-      }
-      usageManager.setActiveOfficialModels([...union]);
+      await buildPricingCatalogPayload();
     } catch {}
   }
   const pricePrefs = await readOptionalJson<{ enabled?: boolean }>(join(stateDir, 'pricing-preferences.json'), 'pricing-preferences.json');
   if (pricePrefs) usageManager.setAutoRemotePricingSync(pricePrefs.enabled === true);
+  else if (typeof configuredAutoPricingSync === 'boolean') usageManager.setAutoRemotePricingSync(configuredAutoPricingSync);
   const idempotencyStore = new IdempotencyStore();
   let backendLease: ProcessLease | undefined;
 
@@ -412,11 +449,6 @@ async function run() {
   ): Record<string, unknown> | null {
     return projectAccountNormalizedWithManager(account, accountsManager, options);
   }
-
-  await mkdir(stateDir, { recursive: true, mode: 0o700 });
-  const stateInfo = await lstat(stateDir);
-  if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink() || stateInfo.uid !== process.getuid?.()) throw new Error(bt('main.state_dir_mismatch'));
-  await chmod(stateDir, 0o700);
   backendLease = await acquireProcessLease(join(stateDir, 'backend.lock'), 0);
   const earlySignalExit = () => { backendLease?.releaseSync(); process.exit(0); };
   process.once('exit', () => backendLease?.releaseSync());
@@ -473,7 +505,7 @@ async function run() {
     preferredConfiguredLanguage !== undefined || runtimePrefs?.translationEnabled !== undefined
       ? resolveInitialRuntimeLanguage({
           configuredLanguage: preferredConfiguredLanguage,
-          legacyTranslationEnabled: explicitLocaleArg ? runtimePrefs?.translationEnabled : runtimePrefs?.translationEnabled,
+          legacyTranslationEnabled: runtimePrefs?.translationEnabled,
           systemLocales: effectiveInitialSystemLocales,
         })
       : { configuredLanguage: 'zh-Hans', resolvedLocale: 'zh-Hans' };
@@ -481,7 +513,13 @@ async function run() {
   const initialDictInfo = await resolveDictionaryForLocale(baseDir, initialLang.resolvedLocale);
   const store = new DictionaryStore(initialDictInfo.baseDir, userDir);
   let fallback;
-  try { fallback = dictionaryFromEntries(validateEntries(JSON.parse(await readFile(join(channelStateDir, 'last-valid-dictionary.json'), 'utf8')).entries)); }
+  try {
+    const cachedRaw = JSON.parse(await readFile(join(channelStateDir, 'last-valid-dictionary.json'), 'utf8'));
+    fallback = dictionaryFromEntries(
+      validateEntries(cachedRaw.entries),
+      cachedRaw.templateRules ? validateTemplateRules(cachedRaw.templateRules) : undefined
+    );
+  }
   catch { fallback = await loadDictionary(initialDictInfo.baseDir); }
   await store.start(fallback);
   let writeChain = Promise.resolve();
@@ -580,8 +618,8 @@ async function run() {
     return accountsManager.selectBestAccount(config, { currentId, currentEmail: detectedEmail ?? undefined, currentQuota: live?.quota });
   }
   const server = createServer(client => {
-    // Long commands legitimately produce no traffic while they run; the client owns the real deadline.
-    client.setTimeout(120_000, () => client.destroy());
+    // 首行请求接收前采用 10s 短超时；解析出合法指令后再切换至 120s 长操作超时
+    client.setTimeout(10_000, () => client.destroy());
     let input = ''; let received = 0; let handled = false; let parsed: any; let ownsIdempotency=false;
     const reply = (value: unknown) => {
       if(ownsIdempotency){ownsIdempotency=false;idempotencyStore.complete(String(parsed.idempotencyKey),value);}
@@ -599,8 +637,14 @@ async function run() {
       if (received > 4_000_000) { handled = true; reply({ ok: false, error: bt('main.request_too_large') }); return; }
       input += decoder.write(chunk);
       if (!input.includes('\n')) return; handled = true;
+      client.setTimeout(120_000, () => client.destroy());
       try { parsed = JSON.parse(input.split('\n')[0]!); } catch { reply({ ok: false, error: bt('main.request_invalid_format') }); return; }
       if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)){reply({ok:false,error:bt('main.request_invalid_format')});return;}
+      const command = parsed.command;
+      if (stopping && command !== 'stop') {
+        reply({ ok: false, error: bt('main.assistant_not_running') });
+        return;
+      }
       if (parsed.idempotencyKey) {
         if(typeof parsed.idempotencyKey!=='string'||parsed.idempotencyKey.length>256){reply({ok:false,error:bt('main.idempotency_invalid')});return;}
         const fingerprint=createHash('sha256').update(JSON.stringify(canonicalPayload(parsed))).digest('hex');
@@ -609,7 +653,6 @@ async function run() {
         if(state!=='owner'){reply({ok:false,error:state==='conflict'?bt('main.idempotency_conflict'):bt('main.too_many_requests')});return;}
         ownsIdempotency=true;
       }
-      const command = parsed.command;
       if (command === 'set_application_channel') {
         try {
           applicationChannel(parsed.channel);
@@ -824,10 +867,8 @@ async function run() {
                 appRunning = true;
                 insidersRunning = true;
               } else if (args.startsWith(stablePrefix)) {
-                if (args.startsWith(`${target.appPath}/Contents/MacOS/${target.executable}`) && !args.includes('Helper')) {
-                  appRunning = true;
-                  stableRunning = true;
-                }
+                appRunning = true;
+                stableRunning = true;
               } else {
                 continue;
               }
@@ -923,10 +964,12 @@ async function run() {
             return;
           }
           if (command === 'api_pricing_get') {
-            await syncActiveOfficialModelsToUsageManager();
-            const rawActivePrices = await usageManager.getActivePricingTable();
-            const prices = localizePricingTable(rawActivePrices);
-            reply({ ok: true, prices, pricingStatus: Object.fromEntries(Object.entries(rawActivePrices).map(([k, v]) => [k, priceStatus(v)])) });
+            const catalogPayload = await buildPricingCatalogPayload();
+            reply({
+              ok: true,
+              ...catalogPayload,
+              status: await usageManager.getPricingSyncStatus(),
+            });
             return;
           }
         })().catch(error => reply({ ok: false, error: sanitizeErrorMessage(error) }));
@@ -934,6 +977,10 @@ async function run() {
       }
       commandChain = commandChain.catch(() => {}).then(async () => {
         try {
+          if (stopping && command !== 'stop') {
+            reply({ ok: false, error: bt('main.assistant_not_running') });
+            return;
+          }
           if(command==='shortcut_set'){if(!fixture)throw new Error(bt('main.shortcut_removed'));await controller.configureShortcut(parsed.enabled===true);reply({ok:true});return;}
           if(command==='api_pricing_revalue_preview'){reply({ok:true,preview:await usageManager.previewRevalueHistory(parsed.mode === 'unpriced_only' ? 'unpriced_only' : 'force_all')});return;}
           if(command==='api_pricing_revalue'){const mode = parsed.mode === 'unpriced_only' ? 'unpriced_only' : 'force_all';reply({ok:true,...await usageManager.revalueHistory(parsed.confirm===true, { mode, previewId: typeof parsed.previewId === 'string' ? parsed.previewId : undefined })});return;}
@@ -941,12 +988,9 @@ async function run() {
           if(command==='pricing_sync_set'){await atomicJson(join(stateDir, 'pricing-preferences.json'), {enabled:parsed.enabled===true});usageManager.setAutoRemotePricingSync(parsed.enabled===true);reply({ok:true});return;}
           if(command==='pricing_sync_check'){
             if(parsed.feedUrl!==undefined&&typeof parsed.feedUrl!=='string')throw new Error(bt('main.pricing_feed_invalid'));
-            await syncActiveOfficialModelsToUsageManager();
             const res=await usageManager.syncRemotePricing(parsed.feedUrl,true);
-            const rawActivePrices=await usageManager.getActivePricingTable();
-            const prices=localizePricingTable(rawActivePrices);
-            const pricingStatus=Object.fromEntries(Object.entries(rawActivePrices).map(([k,v])=>[k,priceStatus(v)]));
-            reply({ok:true,...res,prices,pricingStatus,status:await usageManager.getPricingSyncStatus()});
+            const catalogPayload=await buildPricingCatalogPayload();
+            reply({ok:true,...res,...catalogPayload,status:await usageManager.getPricingSyncStatus()});
             return;
           }
           if(command==='hud_set'){const nextHud=parsed.enabled!==false;await saveRuntimePreferences({hudEnabled:nextHud});await controller.configureHud(nextHud);await writeChain;reply({ok:true,status:controller.snapshot()});return;}
@@ -1106,19 +1150,28 @@ async function run() {
           }
           else if (command === 'toggle') {if(!fixture)throw new Error(bt('main.shortcut_removed'));await controller.toggleLanguage();}
           else if (command === 'reload') await store.reload();
-          else if (command === 'stop') { await accountLogin.close(); await tasks.stop();store.close(); await controller.stop(); stopping = true; }
+          else if (command === 'stop') { stopping = true; server.close(); await accountLogin.close(); await tasks.stop(); store.close(); await controller.stop(); }
           else throw new Error(bt('main.unknown_command'));
           await writeChain; await cacheChain.catch(() => {});
           reply({ ok: true, status: controller.snapshot() });
-          if (stopping) { server.close(); await unlink(socketPath).catch(() => {}); await backendLease?.release(); setTimeout(() => process.exit(0), 100); }
+          if (stopping) { await unlink(socketPath).catch(() => {}); await backendLease?.release(); setTimeout(() => process.exit(0), 100); }
         } catch (error) { reply({ ok: false, error: sanitizeErrorMessage(error) }); }
       });
     });
   });
-  await new Promise<void>((resolveListen, reject) => { server.once('error', reject); server.listen(socketPath, resolveListen); }); await chmod(socketPath, 0o600);
+  server.maxConnections = 64;
+  const previousUmask = process.umask(0o177);
+  try {
+    await new Promise<void>((resolveListen, reject) => { server.once('error', reject); server.listen(socketPath, resolveListen); });
+  } finally {
+    process.umask(previousUmask);
+  }
+  await chmod(socketPath, 0o600);
   const stop = async (code = 0) => {
     if (stopping) return; stopping = true;
-    await accountLogin.close(); await tasks.stop();store.close(); await controller.stop(); await writeChain; await cacheChain.catch(() => {}); server.close(); await unlink(socketPath).catch(() => {}); await backendLease?.release(); process.exit(code);
+    server.close();
+    await commandChain.catch(() => {});
+    await accountLogin.close(); await tasks.stop(); store.close(); await controller.stop(); await writeChain; await cacheChain.catch(() => {}); await unlink(socketPath).catch(() => {}); await backendLease?.release(); process.exit(code);
   };
   process.off('SIGTERM', earlySignalExit); process.off('SIGINT', earlySignalExit);
   process.on('SIGTERM', () => void stop()); process.on('SIGINT', () => void stop());

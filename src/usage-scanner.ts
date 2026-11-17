@@ -309,10 +309,19 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
     const rawInput = ProtobufReader.findVarint(usage, 2) ?? 0;
     const outputTokens = ProtobufReader.findVarint(usage, 3) ?? 0;
     const cachedTokens = ProtobufReader.findVarint(usage, 5) ?? 0;
+    const isValidTokenField = (v: number): boolean => Number.isSafeInteger(v) && v >= 0;
+    if (
+      !isValidTokenField(cacheWriteTokens) ||
+      !isValidTokenField(rawInput) ||
+      !isValidTokenField(outputTokens) ||
+      !isValidTokenField(cachedTokens)
+    ) {
+      continue;
+    }
     const inputTokens = rawInput;
     const totalTokens = inputTokens + cachedTokens + cacheWriteTokens + outputTokens;
 
-    if (totalTokens === 0) continue;
+    if (!Number.isSafeInteger(totalTokens) || totalTokens <= 0) continue;
 
     let timestamp = 0;
     const timingBuf = ProtobufReader.findField(wrapped, 9);
@@ -414,6 +423,7 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
     return { events: previous?.events ?? events, generationsScanned, skippedLargeRecords,
       hasError: true, usedCached: !!previous, error: bt('scanner.err.changed_across_batches') };
   }
+  await reader.close();
   const observedAt = performance.timeOrigin + performance.now();
   for (const event of events) event.source_observed_at = observedAt;
   await ctx.loadUsageLedger();

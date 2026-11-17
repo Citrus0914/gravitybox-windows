@@ -594,7 +594,8 @@ enum QuotaPresentation {
         let refreshState = dict(raw["refreshState"]) ?? nested.flatMap { dict($0["refreshState"]) }
         if let refreshState {
             result.refreshComplete = boolValue(refreshState["complete"])
-            result.refreshMessage = text(refreshState["message"])
+            let errText = text(refreshState["error"])
+            result.refreshMessage = errText.isEmpty ? text(refreshState["message"]) : errText
         }
 
         if let familyWindows, result.hasContract {

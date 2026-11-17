@@ -367,4 +367,103 @@ test('P1-37/P1-39：dict/base.json 无首尾空格，HUD 与 engine.js 术语和
   assert.match(engineSrc, /⚠️ Failed to render LaTeX: \{reason\}/);
   assert.match(engineSrc, /Working directory: \{path\}/);
 });
+
+test('P2-3：loadDictionaryLayers 支持声明式 template-rules.json 热编译且拦截非锚定或嵌套量词风险正则', async () => {
+  const { validateTemplateRules } = await import('../dist/dictionary.js');
+  const dir = await mkdtemp(join(tmpdir(), 'gb-decl-rules-'));
+  try {
+    const base = join(dir, 'base');
+    const user = join(dir, 'user');
+    await mkdir(base, { recursive: true });
+    await mkdir(user, { recursive: true });
+    await writeFile(join(base, 'base.json'), JSON.stringify({ Save: '保存' }), 'utf8');
+    await writeFile(
+      join(user, 'template-rules.json'),
+      JSON.stringify({
+        rules: [
+          {
+            key: 'Synced {count} workspaces',
+            pattern: '^Synced\\s+(\\d+)\\s+workspaces?$',
+            flags: 'i',
+            replacement: '已同步 $1 个工作区',
+          },
+          // 未以 ^ 锚定的模式必须拒绝
+          {
+            key: 'Unanchored {x}',
+            pattern: 'Unanchored\\s+(.+)',
+            flags: 'i',
+            replacement: '未锚定 $1',
+          },
+          // 嵌套量词 ReDoS 风险模式必须拒绝
+          {
+            key: 'Unsafe {x}',
+            pattern: '^([a-z]+)+$',
+            flags: 'i',
+            replacement: '危险 $1',
+          },
+        ],
+      }),
+      'utf8'
+    );
+
+    const validated = validateTemplateRules(JSON.parse(await readFile(join(user, 'template-rules.json'), 'utf8')));
+    assert.equal(validated.length, 1);
+    assert.equal(validated[0].key, 'Synced {count} workspaces');
+
+    const layered = await loadDictionaryLayers(base, user);
+    assert.equal(layered.dictionary.entries.Save, '保存');
+    assert.equal(layered.dictionary.templateRules?.length, 1);
+    assert.equal(layered.dictionary.templateRules?.[0]?.replacement, '已同步 $1 个工作区');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('P1-15: 栈扫描拦截多层嵌套括号量词 ReDoS 绕过，且 DictionaryStore 降级缓存保留 templateRules', async () => {
+  const { hasNestedQuantifiedGroup, validateTemplateRules } = await import('../dist/dictionary.js');
+
+  // 经典多层嵌套分组 ReDoS 绕过必须被精准拦截
+  assert.equal(hasNestedQuantifiedGroup('^((?:a+)+)+$'), true);
+  assert.equal(hasNestedQuantifiedGroup('^([a-z]+(\\s+[a-z]+)+)+$'), true);
+  assert.equal(hasNestedQuantifiedGroup('^((a*)*)$'), true);
+  assert.equal(hasNestedQuantifiedGroup('^(a{1,3}){2,}$'), true);
+  // 合法平面分组与字符类内的 +/* 不误伤
+  assert.equal(hasNestedQuantifiedGroup('^Synced\\s+(\\d+)\\s+workspaces?$'), false);
+  assert.equal(hasNestedQuantifiedGroup('^([a-z+]+)\\s+(\\d+)$'), false);
+
+  const filtered = validateTemplateRules({
+    rules: [
+      { key: 'Nested 1 {x}', pattern: '^((?:a+)+)+$', flags: 'i', replacement: '$1' },
+      { key: 'Nested 2 {x}', pattern: '^([a-z]+(\\s+[a-z]+)+)+$', flags: 'i', replacement: '$1' },
+      { key: 'Safe {n}', pattern: '^Processed\\s+(\\d+)\\s+items?$', flags: 'i', replacement: '已处理 $1 项' },
+    ],
+  });
+  assert.equal(filtered.length, 1);
+  assert.equal(filtered[0].key, 'Safe {n}');
+
+  // 个人词典损坏触发 DictionaryStore.start(fallback) 降级时，fallback.templateRules 必须完整保留
+  const dir = await mkdtemp(join(tmpdir(), 'gb-fallback-rules-'));
+  try {
+    const base = join(dir, 'base');
+    const user = join(dir, 'user');
+    await mkdir(base, { recursive: true });
+    await mkdir(user, { recursive: true });
+    await writeFile(join(base, 'base.json'), '{ broken base json', 'utf8');
+    const fallbackDict = dictionaryFromEntries(
+      { Save: '保存' },
+      [{ key: 'Processed {n} items', pattern: '^Processed\\s+(\\d+)\\s+items?$', flags: 'i', replacement: '已处理 $1 项' }]
+    );
+    const store = new DictionaryStore(base, user);
+    try {
+      await store.start(fallbackDict);
+      assert.equal(store.current.entries.Save, '保存');
+      assert.equal(store.current.templateRules?.length, 1);
+      assert.equal(store.current.templateRules?.[0]?.replacement, '已处理 $1 项');
+    } finally {
+      store.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 });

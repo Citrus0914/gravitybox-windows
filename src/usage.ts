@@ -6,7 +6,7 @@ import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { atomicJson, atomicText } from './files.js';
 import { bt } from './i18n.js';
-import { formatLocalDate, isUnpricedZeroSentinel, type LedgerSnapshot } from './usage-aggregate.js';
+import { createModelQueryMatcher, formatLocalDate, isUnpricedZeroSentinel, type LedgerSnapshot } from './usage-aggregate.js';
 import { UsageLedger, type LedgerEvent } from './usage-ledger.js';
 import {
   DEFAULT_PRICING_FEED_URLS,
@@ -138,6 +138,7 @@ export class UsageStatsManager {
   private lastSyncedSourceUrl = '';
   private lastSyncedVersion = '';
   private activeOfficialModels: string[] | null = null;
+  private activeUnpricedOfficialModels: string[] | null = null;
 
   constructor(options?: { geminiDir?: string; stateDir?: string; remotePricingUrl?: string; fallbackPricingUrls?: string[]; dataDirectoryName?: DataDirectoryName }) {
     const defaultGeminiDir = join(homedir(), '.gemini');
@@ -170,14 +171,29 @@ export class UsageStatsManager {
 
   setAutoRemotePricingSync(enabled: boolean) { this.autoRemotePricingSync = enabled; }
 
-  /** 动态更新当前官方 Antigravity 包含的非禁用模型列表，用于价格基准展示过滤。 */
-  setActiveOfficialModels(modelIds: Iterable<string> | null): void {
+  /** 动态更新当前官方 Antigravity 包含模型列表（含可选未计价实时模型列表），用于价格基准展示过滤与状态计数。 */
+  setActiveOfficialModels(
+    modelIds: Iterable<string> | null,
+    unpricedModelIds?: Iterable<string> | null
+  ): void {
     if (!modelIds) {
       this.activeOfficialModels = null;
+      this.activeUnpricedOfficialModels = unpricedModelIds
+        ? Array.from(new Set(Array.from(unpricedModelIds).map(id => String(id).trim()).filter(Boolean)))
+        : null;
       return;
     }
     const list = Array.from(modelIds).map(id => String(id).trim()).filter(Boolean);
-    this.activeOfficialModels = list.length > 0 ? list : null;
+    const unpricedList = unpricedModelIds
+      ? Array.from(new Set(Array.from(unpricedModelIds).map(id => String(id).trim()).filter(Boolean)))
+      : null;
+    if (list.length === 0 && (!unpricedList || unpricedList.length === 0)) {
+      this.activeOfficialModels = null;
+      this.activeUnpricedOfficialModels = null;
+      return;
+    }
+    this.activeOfficialModels = list;
+    this.activeUnpricedOfficialModels = unpricedList;
   }
 
   private cachedPriceRef(price: ApiPricing): ApiPricing {
@@ -242,11 +258,12 @@ export class UsageStatsManager {
 
   private async loadRateLocksOnce(): Promise<void> {
     if (this.rateLocksLoaded) return;
-    this.rateLocksLoaded = true;
     if (this.largeLedger || this.ledgerUnavailable || this.archivedUnavailable) {
+      this.rateLocksLoaded = true;
       if (this.ledgerUnavailable || this.archivedUnavailable) this.rateLocksUnavailable = true;
       return;
     }
+    let localFileFatal = false;
     try {
       const data = JSON.parse(await readFile(this.rateLocksPath, 'utf8'));
       if (data.version !== 1 || !data.entries || typeof data.entries !== 'object') throw Error(bt('usage.err.rate_ledger_invalid_format'));
@@ -268,14 +285,23 @@ export class UsageStatsManager {
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        localFileFatal = true;
+        this.rateLocksLoaded = true;
         this.rateLocksUnavailable = true;
         this.pricingWarnings.push(bt('usage.warn.rate_ledger_unreadable_stop'));
       }
     }
 
-    if (!this.rateLocksUnavailable) {
-      const indexed = await this.ledger.locks();
-      for (const [key, value] of Object.entries(indexed)) this.rateLocks[key] = { usd: value.usd, price: this.cachedPriceRef(value.price) };
+    if (!localFileFatal) {
+      try {
+        const indexed = await this.ledger.locks();
+        for (const [key, value] of Object.entries(indexed)) this.rateLocks[key] = { usd: value.usd, price: this.cachedPriceRef(value.price) };
+        this.rateLocksUnavailable = false;
+        this.rateLocksLoaded = true;
+      } catch {
+        // 瞬时超时/工作线程退避失败：保持 rateLocksLoaded = false 允许下轮重试，并暂禁覆盖写盘防止删空历史锁
+        this.rateLocksUnavailable = true;
+      }
     }
   }
 
@@ -307,13 +333,15 @@ export class UsageStatsManager {
     const existing = event.event_key ? this.rateLocks[event.event_key] ?? (event.legacy_event_key && this.usageLedgerEvents.get(event.legacy_event_key)?.timestamp_seconds === event.timestamp_seconds ? this.rateLocks[event.legacy_event_key] : undefined) : undefined;
     if (existing && !this.isUnpricedRateLock(existing)) {
       const effectiveExisting = resolveContextTierPricing(existing.price, event.input_tokens + event.cached_tokens + cw);
-      if (cw > 0 && (!Number.isFinite(effectiveExisting.cacheWrite) || effectiveExisting.cacheWrite! < 0)) return null;
-      if (!event.source_id) return existing.usd;
-      const usd = calculateEstimatedUsd(event.input_tokens, event.output_tokens, event.cached_tokens, existing.price, cw);
-      if (!this.rateLocks[event.event_key!] || this.rateLocks[event.event_key!]!.usd !== usd) {
-        this.rateLocks[event.event_key!] = { usd, price: existing.price }; this.rateLocksDirty = true;
+      const lockedMissingCw = cw > 0 && (!Number.isFinite(effectiveExisting.cacheWrite) || effectiveExisting.cacheWrite! < 0);
+      if (!lockedMissingCw) {
+        if (!event.source_id) return existing.usd;
+        const usd = calculateEstimatedUsd(event.input_tokens, event.output_tokens, event.cached_tokens, existing.price, cw);
+        if (!this.rateLocks[event.event_key!] || this.rateLocks[event.event_key!]!.usd !== usd) {
+          this.rateLocks[event.event_key!] = { usd, price: existing.price }; this.rateLocksDirty = true;
+        }
+        return usd;
       }
-      return usd;
     }
     const effectivePrice = price ? resolveContextTierPricing(price, event.input_tokens + event.cached_tokens + cw) : null;
     if (!price || !effectivePrice || (cw > 0 && (!Number.isFinite(effectivePrice.cacheWrite) || effectivePrice.cacheWrite! < 0))) return null;
@@ -551,7 +579,7 @@ export class UsageStatsManager {
 
   private async loadUsageLedgerOnce(): Promise<void> {
     if (this.usageLedgerLoaded) return;
-    this.usageLedgerLoaded = true;
+    if (!this.ledgerCorrupt) this.ledgerUnavailable = false;
     await this.loadObservationTimeline();
     try {
       const totalCount = await this.ledger.count();
@@ -566,10 +594,19 @@ export class UsageStatsManager {
         event.model = resolveDatabaseModelFullName(event.model, null);
         this.usageLedgerEvents.set(event.event_key!, event);
       }
-    } catch {
+      this.usageLedgerLoaded = true;
+    } catch (error) {
+      const msg = (error as Error)?.message ?? String(error);
+      const isTransient = /SQLITE_BUSY|timeout|timed out|超时|exited|退出/i.test(msg);
       this.ledgerUnavailable = true;
-      this.ledgerCorrupt = true;
-      this.storageWarnings.add(bt('usage.warn.ledger_unreadable'));
+      if (isTransient) {
+        // 瞬时超时/退出不标记永久损坏，允许下轮自动自愈重试
+        this.usageLedgerLoaded = false;
+      } else {
+        this.usageLedgerLoaded = true;
+        this.ledgerCorrupt = true;
+        this.storageWarnings.add(bt('usage.warn.ledger_unreadable'));
+      }
     }
     await this.loadArchivedEvents();
     for (const [key, archive] of this.archivedByDb) {
@@ -580,7 +617,25 @@ export class UsageStatsManager {
   private upsertLedger(event: LedgerEvent): void {
     const key = event.event_key;
     if (!key || event.db_file === 'recovered_session.db' || event.db_file === 'recovered_enterprise_session.db') return;
-    const previous = this.usageLedgerEvents.get(key);
+    let previous = this.usageLedgerEvents.get(key);
+    if (!previous && event.legacy_event_key) {
+      for (const [oldKey, candidate] of this.usageLedgerEvents.entries()) {
+        if (
+          oldKey !== key &&
+          candidate.legacy_event_key === event.legacy_event_key &&
+          (!event.db_file || !candidate.db_file || candidate.db_file === event.db_file)
+        ) {
+          previous = candidate;
+          this.usageLedgerEvents.delete(oldKey);
+          this.pendingLedgerEvents.delete(oldKey);
+          if (this.rateLocks[oldKey] && !this.rateLocks[key]) {
+            this.rateLocks[key] = this.rateLocks[oldKey]!;
+            this.rateLocksDirty = true;
+          }
+          break;
+        }
+      }
+    }
     if ((previous?.source_observed_at ?? 0) > (event.source_observed_at ?? 0)) return;
     const next = { ...previous, ...event,
       timestamp_seconds: event.timestamp_seconds || previous?.timestamp_seconds || 0,
@@ -733,10 +788,15 @@ export class UsageStatsManager {
 
   private calendarKey() { const d=new Date();return formatLocalDate(d)+':'+d.getTimezoneOffset()+':'+Intl.DateTimeFormat().resolvedOptions().timeZone; }
 
-  async getRawPricingTable(): Promise<Record<string, ApiPricingEntry>> {
-    const { merged, warnings } = await loadRawPricingTable(this.remotePricingCachePath, this.pricingCachePath);
+  async getRawPricingCatalog(): Promise<{ raw: Record<string, ApiPricingEntry>; publicKeys: Set<string> }> {
+    const { merged, warnings, publicKeys } = await loadRawPricingTable(this.remotePricingCachePath, this.pricingCachePath);
     this.pricingWarnings = warnings;
-    return merged;
+    return { raw: merged, publicKeys };
+  }
+
+  async getRawPricingTable(): Promise<Record<string, ApiPricingEntry>> {
+    const { raw } = await this.getRawPricingCatalog();
+    return raw;
   }
 
   private resolvePricingTableFromRaw(
@@ -765,6 +825,14 @@ export class UsageStatsManager {
     activeModelIds?: Iterable<string> | null
   ): Promise<Record<string, ApiPricing>> {
     const raw = await this.getRawPricingTable();
+    if (
+      activeModelIds === undefined &&
+      this.activeOfficialModels !== null &&
+      this.activeOfficialModels.length === 0 &&
+      (this.activeUnpricedOfficialModels?.length ?? 0) > 0
+    ) {
+      return Object.create(null);
+    }
     return this.resolvePricingTableFromRaw(raw, timestampSeconds, this.canonicalActivePricingKeys(activeModelIds, Object.keys(raw)));
   }
 
@@ -853,12 +921,27 @@ export class UsageStatsManager {
     modelCount: number;
   }> {
     await this.ensureSyncStateLoaded();
-    const activeTable = await this.getActivePricingTable();
+    const raw = await this.getRawPricingTable();
+    const hasOnlyUnpriced =
+      this.activeOfficialModels !== null &&
+      this.activeOfficialModels.length === 0 &&
+      (this.activeUnpricedOfficialModels?.length ?? 0) > 0;
+    const activeKeys = hasOnlyUnpriced
+      ? new Set<string>()
+      : this.canonicalActivePricingKeys(this.activeOfficialModels, Object.keys(raw));
+    const activeTable = hasOnlyUnpriced
+      ? Object.create(null)
+      : this.resolvePricingTableFromRaw(raw, Math.floor(Date.now() / 1000), activeKeys);
+    const unpricedCount = this.activeUnpricedOfficialModels !== null
+      ? this.activeUnpricedOfficialModels.filter((k) => !Object.hasOwn(activeTable, k)).length
+      : (this.activeOfficialModels !== null
+          ? [...activeKeys].filter((k) => !Object.hasOwn(raw, k)).length
+          : 0);
     return buildPricingSyncStatus({
       autoSyncEnabled: this.autoRemotePricingSync,
       state: this.pricingSyncStateSnapshot(),
       remotePricingUrl: this.remotePricingUrl,
-      modelCount: Object.keys(activeTable).length,
+      modelCount: Object.keys(activeTable).length + unpricedCount,
     });
   }
 
@@ -904,7 +987,17 @@ export class UsageStatsManager {
     const unpricedKeys: string[] = [];
     const beforeValidLockedKeys = new Set<string>();
     for (const [key, value] of Object.entries(this.rateLocks)) {
-      if (this.isUnpricedRateLock(value)) {
+      const ledgerEv = this.usageLedgerEvents.get(key);
+      const cw = ledgerEv?.cache_write_tokens ?? 0;
+      const lockedMissingCw = Boolean(
+        cw > 0 &&
+        value?.price &&
+        (() => {
+          const eff = resolveContextTierPricing(value.price, (ledgerEv?.input_tokens ?? 0) + (ledgerEv?.cached_tokens ?? 0) + cw);
+          return !Number.isFinite(eff.cacheWrite) || eff.cacheWrite! < 0;
+        })()
+      );
+      if (this.isUnpricedRateLock(value) || lockedMissingCw) {
         unpricedKeys.push(key);
       } else {
         beforeValidLockedKeys.add(key);
@@ -1004,8 +1097,8 @@ export class UsageStatsManager {
     const cutoff = period === 'all' ? 0 : start.getTime() / 1000;
     const end = new Date(summary.generated_at*1000); end.setHours(24,0,0,0);
     const upper = end.getTime()/1000;
-    const needle = query.toLowerCase().slice(0, 200);
-    let events = snapshot.events.filter(e => (period === 'all' || (e.timestamp_seconds >= cutoff && e.timestamp_seconds < upper)) && e.model.toLowerCase().includes(needle));
+    const matcher = createModelQueryMatcher(query);
+    let events = snapshot.events.filter(e => (period === 'all' || (e.timestamp_seconds >= cutoff && e.timestamp_seconds < upper)) && matcher(e.model));
     if (effectiveAccountId && effectiveAccountId !== 'all') {
       const targetOpt = this.knownAccounts.find(a => a.id === effectiveAccountId || (a.email && a.email.toLowerCase() === effectiveAccountId.toLowerCase()));
       const targetEmail = targetOpt?.email?.toLowerCase() || (effectiveAccountId.includes('@') ? effectiveAccountId.toLowerCase() : null);
@@ -1237,8 +1330,23 @@ export class UsageStatsManager {
 
     // 从追加型永久总账（UsageLedger）合并已离线/已归档或被官方清理的会话事件
     const seenEventKeys = new Set<string>();
+    const seenDbLegacyKeys = new Set<string>();
+    const uniqueLiveEvents: GenerationEvent[] = [];
     for (const ev of allEvents) {
-      if (ev.event_key) seenEventKeys.add(ev.event_key);
+      if (ev.event_key) {
+        if (seenEventKeys.has(ev.event_key)) continue;
+        seenEventKeys.add(ev.event_key);
+      }
+      if (ev.legacy_event_key) {
+        const dbFile = 'db_file' in ev && typeof ev.db_file === 'string' ? ev.db_file : '';
+        const legacySig = `${dbFile}:${ev.legacy_event_key}`;
+        if (seenDbLegacyKeys.has(legacySig)) continue;
+        seenDbLegacyKeys.add(legacySig);
+      }
+      uniqueLiveEvents.push(ev);
+    }
+    if (uniqueLiveEvents.length !== allEvents.length) {
+      allEvents.splice(0, allEvents.length, ...uniqueLiveEvents);
     }
     const currentLegacyKeys = new Set(allEvents.map(event => event.legacy_event_key).filter(Boolean));
     for (const ledgerEv of this.usageLedgerEvents.values()) {
@@ -1249,12 +1357,14 @@ export class UsageStatsManager {
     const mergedLedgerDbs = new Set<string>();
     for (const [evKey, ledgerEv] of this.usageLedgerEvents.entries()) {
       if (currentLegacyKeys.has(evKey)) continue;
+      if (ledgerEv.legacy_event_key && seenDbLegacyKeys.has(`${ledgerEv.db_file ?? ''}:${ledgerEv.legacy_event_key}`)) continue;
       if (!ledgerEv.source_id && ledgerEv.db_file && liveSourceFiles.has(ledgerEv.db_file)) {
         this.storageWarnings.add(bt('usage.warn.ledger_missing_source_id'));
         continue;
       }
       if (!seenEventKeys.has(evKey)) {
         seenEventKeys.add(evKey);
+        if (ledgerEv.legacy_event_key) seenDbLegacyKeys.add(`${ledgerEv.db_file ?? ''}:${ledgerEv.legacy_event_key}`);
         allEvents.push(ledgerEv);
         if (ledgerEv.db_file && !representedFiles.has(ledgerEv.db_file)) mergedLedgerDbs.add(ledgerEv.db_file);
       }

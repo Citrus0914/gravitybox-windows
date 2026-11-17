@@ -18,6 +18,7 @@ export class UsageLedger {
     readonly path: string;
     private worker: Worker | null = null;
     private idleTimer: NodeJS.Timeout | null = null;
+    private pendingTerminate: Promise<void> | null = null;
     private workerQueue: Promise<unknown> = Promise.resolve();
     private inflight: {
         id: string;
@@ -43,7 +44,11 @@ export class UsageLedger {
         this.worker = null;
         if (w) {
             w.removeAllListeners();
-            void w.terminate();
+            const term = w.terminate().then(() => undefined, () => undefined);
+            this.pendingTerminate = term;
+            term.finally(() => {
+                if (this.pendingTerminate === term) this.pendingTerminate = null;
+            });
         }
     }
 
@@ -93,12 +98,20 @@ export class UsageLedger {
     }
 
     private request<T>(operation: string, events?: LedgerEvent[], options?: unknown): Promise<T> {
+        const runWithTerminateBarrier = async (): Promise<T> => {
+            if (this.pendingTerminate) await this.pendingTerminate;
+            try {
+                return await this.performRequest<T>(operation, events, options);
+            } finally {
+                if (this.pendingTerminate) await this.pendingTerminate;
+            }
+        };
         const execute = async (): Promise<T> => {
             if (!['load', 'review', 'locks', 'version'].includes(operation)) {
                 await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
-                return withProcessLease(this.path + '.lock', () => this.performRequest<T>(operation, events, options));
+                return withProcessLease(this.path + '.lock', runWithTerminateBarrier);
             }
-            return this.performRequest<T>(operation, events, options);
+            return runWithTerminateBarrier();
         };
         const next = this.workerQueue.catch(() => {}).then(execute);
         this.workerQueue = next.catch(() => {});

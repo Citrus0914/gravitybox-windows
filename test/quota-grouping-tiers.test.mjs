@@ -720,5 +720,147 @@ test('跨套餐智能切换推荐自适应：配置 argon 时在 Pro 监测独�
   assert.equal((await manager.getAutoSwitchConfig()).monitored_model, 'argon');
 });
 
+test('Google AI Ultra 账号 ("Ultra User" ultra@example.invalid) 实机 GetUserStatus 与 loadCodeAssist 回归：planInfo.planName="Pro" 不得覆盖 userTier="g1-ultra-tier"', async t => {
+  const { resolveProbeSubscriptionTier } = await import('../dist/account-probe.js');
+
+  // 1. GetUserStatus 实机载荷：planStatus.planInfo.planName 为 "Pro"，真实 Ultra 身份在 userTier / g1Tier
+  assert.equal(
+    resolveProbeSubscriptionTier({
+      email: 'ultra@example.invalid',
+      name: 'Ultra User',
+      planStatus: { planInfo: { planName: 'Pro', teamsTier: 'TEAMS_TIER_PRO' } },
+      userTier: { id: 'g1-ultra-tier', name: 'Google AI Ultra', description: 'Google AI Ultra' },
+    }),
+    'ULTRA'
+  );
+  assert.equal(
+    resolveProbeSubscriptionTier({
+      email: 'ultra@example.invalid',
+      planStatus: { planInfo: { planName: 'Pro' } },
+      g1Tier: 'g1-ultra-tier',
+    }),
+    'ULTRA'
+  );
+  // 真实 Pro 账号保持 PRO
+  assert.equal(
+    resolveProbeSubscriptionTier({
+      email: 'pro@example.test',
+      planStatus: { planInfo: { planName: 'Pro' } },
+      userTier: { id: 'g1-pro-tier', name: 'Google AI Pro' },
+    }),
+    'PRO'
+  );
+  // 企业 Vertex AI 账号保持 ENTERPRISE
+  assert.equal(
+    resolveProbeSubscriptionTier({
+      email: 'corp@example.test',
+      planStatus: { planInfo: { planName: 'Enterprise' } },
+      userTier: { id: 'agy-business-paygo-tier', name: 'Antigravity Agent Platform', usesGcpTos: true },
+    }),
+    'ENTERPRISE'
+  );
+
+  // 2. loadCodeAssist 中 name="Pro" 但 id="g1-ultra-tier" 时仍识别为 ULTRA
+  const { manager, acc } = await createTempManager(t);
+  const reset5h = new Date(Date.now() + 3600 * 1000).toISOString();
+  const refreshed = await manager.refreshQuota(acc.id, async (url) => {
+    if (String(url).includes('loadCodeAssist')) {
+      return Response.json({
+        currentTier: { id: 'g1-ultra-tier', name: 'Pro' },
+      });
+    }
+    if (String(url).includes('fetchAvailableModels')) {
+      return Response.json({
+        models: {
+          'gemini-4-carbon': {
+            displayName: 'Gemini 4 Carbon',
+            quotaBucketName: 'Gemini Models',
+            quotaInfo: { remainingFraction: 1, resetTime: reset5h },
+          },
+        },
+      });
+    }
+    return Response.json({
+      groups: [
+        {
+          displayName: 'Gemini Models',
+          buckets: [{ bucketId: 'g-5h', window: '5h', remainingFraction: 1, resetTime: reset5h }],
+        },
+      ],
+    });
+  });
+  const overview = manager.getAccountQuotaOverview(refreshed);
+  assert.equal(overview.carbonStatus.mode, 'unified');
+  const ipcAccount = projectAccountForIpcNormalized(refreshed, manager, { includeOverviewFields: true });
+  assert.equal(ipcAccount.subscription_tier, 'ULTRA');
+  assert.equal(ipcAccount.quota.subscription_tier, 'ULTRA');
+});
+
+test('P0-04 & P1-16 & P2-20: 订阅到期 PRO/ULTRA->FREE 真实降级同步、残缺探测防误降级、摘要态凭据就绪与新一代 3P 家族归类', async t => {
+  const { mergeSubscriptionTier } = await import('../dist/account-probe.js');
+  const { projectAccountForIpc } = await import('../dist/account-quota.js');
+
+  // 1) mergeSubscriptionTier 单元契约
+  assert.equal(mergeSubscriptionTier('FREE', 'PRO', true), 'FREE', '完整探测确认降级为 FREE 时必须更新为 FREE');
+  assert.equal(mergeSubscriptionTier('FREE', 'ULTRA', true), 'FREE', '完整探测确认 ULTRA 到期降级为 FREE 时必须更新为 FREE');
+  assert.equal(mergeSubscriptionTier('FREE', 'PRO', false), 'PRO', '残缺探测临时回落 FREE 时保留已验证历史等级 PRO');
+  assert.equal(mergeSubscriptionTier('', 'ULTRA', true), 'ULTRA', '未返回套餐字段时保留历史等级 ULTRA');
+  assert.equal(mergeSubscriptionTier('PRO', 'ULTRA', true), 'PRO', 'ULTRA 降为 PRO 时同步更新为 PRO');
+
+  // 2) AccountsManager.refreshQuota 端到端降级验证：曾为 ULTRA 的账号到期变为 Starter/Free 后，徽章与配额视图必须同步为 FREE
+  const { manager, acc } = await createTempManager(t);
+  const reset5h = new Date(Date.now() + 3600 * 1000).toISOString();
+  acc.quota = {
+    subscription_tier: 'ULTRA',
+    source: 'cloud',
+    last_updated: Math.floor(Date.now() / 1000) - 600,
+    is_forbidden: false,
+    model_forwarding_rules: {},
+    models: [],
+  };
+  await manager.saveAccount(acc);
+
+  const downgraded = await manager.refreshQuota(acc.id, async (url) => {
+    if (String(url).includes('loadCodeAssist')) {
+      return Response.json({ currentTier: { id: 'g1-free-tier', name: 'Free' } });
+    }
+    if (String(url).includes('fetchAvailableModels')) {
+      return Response.json({
+        models: {
+          'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash', quotaInfo: { remainingFraction: 0.8, resetTime: reset5h } },
+          'o5-mini': { displayName: 'OpenAI o5-mini', quotaInfo: { remainingFraction: 0.6, resetTime: reset5h } },
+          'deepseek-r1': { displayName: 'DeepSeek R1', quotaInfo: { remainingFraction: 0.6, resetTime: reset5h } },
+        },
+      });
+    }
+    return Response.json({
+      groups: [
+        { displayName: 'Gemini Models', buckets: [{ bucketId: 'g-5h', window: '5h', remainingFraction: 0.8, resetTime: reset5h }] },
+        { displayName: 'Third-Party Models', buckets: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 0.6, resetTime: reset5h }] },
+      ],
+    });
+  });
+  assert.equal(downgraded.quota?.subscription_tier, 'Free');
+  const downgradedOverview = manager.getAccountQuotaOverview(downgraded);
+  assert.equal(downgradedOverview.subscriptionTier, 'FREE');
+  const downgradedIpc = projectAccountForIpcNormalized(downgraded, manager, { includeOverviewFields: true });
+  assert.equal(downgradedIpc.subscription_tier, 'FREE');
+  assert.equal(downgradedIpc.quota.subscription_tier, 'FREE');
+  // o5-mini 与 deepseek-r1 归入共享第三方池 claude，不误拆为 standaloneModels
+  assert.deepEqual(downgradedOverview.standaloneModels, []);
+  assert.deepEqual(downgradedOverview.projectedQuotaGroups.map(g => g.key), ['gemini', 'claude']);
+
+  // 3) P1-16: 不含 token 字段的 AccountSummary 投影不得误判为 needs_refresh
+  const summaryProjected = projectAccountForIpc({
+    id: 'summary-only-id',
+    email: 'summary@example.test',
+    name: 'Summary User',
+    created_at: 1700000000,
+    last_used: 1700000100,
+  });
+  assert.equal(summaryProjected.credentialReadiness.state, 'ready');
+});
+
+
 
 

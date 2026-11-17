@@ -545,7 +545,8 @@ export async function collectAgentConversationTargets(ctx: MaintenanceDiscoveryC
       'scratch',
     ]) {
       const candidate = join(bPath, rel);
-      if (await lstat(candidate).catch(() => null)) {
+      const st = await lstat(candidate).catch(() => null);
+      if (st && !st.isSymbolicLink()) {
         taskStepTargets.push({ path: candidate });
       }
     }
@@ -555,7 +556,8 @@ export async function collectAgentConversationTargets(ctx: MaintenanceDiscoveryC
       join('.system_generated', 'logs', 'transcript_full.jsonl'),
     ]) {
       const candidate = join(bPath, rel);
-      if (await lstat(candidate).catch(() => null)) {
+      const st = await lstat(candidate).catch(() => null);
+      if (st && !st.isSymbolicLink()) {
         verboseTranscriptTargets.push({ path: candidate });
       }
     }

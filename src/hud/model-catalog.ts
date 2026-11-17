@@ -1,5 +1,5 @@
 import { normalizeModelId } from '../model-identity.js';
-import { getEffectiveModelPriceAlias, getRemoteModelSpec, MODEL_NAMES } from '../model-catalog.js';
+import { getEffectiveModelPriceAlias, getRemoteModelSpec, MODEL_CAPACITIES, MODEL_NAMES } from '../model-catalog.js';
 import { resolveDatabaseModelFullName } from '../usage-types.js';
 import { bt } from '../i18n.js';
 /**
@@ -84,42 +84,20 @@ const MODEL_CAPACITY_RULES: readonly ModelFamilyRule[] = [
   },
 ];
 
-const DISPLAY_NAME_MAP: Record<string, string> = {
-  'gemini-4-argon': 'Gemini 4 Argon',
+const INTERNAL_DISPLAY_NAME_OVERRIDES: Record<string, string> = {
   'gemini-4-argon-trial': 'Gemini 4 Argon Trial',
-  'gemini-4-carbon': 'Gemini 4 Carbon',
   'gemini-4-carbon-trial': 'Gemini 4 Carbon Trial',
-  'gemini-4-hydrogen': 'Gemini 4 Hydrogen',
-  'gemini-3.9-flash': 'Gemini 3.9 Flash',
-  'gemini-3.8-flash': 'Gemini 3.8 Flash',
   'gemini-3.8-flash-control': 'Gemini 3.8 Flash',
   'gemini-3.8-flash-n': 'Gemini 3.8 Flash',
   'gemini-3.8-flash-tiered': 'Gemini 3.8 Flash',
   'gemini-3.8-flash-exp-a': 'Gemini 3.8 Flash',
-  'gemini-3.8-pro': 'Gemini 3.8 Pro',
-  'gemini-3.7-flash': 'Gemini 3.7 Flash',
   'gemini-3.7-flash-tiered': 'Gemini 3.7 Flash',
   'gemini-3.7-flash-safety-le': 'Gemini 3.7 Flash',
-  'gemini-3.6-flash': 'Gemini 3.6 Flash',
   'gemini-3.6-flash-tiered': 'Gemini 3.6 Flash',
   'gemini-3.6-flash-exp-a': 'Gemini 3.6 Flash',
-  'gemini-3.5-flash': 'Gemini 3.5 Flash',
   'gemini-3-flash': 'Gemini 3 Flash',
   'gemini-3-flash-a': 'Gemini 3 Flash',
-  'gemini-3.1-pro': 'Gemini 3.1 Pro',
   'gemini-pro-default': 'Gemini Pro',
-  'gemini-2.5-pro': 'Gemini 2.5 Pro',
-  'gemini-2.5-flash': 'Gemini 2.5 Flash',
-  'claude-sonnet-5-5': 'Claude Sonnet 5.5',
-  'claude-opus-5-5': 'Claude Opus 5.5',
-  'claude-sonnet-4-6': 'Claude Sonnet 4.6',
-  'claude-opus-4-6': 'Claude Opus 4.6',
-  'claude-3-7-sonnet': 'Claude 3.7 Sonnet',
-  'claude-3-5-sonnet': 'Claude 3.5 Sonnet',
-  'claude-3-5-haiku': 'Claude 3.5 Haiku',
-  'gpt-4o': 'GPT-4o',
-  'gpt-4o-mini': 'GPT-4o mini',
-  'gpt-oss-120b': 'GPT-OSS 120B',
 };
 
 function formatCompactCapacity(tokens: number): string {
@@ -204,20 +182,27 @@ export function resolveModelCapacity(rawModelInput?: string | null, depth = 0): 
   }
 
   const remoteSpec = getRemoteModelSpec(normalizedId);
+  const bundledCapacity =
+    Object.hasOwn(MODEL_CAPACITIES, normalizedId) &&
+    typeof MODEL_CAPACITIES[normalizedId] === 'number' &&
+    MODEL_CAPACITIES[normalizedId]! > 0
+      ? MODEL_CAPACITIES[normalizedId]!
+      : undefined;
   const displayName =
     remoteSpec?.displayName ||
-    DISPLAY_NAME_MAP[normalizedId] ||
+    INTERNAL_DISPLAY_NAME_OVERRIDES[normalizedId] ||
     (Object.hasOwn(MODEL_NAMES, normalizedId) ? MODEL_NAMES[normalizedId] : undefined) ||
     autoFormatDynamicModelName(normalizedId) ||
     cleanedRaw ||
     raw;
 
-  if (remoteSpec?.capacityTokens) {
+  const explicitCap = remoteSpec?.capacityTokens ?? bundledCapacity;
+  if (explicitCap) {
     return {
       modelId: normalizedId,
       displayName,
-      capacityTokens: remoteSpec.capacityTokens,
-      capacityCompact: formatCompactCapacity(remoteSpec.capacityTokens),
+      capacityTokens: explicitCap,
+      capacityCompact: formatCompactCapacity(explicitCap),
       isFallback: false,
     };
   }
@@ -246,7 +231,7 @@ export function resolveModelCapacity(rawModelInput?: string | null, depth = 0): 
 
   return {
     modelId: normalizedId || 'unknown-model',
-    displayName: cleanedRaw || raw || 'Unknown Model',
+    displayName: cleanedRaw || raw || bt('usage.unknown_model'),
     capacityTokens: DEFAULT_CONTEXT_CAPACITY_TOKENS,
     capacityCompact: '~200K',
     isFallback: true,

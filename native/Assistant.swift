@@ -167,7 +167,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         if restartedAfterUpdate {
             for _ in 0..<25 {
                 if Self.findExistingMainPeer() == nil { break }
-                usleep(100_000)
+                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
             }
         }
         if let peer = Self.findExistingMainPeer() {
@@ -589,6 +589,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
     }
 
     @objc func showPanel() {
+        guard !quitting else { return }
         if window == nil {
             let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 1024, height: 710),
@@ -855,8 +856,9 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
 
     func applyLocalizedChrome() {
         installApplicationMenu()
-        if let win = window {
-            let deferStorageRebuild = cachePage?.busy == true || preferencesController?.maintenanceSheet != nil
+        if window != nil {
+            let deferPrefsSheetRebuild = preferencesController?.maintenanceSheet != nil || preferencesController?.pricingSheet != nil
+            let deferStorageCacheRebuild = deferPrefsSheetRebuild || cachePage?.busy == true
             sidebar.setAccessibilityLabel(L10n.t("nav.accessibility", fallback: "导航"))
             sidebar.reloadData()
             if names.indices.contains(currentPage) {
@@ -874,9 +876,11 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             overview = nil
             accountsPage = nil
             usagePage = nil
-            if !deferStorageRebuild {
-                pendingLocalizedRebuildAfterMaintenance = false
+            if !deferStorageCacheRebuild {
                 cachePage = nil
+            }
+            if !deferPrefsSheetRebuild {
+                pendingLocalizedRebuildAfterMaintenance = deferStorageCacheRebuild
                 preferencesController = nil
             } else {
                 pendingLocalizedRebuildAfterMaintenance = true

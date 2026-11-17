@@ -24,7 +24,7 @@ if(!ready){process.stderr.write('先运行 npm run setup:dev 准备依赖；缺�
 // Git pre-push hook 门禁配置
 let hooksConfigured = false;
 const hookPath = join(root, '.githooks/pre-push');
-if (existsSync(hookPath)) {
+if (setup && existsSync(hookPath)) {
   try { chmodSync(hookPath, 0o755); } catch {}
 }
 if (existsSync(join(root, '.git'))) {

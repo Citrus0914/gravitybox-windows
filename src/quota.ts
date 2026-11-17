@@ -170,9 +170,10 @@ export function classifyFamily(input: {
   // A reset description can mention other pools. Identity fields take precedence.
   const identity = [input.bucketId, input.modelId, input.displayName, input.modelOrAlias]
     .map(value => String(value ?? '').toLowerCase()).join(' ');
+  const provider = String(input.modelProvider ?? '').toLowerCase();
   const text = (identity.includes('argon') || identity.includes('carbon'))
     ? identity
-    : [input.groupName, identity, input.modelProvider].map(value => String(value ?? '').toLowerCase()).join(' ');
+    : [input.groupName, identity, provider].map(value => String(value ?? '').toLowerCase()).join(' ');
   if (text.includes('argon')) return 'argon';
   if (text.includes('carbon')) return 'carbon';
   // 自动识别未来新上线的 Gemini 4+ 独立代号模型（如 gemini-4-neon 等），归为独立 'other' 而不污染基础 Gemini 池；
@@ -184,7 +185,12 @@ export function classifyFamily(input: {
       return 'other';
     }
   }
-  if (/claude|gpt|openai|anthropic|3p\b|\bo[134](?:-(?:mini|pro|preview))?\b/.test(text)) return 'claude';
+  if (
+    /claude|gpt|openai|anthropic|grok|xai|deepseek|mistral|llama|third[_-]?party|3p\b|\bo[1-9]\d*(?:$|[-_\s]|-(?:mini|pro|preview|high|low|medium))\b/.test(text)
+    || (Boolean(provider.trim()) && !/google|gemini|vertex|unspecified|unknown/.test(provider) && /provider/.test(provider))
+  ) {
+    return 'claude';
+  }
   if (/gemini|google/.test(text)) return 'gemini';
   return 'other';
 }
@@ -206,7 +212,7 @@ export function formatCountdown(
   if (!normalized) return options?.preserveUnparsed ? String(resetTime) : '';
   const tsMs = Date.parse(normalized);
   const diffMs = tsMs - nowMs;
-  if (diffMs <= 0) return bt('quota.countdown.passed');
+  if (diffMs <= 0) return bt('quota.countdown.overdue');
   if (diffMs <= 60000) return bt('quota.countdown.soon');
   const totalMin = Math.floor(diffMs / 60000);
   const days = Math.floor(totalMin / (24 * 60));
@@ -434,17 +440,37 @@ export function mergeGroupSets(groupSets: NormalizedGroup[][]): NormalizedGroup[
         current.description = group.description;
       }
       for (const bucket of group.buckets) {
-        const key = `${groupKey}:${bucket.window}`;
+        const bucketSubKey = bucket.bucket_id || bucket.window;
+        const key = `${groupKey}:${bucketSubKey}`;
         const existing = bucketAcc.get(key);
         const usable = bucket.remaining_fraction_known || bucket.reset_time !== null;
         if (!existing) {
           bucketAcc.set(key, { bucket: { ...bucket }, priority });
           continue;
         }
-        // 高优先级优先；同优先级取更早观测（更保守）。低优先级绝不覆盖已 known 的高优先级值。
-        if (priority < existing.priority) continue;
+        // 高优先级优先（input index 0 > 1 > 2）；同优先级取更小/更保守的已知值；低优先级绝不覆盖已 known 的高优先级值。
+        if (priority < existing.priority) {
+          if (usable) bucketAcc.set(key, { bucket: { ...bucket }, priority });
+          continue;
+        }
+        if (priority > existing.priority) {
+          if (!existing.bucket.remaining_fraction_known && usable) {
+            bucketAcc.set(key, { bucket: { ...bucket }, priority });
+          }
+          continue;
+        }
         if (existing.bucket.remaining_fraction_known && !usable) continue;
         if (!existing.bucket.remaining_fraction_known && usable) {
+          bucketAcc.set(key, { bucket: { ...bucket }, priority: existing.priority });
+          continue;
+        }
+        if (
+          existing.bucket.remaining_fraction_known &&
+          bucket.remaining_fraction_known &&
+          bucket.remaining_fraction !== null &&
+          existing.bucket.remaining_fraction !== null &&
+          bucket.remaining_fraction < existing.bucket.remaining_fraction
+        ) {
           bucketAcc.set(key, { bucket: { ...bucket }, priority: existing.priority });
         }
       }
@@ -762,7 +788,7 @@ function buildStandaloneFamilyStatus(
   const { shortLabel, fullLabel } = options;
   let message: string;
   if (availability === 'disabled') {
-    message = bt('quota.standalone.no_permission', { fullLabel });
+    message = bt('quota.standalone.backend_no_permission', { fullLabel });
   } else if (availability === 'unknown') {
     message = familyModels.length ? bt('quota.standalone.listed_unknown', { shortLabel })
       : bt('quota.standalone.not_reported', { shortLabel });
@@ -837,7 +863,7 @@ function matchPoolByBucketName(
     }
   }
   if (/argon|carbon/i.test(norm)) return null;
-  if (/claude|anthropic|openai|gpt|3p\b|\bo[134](?:-(?:mini|pro|preview))?\b/i.test(norm)) return 'claude';
+  if (/claude|anthropic|openai|gpt|grok|xai|deepseek|mistral|llama|third[_-]?party|3p\b|\bo[1-9]\d*(?:$|[-_\s]|-(?:mini|pro|preview|high|low|medium))\b/i.test(norm)) return 'claude';
   if (/gemini|google/i.test(norm)) return 'gemini';
   return null;
 }

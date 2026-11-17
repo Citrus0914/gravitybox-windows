@@ -32,7 +32,7 @@ import { atomicJson } from '../dist/files.js';
 import { preservedIdentifier, PROPER_NOUNS, GLOSSARY_RULES } from '../dist/coverage.js';
 export { PROPER_NOUNS, GLOSSARY_RULES };
 
-const placeholderTokens = (text) => (text.match(/\{\{?\w+\}?\}|\$\d+|%[sd]/g) ?? []).sort().join('|');
+const placeholderTokens = (text) => (text.match(/\{\{?[a-zA-Z0-9_.-]+\}?\}|\$\{[^}]+\}|\$\d+|%(?:\d+\$)?[sdifu]/g) ?? []).sort().join('|');
 const hasCJK = (text) => /[\u3400-\u9fff]/.test(text);
 const inKeyAsWord = (key, noun) => new RegExp(`(?:^|[^A-Za-z])${noun.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^A-Za-z])`, 'i').test(key);
 

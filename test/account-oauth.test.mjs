@@ -34,13 +34,16 @@ test('OAuth malformed token and Google errors are sanitized, never stored',async
  }
 });
 
-test('OAuth client ID and secret are non-empty and support environment override', async () => {
-  const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, getGoogleClientId, getGoogleClientSecret } = await import('../dist/accounts.js');
-  assert.ok(typeof GOOGLE_CLIENT_ID === 'string' && GOOGLE_CLIENT_ID.length > 10);
-  assert.ok(typeof GOOGLE_CLIENT_SECRET === 'string' && GOOGLE_CLIENT_SECRET.length > 10);
-  assert.ok(GOOGLE_CLIENT_ID.includes('.apps.googleusercontent.com'));
-  assert.equal(getGoogleClientId(), GOOGLE_CLIENT_ID);
-  assert.equal(getGoogleClientSecret(), GOOGLE_CLIENT_SECRET);
+test('OAuth client ID and secret getters support dynamic environment overrides without stale module-load constants', async () => {
+  const accountsMod = await import('../dist/accounts.js');
+  const { getGoogleClientId, getGoogleClientSecret } = accountsMod;
+  assert.equal('GOOGLE_CLIENT_ID' in accountsMod, false);
+  assert.equal('GOOGLE_CLIENT_SECRET' in accountsMod, false);
+  const cid = getGoogleClientId();
+  const sec = getGoogleClientSecret();
+  assert.ok(typeof cid === 'string' && cid.length > 10);
+  assert.ok(typeof sec === 'string' && sec.length > 10);
+  assert.ok(cid.includes('.apps.googleusercontent.com'));
 });
 
 test('P1-18: CodedAccountError 保留业务错误语义，中英文凭据就绪度与 403/#3501 保持兼容', async t => {

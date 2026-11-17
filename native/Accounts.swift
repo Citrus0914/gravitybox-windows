@@ -276,7 +276,10 @@ final class AccountsPage: NSObject {
         for group in contract.displayGroups {
             if let pct = group.primaryPercentage {
                 let label = group.summaryLabel.isEmpty ? group.displayName : group.summaryLabel
-                parts.append("\(label) \(pct)%")
+                let staleSuffix = group.primaryWindow?.stale == true
+                    ? " (\(L10n.t("quota.stale", fallback: "已过期")))"
+                    : ""
+                parts.append("\(label) \(pct)%\(staleSuffix)")
             }
         }
         guard !parts.isEmpty else { return L10n.t("accounts.collapsed_pending") }
@@ -1109,7 +1112,14 @@ final class AccountsPage: NSObject {
         alert.addButton(withTitle: L10n.t("accounts.rollback.confirm_action")); alert.addButton(withTitle: L10n.t("common.cancel"))
         alert.beginSheetModal(for: window) { [weak self] result in
             guard let self, result == .alertFirstButtonReturn else { return }
-            self.app.perform(["command": "account_switch_rollback"]) { [weak self] value in guard let self else { return }; self.app.showMessage(value["message"] as? String ?? L10n.t("accounts.rollback.restored")); self.fetch(); self.app.refresh() }
+            self.rollbackButton.isEnabled = false
+            self.app.perform(["command": "account_switch_rollback"]) { [weak self] value in
+                guard let self else { return }
+                self.rollbackButton.isEnabled = true
+                self.app.showMessage(value["message"] as? String ?? L10n.t("accounts.rollback.restored"))
+                self.fetch()
+                self.app.refresh()
+            }
         }
     }
 

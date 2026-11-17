@@ -27,10 +27,23 @@ final class AppUpdateManager {
     static let latestReleaseEndpoint = URL(string: "https://api.github.com/repos/Enzoo404/gravitybox/releases/latest")!
     static let releasesPageURL = URL(string: "https://github.com/Enzoo404/gravitybox/releases")!
 
+    private static func httpsURL(from raw: String?) -> URL? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              url.scheme?.lowercased() == "https",
+              let host = url.host,
+              !host.isEmpty else {
+            return nil
+        }
+        return url
+    }
+
     unowned let app: Assistant
     private(set) var state: State = .idle
     private(set) var availableRelease: AppReleaseInfo?
     private(set) var downloadedDMGURL: URL?
+    private(set) var downloadProgressPercent: Int? = nil
     var onStateChanged: (() -> Void)?
     #if NATIVE_UI_TEST
     var checkTransport: ((URLRequest, @escaping (Data?, URLResponse?, Error?) -> Void) -> Void)?
@@ -130,6 +143,7 @@ final class AppUpdateManager {
     func simulateRelease(_ release: AppReleaseInfo?) {
         availableRelease = release
         downloadedDMGURL = nil
+        downloadProgressPercent = nil
         if let release {
             state = .updateAvailable(release)
         } else {
@@ -140,14 +154,16 @@ final class AppUpdateManager {
     }
 
     func simulateChecking() {
+        downloadProgressPercent = nil
         state = .checking
         app.syncUpdatePromptControls()
         onStateChanged?()
     }
 
-    func simulateDownloading(_ release: AppReleaseInfo) {
+    func simulateDownloading(_ release: AppReleaseInfo, progressPercent: Int? = nil) {
         availableRelease = release
         downloadedDMGURL = nil
+        downloadProgressPercent = progressPercent
         state = .downloading(release)
         app.syncUpdatePromptControls()
         onStateChanged?()
@@ -156,6 +172,7 @@ final class AppUpdateManager {
     func simulateReadyToInstall(_ release: AppReleaseInfo, dmgURL: URL) {
         availableRelease = release
         downloadedDMGURL = dmgURL
+        downloadProgressPercent = nil
         state = .readyToInstall(release, dmgURL)
         app.syncUpdatePromptControls()
         onStateChanged?()
@@ -163,12 +180,14 @@ final class AppUpdateManager {
 
     func simulateInstalling(_ release: AppReleaseInfo) {
         availableRelease = release
+        downloadProgressPercent = nil
         state = .installing(release)
         app.syncUpdatePromptControls()
         onStateChanged?()
     }
 
     func simulateFailed(_ message: String) {
+        downloadProgressPercent = nil
         state = .failed(message)
         app.syncUpdatePromptControls()
         onStateChanged?()
@@ -245,7 +264,7 @@ final class AppUpdateManager {
             let body = (json["body"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let publishedRaw = (json["published_at"] as? String) ?? ""
             let publishedDate = publishedRaw.count >= 10 ? String(publishedRaw.prefix(10)) : L10n.t("update.latest_build", fallback: "最新构建")
-            let htmlURL = (json["html_url"] as? String).flatMap(URL.init(string:)) ?? Self.releasesPageURL
+            let htmlURL = Self.httpsURL(from: json["html_url"] as? String) ?? Self.releasesPageURL
 
             var dmgURL: URL?
             var sha256URL: URL?
@@ -253,7 +272,7 @@ final class AppUpdateManager {
                 for asset in assets {
                     guard let assetName = asset["name"] as? String,
                           let downloadStr = asset["browser_download_url"] as? String,
-                          let url = URL(string: downloadStr) else { continue }
+                          let url = Self.httpsURL(from: downloadStr) else { continue }
                     let expectedName = "GravityBox-\(remoteVersion)-arm64.dmg"
                     if assetName == expectedName { dmgURL = url }
                     else if assetName == expectedName + ".sha256" { sha256URL = url }
@@ -296,13 +315,19 @@ final class AppUpdateManager {
                 lower.contains("sha256") ||
                 lower.contains("checksum") ||
                 lower.contains("verification") ||
+                lower == "installation" ||
+                lower == "install" ||
+                lower.hasPrefix("installation ") ||
                 lower.contains("installation & first launch") ||
                 lower.contains("installation and first launch") ||
                 lower.contains("manual installation") ||
+                lower.contains("manual install") ||
                 lower.contains("first launch") ||
                 heading.contains("附件校验") ||
                 heading.contains("安装与首次打开") ||
-                heading.contains("手动安装")
+                heading.contains("安装说明") ||
+                heading.contains("手动安装") ||
+                heading == "安装"
         }
 
         func isBoilerplateCodeLine(_ line: String) -> Bool {
@@ -391,14 +416,130 @@ final class AppUpdateManager {
         try UpdatePackageIntegrity.verify(file, expected: expected)
     }
 
+    private static func makeUpdateDownloadSession() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 300
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }
+
+    private final class LockedDownloadHandle: @unchecked Sendable {
+        private let lock = NSLock()
+        private var task: URLSessionDownloadTask?
+        private var observation: NSKeyValueObservation?
+        private var isCancelled = false
+        private var lastReportedPercent = -1
+
+        func bind(task: URLSessionDownloadTask, observation: NSKeyValueObservation) {
+            var shouldCancelNow = false
+            lock.lock()
+            if isCancelled {
+                shouldCancelNow = true
+            } else {
+                self.task = task
+                self.observation = observation
+            }
+            lock.unlock()
+            if shouldCancelNow {
+                observation.invalidate()
+                task.cancel()
+            }
+        }
+
+        func shouldReport(percent: Int) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !isCancelled, percent != lastReportedPercent else { return false }
+            lastReportedPercent = percent
+            return true
+        }
+
+        func finish() {
+            lock.lock()
+            let obs = observation
+            observation = nil
+            task = nil
+            lock.unlock()
+            obs?.invalidate()
+        }
+
+        func cancel() {
+            lock.lock()
+            isCancelled = true
+            let activeTask = task
+            let obs = observation
+            observation = nil
+            task = nil
+            lock.unlock()
+            obs?.invalidate()
+            activeTask?.cancel()
+        }
+    }
+
+    private static func downloadFileWithProgress(
+        session: URLSession,
+        url: URL,
+        destination: URL,
+        onProgress: @escaping @Sendable (Int) -> Void
+    ) async throws {
+        let handle = LockedDownloadHandle()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let task = session.downloadTask(with: url) { tempURL, response, error in
+                    handle.finish()
+                    if let error {
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                    guard (response as? HTTPURLResponse)?.statusCode == 200, let tempURL else {
+                        continuation.resume(throwing: URLError(.badServerResponse))
+                        return
+                    }
+                    do {
+                        let fm = FileManager.default
+                        if fm.fileExists(atPath: destination.path) {
+                            try? fm.removeItem(at: destination)
+                        }
+                        try fm.moveItem(at: tempURL, to: destination)
+                        continuation.resume(returning: ())
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+                let observation = task.progress.observe(\.fractionCompleted, options: [.new]) { progress, _ in
+                    guard progress.totalUnitCount > 0 else { return }
+                    let pct = max(0, min(100, Int((progress.fractionCompleted * 100.0).rounded(.down))))
+                    if handle.shouldReport(percent: pct) {
+                        onProgress(pct)
+                    }
+                }
+                handle.bind(task: task, observation: observation)
+                task.resume()
+            }
+        } onCancel: {
+            handle.cancel()
+        }
+    }
+
     func preDownloadRelease(_ release: AppReleaseInfo, silent: Bool, completion: ((Result<URL, Error>) -> Void)? = nil) {
         guard !downloadInFlight else { return }
         downloadInFlight = true
         downloadedDMGURL = nil
+        downloadProgressPercent = nil
         transition(.downloading(release))
         let targetFile = cachedDMGPath(for: release.version)
         downloadTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            let reportProgress: @Sendable (Int) -> Void = { [weak self] pct in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.downloadInFlight else { return }
+                    if case .downloading = self.state {
+                        self.downloadProgressPercent = pct
+                        self.onStateChanged?()
+                    }
+                }
+            }
             let preparation = Task.detached(priority: .utility) { () -> Result<URL, Error> in
             let result: Result<URL, Error>
             do {
@@ -414,18 +555,18 @@ final class AppUpdateManager {
                 guard let dmgURL = release.dmgURL, let shaURL = release.sha256URL else {
                     throw UpdatePackageIntegrity.failure(L10n.t("update.error.missing_assets", fallback: "该版本缺少安装包或 SHA-256 校验文件，已停止更新；当前版本仍可继续使用。"))
                 }
+                let session = Self.makeUpdateDownloadSession()
+                defer { session.invalidateAndCancel() }
                 let shaText: String
-                do { let (data, response) = try await URLSession.shared.data(from: shaURL); guard (response as? HTTPURLResponse)?.statusCode == 200, data.count < 65536, let decoded = String(data: data, encoding: .utf8) else { throw URLError(.badServerResponse) }; shaText = decoded }
+                do { let (data, response) = try await session.data(from: shaURL); guard (response as? HTTPURLResponse)?.statusCode == 200, data.count < 65536, let decoded = String(data: data, encoding: .utf8) else { throw URLError(.badServerResponse) }; shaText = decoded }
                 catch { throw UpdatePackageIntegrity.failure(L10n.t("update.error.sha_read_failed", fallback: "无法读取 SHA-256 校验文件，已停止更新，请稍后重试。")) }
                 let expected = try UpdatePackageIntegrity.expectedHash(shaText, fileName: targetFile.lastPathComponent)
                 let dir = targetFile.deletingLastPathComponent()
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
                 let tempDMG = dir.appendingPathComponent("download-\(UUID().uuidString).dmg.part")
                 defer { try? fm.removeItem(at: tempDMG) }
-                let (download, response) = try await URLSession.shared.download(from: dmgURL)
-                guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                try await Self.downloadFileWithProgress(session: session, url: dmgURL, destination: tempDMG, onProgress: reportProgress)
                 try Task.checkCancellation()
-                try fm.moveItem(at: download, to: tempDMG)
                 try UpdatePackageIntegrity.verify(tempDMG, expected: expected)
                 let verify = Process()
                 verify.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
@@ -446,6 +587,7 @@ final class AppUpdateManager {
             }
             let result = await withTaskCancellationHandler { await preparation.value } onCancel: { preparation.cancel() }
                 self.downloadInFlight = false
+                self.downloadProgressPercent = nil
                 let shouldAutoInstall = self.pendingInstallAfterDownload
                 self.pendingInstallAfterDownload = false
                 switch result {
@@ -464,7 +606,7 @@ final class AppUpdateManager {
         }
     }
 
-    func cancelDownload() { pendingInstallAfterDownload = false; downloadTask?.cancel() }
+    func cancelDownload() { pendingInstallAfterDownload = false; downloadProgressPercent = nil; downloadTask?.cancel() }
 
     func installRelease(_ release: AppReleaseInfo) {
         guard !installationInFlight else { return }
@@ -834,7 +976,10 @@ final class AppUpdateManager {
                 let receipt = try UpdateInstaller.prepare(stagedApp: stagedApp, target: URL(fileURLWithPath: targetAppPath),
                     work: workDir, version: release.version, dmg: dmgFile)
                 let helper = workDir.appendingPathComponent("installer")
-                try fm.copyItem(at: Bundle.main.executableURL!, to: helper)
+                guard let executableURL = Bundle.main.executableURL else {
+                    throw UpdatePackageIntegrity.failure(L10n.t("update.error.helper_missing", fallback: "未能定位当前应用可执行文件。"))
+                }
+                try fm.copyItem(at: executableURL, to: helper)
                 try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
                 let stagedI18n = workDir.appendingPathComponent("i18n", isDirectory: true)
                 if let srcI18n = Self.findBundledI18nDirectory(fileManager: fm) {

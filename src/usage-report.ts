@@ -96,9 +96,21 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
   // 局部浅拷贝防止本次计算的临时告警（如 receipts_unmatched）永久污染调用方的持久 storageWarnings 集合
   const reportStorageWarnings = new Set(storageWarnings);
 
-  const orderedEvents = [...effectiveEvents].sort(
-    (a, b) => a.timestamp_seconds - b.timestamp_seconds || (a.event_key ?? '').localeCompare(b.event_key ?? '')
-  );
+  let alreadyOrdered = true;
+  for (let i = 1; i < effectiveEvents.length; i += 1) {
+    const prev = effectiveEvents[i - 1]!;
+    const curr = effectiveEvents[i]!;
+    const cmp = prev.timestamp_seconds - curr.timestamp_seconds;
+    if (cmp > 0 || (cmp === 0 && (prev.event_key ?? '').localeCompare(curr.event_key ?? '') > 0)) {
+      alreadyOrdered = false;
+      break;
+    }
+  }
+  const orderedEvents = alreadyOrdered
+    ? effectiveEvents
+    : [...effectiveEvents].sort(
+        (a, b) => a.timestamp_seconds - b.timestamp_seconds || (a.event_key ?? '').localeCompare(b.event_key ?? '')
+      );
   const anchorMs = Number.isFinite(now) && now > 0 ? now * 1000 : Date.now();
   const todayDate = new Date(anchorMs);
   todayDate.setHours(0, 0, 0, 0);

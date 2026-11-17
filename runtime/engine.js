@@ -4,16 +4,28 @@
   const options = globalThis.__GRAVITYBOX_BOOT__;
   if (!options || location.origin !== options.origin) return;
   if (options.path === '/fixture' && location.pathname !== '/fixture') return;
-  const allowedPath=location.pathname==='/'||/^\/(?:history|sidecars|customizations|automations|settings|settings-standalone|terminal-standalone|new-project|onboarding|multi|artifact|s|chatski-connect)(?:\/.*)?$/i.test(location.pathname)||/^\/c(?:\/|\/(?:[0-9a-f-]{36}|_new)(?:\/.*)?)?$/i.test(location.pathname)||/^\/(?:forked|view|battle)\/.*$/i.test(location.pathname)||(options.path==='/fixture'&&location.pathname==='/fixture');
+  const allowedPath=location.pathname==='/'||/^\/(?:history|sidecars|customizations|automations|settings|settings-standalone|terminal-standalone|new-project|multi|artifact|s|chatski-connect)(?:\/.*)?$/i.test(location.pathname)||/^\/c(?:\/|\/(?:[0-9a-f-]{36}|_new)(?:\/.*)?)?$/i.test(location.pathname)||/^\/(?:forked|view|battle)\/.*$/i.test(location.pathname)||(options.path==='/fixture'&&location.pathname==='/fixture');
   if(!allowedPath)return;
-  if(options.conservative&&/^\/(?:onboarding|oauth|auth|login|sign-in)(?:\/|$)/i.test(location.pathname))return;
+  if(options.conservative&&/^\/(?:oauth|auth|login|sign-in)(?:\/|$)/i.test(location.pathname))return;
   // Recognize the actual system-settings shell, then admit only its content pane.
   // Project navigation, editable values, chat and code keep their existing protection.
+  const SETTINGS_SCREEN_RE=/^(General|App|AppSettings|Application|Appearance|Account|Accounts|Plan|Notifications|NotificationSettings|Notification Settings|Models|ModelsAndUsage|Models & Usage|KeyboardShortcuts|Shortcuts|Customizations|Editor|Tab|Browser|Developer|Project 4K|Jetski Chat|Provide Feedback|Project General|Project Folders|Project Agent|Permissions)$/i;
+  const BASE_SETTINGS_NAV_KEYS=['General','通用','App','应用','Application','App Settings','应用设置','Appearance','外观','Notifications','通知','Notification Settings','通知设置','Models','Models & Usage','模型','模型与使用量','模型与用量','驱动模型','Keyboard Shortcuts','Keyboard shortcuts','Shortcuts','快捷键','键盘快捷键','键盘快捷方式','Account','Accounts','账户','账号','Plan','计划','规划','Permissions','权限','Customizations','自定义','Editor','Editor Settings','编辑器','编辑器设置','Tab','Tab 键补全','标签页','Browser','浏览器','Developer','开发者','Provide Feedback','提供反馈'];
+  const SETTINGS_NAV_SET=new Set(BASE_SETTINGS_NAV_KEYS.map(s=>s.toLowerCase()));
+  const normalize = s => s.replace(/\s+/g, ' ').trim();
+  const nodeSlots = new WeakMap();
   let settingsPaneCache = null;
+  function settingsDialogRoot(el) {
+    const root=el?.closest?.('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]');
+    if(!root)return null;
+    const labels=['Settings','设置',options.dictionary?.entries?.Settings].filter(Boolean);
+    const hasHeader=[...root.querySelectorAll('h1')].some(e=>labels.includes(normalize(originalText(e)))||labels.includes(normalize(e.textContent||'')));
+    return hasHeader?root:null;
+  }
   function systemSettingsPane() {
     const query=new URL(location.href).searchParams;
     const screen=query.get('settingsScreen');
-    if(screen&&!/^(General|App|AppSettings|Application|Appearance|Account|Notifications|Models|KeyboardShortcuts|Shortcuts|Customizations|Editor|Tab|Browser|Developer|Project 4K|Jetski Chat|Provide Feedback|Project General|Project Folders|Project Agent|Permissions)$/i.test(screen)){settingsPaneCache=null;return null;}
+    if(screen&&!SETTINGS_SCREEN_RE.test(screen)){settingsPaneCache=null;return null;}
     const cached = settingsPaneCache;
     // React can mount before updating the URL, and retain the dialog during its exit animation.
     // A validated, connected pane remains the same scope until it is replaced or detached.
@@ -22,16 +34,17 @@
       &&cached.root.contains(cached.header)&&cached.pane.contains(cached.heading)&&!cached.pane.contains(cached.header))return cached.pane;
     settingsPaneCache=null;
     const clean=e=>(e?.textContent||'').replace(/\s+/g,' ').trim();
+    const rawLabel=e=>normalize(originalText(e))||clean(e);
+    const isNavMatch=e=>{const raw=rawLabel(e).toLowerCase(),cur=clean(e).toLowerCase();return SETTINGS_NAV_SET.has(raw)||SETTINGS_NAV_SET.has(cur);};
     const labels=['Settings','设置',options.dictionary?.entries?.Settings].filter(Boolean);
-    const navigation=['General','通用','Application','App Settings','应用设置','Appearance','外观','Notifications','通知','Models','模型','Keyboard Shortcuts','Shortcuts','快捷键','键盘快捷方式','Account','账户','账号','Customizations','自定义','Editor','Editor Settings','编辑器','编辑器设置','Tab','Browser','浏览器','Developer','开发者','Provide Feedback','提供反馈'];
     const selectors=labels.map(label=>'[role="dialog"][aria-label="'+CSS.escape(label)+'"]').concat('[data-testid="settings-root"]','[data-testid="settings-dialog"]');
     for(const root of document.querySelectorAll(selectors.join(','))) {
-      const header=[...root.querySelectorAll('h1')].find(e=>labels.includes(clean(e)));
+      const header=[...root.querySelectorAll('h1')].find(e=>labels.includes(rawLabel(e))||labels.includes(clean(e)));
       if(!header)continue;
-      const navigationButtons=[...root.querySelectorAll('button')].filter(e=>navigation.includes(clean(e))||(e.getAttribute('data-testid')||'').startsWith('settings-nav-item-'));
-      const names=new Set(navigationButtons.map(clean));
+      const navigationButtons=[...root.querySelectorAll('button')].filter(e=>isNavMatch(e)||(e.getAttribute('data-testid')||'').startsWith('settings-nav-item-'));
+      const names=new Set(navigationButtons.map(e=>rawLabel(e).toLowerCase()));
       if(names.size<3)continue;
-      const headings=[...root.querySelectorAll('h2')].filter(e=>navigation.includes(clean(e)));
+      const headings=[...root.querySelectorAll('h2')].filter(isNavMatch);
       const heading=headings.find(e=>e.closest('[style*="display: block"]'))||headings[0];
       if(!heading)continue;
       let pane=heading;
@@ -149,7 +162,6 @@
   }
   const TRANSLATABLE_ATTRS = ['title', 'aria-label', 'data-tooltip', 'placeholder'];
   const QUEUE_LIMIT = 50000;
-  const nodeSlots = new WeakMap();
   const activeNodes = new Set();
   const observed = new Set();
   const inlineGroups = new WeakMap();
@@ -159,7 +171,6 @@
   const unsupportedInlineGroupReasons = new WeakMap();
   const unsupportedInlineGroupSet = new Set();
   const INLINE_LAYOUT_WARNING = '内联占位符无法安全映射（语序重排/缺少对应文本槽/占位符集合不一致）：已保留完整英文，请在词典中按原占位顺序提供译文';
-  const normalize = s => s.replace(/\s+/g, ' ').trim();
   const lower = s => s.toLowerCase();
   const foldKey = s => lower(s).replace(/[\u2018\u2019]/g, "'");
   let auditKeys = null, auditExpires = 0;
@@ -229,7 +240,7 @@
 
   let lastMatchedKeys=[];
   const conservative=!!options.conservative;
-  const restrictedAdaptiveRoute=()=>conservative&&/^\/(?:onboarding|oauth|auth|login|sign-in)(?:\/|$)/i.test(location.pathname);
+  const restrictedAdaptiveRoute=()=>false;
   const scopeRoute=(el)=>{if(inSystemSettings(el,scanCount))return '/settings';const panel=el?.closest('[role="dialog"],[data-testid*="settings"],[data-testid*="preferences"]');if(panel&&((panel.getAttribute('data-testid')||'').match(/settings|preferences/)||/^(Settings|设置)$/i.test(panel.getAttribute('aria-label')||'')||/^(Settings|设置)$/.test(panel.querySelector('h1,[role="heading"]')?.textContent?.trim()??'')))return '/settings';return location.pathname==='/fixture'?'/fixture':/^\/customizations(?:\/installed)?$/.test(location.pathname)?location.pathname:location.pathname.startsWith('/settings')?'/settings':location.pathname.startsWith('/automations')?'/automations':location.pathname.startsWith('/sidecars')?'/sidecars':['/','/history'].includes(location.pathname)?location.pathname:'/other';};
   const scopeKey=(key,kind,route=scopeRoute())=>`@ui:${route}|${kind}|${key}`;
   /* J02 SPA route guard. The bootstrap allow-list above is evaluated once per document, but the app
@@ -265,6 +276,7 @@
     routeExcluded = excluded;
     try { globalThis.__GRAVITYBOX_HUD_V1__?.setRouteExcluded?.(routeExcluded); } catch {}
     if (excluded) {
+      pluginCards = []; pluginCardsAt = -1;
       if (timer !== null) { clearTimeout(timer); timer = null; }
       pending.clear(); waiting.clear(); settingsWaiting.clear(); requeueDocument = false; reconcileRequested = false; reconcileQueue = null;
       /* updateValue() is the single place that knows how to put a slot back to English and drop it;
@@ -280,7 +292,7 @@
   routeExcluded = !routeAllowedNow();
   let pluginCardsAt=-1,pluginCards=[];
   function pluginCardRoots(){
-    if(!/^\/customizations(?:\/installed)?$/.test(location.pathname))return [];
+    if(!/^\/customizations(?:\/installed)?$/.test(location.pathname)){pluginCards=[];pluginCardsAt=-1;return [];}
     if(pluginCardsAt===scanCount)return pluginCards;pluginCardsAt=scanCount;pluginCards=[];
     const pluginLink=a=>{try{const u=new URL(a.href,location.href);return u.origin===location.origin&&/^\/customizations\/(?:plugins\/[\w.-]+|marketplaces\/[\w.-]+\/plugins\/[\w.-]+)$/.test(u.pathname);}catch{return false;}};
     for(const anchor of [...document.querySelectorAll('a[href]')].filter(pluginLink)){
@@ -318,9 +330,82 @@
       if(entries.length>=250)break;
     }return entries;
   }
+  let customTemplateRules = [];
+  function isRepeatableBraceQuantifier(tail) {
+    const m = tail.match(/^\{(\d+)(?:,(\d*))?\}/);
+    if (!m) return false;
+    if (m[2] === undefined) return Number(m[1]) >= 2;
+    if (m[2] === '') return true;
+    return Number(m[2]) >= 2;
+  }
+  function hasNestedQuantifiedGroup(pattern) {
+    const groupHasQuantifier = [];
+    let inCharClass = false;
+    for (let i = 0; i < pattern.length; i++) {
+      const ch = pattern[i];
+      if (ch === '\\') { i++; continue; }
+      if (ch === '[') { inCharClass = true; continue; }
+      if (ch === ']' && inCharClass) { inCharClass = false; continue; }
+      if (inCharClass) continue;
+      if (ch === '(') {
+        groupHasQuantifier.push(false);
+      } else if (ch === ')') {
+        const innerQuantified = groupHasQuantifier.pop() ?? false;
+        const next = pattern[i + 1] ?? '';
+        const outerRepeats =
+          next === '+' ||
+          next === '*' ||
+          (next === '{' && isRepeatableBraceQuantifier(pattern.slice(i + 1)));
+        const outerOptional = next === '?';
+        if (innerQuantified && (outerRepeats || outerOptional)) return true;
+        if ((innerQuantified || outerRepeats) && groupHasQuantifier.length > 0) {
+          groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+        }
+      } else if (
+        (ch === '+' || ch === '*' || (ch === '{' && isRepeatableBraceQuantifier(pattern.slice(i))))
+        && groupHasQuantifier.length > 0
+      ) {
+        groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+      }
+    }
+    return false;
+  }
+  function compileDeclarativeTemplateRules(rawRules) {
+    if (!Array.isArray(rawRules) || rawRules.length === 0) return [];
+    const compiled = [];
+    for (const item of rawRules) {
+      if (!item || typeof item !== 'object') continue;
+      const key = typeof item.key === 'string' ? item.key.trim() : '';
+      const patternSrc = typeof item.pattern === 'string' ? item.pattern : '';
+      const flags = typeof item.flags === 'string' ? item.flags : 'i';
+      const replacement = typeof item.replacement === 'string' ? item.replacement : '';
+      if (!key || key.length > 240 || !patternSrc || patternSrc.length > 320 || !patternSrc.startsWith('^') || !replacement || replacement.length > 400) continue;
+      if (!/^[iu]*$/.test(flags)) continue;
+      if (hasNestedQuantifiedGroup(patternSrc) || /(\([^)]*[+*][^)]*\))[+*?]/.test(patternSrc)) continue;
+      try {
+        const pattern = new RegExp(patternSrc, flags);
+        compiled.push({
+          key,
+          pattern,
+          inlineOnly: item.inlineOnly === true || key.includes('{0}'),
+          replace: (...args) => {
+            const groups = args.slice(1, -2);
+            return replacement.replace(/\$([1-9]\d?|\$)/g, (_, token) => {
+              if (token === '$') return '$';
+              const idx = Number(token) - 1;
+              return groups[idx] !== undefined ? String(groups[idx]) : '';
+            });
+          },
+        });
+        if (compiled.length >= 256) break;
+      } catch {}
+    }
+    return compiled;
+  }
   function rebuildIndex(dict) {
     dictionary = dict;
     foldedMap = new Map();
+    customTemplateRules = compileDeclarativeTemplateRules(dict?.templateRules);
     if (!dict?.entries) return;
     for (const [k, v] of Object.entries(dict.entries)) {
       if(k.startsWith('@ui:'))continue;
@@ -459,13 +544,14 @@
     const button=element?.closest?.('button');
     if(!button||inSystemSettings(button,scan))return false;
     const pane=settingsScope;
-    const root=pane?.closest('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]');
+    const root=pane?.closest('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]')||settingsDialogRoot(button);
     if(!root?.contains(button))return false;
+    if(pane?pane.contains(button):Boolean(button.closest('main,[role="tabpanel"]')))return false;
     // The small standalone expansion control is built-in navigation, unlike project rows.
     const original=nodeSlots.get(button.firstChild)?.get('')?.original??button.textContent??'';
     if(button.matches('.mx-4.hover\\:underline:is(.text-xs,.text-sm)')&&['Show All','Show all','Show Less','Show less','显示全部','Collapse','收起'].includes(normalize(original)))return false;
-    const headings=[...root.querySelectorAll('h2')].filter(e=>!pane.contains(e));
-    const label=e=>(e.textContent||'').replace(/\s+/g,' ').trim();
+    const headings=[...root.querySelectorAll('h2')].filter(e=>pane?!pane.contains(e):!e.closest('main,[role="tabpanel"]'));
+    const label=e=>normalize(originalText(e))||(e.textContent||'').replace(/\s+/g,' ').trim();
     const start=headings.find(e=>['Projects','Project list','项目列表','项目'].includes(label(e)));
     if(!start||!(start.compareDocumentPosition(button)&Node.DOCUMENT_POSITION_FOLLOWING))return false;
     const next=headings.find(e=>e!==start&&(start.compareDocumentPosition(e)&Node.DOCUMENT_POSITION_FOLLOWING));
@@ -804,7 +890,7 @@
       key: "{category} (", pattern: /^(Child Subagents|Generation Steps|Tools|Subagents|Workspaces|Plugins|Skills|Rules|Hooks|Mcp|Sessions)\s*\($/i,
       replace: (_, name) => {
         const nMap = {
-          'child subagents': '子级智能体',
+          'child subagents': '子智能体',
           'generation steps': '生成步骤',
           'tools': '工具',
           'subagents': '子智能体',
@@ -890,7 +976,7 @@
       replace: () => '您确定要删除该'
     },
     {
-      key: "Are you sure you want to delete {name}?", pattern: /^Are you sure you want to delete\s+(?:the\s+)?(.+?)\??$/i,
+      key: "Are you sure you want to delete {name}?", pattern: /^Are you sure you want to delete\s+(?:the\s+)?(.+?)\?$/i,
       replace: (_, target) => `您确定要删除 ${target} 吗？`
     },
     {
@@ -1005,7 +1091,7 @@
     },
     {
       key: "{count} Side Questions", pattern: /^(\d+)\s+Side\s+Questions?$/i,
-      replace: (_, n) => `${n} 个旁路追问`
+      replace: (_, n) => `${n} 个侧边提问`
     },
     {
       key: "{count} seconds", pattern: /^(\d+)\s+seconds?$/i,
@@ -1089,19 +1175,19 @@
     },
     {
       key: "{name} (Default)", pattern: /^(.+?)\s+\(Default\)$/i,
-      replace: (_, name) => `${entryFor(name) || name}（默认）`
+      replace: (_, name) => `${nestedLabel(name)}（默认）`
     },
     {
       key: "{name} (Archived)", pattern: /^(.+?)\s+\(Archived\)$/i,
-      replace: (_, name) => `${entryFor(name) || name}（已归档）`
+      replace: (_, name) => `${nestedLabel(name)}（已归档）`
     },
     {
       key: "{name} (Experimental)", pattern: /^(.+?)\s+\(Experimental\)$/i,
-      replace: (_, name) => `${entryFor(name) || name}（实验性）`
+      replace: (_, name) => `${nestedLabel(name)}（实验性）`
     },
     {
       key: "{name} (disabled by admin)", pattern: /^(.+?)\s+\(disabled\s+by\s+admin\)$/i,
-      replace: (_, name) => `${entryFor(name) || name}（已被管理员禁用）`
+      replace: (_, name) => `${nestedLabel(name)}（已被管理员禁用）`
     },
     {
       key: "{name} [Remote]", pattern: /^(.+?)\s+\[Remote\]$/i,
@@ -1417,7 +1503,7 @@
     },
     {
       key: "View {count} side questions", pattern: /^View\s+(\d+)\s+side\s+questions?$/i,
-      replace: (_, n) => `查看 ${n} 个旁路追问`
+      replace: (_, n) => `查看 ${n} 个侧边提问`
     },
     {
       key: "Open {name} skill", pattern: /^Open\s+(.+?)\s+skill$/i,
@@ -1440,7 +1526,7 @@
     {
       key: "{name} (Remote)",
       pattern: /^(.+?)\s+\(Remote\)$/i,
-      replace: (_, name) => `${name}（远程）`
+      replace: (_, name) => `${nestedLabel(name)}（远程）`
     },
     {
       key: "Account this MCP server uses: {name}",
@@ -1540,17 +1626,17 @@
     {
       key: "Side Question: {title}",
       pattern: /^Side\s+Question:\s*(.+)$/i,
-      replace: (_, t) => `旁路追问：${t}`
+      replace: (_, t) => `侧边提问：${t}`
     },
     {
       key: "Delete side question: {title}",
       pattern: /^Delete\s+side\s+question:\s*(.+)$/i,
-      replace: (_, t) => `删除旁路追问：${t}`
+      replace: (_, t) => `删除侧边提问：${t}`
     },
     {
       key: "Edit side question title: {title}",
       pattern: /^Edit\s+side\s+question\s+title:\s*(.+)$/i,
-      replace: (_, t) => `编辑旁路追问标题：${t}`
+      replace: (_, t) => `编辑侧边提问标题：${t}`
     },
     {
       key: "Couldn't connect to {target}",
@@ -1734,6 +1820,14 @@
   }
   function matchTemplate(key) {
     const hasInlineSlot = key.includes('{0}');
+    for (let i = 0; i < customTemplateRules.length; i++) {
+      const rule = customTemplateRules[i];
+      if (rule.inlineOnly && !hasInlineSlot) continue;
+      if (rule.pattern.test(key)) {
+        lastMatchedKeys = [rule.key];
+        return key.replace(rule.pattern, rule.replace);
+      }
+    }
     for (let i = 0; i < TEMPLATE_RULES.length; i++) {
       const rule = TEMPLATE_RULES[i];
       if (rule.inlineOnly && !hasInlineSlot) continue;
@@ -2121,6 +2215,8 @@
   }
   function pruneActiveNodes() {
     lastPruneAt = performance.now();
+    if (settingsPaneCache && !settingsPaneCache.root.isConnected) { settingsPaneCache = null; settingsScope = null; settingsScopeScan = -1; }
+    if (!/^\/customizations(?:\/installed)?$/.test(location.pathname)) { pluginCards = []; pluginCardsAt = -1; }
     for (const ref of ownedProjectMarkers) if (!ref.deref()) ownedProjectMarkers.delete(ref);
     for (const node of activeNodes) if (!node.isConnected) activeNodes.delete(node);
     for (const el of inlineGroupContainers) if (!el.isConnected) inlineGroupContainers.delete(el);
@@ -2207,7 +2303,16 @@
     if (!scanning) checkRoute();
     let hasAdded = false;
     for (const mutation of mutations) {
+      const targetEl = mutation.target.nodeType === Node.ELEMENT_NODE ? mutation.target : mutation.target.parentElement;
+      const inStaticProtected = Boolean(
+        targetEl?.closest?.('[data-gravitybox-protect],.monaco-editor,.xterm') &&
+        !targetEl.closest?.('[data-testid="conversation-row-sidebar"],[data-testid*="model"]')
+      );
       if (mutation.type === 'childList') {
+        if (inStaticProtected) {
+          if (mutation.removedNodes.length && [...mutation.removedNodes].some(n => activeNodes.has(n))) reconcileRequested = true;
+          continue;
+        }
         for (const node of mutation.addedNodes) {
           pending.add(node);
           hasAdded = true;
@@ -2216,6 +2321,7 @@
         if (inlineGroups.has(mutation.target)) refreshInlineGroup(mutation.target, ++scanCount);
         if (!projectSearchDirty && mutation.target.nodeType === Node.ELEMENT_NODE && (matches(mutation.target, '[data-testid="project-header"],[data-testid*="project-selector"]') || mutation.target.closest('[data-testid="project-header"],[data-testid*="project-selector"]'))) projectSearchDirty = true;
       } else if (mutation.type === 'characterData') {
+        if (inStaticProtected && !nodeSlots.has(mutation.target)) continue;
         /* Ignore the engine's own text mutations to avoid self-feedback churn. */
         const slot = nodeSlots.get(mutation.target)?.get('');
         if (slot && getValue(mutation.target, '') === slot.last) continue;
@@ -2236,7 +2342,11 @@
     }
     // Mounts and React text updates in settings are handled before paint. The normal page queue
     // retains its existing incremental scheduling and every queue still obeys flush's budget.
-    const settingsPane = systemSettingsPane();
+    const maybeSettings = settingsPaneCache !== null || (hasAdded && [...pending].some(node => {
+      const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+      return el?.closest?.('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]') || el?.querySelector?.('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]');
+    }));
+    const settingsPane = maybeSettings ? systemSettingsPane() : null;
     const settingsRoot = settingsPane ? settingsPaneCache?.root : null;
     const settingsChanged = (settingsRoot || settingsPane) && [...pending].some(node => (settingsRoot || settingsPane).contains(node));
     if ((hasAdded || settingsChanged || (pending.size > 0 && pending.size <= 32 && !reconcileRequested)) && !scanning) {
@@ -2261,7 +2371,7 @@
     update(next) {
       if (!active || !next || next.schema !== 1 || typeof next.version !== 'string' || !next.entries) throw new Error('Invalid dictionary');
       checkRoute();
-      const changed = next.version !== dictionary.version;
+      const changed = next.version !== dictionary.version || JSON.stringify(next.templateRules ?? null) !== JSON.stringify(dictionary?.templateRules ?? null);
       if (!changed) return api.refresh();
       rebuildIndex(next);
       dictionaryToastPending = true;
@@ -2368,10 +2478,10 @@
       }maxSliceMs=Math.max(maxSliceMs,performance.now()-collectStarted);return [...rows.values()];
     },
     pluginCatalog(){return pluginCatalog();},
-    ruleCatalog(){return TEMPLATE_RULES.map(r=>r.key);},
+    ruleCatalog(){return [...new Set([...customTemplateRules.map(r=>r.key),...TEMPLATE_RULES.map(r=>r.key)])];},
     capabilities(){return TEMPLATE_CAPABILITIES;},
     startAudit(knownKeys = []) {
-      auditKeys = new Map([...knownKeys,...TEMPLATE_RULES.map(r=>r.key)].filter(k => typeof k === 'string').map(k => [normalize(k),k]));
+      auditKeys = new Map([...knownKeys,...customTemplateRules.map(r=>r.key),...TEMPLATE_RULES.map(r=>r.key)].filter(k => typeof k === 'string').map(k => [normalize(k),k]));
       auditExpires = Date.now() + 15 * 60 * 1000; auditTrail.clear();
       return { expiresAt: new Date(auditExpires).toISOString() };
     },
@@ -2380,7 +2490,7 @@
       if(languageMode==='en'||routeExcluded)return{observations:[],unmatchedCount:0,protectedCount:0,languageMode:'en',intentionalEnglish:languageMode==='en',routeExcluded};
       // Only return catalogued UI strings. Unknown text is counted, never copied out of the page.
       const auditStarted=performance.now();
-      const known = new Map([...knownKeys,...TEMPLATE_RULES.map(r=>r.key)].filter(k => typeof k === 'string').map(k => [normalize(k), k]));
+      const known = new Map([...knownKeys,...customTemplateRules.map(r=>r.key),...TEMPLATE_RULES.map(r=>r.key)].filter(k => typeof k === 'string').map(k => [normalize(k), k]));
       const observations = new Map(); let unmatchedCount = 0; let protectedCount = 0; let visited = 0; let truncated = false;
       const scan = ++scanCount;
       refreshProjectNames(scan);
@@ -2469,6 +2579,7 @@
       }
       skippedRestores = skipped;
       for (const ref of ownedProjectMarkers) ref.deref()?.classList.remove('gravitybox-project-name'); ownedProjectMarkers.clear();
+      pluginCards = []; pluginCardsAt = -1; settingsPaneCache = null; settingsScope = null; settingsScopeScan = -1;
       if (globalThis.__GRAVITYBOX_BOOT__ === options) delete globalThis.__GRAVITYBOX_BOOT__;
       activeNodes.clear(); observed.clear(); inlineGroupContainers.clear(); unsupportedInlineGroupSet.clear(); delete globalThis[KEY];
       return { restored, skipped, active: false };

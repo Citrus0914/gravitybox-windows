@@ -139,8 +139,10 @@ extension Assistant {
                 let accItem = NSMenuItem(title: title, action: #selector(switchAccountFromMenu(_:)), keyEquivalent: "")
                 accItem.target = self
                 accItem.representedObject = id
-                accItem.isEnabled = acc["disabled"] as? Bool != true
-                if id == activeAccountId || (activeAccountId.isEmpty && accEmail == statusValue.activeAccountEmail) { accItem.state = .on }
+                let isBlocked = acc["disabled"] as? Bool == true || acc["validation_blocked"] as? Bool == true
+                let isCurrent = id == activeAccountId || (activeAccountId.isEmpty && accEmail == statusValue.activeAccountEmail)
+                accItem.isEnabled = !isBlocked && !isCurrent
+                if isCurrent { accItem.state = .on }
                 switchSubmenu.addItem(accItem)
             }
         }
@@ -149,10 +151,6 @@ extension Assistant {
         manageItem.target = self
         switchSubmenu.addItem(manageItem)
         return switchSubmenu
-    }
-    func popUpAccountSwitchMenu(from anchorView: NSView) {
-        let submenu = buildAccountSwitchMenu()
-        Design.popUpMenu(submenu, below: anchorView)
     }
     @objc func showAccountsFromMenuCard() {
         closeMenuPopover()

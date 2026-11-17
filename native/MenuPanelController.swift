@@ -81,6 +81,8 @@ final class MenuPanelController: NSViewController {
     private var hasInitializedExpandedAccount = false
     private var renderedUsageSnapshotKey = ""
     private var renderedUsageModelKey = ""
+    private var renderedQuotaTabKey = ""
+    private var lastMeasuredContentFingerprint = ""
     private var quotaHeaderEmail: String = ""
     private var activePeriodTrendNote: String = ""
 
@@ -786,7 +788,7 @@ final class MenuPanelController: NSViewController {
         }
 
         let models = (report["byModel"] as? [[String: Any]]) ?? (report["models"] as? [[String: Any]]) ?? []
-        let modelKey = "\(report["snapshotId"] ?? ""):\(periodKey):\(models.count):\(showAllModels):\(total)"
+        let modelKey = "\(L10n.shared.currentLocale):\(report["snapshotId"] ?? ""):\(periodKey):\(models.count):\(showAllModels):\(total)"
         if modelKey != renderedUsageModelKey {
             renderedUsageModelKey = modelKey
             rebuildMenuModelList(models: models, totalTokens: total)
@@ -937,41 +939,52 @@ final class MenuPanelController: NSViewController {
             return
         }
 
-        let allNames = models.map { InterfaceText.localizedModelLabel($0["model"] as? String) }
-        let validNames = Set(allNames)
-        modelRowViewsByName = modelRowViewsByName.filter { validNames.contains($0.key) }
-        modelDividerViewsByName = modelDividerViewsByName.filter { validNames.contains($0.key) }
+        var seenKeys = Set<String>()
+        var keyedItems: [(key: String, rawId: String, displayName: String, item: [String: Any])] = []
+        keyedItems.reserveCapacity(models.count)
+        for (idx, item) in models.enumerated() {
+            let rawId = (item["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let displayName = InterfaceText.localizedModelLabel(item["model"] as? String)
+            let baseKey = rawId.isEmpty ? "model_idx_\(idx)" : rawId
+            let uniqueKey = seenKeys.insert(baseKey).inserted ? baseKey : "\(baseKey)#\(idx)"
+            keyedItems.append((key: uniqueKey, rawId: rawId, displayName: displayName, item: item))
+        }
 
-        for item in models {
-            let rawName = InterfaceText.localizedModelLabel(item["model"] as? String)
-            let mTokens = intVal(item, "totalTokens", fallback: intVal(item, "total_tokens"))
+        let allKeys = keyedItems.map(\.key)
+        let validKeys = Set(allKeys)
+        modelRowViewsByName = modelRowViewsByName.filter { validKeys.contains($0.key) }
+        modelDividerViewsByName = modelDividerViewsByName.filter { validKeys.contains($0.key) }
+
+        for entry in keyedItems {
+            let mTokens = intVal(entry.item, "totalTokens", fallback: intVal(entry.item, "total_tokens"))
             let ratio = totalTokens > 0 ? CGFloat(mTokens) / CGFloat(totalTokens) : 0
             let tokensStr = InterfaceText.formatCompactTokens(mTokens, formatSmallWithLocale: true)
 
-            if let existing = modelRowViewsByName[rawName] {
-                existing.update(tokensText: tokensStr, shareFraction: ratio)
+            if let existing = modelRowViewsByName[entry.key] {
+                existing.update(displayName: entry.displayName, tokensText: tokensStr, shareFraction: ratio)
             } else {
                 let rowView = MenuModelUsageItemView(
-                    model: rawName,
+                    model: entry.displayName,
+                    rawModelKey: entry.rawId.isEmpty ? entry.displayName : entry.rawId,
                     tokensText: tokensStr,
                     shareFraction: ratio
                 )
-                modelRowViewsByName[rawName] = rowView
+                modelRowViewsByName[entry.key] = rowView
             }
         }
 
-        if allNames != renderedModelNames {
-            renderedModelNames = allNames
+        if allKeys != renderedModelNames {
+            renderedModelNames = allKeys
             modelsListStack.arrangedSubviews.forEach {
                 modelsListStack.removeArrangedSubview($0)
                 $0.removeFromSuperview()
             }
-            for (idx, name) in allNames.enumerated() {
-                guard let rowView = modelRowViewsByName[name] else { continue }
+            for (idx, key) in allKeys.enumerated() {
+                guard let rowView = modelRowViewsByName[key] else { continue }
                 if idx > 0 {
-                    let line = modelDividerViewsByName[name] ?? {
+                    let line = modelDividerViewsByName[key] ?? {
                         let d = divider()
-                        modelDividerViewsByName[name] = d
+                        modelDividerViewsByName[key] = d
                         return d
                     }()
                     modelsListStack.addArrangedSubview(line)
@@ -982,13 +995,13 @@ final class MenuPanelController: NSViewController {
             }
         }
 
-        let visibleCount = showAllModels ? allNames.count : min(3, allNames.count)
-        for (idx, name) in allNames.enumerated() {
+        let visibleCount = showAllModels ? allKeys.count : min(3, allKeys.count)
+        for (idx, key) in allKeys.enumerated() {
             let shouldHide = idx >= visibleCount
-            if let rowView = modelRowViewsByName[name], rowView.isHidden != shouldHide {
+            if let rowView = modelRowViewsByName[key], rowView.isHidden != shouldHide {
                 rowView.isHidden = shouldHide
             }
-            if idx > 0, let divView = modelDividerViewsByName[name], divView.isHidden != shouldHide {
+            if idx > 0, let divView = modelDividerViewsByName[key], divView.isHidden != shouldHide {
                 divView.isHidden = shouldHide
             }
         }
@@ -1050,67 +1063,80 @@ final class MenuPanelController: NSViewController {
         let modelQuotaText = L10n.t("quota.model_quota", fallback: "模型配额")
         let contract = QuotaPresentation.contract(account)
 
-        quotaUnifiedContentStack.arrangedSubviews.forEach {
-            quotaUnifiedContentStack.removeArrangedSubview($0)
-            $0.removeFromSuperview()
-        }
-        var assignedG5 = false
-        var assignedGW = false
-        var assignedC5 = false
-        var assignedCW = false
+        let quotaRowsFingerprint = [
+            L10n.shared.currentLocale,
+            id,
+            email,
+            contract.displayGroups.map { g in
+                let ws = g.windows.map { "\($0.localizedLabel):\($0.percentage.map(String.init) ?? "-"):\($0.placeholder(availability: g.availability)):\($0.resetText):\($0.stale)" }.joined(separator: ",")
+                return "\(g.key)|\(g.displayName)|\(g.availability)|\(ws)"
+            }.joined(separator: ";")
+        ].joined(separator: "#")
 
-        for (groupIdx, quotaGroup) in contract.displayGroups.enumerated() {
-            if groupIdx > 0 {
-                let div = divider()
-                quotaUnifiedContentStack.addArrangedSubview(div)
-                fillWidth(div, in: quotaUnifiedContentStack)
+        if quotaRowsFingerprint != renderedQuotaTabKey {
+            renderedQuotaTabKey = quotaRowsFingerprint
+            quotaUnifiedContentStack.arrangedSubviews.forEach {
+                quotaUnifiedContentStack.removeArrangedSubview($0)
+                $0.removeFromSuperview()
             }
-            let brands = quotaGroup.brands.isEmpty ? ModelIcons.brands(for: quotaGroup.displayName) : quotaGroup.brands
-            let header = MenuQuotaHelpers.groupHeader(quotaGroup.displayName, brands: brands, fontSize: 11.5, iconSize: 13)
-            var groupViews: [NSView] = [header]
-            var rowsForGroup: [MenuMeterRow] = []
+            var assignedG5 = false
+            var assignedGW = false
+            var assignedC5 = false
+            var assignedCW = false
 
-            if quotaGroup.windows.isEmpty {
-                let row = MenuMeterRow(title: modelQuotaText)
-                row.accessibilityGroupName = quotaGroup.displayName
-                let ph = quotaGroup.availability == "disabled" ? unavailableText : unknownText
-                row.apply(percentage: nil, placeholder: ph, reset: "", stale: false)
-                groupViews.append(row)
-                rowsForGroup.append(row)
-            } else {
-                for win in quotaGroup.windows {
-                    let row = MenuMeterRow(title: win.localizedLabel)
+            for (groupIdx, quotaGroup) in contract.displayGroups.enumerated() {
+                if groupIdx > 0 {
+                    let div = divider()
+                    quotaUnifiedContentStack.addArrangedSubview(div)
+                    fillWidth(div, in: quotaUnifiedContentStack)
+                }
+                let brands = quotaGroup.brands.isEmpty ? ModelIcons.brands(for: quotaGroup.displayName) : quotaGroup.brands
+                let header = MenuQuotaHelpers.groupHeader(quotaGroup.displayName, brands: brands, fontSize: 11.5, iconSize: 13)
+                var groupViews: [NSView] = [header]
+                var rowsForGroup: [MenuMeterRow] = []
+
+                if quotaGroup.windows.isEmpty {
+                    let row = MenuMeterRow(title: modelQuotaText)
                     row.accessibilityGroupName = quotaGroup.displayName
-                    row.apply(
-                        percentage: win.percentage,
-                        placeholder: win.placeholder(availability: quotaGroup.availability),
-                        reset: win.percentage == nil ? "" : win.resetText,
-                        stale: win.stale
-                    )
+                    let ph = quotaGroup.availability == "disabled" ? unavailableText : unknownText
+                    row.apply(percentage: nil, placeholder: ph, reset: "", stale: false)
                     groupViews.append(row)
                     rowsForGroup.append(row)
+                } else {
+                    for win in quotaGroup.windows {
+                        let row = MenuMeterRow(title: win.localizedLabel)
+                        row.accessibilityGroupName = quotaGroup.displayName
+                        row.apply(
+                            percentage: win.percentage,
+                            placeholder: win.placeholder(availability: quotaGroup.availability),
+                            reset: win.percentage == nil ? "" : win.resetText,
+                            stale: win.stale
+                        )
+                        groupViews.append(row)
+                        rowsForGroup.append(row)
+                    }
+                }
+
+                let groupStack = vertical(groupViews, spacing: 6)
+                groupStack.alignment = .leading
+                for v in groupViews { fillWidth(v, in: groupStack) }
+                quotaUnifiedContentStack.addArrangedSubview(groupStack)
+                fillWidth(groupStack, in: quotaUnifiedContentStack)
+
+                let normalizedKey = quotaGroup.key.lowercased()
+                if normalizedKey == "gemini" {
+                    if let first = rowsForGroup.first { quotaGemini5h = first; assignedG5 = true }
+                    if rowsForGroup.count > 1 { quotaGeminiWeekly = rowsForGroup[1]; assignedGW = true }
+                } else if normalizedKey == "claude" || normalizedKey == "claude_gpt" {
+                    if let first = rowsForGroup.first { quotaClaude5h = first; assignedC5 = true }
+                    if rowsForGroup.count > 1 { quotaClaudeWeekly = rowsForGroup[1]; assignedCW = true }
                 }
             }
-
-            let groupStack = vertical(groupViews, spacing: 6)
-            groupStack.alignment = .leading
-            for v in groupViews { fillWidth(v, in: groupStack) }
-            quotaUnifiedContentStack.addArrangedSubview(groupStack)
-            fillWidth(groupStack, in: quotaUnifiedContentStack)
-
-            let normalizedKey = quotaGroup.key.lowercased()
-            if normalizedKey == "gemini" {
-                if let first = rowsForGroup.first { quotaGemini5h = first; assignedG5 = true }
-                if rowsForGroup.count > 1 { quotaGeminiWeekly = rowsForGroup[1]; assignedGW = true }
-            } else if normalizedKey == "claude" || normalizedKey == "claude_gpt" {
-                if let first = rowsForGroup.first { quotaClaude5h = first; assignedC5 = true }
-                if rowsForGroup.count > 1 { quotaClaudeWeekly = rowsForGroup[1]; assignedCW = true }
-            }
+            if !assignedG5 { quotaGemini5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时")) }
+            if !assignedGW { quotaGeminiWeekly = MenuMeterRow(title: L10n.t("common.period.weekly", fallback: "每周")) }
+            if !assignedC5 { quotaClaude5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时")) }
+            if !assignedCW { quotaClaudeWeekly = MenuMeterRow(title: L10n.t("common.period.weekly", fallback: "每周")) }
         }
-        if !assignedG5 { quotaGemini5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时")) }
-        if !assignedGW { quotaGeminiWeekly = MenuMeterRow(title: L10n.t("common.period.weekly", fallback: "每周")) }
-        if !assignedC5 { quotaClaude5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时")) }
-        if !assignedCW { quotaClaudeWeekly = MenuMeterRow(title: L10n.t("common.period.weekly", fallback: "每周")) }
 
         var warnings: [String] = []
         if let readiness = account["credentialReadiness"] as? [String: Any], readiness["state"] as? String == "needs_authorization" {
@@ -1249,11 +1275,42 @@ final class MenuPanelController: NSViewController {
 
     // MARK: - Dynamic Content-Fitted Panel Height (Zero bottom blank gap, smooth micro-interpolation)
 
-    func updatePreferredPanelSize() {
+    func updatePreferredPanelSize(force: Bool = false) {
         guard isViewLoaded else { return }
+        let activeScreen = app.item?.button?.window?.screen ?? viewIfLoaded?.window?.screen ?? NSScreen.main
+        let screenMax = (activeScreen?.visibleFrame.height ?? 820) - 48
+        let tabFingerprint: String
+        switch selectedTab {
+        case 0:
+            let visibleCount = showAllModels ? renderedModelNames.count : min(3, renderedModelNames.count)
+            let visibleLabels = renderedModelNames.prefix(visibleCount).compactMap { modelRowViewsByName[$0]?.nameLabel.stringValue }.joined(separator: "|")
+            tabFingerprint = "u:\(usageScopeLabel.isHidden):\(usageScopeLabel.stringValue):\(modelsListStack.arrangedSubviews.count):\(renderedModelNames.count):\(showAllModels):\(visibleLabels):\(toggleModelsButton.isHidden):\(toggleModelsButton.title):\(usageFooterLabel.stringValue)"
+        case 1:
+            tabFingerprint = "q:\(quotaAccountNameLabel.stringValue):\(quotaTierBadge.isHidden):\(quotaStatusBadge.isHidden):\(quotaEmailLabel.stringValue):\(quotaGroupsContainer.isHidden):\(renderedQuotaTabKey):\(quotaEmptyButton.isHidden):\(quotaWarningLabel.isHidden):\(quotaWarningLabel.stringValue):\(quotaFooterLabel.stringValue)"
+        default:
+            let cardsSummary = renderedAccountIds.map { id -> String in
+                guard let card = accountCardsById[id] else { return id }
+                guard expandedAccountIds.contains(id) else { return "\(id):0" }
+                return "\(id):1:\(card.quotaRowsStack.arrangedSubviews.count):\(card.warningLabel.isHidden ? "" : card.warningLabel.stringValue)"
+            }.joined(separator: "|")
+            tabFingerprint = "a:\(accountsCardsStack.arrangedSubviews.count):\(app.reachable):\(cardsSummary)"
+        }
+        let measureFingerprint = "\(selectedTab):\(L10n.shared.currentLocale):\(Int(screenMax)):\(tabFingerprint)"
+        if !force && measureFingerprint == lastMeasuredContentFingerprint {
+            let sizeInSync: Bool
+            if let popover = app.menuPopover {
+                sizeInSync = abs(popover.contentSize.height - preferredContentSize.height) <= 0.5 && abs(popover.contentSize.width - preferredContentSize.width) <= 0.5
+            } else {
+                sizeInSync = abs(view.frame.height - preferredContentSize.height) <= 0.5 && abs(view.frame.width - preferredContentSize.width) <= 0.5
+            }
+            if sizeInSync {
+                return
+            }
+        }
+        lastMeasuredContentFingerprint = measureFingerprint
+
         let contentWidth = Self.panelWidth - 28
         documentContainer.frame.size.width = Self.panelWidth
-        documentContainer.layoutSubtreeIfNeeded()
         let activeRoot: NSView = selectedTab == 0 ? usageRoot : (selectedTab == 1 ? quotaRoot : accountsRoot)
         activeRoot.frame.size.width = contentWidth
         activeRoot.layoutSubtreeIfNeeded()
@@ -1261,14 +1318,14 @@ final class MenuPanelController: NSViewController {
         let contentHeight = ceil(activeRoot.fittingSize.height) + 20 // 10pt top + 10pt bottom inset
         let chromeHeight: CGFloat = 86 + 42 // header (86pt) + footer (42pt)
         let rawTotal = chromeHeight + contentHeight
-        let activeScreen = app.item?.button?.window?.screen ?? viewIfLoaded?.window?.screen ?? NSScreen.main
-        let screenMax = (activeScreen?.visibleFrame.height ?? 820) - 48
         let targetHeight = min(max(300, rawTotal), min(686, screenMax))
         let newSize = NSSize(width: Self.panelWidth, height: targetHeight)
         preferredContentSize = newSize
         let shouldAnimate = Design.shouldAnimate(in: view) && app.menuPopover?.isShown == true
+        var sizeDidChange = false
         if let popover = app.menuPopover {
             if abs(popover.contentSize.height - newSize.height) > 0.5 || abs(popover.contentSize.width - newSize.width) > 0.5 {
+                sizeDidChange = true
                 if shouldAnimate {
                     NSAnimationContext.runAnimationGroup { ctx in
                         ctx.duration = 0.18
@@ -1279,7 +1336,8 @@ final class MenuPanelController: NSViewController {
                     popover.contentSize = newSize
                 }
             }
-        } else if abs(view.frame.height - newSize.height) > 0.5 {
+        } else if abs(view.frame.height - newSize.height) > 0.5 || abs(view.frame.width - newSize.width) > 0.5 {
+            sizeDidChange = true
             if shouldAnimate {
                 NSAnimationContext.runAnimationGroup { ctx in
                     ctx.duration = 0.18
@@ -1290,7 +1348,9 @@ final class MenuPanelController: NSViewController {
                 view.frame.size = newSize
             }
         }
-        view.layoutSubtreeIfNeeded()
+        if sizeDidChange || view.needsLayout {
+            view.layoutSubtreeIfNeeded()
+        }
     }
 }
 

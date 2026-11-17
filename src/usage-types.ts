@@ -144,29 +144,30 @@ export function resolveDatabaseModelFullName(
   const rawLabel = typeof label === 'string' ? label.trim() : '';
   const cleanLabel = isUnknownModelName(rawLabel) ? '' : rawLabel;
 
-  // Antigravity Orchestrator 双阶段模型归一化（方案 B）：
-  // 1. 规划阶段 (Plan Mode)：response_model 恒为 "gemini-pro-orchestrator-g1-pro"，由 label ("Orchestrator (Argon)" / "Orchestrator (Carbon)") 或 model_enum (1668 / 1667) 区分底层规划模型；
-  // 2. 执行阶段 (Execution Mode)：model_enum 为 1669 (MODEL_PLACEHOLDER_M669)，response_model 为 "gemini-flash-worker-agy"，label 为 "Gemini Flash"，对应底层 Gemini 3.8 Flash。
-  const isOrchestratorId = /\borchestrator\b/i.test(strippedId) || /^MODEL_PLACEHOLDER_M66[78]$/i.test(strippedId);
-  const isOrchestratorLabel = /\borchestrator\b/i.test(cleanLabel);
-  if (isOrchestratorId || isOrchestratorLabel || modelEnum === 1667 || modelEnum === 1668) {
+  // Antigravity Orchestrator 双阶段模型归一化：
+  // 1. 规划阶段 (Plan Mode)：旧版 response_model 恒为 "gemini-pro-orchestrator-g1-pro"，需结合 label / model_enum 区分 Carbon / Hydrogen / Argon；
+  // 2. 其他已知历史 ID 与远端热更新别名优先走 getEffectiveModelPriceAlias，未知新变体原样保留以便归入未计价统计（禁止前缀猜名伪造费用）。
+  const isLegacyAmbiguousOrchestratorId =
+    /^gemini-pro-orchestrator(?:-g1-pro)?$/i.test(strippedId) ||
+    /^MODEL_PLACEHOLDER_M66[78]$/i.test(strippedId) ||
+    /^Orchestrator\s*\(\s*(?:Carbon|Hydrogen|Argon)\s*\)$/i.test(strippedId);
+
+  if (!strippedId || isLegacyAmbiguousOrchestratorId) {
     if (/\bcarbon\b/i.test(cleanLabel) || /\bcarbon\b/i.test(strippedId) || modelEnum === 1667 || /M667$/i.test(strippedId)) {
-      return 'gemini-4-carbon';
+      return getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M667') ?? 'gemini-4-carbon';
     }
     if (/\bhydrogen\b/i.test(cleanLabel) || /\bhydrogen\b/i.test(strippedId)) {
-      return 'gemini-4-hydrogen';
+      return getEffectiveModelPriceAlias(cleanLabel) ?? 'gemini-4-hydrogen';
     }
     if (/\bargon\b/i.test(cleanLabel) || /\bargon\b/i.test(strippedId) || modelEnum === 1668 || /M668$/i.test(strippedId)) {
-      return 'gemini-4-argon';
+      return getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M668') ?? 'gemini-4-argon';
     }
-    const dynamicCodename = cleanLabel.match(/Orchestrator\s*\(\s*([A-Za-z][A-Za-z0-9._-]{1,31})\s*\)/i)?.[1];
-    if (dynamicCodename) {
-      return `gemini-4-${dynamicCodename.toLowerCase()}`;
-    }
-    if (/^gemini-pro-orchestrator/i.test(strippedId)) {
-      return 'gemini-4-argon';
+    if (cleanLabel) {
+      const labelAlias = getEffectiveModelPriceAlias(cleanLabel);
+      if (labelAlias) return labelAlias;
     }
   }
+
   if (
     /^gemini-flash-worker(?:-agy)?$/i.test(strippedId) ||
     /^MODEL_PLACEHOLDER_M669$/i.test(strippedId) ||
@@ -176,7 +177,10 @@ export function resolveDatabaseModelFullName(
     if (/\bhydrogen\b/i.test(cleanLabel) || /\bhydrogen\b/i.test(strippedId)) {
       return 'gemini-4-hydrogen';
     }
-    return 'gemini-3.8-flash';
+    const workerAlias = strippedId
+      ? (getEffectiveModelPriceAlias(strippedId) ?? getEffectiveModelPriceAlias(cleanId))
+      : undefined;
+    return workerAlias ?? getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M669') ?? 'gemini-3.8-flash';
   }
 
   const normalizeDisplayLabel = (lbl: string): string =>
@@ -188,6 +192,9 @@ export function resolveDatabaseModelFullName(
   if (cleanId) {
     const dynamicIdAlias = getEffectiveModelPriceAlias(strippedId) ?? getEffectiveModelPriceAlias(cleanId);
     if (dynamicIdAlias) return dynamicIdAlias;
+    if (/^(?:gemini-pro-orchestrator|gemini-pro-orchestrator-g1-pro|gemini-pro-orchestrator-argon)$/i.test(strippedId)) {
+      return 'gemini-4-argon';
+    }
     if (/^MODEL_PLACEHOLDER_M\d+$/i.test(strippedId) && cleanLabel) {
       const normalizedLabel = normalizeDisplayLabel(cleanLabel);
       return getEffectiveModelPriceAlias(normalizedLabel) ?? normalizedLabel;

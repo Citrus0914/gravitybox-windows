@@ -1,11 +1,11 @@
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { openAsarArchive, parseAsarHeaderPrefix, resolveAsarEntryRange, type AsarFileEntry } from './asar.js';
-import { extractUiStrings, extractedKind, fetchBuffer, isEnglishSource, normalizeText as normalize } from './bundle.js';
+import { extractUiStrings, extractedKind, fetchBuffer, foldDictionaryKey, isEnglishSource, normalizeText as normalize } from './bundle.js';
 import { decodeScopedKey } from './candidates.js';
 import type { Dictionary } from './dictionary.js';
 import type { DeepReport } from './deep-scan.js';
-import { bt } from './i18n.js';
+import { bt, getActiveLocale } from './i18n.js';
 
 export type CoverageSource = { id: string; scope: 'renderer' | 'native'; source: string };
 export type CoverageEntry = { key: string; translation?: string; status: string; sources: string[]; confidence: 'ui' | 'literal'; kind?: string; observed?: 'verified' | 'untranslated'; observations?: number; scoped?: boolean };
@@ -86,11 +86,11 @@ export function coverageTranslationLookup(dictionary: Dictionary): CoverageTrans
   const scoped = new Map<string, { key: string; value: string }>();
   const scopedText = new Map<string, string[]>();
   for (const [key, value] of Object.entries(dictionary.entries)) {
-    folded.set(normalize(key).toLowerCase(), value);
+    folded.set(foldDictionaryKey(key), value);
     const scope = decodeScopedKey(key);
     if (!scope) continue;
-    scoped.set(key.toLowerCase(), { key, value });
-    const text = normalize(scope.key).toLowerCase();
+    scoped.set(foldDictionaryKey(key), { key, value });
+    const text = foldDictionaryKey(scope.key);
     const values = scopedText.get(text) ?? [];
     values.push(value);
     scopedText.set(text, values);
@@ -110,9 +110,9 @@ export function resolveCoverageTranslation(
   lookup: CoverageTranslationLookup,
   scopes: CoverageScope[] = []
 ): { translation?: string; scoped?: boolean; ambiguous?: boolean } {
-  const text = normalize(key), lower = text.toLowerCase();
+  const text = normalize(key), lower = foldDictionaryKey(text);
   for (const scope of scopes) {
-    const exact = lookup.scoped.get(`@ui:${scope.route}|${scope.kind}|${text}`.toLowerCase());
+    const exact = lookup.scoped.get(foldDictionaryKey(`@ui:${scope.route}|${scope.kind}|${text}`));
     if (exact) return { translation: exact.value, scoped: true };
   }
   const plain = lookup.folded.get(lower);
@@ -417,7 +417,8 @@ export function coverageMarkdown(report: CoverageReport) {
   const metric = coverageMetricSnapshot(report);
   const sum = Object.values(report.counts).reduce((total, count) => total + count, 0);
   const statusLabel = (key: string) => bt(`coverage.status.${key}`, undefined, coverageStatusNames[key] ?? key);
-  const lines=[bt('coverage.md.title'),'',bt('coverage.md.app_line',{version:report.appVersion,generatedAt:report.generatedAt}),bt('coverage.md.dict_line',{dictVersion:report.dictionaryVersion,bundleSha256:report.bundleSha256}),'',bt('coverage.md.disclaimer'),'',bt('coverage.md.extracted_summary',{extracted:metric.extracted,sum}),'',bt('coverage.md.section_counts'),'',...Object.entries(report.counts).map(([key,count])=>`- ${statusLabel(key)}：${count}`),'',bt('coverage.md.section_observed'),'',...(Object.entries(report.observedCounts ?? {}).length?Object.entries(report.observedCounts!).map(([key,count])=>`- ${statusLabel(key)}：${count}`):[bt('coverage.md.no_observed')]),'',bt('coverage.md.resources_summary',{resources:report.resources.length,visits:report.visits.length,skipped:report.skipped.length}),'',...report.limits.map(s=>'- '+s),'',bt('coverage.md.table_header'),'| --- | --- | --- | --- |'];
+  const colon = getActiveLocale() === 'en' ? ': ' : '：';
+  const lines=[bt('coverage.md.title'),'',bt('coverage.md.app_line',{version:report.appVersion,generatedAt:report.generatedAt}),bt('coverage.md.dict_line',{dictVersion:report.dictionaryVersion,bundleSha256:report.bundleSha256}),'',bt('coverage.md.disclaimer'),'',bt('coverage.md.extracted_summary',{extracted:metric.extracted,sum}),'',bt('coverage.md.section_counts'),'',...Object.entries(report.counts).map(([key,count])=>`- ${statusLabel(key)}${colon}${count}`),'',bt('coverage.md.section_observed'),'',...(Object.entries(report.observedCounts ?? {}).length?Object.entries(report.observedCounts!).map(([key,count])=>`- ${statusLabel(key)}${colon}${count}`):[bt('coverage.md.no_observed')]),'',bt('coverage.md.resources_summary',{resources:report.resources.length,visits:report.visits.length,skipped:report.skipped.length}),'',...report.limits.map(s=>'- '+s),'',bt('coverage.md.table_header'),'| --- | --- | --- | --- |'];
   const esc=(s:string)=>s.replace(/\|/g,'\\|').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,' ');
   for(const e of report.entries)lines.push(`| ${esc(e.key)} | ${statusLabel(e.status)}${e.confidence==='literal'?bt('coverage.md.needs_review_suffix'):''} | ${e.observed?statusLabel(e.observed):bt('coverage.md.unchecked')} | ${e.sources.map(esc).join(', ')} |`);
   return lines.join('\n')+'\n';

@@ -48,28 +48,70 @@ export class AntigravityHudManager {
       this.mutationObserver = new MutationObserver((mutations) => {
         if (!this.active || !this.enabled) return;
         if (this.reconcileTimer !== null) return;
-        if (
-          Array.isArray(mutations) &&
-          mutations.length > 0 &&
-          mutations.every((m) => {
+        let hasUrgent = false;
+        if (Array.isArray(mutations) && mutations.length > 0) {
+          let hasRelevant = false;
+          for (const m of mutations) {
             const t = m?.target;
-            return Boolean(
+            if (
               t &&
-                (t.classList?.contains?.('__gravitybox_hud_host__') ||
-                  t.closest?.('.__gravitybox_hud_host__'))
-            );
-          })
-        ) {
-          return;
+              (t.classList?.contains?.('__gravitybox_hud_host__') ||
+                t.closest?.('.__gravitybox_hud_host__'))
+            ) {
+              continue;
+            }
+            if (m?.type === 'childList') {
+              hasRelevant = true;
+              hasUrgent = true;
+              continue;
+            }
+            const attr = m?.attributeName || '';
+            if (attr !== 'class' && attr !== 'aria-label' && attr !== 'style') {
+              hasRelevant = true;
+              hasUrgent = true;
+              continue;
+            }
+            if (
+              !t ||
+              t === document.body ||
+              t === document.documentElement ||
+              typeof t.matches !== 'function'
+            ) {
+              hasRelevant = true;
+              continue;
+            }
+            if (
+              t.tagName === 'BUTTON' ||
+              t.getAttribute?.('role') === 'button' ||
+              t.hasAttribute?.('data-testid') ||
+              t.hasAttribute?.('data-cascade-id') ||
+              t.hasAttribute?.('data-conversation-id') ||
+              t.hasAttribute?.('data-subagent-id') ||
+              t.hasAttribute?.('data-media-drop-scope') ||
+              t.matches(
+                '.surface-composer, .model-selector, .animate-shimmer-text, .animate-spin, .codicon-loading, .spinner'
+              ) ||
+              t.closest?.(
+                '[data-testid="idle-status-text"], [data-testid="ephemeral-tool-status"], [data-testid="agent-loading"], [data-testid="model-selector-trigger"], .surface-composer'
+              )
+            ) {
+              hasRelevant = true;
+              if (t.tagName === 'BUTTON' || attr === 'aria-label') hasUrgent = true;
+            }
+          }
+          if (!hasRelevant) return;
+        } else {
+          hasUrgent = true;
         }
 
+        const delayMs = hasUrgent ? 20 : 60;
         this.reconcileTimer = setTimeout(() => {
           this.reconcileTimer = null;
           this.checkRoute();
           if (this.enabled && !this.routeExcluded) {
             this.reconcileMounts();
           }
-        }, 20);
+        }, delayMs);
       });
       this.mutationObserver.observe(document.body, {
         childList: true,
@@ -84,6 +126,9 @@ export class AntigravityHudManager {
           'data-theme',
           'data-subagent-id',
           'data-agent-state',
+          'data-side-panel-open',
+          'data-aux-pane-open',
+          'data-split-transition',
           'aria-label',
           'class',
         ],
@@ -151,6 +196,7 @@ export class AntigravityHudManager {
     if (!this.active || !this.enabled || this.routeExcluded) return;
     this.reconcileMounts();
     for (const instance of this.instances.values()) {
+      instance.lastMetricsSequence = 0;
       instance.requestRefresh?.();
     }
   }
@@ -225,8 +271,9 @@ export class AntigravityHudManager {
     }
 
     const panes = views.filter(Boolean).map((view, index) => {
-      const subConvNode = view.getAttribute?.('data-media-drop-scope') === 'subpane'
-        ? view.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]') : null;
+      const subConvNode = view?.getAttribute?.('data-testid') === 'subagent-tab-conversation'
+        ? view
+        : view?.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]') || null;
       const rawCascadeId = view.getAttribute?.('data-cascade-id') || subConvNode?.getAttribute?.('data-cascade-id');
       let slotId = this.viewToSlotId.get(view);
       if (!slotId) { slotId = `slot-${this.nextSlotSeq++}`; this.viewToSlotId.set(view, slotId); }
@@ -239,7 +286,7 @@ export class AntigravityHudManager {
     const domSubagentIds = this.collectDomSubagentIds();
     for (const { view, index, subConvNode, rawCascadeId, slotId, composer } of panes) {
       const isSubpane = Boolean(subConvNode || view.getAttribute?.('data-media-drop-scope') === 'subpane');
-      const convId = this.resolveConversationId(view, rawCascadeId, views.length);
+      const convId = this.resolveConversationId(view, rawCascadeId, views.length, isSubpane);
       const modelId = this.resolveActiveModel(view, views.length);
       const sharedButtons = typeof view.querySelectorAll === 'function' ? view.querySelectorAll('button, [role="button"]') : null;
       const subagentState = this.resolveSubagentState(view, { isSubpane, buttons: sharedButtons });
@@ -334,8 +381,15 @@ export class AntigravityHudManager {
    * 3. 分栏内部 /c/<uuid> 锚点
    * 4. 单栏模式下回退至 window.location.pathname 中的 /c/<uuid>
    */
-  resolveConversationId(view, rawCascadeId, totalViews = 1) {
-    const allowUrl = totalViews === 1 && view?.getAttribute?.('data-media-drop-scope') !== 'subpane';
+  resolveConversationId(view, rawCascadeId, totalViews = 1, isSubpane = null) {
+    const subpaneDetected = isSubpane !== null
+      ? Boolean(isSubpane)
+      : Boolean(
+          view?.getAttribute?.('data-media-drop-scope') === 'subpane' ||
+          view?.getAttribute?.('data-testid') === 'subagent-tab-conversation' ||
+          view?.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]')
+        );
+    const allowUrl = totalViews === 1 && !subpaneDetected;
     if (view && typeof view.getAttribute === 'function') {
       const directId = view.getAttribute('data-conversation-id');
       if (directId && directId !== 'conversation') return directId;

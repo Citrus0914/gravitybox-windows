@@ -29,11 +29,23 @@ export const HUD_STEP_METADATA_MINIMAL_PROJECTION: ProtoSelection = {
   ...HUD_STEP_METADATA_PROJECTION,
   4: { 2: true },
 };
+export const HUD_STEP_RENDER_INFO_PROJECTION: ProtoSelection = {
+  9: { 5: true },
+  10: {
+    4: true,
+    5: {
+      1: {
+        9: { 5: true },
+        10: { 4: true },
+      },
+    },
+  },
+};
 export const HUD_GEN_METADATA_PROJECTION: ProtoSelection = {
   1: {
     3: true,
     4: true,
-    9: { 10: { 1: true, 3: true, 4: true } },
+    9: { 4: { 1: true }, 10: { 1: true, 4: true } },
     11: true,
     12: true,
     19: true,

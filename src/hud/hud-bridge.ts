@@ -41,7 +41,7 @@ export class CdpHudBridge implements ICdpHudBridge {
   private pollTimer: NodeJS.Timeout | null = null;
   private pollInFlight = false;
   private lastPollStartedAt = 0;
-  private sequenceCounter = 0;
+  private sequenceCounter = Date.now();
   private readonly basePollIntervalMs: number;
   private disposed = false;
 
@@ -244,15 +244,29 @@ export class CdpHudBridge implements ICdpHudBridge {
       return;
     }
 
+    const sessionForFingerprint = metrics.isStreaming
+      ? {
+          ...metrics.session,
+          currentTurnDurationSeconds: 0,
+          currentTurnDurationFormatted: '',
+          currentTurnDurationFormattedEn: '',
+          currentTurnDurationCompactZh: '',
+          currentTurnDurationCompactEn: '',
+          currentTurnModelDurationSeconds: 0,
+          currentTurnToolDurationSeconds: 0,
+          inFlightModelDurationSeconds: 0,
+          inFlightToolDurationSeconds: 0,
+        }
+      : {
+          ...metrics.session,
+          currentTurnDurationSeconds: Math.round(metrics.session.currentTurnDurationSeconds ?? 0),
+          currentTurnModelDurationSeconds: Math.round(metrics.session.currentTurnModelDurationSeconds ?? 0),
+          currentTurnToolDurationSeconds: Math.round(metrics.session.currentTurnToolDurationSeconds ?? 0),
+          inFlightModelDurationSeconds: Math.round(metrics.session.inFlightModelDurationSeconds ?? 0),
+          inFlightToolDurationSeconds: Math.round(metrics.session.inFlightToolDurationSeconds ?? 0),
+        };
     const fingerprint = JSON.stringify({
-      session: {
-        ...metrics.session,
-        currentTurnDurationSeconds: Math.round(metrics.session.currentTurnDurationSeconds ?? 0),
-        currentTurnModelDurationSeconds: Math.round(metrics.session.currentTurnModelDurationSeconds ?? 0),
-        currentTurnToolDurationSeconds: Math.round(metrics.session.currentTurnToolDurationSeconds ?? 0),
-        inFlightModelDurationSeconds: Math.round(metrics.session.inFlightModelDurationSeconds ?? 0),
-        inFlightToolDurationSeconds: Math.round(metrics.session.inFlightToolDurationSeconds ?? 0),
-      },
+      session: sessionForFingerprint,
       tokens: metrics.tokens,
       context: metrics.context,
       availability: metrics.availability,
@@ -312,11 +326,11 @@ export class CdpHudBridge implements ICdpHudBridge {
     if (contextId === undefined) return false;
     const serialized = JSON.stringify(metrics);
     try {
-      await target.cdp.evaluate(
-        `((m) => (globalThis.__gravityboxUpdateHudMetrics ? globalThis.__gravityboxUpdateHudMetrics(m) : globalThis.__GRAVITYBOX_HUD_V1__?.dispatchMetrics?.(m)))(${serialized})`,
+      const accepted = await target.cdp.evaluate(
+        `((m) => Boolean(globalThis.__gravityboxUpdateHudMetrics ? globalThis.__gravityboxUpdateHudMetrics(m) : globalThis.__GRAVITYBOX_HUD_V1__?.dispatchMetrics?.(m)))(${serialized})`,
         contextId
       );
-      return true;
+      return Boolean(accepted);
     } catch {
       // 忽略窗口关闭或导航瞬间的执行上下文失效
       return false;

@@ -43,6 +43,7 @@ export class GoogleAccountLogin {
       const code = callback.searchParams.get('code');
       if (!code || code.length > 8192) { respond(400, bt('oauth.http.incomplete_response')); return; }
       s.phase = 'exchanging'; respond(200, bt('oauth.http.completing'));
+      s.server.close();
       s.work = this.exchange(s, code);
     });
     return { id: s.id, url: s.url };

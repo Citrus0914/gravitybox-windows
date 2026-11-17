@@ -5,6 +5,7 @@
   "source": "https://raw.githubusercontent.com/Enzoo404/gravitybox/main/assets/pricing-feed.json",
   "aliases": {
     "gemini-pro-orchestrator-g1-pro": "gemini-4-argon",
+    "gemini-pro-orchestrator-argon": "gemini-4-argon",
     "gemini-pro-orchestrator": "gemini-4-argon",
     "orchestrator (argon)": "gemini-4-argon",
     "Orchestrator (Argon)": "gemini-4-argon",
@@ -16,8 +17,18 @@
     "gemini-flash": "gemini-3.8-flash",
     "MODEL_PLACEHOLDER_M667": "gemini-4-carbon",
     "MODEL_PLACEHOLDER_M668": "gemini-4-argon",
-    "MODEL_PLACEHOLDER_M669": "gemini-3.8-flash"
+    "MODEL_PLACEHOLDER_M669": "gemini-3.8-flash",
+    "MODEL_PLACEHOLDER_M681": "gemini-4-argon"
   },
+  "activeModels": [
+    "gemini-4-carbon",
+    "gemini-4-argon",
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gpt-oss-120b"
+  ],
   "models": {
     "gemini-3.8-flash": {
       "displayName": "Gemini 3.8 Flash"

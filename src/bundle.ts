@@ -26,6 +26,7 @@ export function isVerifiedVersion(version?: string): boolean {
 }
 
 export const normalizeText = (text: string): string => text.replace(/\s+/g, ' ').trim();
+export const foldDictionaryKey = (text: string): string => normalizeText(text).toLowerCase().replace(/[\u2018\u2019]/g, "'");
 
 function fetchLoopbackBytes(
   url: string,
@@ -328,11 +329,11 @@ export function findMissingStrings(extracted: { text: string; kinds?: string[] }
   const missing: string[] = [];
   const foldedMap = new Set<string>();
   for (const k of Object.keys(entries)) {
-    foldedMap.add(k.toLowerCase());
+    foldedMap.add(foldDictionaryKey(k));
     if (k.startsWith('@ui:')) {
       const parts = k.slice(4).split('|');
       if (parts.length >= 3) {
-        foldedMap.add(parts.slice(2).join('|').toLowerCase());
+        foldedMap.add(foldDictionaryKey(parts.slice(2).join('|')));
       }
     }
   }
@@ -340,7 +341,7 @@ export function findMissingStrings(extracted: { text: string; kinds?: string[] }
     if (item.kinds?.includes('template') || item.kinds?.includes('fragment')) continue;
     const key = normalizeText(item.text);
     if (Object.hasOwn(entries, key)) continue;
-    if (foldedMap.has(key.toLowerCase())) continue;
+    if (foldedMap.has(foldDictionaryKey(key))) continue;
     missing.push(key);
   }
   return [...new Set(missing)].sort((a, b) => a.localeCompare(b));

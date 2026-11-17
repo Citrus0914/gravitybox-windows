@@ -905,9 +905,9 @@ export function computeAccountRemaining(account: Account, monitoredModel = 'all'
   const familyHasKnownModel = (family: 'gemini' | 'claude') => modelsOfFamily(family).some(model => model.effective_known === true && model.stale !== true);
 
   const trimmed = monitoredModel.trim().toLowerCase();
-  const isArgonTarget = trimmed === 'argon' || trimmed === 'gemini 4 argon';
-  const isCarbonTarget = trimmed === 'carbon' || trimmed === 'gemini 4 carbon';
-  const isClaudeTarget = trimmed === 'claude' || trimmed === '3p' || trimmed === 'claude/gpt';
+  const isArgonTarget = trimmed === 'argon' || trimmed === 'gemini 4 argon' || trimmed === 'gemini-4-argon';
+  const isCarbonTarget = trimmed === 'carbon' || trimmed === 'gemini 4 carbon' || trimmed === 'gemini-4-carbon';
+  const isClaudeTarget = trimmed === 'claude' || trimmed === '3p' || trimmed === 'claude/gpt' || trimmed === 'gpt';
   const isGeminiTarget = trimmed === 'gemini';
   const isGeminiAllTarget = trimmed === 'gemini_all' || trimmed === 'gemini 全系模型' || trimmed === 'all gemini models';
   const isAllTarget = !trimmed || trimmed === 'all';
@@ -1047,7 +1047,7 @@ export function subscriptionTierRank(account: Account | AccountSummary | null | 
   const raw = String(account.quota?.subscription_tier ?? '').toUpperCase();
   if (raw.includes('ULTRA') || raw.includes('ENTERPRISE')) return 5;
   if (raw.includes('TEAM') || raw.includes('BUSINESS') || raw.includes('WORKSPACE')) return 4;
-  if (raw.includes('PRO')) return 3;
+  if (raw.includes('PRO') || raw.includes('AI PREMIUM')) return 3;
   if (raw.includes('PLUS')) return 2.5;
   if (raw.includes('FREE') || raw.includes('STARTER') || raw.includes('TRIAL')) return 1;
   return 2;
@@ -1447,7 +1447,7 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
     carbonResetCountdown: legacySnapshot.carbonWeeklyResetCountdown,
     resetTime,
     resetCountdown,
-    subscriptionTier: quota.subscription_tier && /starter/i.test(quota.subscription_tier) ? 'FREE' : quota.subscription_tier || bt('quota.tier.pending'),
+    subscriptionTier: quota.subscription_tier && /\b(?:free|starter|trial)\b/i.test(quota.subscription_tier) ? 'FREE' : quota.subscription_tier || bt('quota.tier.pending'),
     quotaGroups: outGroups,
     staleGroups,
     unknownBuckets,
@@ -1516,6 +1516,22 @@ export function projectAccountForIpc(account: Account | AccountSummary | null | 
   const summary = account as AccountSummary;
   const rawQuota = summary.quota ?? null;
   const quota = localizeStoredQuotaForIpc(rawQuota);
+  const hasTokenObject = Boolean((account as Account).token && typeof (account as Account).token === 'object');
+  const resolvedReadiness =
+    summary.credentialReadiness ??
+    (hasTokenObject
+      ? accountCredentialReadiness(account as Account)
+      : accountCredentialReadiness({
+          ...(summary as unknown as Account),
+          token: {
+            access_token: 'summary_projected',
+            refresh_token: 'summary_projected',
+            expires_in: 3600,
+            expiry_timestamp: Date.now() / 1000 + 3600,
+            token_type: 'Bearer',
+            is_gcp_tos: false,
+          },
+        }));
   return {
     id: summary.id,
     email: summary.email,
@@ -1529,7 +1545,7 @@ export function projectAccountForIpc(account: Account | AccountSummary | null | 
     created_at: summary.created_at ?? null,
     last_used: summary.last_used ?? null,
     quota,
-    credentialReadiness: summary.credentialReadiness ?? accountCredentialReadiness(account as Account),
+    credentialReadiness: resolvedReadiness,
     quota_refresh_error: cleanAndLocalizeRefreshError(summary.quota_refresh_error),
     quota_last_updated: summary.quota_last_updated ?? rawQuota?.last_updated ?? 0,
     subscription_tier: rawQuota?.subscription_tier ?? null,

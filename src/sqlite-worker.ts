@@ -8,6 +8,7 @@ import {
   STEP_PROJECTION,
   HUD_STEP_METADATA_PROJECTION,
   HUD_STEP_METADATA_MINIMAL_PROJECTION,
+  HUD_STEP_RENDER_INFO_PROJECTION,
   HUD_GEN_METADATA_PROJECTION,
 } from './protobuf-projection.js';
 
@@ -36,6 +37,7 @@ export interface HudWorkerRawStepRow {
   metadata_len: number;
   data?: Uint8Array | null;
   render_info?: Uint8Array | null;
+  render_info_len?: number;
   step_payload?: Uint8Array | null;
 }
 
@@ -70,7 +72,7 @@ function hashRawStepRow(hash: Hash, r: any): void {
   if (r.metadata && r.metadata.byteLength > 0) hash.update(r.metadata);
   hash.update(`:${r.data?.byteLength ?? 0}:`);
   if (r.data && r.data.byteLength > 0) hash.update(r.data);
-  hash.update(`:${r.render_info?.byteLength ?? 0}:`);
+  hash.update(`:${r.render_info_len ?? r.render_info?.byteLength ?? 0}:`);
   if (r.render_info && r.render_info.byteLength > 0) hash.update(r.render_info);
   hash.update(`:${r.step_payload?.byteLength ?? 0}:`);
   if (r.step_payload && r.step_payload.byteLength > 0) hash.update(r.step_payload);
@@ -198,19 +200,22 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
       const metaExpr = `CASE WHEN step_type NOT IN (14, 23, 101) AND length(metadata) <= ${inlineLimit} THEN metadata ELSE NULL END as metadata, CASE WHEN step_type NOT IN (14, 23, 101) THEN COALESCE(length(metadata), 0) ELSE 0 END as metadata_len`;
       const extraCols: string[] = [];
       if (hasDataColumn) {
-        extraCols.push(`CASE WHEN step_type IN (127, 132) AND length(data) <= ${inlineLimit} THEN data ELSE NULL END as data`);
+        extraCols.push(`CASE WHEN step_type IN (85, 127, 132) THEN substr(data, 1, ${inlineLimit}) ELSE NULL END as data`);
       }
       if (hasRenderInfoColumn) {
-        extraCols.push(`CASE WHEN step_type IN (127, 132) AND length(render_info) <= ${inlineLimit} THEN render_info ELSE NULL END as render_info`);
+        extraCols.push(
+          `CASE WHEN step_type IN (85, 127, 132) AND length(render_info) <= ${inlineLimit} THEN render_info WHEN step_type NOT IN (14, 15, 23, 101) AND length(metadata) > ${inlineLimit} THEN substr(render_info, 1, 16384) ELSE NULL END as render_info, CASE WHEN step_type IN (85, 127, 132) THEN COALESCE(length(render_info), 0) ELSE 0 END as render_info_len`
+        );
       }
       if (hasStepPayloadColumn) {
-        extraCols.push(`CASE WHEN step_type IN (127, 132) THEN substr(step_payload, 1, ${inlineLimit}) ELSE NULL END as step_payload`);
+        extraCols.push(`CASE WHEN step_type IN (85, 127, 132) THEN substr(step_payload, 1, ${inlineLimit}) ELSE NULL END as step_payload`);
       }
       return ['idx', 'step_type', 'status', metaExpr, ...extraCols].join(', ');
     };
 
     const stepColumnsSql = buildStepSelectColumns();
     let projectStepMetaStmt: ReturnType<DatabaseSync['prepare']> | undefined;
+    let projectRenderInfoStmt: ReturnType<DatabaseSync['prepare']> | undefined;
     const canIncludeStepInPrefix = (row: any): boolean => {
       const st = Number(row.status);
       return TERMINAL_STEP_STATUSES.has(st);
@@ -246,6 +251,27 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
           }
         }
       }
+      const renderInfoLen = Number(row.render_info_len ?? 0);
+      let effectiveRenderInfo: Uint8Array | null =
+        row.render_info && row.render_info.byteLength > 0 ? detachBuf(row.render_info) : null;
+      if (!effectiveRenderInfo && Number.isSafeInteger(renderInfoLen) && renderInfoLen > inlineLimit) {
+        try {
+          projectRenderInfoStmt ??= db.prepare('SELECT substr(render_info, ?, ?) AS chunk FROM steps WHERE idx = ?');
+          const projectedRenderInfo = projectProtobuf(
+            renderInfoLen,
+            (offset, length) =>
+              (projectRenderInfoStmt!.get(offset + 1, length, idx) as { chunk?: Uint8Array } | undefined)?.chunk ?? new Uint8Array(0),
+            HUD_STEP_RENDER_INFO_PROJECTION,
+            { skipOversizedLeafFields: true }
+          );
+          effectiveRenderInfo = detachBuf(projectedRenderInfo.data);
+        } catch {
+          projectRenderInfoStmt ??= db.prepare('SELECT substr(render_info, ?, ?) AS chunk FROM steps WHERE idx = ?');
+          effectiveRenderInfo = detachBuf(
+            (projectRenderInfoStmt.get(1, inlineLimit, idx) as { chunk?: Uint8Array } | undefined)?.chunk ?? null
+          );
+        }
+      }
       return {
         idx,
         step_type: Number(row.step_type),
@@ -253,7 +279,8 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
         metadata: effectiveMeta,
         metadata_len: metadataLen,
         data: detachBuf(row.data),
-        render_info: detachBuf(row.render_info),
+        render_info: effectiveRenderInfo,
+        render_info_len: renderInfoLen,
         step_payload: detachBuf(row.step_payload),
       };
     };

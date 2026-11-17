@@ -233,8 +233,4 @@ export class ProtobufWriter {
   static encodeVarintField(fieldNumber: number, value: number | bigint): Buffer {
     return this.encodeField(fieldNumber, 0, this.encodeVarint(value));
   }
-
-  static encodeUint64(fieldNumber: number, value: number | bigint): Buffer {
-    return this.encodeVarintField(fieldNumber, value);
-  }
 }
