@@ -983,7 +983,7 @@ export class HudInstance {
           <button type="button" class="capsule capsule-session" data-capsule-id="session" aria-haspopup="dialog" aria-expanded="false" aria-label="${this.t('capsuleSessionLabel')}">
             <span class="hud-status-dot" aria-hidden="true"></span>
             <span class="capsule-text" id="hud-txt-session">
-              <span class="hud-turns">${this.t('turnsUnit', { count: 0 })}</span><span class="hud-turn-dur"><span class="hud-turn-dot">· </span><span class="hud-turn-text">${this.t('turnCompactDefault')}</span></span><span class="hud-speed"> · —</span><span class="hud-subagent-tag" hidden><span class="hud-subagent-sep" aria-hidden="true"> · </span><svg class="hud-subagent-icon" viewBox="0 0 12 12" aria-hidden="true"><circle cx="3" cy="3" r="1.5" fill="currentColor"/><circle cx="9.2" cy="3.8" r="1.35" fill="currentColor"/><circle cx="9.2" cy="8.8" r="1.35" fill="currentColor"/><path d="M4.3 3.2H5.8C6.5 3.2 7 3.7 7 4.4M5.8 3.2V7.6C5.8 8.3 6.3 8.8 7 8.8H7.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="hud-subagent-count"></span></span>
+              <span class="hud-turns">${this.t('turnsUnit', { count: 0 })}</span><span class="hud-turn-dur"><span class="hud-turn-dot">· </span><span class="hud-turn-text">${this.t('turnCompactDefault')}</span></span><span class="hud-speed"> · —</span><span class="hud-subagent-tag" hidden><span class="hud-subagent-sep" aria-hidden="true"></span><svg class="hud-subagent-icon" viewBox="0 0 12 12" aria-hidden="true"><circle cx="3" cy="3" r="1.5" fill="currentColor"/><circle cx="9.2" cy="3.8" r="1.35" fill="currentColor"/><circle cx="9.2" cy="8.8" r="1.35" fill="currentColor"/><path d="M4.3 3.2H5.8C6.5 3.2 7 3.7 7 4.4M5.8 3.2V7.6C5.8 8.3 6.3 8.8 7 8.8H7.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="hud-subagent-count"></span></span>
             </span>
           </button>
 
@@ -1348,6 +1348,10 @@ export class HudInstance {
   syncSubagentTagElement(isRunning, activeSubagentsBar = '1', activeSubagents = 1) {
     const subagentTagEl = this.getShadowEl('#hud-txt-session .hud-subagent-tag');
     if (!subagentTagEl) return;
+    const sepEl =
+      this.getShadowEl('#hud-txt-session .hud-subagent-sep') ||
+      subagentTagEl.querySelector?.('.hud-subagent-sep') ||
+      null;
     const countEl =
       this.getShadowEl('#hud-txt-session .hud-subagent-count') ||
       subagentTagEl.querySelector?.('.hud-subagent-count') ||
@@ -1356,6 +1360,7 @@ export class HudInstance {
       subagentTagEl.removeAttribute?.('hidden');
       subagentTagEl.setAttribute?.('data-subagent-active', 'true');
       subagentTagEl.setAttribute?.('data-subagent-count', String(activeSubagents));
+      if (sepEl && sepEl.textContent !== ' · ') sepEl.textContent = ' · ';
       if (countEl) {
         const nextCount = activeSubagents > 1 ? String(activeSubagentsBar) : '';
         if (countEl.textContent !== nextCount) countEl.textContent = nextCount;
@@ -1367,6 +1372,7 @@ export class HudInstance {
       subagentTagEl.setAttribute?.('hidden', '');
       subagentTagEl.removeAttribute?.('data-subagent-active');
       subagentTagEl.removeAttribute?.('data-subagent-count');
+      if (sepEl && sepEl.textContent !== '') sepEl.textContent = '';
       if (countEl) {
         if (countEl.textContent !== '') countEl.textContent = '';
       } else if (subagentTagEl.textContent !== '') {
