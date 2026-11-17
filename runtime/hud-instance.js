@@ -1077,13 +1077,17 @@ export class HudInstance {
       this.mount(targetComposer);
       return;
     }
-    let moved = this.targetComposer !== targetComposer;
+    const composerChanged = this.targetComposer !== targetComposer;
+    let moved = composerChanged;
     this.targetComposer = targetComposer;
     if (this.host.previousElementSibling !== targetComposer) {
       if (typeof targetComposer.insertAdjacentElement === 'function') {
         targetComposer.insertAdjacentElement('afterend', this.host);
         moved = true;
       }
+    }
+    if (composerChanged) {
+      this.rebindResizeObserver(targetComposer);
     }
     this.hostMountedInDom = Boolean(this.host.isConnected);
     const rect =
@@ -2378,8 +2382,13 @@ export class HudInstance {
       }
       return '—';
     };
+    const rawEstCostText = formatUsdDisplay(t.estimatedCostUsd, t.estimatedCostFormatted);
+    const estCostText =
+      rawEstCostText !== '—' && t.hasUnpricedSteps === true && isRawNumber(t.estimatedCostUsd) && t.estimatedCostUsd > 0
+        ? `≥ ${rawEstCostText.replace(/^~\s*/, '')}`
+        : rawEstCostText;
     setTxt('#lbl-est-cost', this.t('lblEstCost'));
-    setTxt('#val-est-cost', formatUsdDisplay(t.estimatedCostUsd, t.estimatedCostFormatted));
+    setTxt('#val-est-cost', estCostText);
     setTxt('#lbl-cache-saved', this.t('lblCacheSaved'));
     setTxt('#val-cache-saved', formatUsdDisplay(t.cacheSavedUsd, t.cacheSavedFormatted));
     q('#val-est-cost')?.setAttribute('aria-description', this.t('descEstCost'));
@@ -2855,14 +2864,25 @@ export class HudInstance {
       });
     }
 
+    this.rebindResizeObserver(targetComposer);
+  }
+
+  rebindResizeObserver(targetComposer) {
+    if (this.resizeObserver) {
+      try {
+        this.resizeObserver.disconnect();
+      } catch {}
+      this.resizeObserver = null;
+    }
     if (typeof ResizeObserver === 'function' && targetComposer) {
       this.resizeObserver = new ResizeObserver((entries) => {
-        const boundedWidth = this.syncHorizontalBounds(targetComposer);
+        const activeComposer = this.targetComposer || targetComposer;
+        const boundedWidth = this.syncHorizontalBounds(activeComposer);
         if (boundedWidth > 0) {
           this.handleContainerResize(boundedWidth);
         } else {
           for (const entry of entries) {
-            const width = entry.contentRect?.width ?? targetComposer.clientWidth ?? 0;
+            const width = entry.contentRect?.width ?? activeComposer.clientWidth ?? 0;
             if (width > 0) this.handleContainerResize(width);
           }
         }

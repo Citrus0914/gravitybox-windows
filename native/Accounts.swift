@@ -1118,12 +1118,19 @@ final class AccountsPage: NSObject {
         alert.beginSheetModal(for: window) { [weak self] result in
             guard let self, result == .alertFirstButtonReturn else { return }
             self.rollbackButton.isEnabled = false
-            self.app.perform(["command": "account_switch_rollback"]) { [weak self] value in
+            self.app.bridge.send(["command": "account_switch_rollback"]) { [weak self] response in
                 guard let self else { return }
                 self.rollbackButton.isEnabled = true
-                self.app.showMessage(value["message"] as? String ?? L10n.t("accounts.rollback.restored"))
-                self.fetch()
-                self.app.refresh()
+                switch response {
+                case .success(let value):
+                    self.app.showMessage(value["message"] as? String ?? L10n.t("accounts.rollback.restored"))
+                    self.fetch()
+                    self.app.refresh()
+                case .failure(let error):
+                    self.app.showMessage(error.localizedDescription, error: true)
+                    self.fetch()
+                    self.app.refresh()
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
-import type { HudWorkerScanRequest, HudWorkerScanResult, UsageWorkerScanRequest, UsageWorkerScanResult } from './sqlite-worker.js';
+import type { HudWorkerScanRequest, HudWorkerScanResult, SummariesLookupRequest, SummariesLookupResult, UsageWorkerScanRequest, UsageWorkerScanResult } from './sqlite-worker.js';
 import { bt, getActiveLocale } from './i18n.js';
 
 const MAX_IDLE_WORKERS = 8;
@@ -296,5 +296,57 @@ export async function runUsageDbScanInWorker(
     worker.once('error', onError);
     worker.once('exit', onExit);
     worker.postMessage({ id, usageScan, locale: getActiveLocale() });
+  });
+}
+
+export async function runSummariesLookupInWorker(
+  summariesLookup: SummariesLookupRequest,
+  timeoutMs = 1500
+): Promise<SummariesLookupResult | null> {
+  const worker = acquirePooledWorker('');
+  const id = randomUUID();
+  return new Promise<SummariesLookupResult | null>((resolve) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      worker.removeListener('message', onMessage);
+      worker.removeListener('error', onError);
+      worker.removeListener('exit', onExit);
+    };
+    const onMessage = (msg: any) => {
+      if (!msg || msg.id !== id || settled) return;
+      settled = true;
+      cleanup();
+      releasePooledWorker(worker);
+      if (msg.ok && msg.summariesResult) {
+        resolve(msg.summariesResult as SummariesLookupResult);
+      } else {
+        resolve(null);
+      }
+    };
+    const onError = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      void worker.terminate();
+      resolve(null);
+    };
+    const onExit = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(null);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      void worker.terminate();
+      resolve(null);
+    }, timeoutMs);
+    worker.on('message', onMessage);
+    worker.once('error', onError);
+    worker.once('exit', onExit);
+    worker.postMessage({ id, summariesLookup, locale: getActiveLocale() });
   });
 }

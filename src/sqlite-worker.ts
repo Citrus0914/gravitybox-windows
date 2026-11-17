@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createHash, type Hash } from 'node:crypto';
 import { parentPort, workerData } from 'node:worker_threads';
 import { bt, setActiveLocale } from './i18n.js';
+import { decodeVarint64, skipProtobufField } from './protobuf.js';
 import {
   projectProtobuf,
   GENERATION_PROJECTION,
@@ -608,10 +609,200 @@ export interface UsageWorkerScanResult {
   stepRows: UsageWorkerScanRow[];
 }
 
-function hasInlineGenerationTimestamp(buf: Uint8Array): boolean {
+export interface SummariesLookupRequest {
+  dbPath: string;
+  parentIds: string[];
+}
+
+export interface SummariesLookupResult {
+  foundTable: boolean;
+  childIds: string[];
+  terminalChildIds: string[];
+}
+
+const NON_RUNNING_SUMMARY_STATUS_RE =
+  /^(?:CASCADE_RUN_STATUS_)?(?:IDLE|UNSPECIFIED|DONE|COMPLETED|CLEARED|ERROR|CANCELL?ED|KILLED)$/i;
+
+function executeSummariesLookup(req: SummariesLookupRequest): SummariesLookupResult {
+  const cleanParents = [...new Set((req.parentIds ?? []).map(p => String(p ?? '').trim().toLowerCase()).filter(Boolean))];
+  if (cleanParents.length === 0) return { foundTable: false, childIds: [], terminalChildIds: [] };
+  const db = new DatabaseSync(req.dbPath, { readOnly: true });
+  try {
+    db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 400;');
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('conversation_parents', 'conversation_summaries')")
+      .all() as Array<{ name?: unknown }>;
+    const tableSet = new Set(tables.map(t => String(t.name ?? '')));
+    if (tableSet.size === 0) return { foundTable: false, childIds: [], terminalChildIds: [] };
+    const childIds = new Set<string>();
+    const terminalChildIds = new Set<string>();
+    if (tableSet.has('conversation_parents')) {
+      const pCols = new Set(
+        (db.prepare('PRAGMA table_info(conversation_parents)').all() as Array<{ name?: unknown }>).map(c => String(c.name ?? ''))
+      );
+      const childCol = pCols.has('conversation_id') ? 'conversation_id' : pCols.has('child_id') ? 'child_id' : '';
+      const parentCol = pCols.has('parent_id') ? 'parent_id' : pCols.has('parent_conversation_id') ? 'parent_conversation_id' : '';
+      if (childCol && parentCol) {
+        const stmt = db.prepare(`SELECT ${childCol} AS cid FROM conversation_parents WHERE lower(${parentCol}) = ?`);
+        for (const pid of cleanParents) {
+          for (const r of stmt.all(pid) as Array<{ cid?: unknown }>) {
+            const cid = String(r.cid ?? '').trim().toLowerCase();
+            if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(cid)) childIds.add(cid);
+          }
+        }
+      }
+    }
+    if (tableSet.has('conversation_summaries')) {
+      const cols = new Set(
+        (db.prepare('PRAGMA table_info(conversation_summaries)').all() as Array<{ name?: unknown }>).map(c => String(c.name ?? ''))
+      );
+      const childCol = cols.has('conversation_id') ? 'conversation_id' : cols.has('id') ? 'id' : '';
+      const parentCol = cols.has('parent_conversation_id') ? 'parent_conversation_id' : cols.has('parent_id') ? 'parent_id' : '';
+      const hasStatus = cols.has('status');
+      const selectStatusSql = hasStatus ? ', status' : '';
+      if (childCol && parentCol) {
+        const stmt = db.prepare(`SELECT ${childCol} AS cid${selectStatusSql} FROM conversation_summaries WHERE lower(${parentCol}) = ?`);
+        for (const pid of cleanParents) {
+          for (const r of stmt.all(pid) as Array<{ cid?: unknown; status?: unknown }>) {
+            const cid = String(r.cid ?? '').trim().toLowerCase();
+            if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(cid)) {
+              childIds.add(cid);
+              if (hasStatus && r.status !== null && r.status !== undefined) {
+                const rawSt = String(r.status).trim();
+                if (NON_RUNNING_SUMMARY_STATUS_RE.test(rawSt) || rawSt === '0' || rawSt === '1') {
+                  terminalChildIds.add(cid);
+                }
+              }
+            }
+          }
+        }
+      } else if (childCol && hasStatus && childIds.size > 0) {
+        const byIdStmt = db.prepare(`SELECT status FROM conversation_summaries WHERE lower(${childCol}) = ?`);
+        for (const cid of childIds) {
+          const row = byIdStmt.get(cid) as { status?: unknown } | undefined;
+          if (row && row.status !== null && row.status !== undefined) {
+            const rawSt = String(row.status).trim();
+            if (NON_RUNNING_SUMMARY_STATUS_RE.test(rawSt) || rawSt === '0' || rawSt === '1') {
+              terminalChildIds.add(cid);
+            }
+          }
+        }
+      }
+    }
+    return { foundTable: true, childIds: [...childIds], terminalChildIds: [...terminalChildIds] };
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
+function hasValidStartedAtField4(startBuf: Uint8Array): boolean {
+  const cStart = { pos: 0 };
+  while (cStart.pos < startBuf.length) {
+    let tagNum: number;
+    try {
+      tagNum = Number(decodeVarint64(startBuf, cStart));
+    } catch {
+      return false;
+    }
+    if (!tagNum) break;
+    const fn = tagNum >>> 3;
+    const wt = tagNum & 0x07;
+    if (wt === 2 && fn === 4) {
+      let len: number;
+      try {
+        len = Number(decodeVarint64(startBuf, cStart));
+      } catch {
+        return false;
+      }
+      if (!Number.isSafeInteger(len) || len <= 0 || cStart.pos + len > startBuf.length) return false;
+      const tsBuf = startBuf.subarray(cStart.pos, cStart.pos + len);
+      cStart.pos += len;
+      const cTs = { pos: 0 };
+      while (cTs.pos < tsBuf.length) {
+        let tsTag: number;
+        try {
+          tsTag = Number(decodeVarint64(tsBuf, cTs));
+        } catch {
+          break;
+        }
+        if (!tsTag) break;
+        if ((tsTag & 0x07) === 0 && (tsTag >>> 3) === 1) {
+          try {
+            const sec = Number(decodeVarint64(tsBuf, cTs));
+            if (Number.isFinite(sec) && sec >= 946_684_800) return true;
+          } catch {
+            break;
+          }
+        } else if (!skipProtobufField(tsBuf, cTs, tsTag & 0x07)) {
+          break;
+        }
+      }
+    } else if (!skipProtobufField(startBuf, cStart, wt)) {
+      break;
+    }
+  }
+  return false;
+}
+
+function hasChatStartTimestamp(modelBuf: Uint8Array): boolean {
+  const cursor = { pos: 0 };
+  while (cursor.pos < modelBuf.length) {
+    let tagNum: number;
+    try {
+      tagNum = Number(decodeVarint64(modelBuf, cursor));
+    } catch {
+      return false;
+    }
+    if (!tagNum) break;
+    const fn = tagNum >>> 3;
+    const wt = tagNum & 0x07;
+    if (wt === 2) {
+      let len: number;
+      try {
+        len = Number(decodeVarint64(modelBuf, cursor));
+      } catch {
+        return false;
+      }
+      if (!Number.isSafeInteger(len) || len < 0 || cursor.pos + len > modelBuf.length) return false;
+      const slice = modelBuf.subarray(cursor.pos, cursor.pos + len);
+      cursor.pos += len;
+      if (fn === 9 && hasValidStartedAtField4(slice)) return true;
+    } else if (!skipProtobufField(modelBuf, cursor, wt)) {
+      return false;
+    }
+  }
+  return false;
+}
+
+export function hasInlineGenerationTimestamp(buf: Uint8Array): boolean {
   if (!buf || buf.byteLength < 6) return false;
-  for (let i = 0; i < buf.byteLength - 3; i++) {
-    if (buf[i] === 0x4a && buf[i + 2] === 0x22) return true;
+  if (hasChatStartTimestamp(buf)) return true;
+  const cursor = { pos: 0 };
+  while (cursor.pos < buf.length) {
+    let tagNum: number;
+    try {
+      tagNum = Number(decodeVarint64(buf, cursor));
+    } catch {
+      return false;
+    }
+    if (!tagNum) break;
+    const fn = tagNum >>> 3;
+    const wt = tagNum & 0x07;
+    if (wt === 2) {
+      let len: number;
+      try {
+        len = Number(decodeVarint64(buf, cursor));
+      } catch {
+        return false;
+      }
+      if (!Number.isSafeInteger(len) || len < 0 || cursor.pos + len > buf.length) return false;
+      const slice = buf.subarray(cursor.pos, cursor.pos + len);
+      cursor.pos += len;
+      if (fn === 1 && hasChatStartTimestamp(slice)) return true;
+      if (fn === 9 && hasValidStartedAtField4(slice)) return true;
+    } else if (!skipProtobufField(buf, cursor, wt)) {
+      return false;
+    }
   }
   return false;
 }
@@ -811,9 +1002,18 @@ function executeUsageScan(req: UsageWorkerScanRequest): { result: UsageWorkerSca
   }
 }
 
-parentPort?.on('message', (request: { id: string; locale?: string; open?: string; sql?: string; verify?: boolean; close?: boolean; reusable?: boolean; projection?: {table:string;column:string;idx:number}; hudScan?: HudWorkerScanRequest; usageScan?: UsageWorkerScanRequest }) => {
+parentPort?.on('message', (request: { id: string; locale?: string; open?: string; sql?: string; verify?: boolean; close?: boolean; reusable?: boolean; projection?: {table:string;column:string;idx:number}; hudScan?: HudWorkerScanRequest; usageScan?: UsageWorkerScanRequest; summariesLookup?: SummariesLookupRequest }) => {
   if (typeof request.locale === 'string' && request.locale) {
     setActiveLocale(request.locale);
+  }
+  if (request.summariesLookup) {
+    try {
+      const summariesResult = executeSummariesLookup(request.summariesLookup);
+      parentPort?.postMessage({ id: request.id, ok: true, summariesResult });
+    } catch (error) {
+      parentPort?.postMessage({ id: request.id, ok: false, error: (error as Error).message });
+    }
+    return;
   }
   if (request.hudScan) {
     try {

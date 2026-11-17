@@ -9,6 +9,7 @@ import {
   detectBlockedOrEmptyPage,
   evaluateModelConsensus,
   extractCleanPricingText,
+  extractPricesWithGemini,
   parseLiteLlmRates,
   parseOpenRouterRates,
   runAutoUpdatePricing,
@@ -152,6 +153,27 @@ test('共识门禁：双源一致放行 green，分歧/孤证/越界波动/未�
     nowMs,
   });
   assert.equal(futureBlocked.status, 'yellow');
+
+  // 若官网价正好吻合本地已排期的未来生效区间（如 gemini-4-hydrogen 的 2027-01-12 cacheWrite=$1.875），不重复报黄灯
+  const hydrogenScheduledEntry = {
+    model: 'gemini-4-hydrogen',
+    input: 1.5,
+    output: 7.5,
+    cached: 0.075,
+    cacheWrite: 0,
+    intervals: [
+      { model: 'gemini-4-hydrogen', validFrom: null, validUntil: '2027-01-11T23:59:59Z', input: 1.5, output: 7.5, cached: 0.075, cacheWrite: 0 },
+      { model: 'gemini-4-hydrogen', validFrom: '2027-01-12T00:00:00Z', validUntil: null, input: 1.5, output: 7.5, cached: 0.075, cacheWrite: 1.875 },
+    ],
+  };
+  const scheduledExpected = evaluateModelConsensus({
+    key: 'gemini-4-hydrogen',
+    localEntry: hydrogenScheduledEntry,
+    official: { officialModelName: 'Gemini 4 Hydrogen', inputPer1M: 1.5, outputPer1M: 7.5, cachedPer1M: 0.075, cacheWritePer1M: 1.875, confidence: 'high', evidenceQuote: '...' },
+    litellm: { input: 1.5, output: 7.5, cached: 0.075 },
+    nowMs,
+  });
+  assert.equal(scheduledExpected.status, 'unchanged');
 });
 
 test('安全增量写入：不篡改历史区间、保持英文 provenance 无中文残留并正确递增 -rN 版本号', () => {
@@ -330,3 +352,73 @@ test('端到端干跑与自动写入：模拟官网 + Gemini Flash + LiteLLM 全
   assert.deepEqual(buildPricingFeed(updatedCatalog), updatedFeed);
   assert.equal(updatedFeed.prices['claude-3-5-haiku'][1].input, 0.8);
 });
+
+test('上游抓取异常与确定性 4xx 防护：HTTP 404 不重试，上游阻塞时返回 fetch_failed 防误关告警 Issue', async (t) => {
+  let geminiCalls = 0;
+  await assert.rejects(
+    () =>
+      extractPricesWithGemini({
+        url: 'https://cloud.google.com/vertex-ai/pricing',
+        vendor: 'Google',
+        cleanText: 'Gemini 4 Hydrogen $1.50 / $7.50',
+        targetModels: [{ key: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen' }],
+        apiKey: 'fake-key',
+        model: 'invalid-model-404',
+        fetchImpl: async () => {
+          geminiCalls++;
+          return new Response('Not Found', { status: 404 });
+        },
+      }),
+    /Gemini API HTTP 404/
+  );
+  assert.equal(geminiCalls, 1, '确定性 HTTP 404 应单次立即抛出，不浪费重试');
+
+  const dir = await mkdtemp(join(tmpdir(), 'gb-auto-pricing-fail-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const catalogPath = join(dir, 'model-catalog.json');
+  const feedPath = join(dir, 'pricing-feed.json');
+  const reportPath = join(dir, 'report.json');
+  await writeFile(
+    catalogPath,
+    JSON.stringify({
+      schema: 1,
+      names: { 'claude-3-5-haiku': 'Claude 3.5 Haiku' },
+      prices: {
+        'claude-3-5-haiku': {
+          model: 'claude-3-5-haiku',
+          input: 1.0,
+          output: 5.0,
+          cached: 0.1,
+          provenance: {
+            sourceUrl: 'https://platform.claude.com/docs/en/about-claude/pricing',
+            verification: 'confirmed',
+          },
+        },
+      },
+      activeModels: ['claude-3-5-haiku'],
+      feedModels: ['claude-3-5-haiku'],
+      pricingVersion: '2026-11-17',
+    }),
+    'utf8'
+  );
+
+  const report = await runAutoUpdatePricing({
+    write: false,
+    nowMs: Date.parse('2026-11-17T02:00:00Z'),
+    catalogPath,
+    feedPath,
+    reportPath,
+    geminiApiKey: 'test-fake-key',
+    fetchImpl: async (url) => {
+      const target = String(url);
+      if (target.includes('platform.claude.com')) return new Response('Forbidden', { status: 403 });
+      if (target.includes('litellm')) return new Response('Service Unavailable', { status: 503 });
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    },
+  });
+
+  assert.equal(report.decision, 'fetch_failed');
+  assert.equal(report.pageAlerts.length >= 2, true);
+  assert.match(report.summaryMarkdown, /Upstream Fetch Alerts/);
+});
+

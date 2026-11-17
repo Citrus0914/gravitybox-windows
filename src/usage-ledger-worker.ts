@@ -297,6 +297,7 @@ function reconcileDuplicateLegacyAliases(db: DatabaseSync): void {
 
     const alias = db.prepare('INSERT OR REPLACE INTO event_aliases VALUES(?,?)');
     const redirectAlias = db.prepare('UPDATE event_aliases SET event_key=? WHERE event_key=?');
+    const deleteSelfAlias = db.prepare('DELETE FROM event_aliases WHERE legacy_key=?');
     const copyLock = db.prepare('INSERT OR IGNORE INTO rate_locks(event_key,unit_price,usd) SELECT ?,unit_price,usd FROM rate_locks WHERE event_key=?');
     const updateWinner = db.prepare('UPDATE events SET timestamp=?,account_id=?,payload=?,observed_at=? WHERE event_key=?');
     const insertRevision = db.prepare('INSERT INTO event_revisions(event_key,timestamp,payload) VALUES(?,?,?)');
@@ -371,7 +372,8 @@ function reconcileDuplicateLegacyAliases(db: DatabaseSync): void {
                     alias.run(loser.event_key, winner.event_key);
                     redirectAlias.run(winner.event_key, loser.event_key);
                 }
-                alias.run(leg, winner.event_key);
+                if (leg && leg !== winner.event_key) alias.run(leg, winner.event_key);
+                deleteSelfAlias.run(winner.event_key);
                 reconciledGroups++;
             }
         }
@@ -485,6 +487,7 @@ function runRequest(payload: {
             "CREATE TABLE IF NOT EXISTS snapshot_pins(snapshot_id TEXT PRIMARY KEY,revision INTEGER NOT NULL,expires INTEGER NOT NULL);",
             "CREATE TABLE IF NOT EXISTS ledger_maintenance(key TEXT PRIMARY KEY,last_run INTEGER NOT NULL);",
         ].join('\n'));
+        db.exec('DELETE FROM event_aliases WHERE legacy_key = event_key;');
         if (!(db.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>).some(column => column.name === 'observed_at')) db.exec('ALTER TABLE events ADD COLUMN observed_at REAL NOT NULL DEFAULT 0');
         db.exec('INSERT INTO event_revisions(event_key,timestamp,payload) SELECT event_key,timestamp,payload FROM events WHERE NOT EXISTS(SELECT 1 FROM event_revisions LIMIT 1);');
         if (operation === 'events')
@@ -509,6 +512,26 @@ function runRequest(payload: {
             catch (error) {
                 db.exec('ROLLBACK');
                 throw error;
+            }
+            try {
+                db.exec('PRAGMA wal_checkpoint(PASSIVE);');
+                const pageSize = Number(db.prepare('PRAGMA page_size').get()?.page_size ?? 4096);
+                const pageCount = Number(db.prepare('PRAGMA page_count').get()?.page_count ?? 0);
+                const freePages = Number(db.prepare('PRAGMA freelist_count').get()?.freelist_count ?? 0);
+                const freeBytes = freePages * pageSize;
+                const lastVacuum = Number(db.prepare("SELECT last_run FROM ledger_maintenance WHERE key='vacuum'").get()?.last_run ?? 0);
+                const shouldVacuum =
+                    (operation === 'prune' && freeBytes >= 4 * 1024 * 1024) ||
+                    (Date.now() - lastVacuum > 6 * 3600 * 1000 &&
+                        freeBytes >= 32 * 1024 * 1024 &&
+                        pageCount > 0 &&
+                        freePages / pageCount >= 0.25);
+                if (shouldVacuum) {
+                    db.exec('VACUUM; PRAGMA wal_checkpoint(TRUNCATE);');
+                    db.prepare("INSERT OR REPLACE INTO ledger_maintenance VALUES('vacuum',?)").run(Date.now());
+                }
+            } catch {
+                // 只读并发持有快照时延后至下个维护周期执行物理紧缩，不阻断写入
             }
             if (operation === 'prune')
                 return { pruned: true };
@@ -576,18 +599,54 @@ function runRequest(payload: {
         const copyLock = db.prepare('INSERT OR IGNORE INTO rate_locks(event_key,unit_price,usd) SELECT ?,unit_price,usd FROM rate_locks WHERE event_key=?');
         const alias = db.prepare('INSERT OR REPLACE INTO event_aliases VALUES(?,?)');
         const redirectAlias = db.prepare('UPDATE event_aliases SET event_key=? WHERE event_key=?');
+        const deleteSelfAlias = db.prepare('DELETE FROM event_aliases WHERE legacy_key=?');
+        const selectCanonicalByAlias = db.prepare('SELECT a.event_key, e.payload, e.observed_at FROM event_aliases a JOIN events e ON e.event_key=a.event_key WHERE a.legacy_key=? AND a.event_key<>?');
         const bindAliases = (targetKey: string, legacyKey: string | undefined, matches: LegacyCandidateRow[]) => {
             for (let i = matches.length - 1; i >= 0; i--) {
                 const match = matches[i]!;
+                if (match.event_key === targetKey) continue;
                 copyLock.run(targetKey, match.event_key);
                 alias.run(match.event_key, targetKey);
                 redirectAlias.run(targetKey, match.event_key);
             }
-            if (legacyKey) alias.run(legacyKey, targetKey);
+            if (legacyKey && legacyKey !== targetKey) alias.run(legacyKey, targetKey);
+            deleteSelfAlias.run(targetKey);
         };
         db.exec('BEGIN IMMEDIATE');
         try {
             for (const event of events) {
+                const existingCanonical = selectCanonicalByAlias.get(event.event_key!, event.event_key!) as { event_key: string; payload: string; observed_at: number } | undefined;
+                if (existingCanonical) {
+                    try {
+                        const canonicalParsed = JSON.parse(String(existingCanonical.payload)) as LedgerEvent;
+                        if (canonicalParsed.source_id || !event.source_id) {
+                            copyLock.run(existingCanonical.event_key, event.event_key!);
+                            const mergedCanonical: LedgerEvent = { ...canonicalParsed };
+                            mergeLegacyMetadataIntoEvent(mergedCanonical, event);
+                            const nextObserved = Math.max(Number(existingCanonical.observed_at ?? 0), event.source_observed_at ?? 0);
+                            if (nextObserved > (mergedCanonical.source_observed_at ?? 0)) {
+                                mergedCanonical.source_observed_at = nextObserved;
+                            }
+                            const nextTs = mergedCanonical.timestamp_seconds || canonicalParsed.timestamp_seconds || 0;
+                            mergedCanonical.timestamp_seconds = nextTs;
+                            const nextCanonicalPayload = JSON.stringify(mergedCanonical);
+                            if (nextCanonicalPayload !== String(existingCanonical.payload) || nextObserved > Number(existingCanonical.observed_at ?? 0)) {
+                                if (upsert.run(existingCanonical.event_key, nextTs, mergedCanonical.account_id ?? null, mergedCanonical.model, nextCanonicalPayload, nextObserved).changes) {
+                                    revision.run(existingCanonical.event_key, nextTs, nextCanonicalPayload);
+                                } else if (nextObserved > Number(existingCanonical.observed_at ?? 0)) {
+                                    updateObserved.run(nextObserved, existingCanonical.event_key);
+                                }
+                            }
+                            if (event.legacy_event_key && event.legacy_event_key !== existingCanonical.event_key) {
+                                alias.run(event.legacy_event_key, existingCanonical.event_key);
+                            }
+                            deleteSelfAlias.run(existingCanonical.event_key);
+                            continue;
+                        }
+                    } catch {
+                        // fall through to standard upsert
+                    }
+                }
                 const sameKeyStored = previous.get(event.event_key!) as { payload: string; observed_at: number } | undefined;
                 const legacyMatches = event.legacy_event_key
                     ? findMatchingLegacyRows(byLegacyKey, event.legacy_event_key, event.event_key!, event.db_file)

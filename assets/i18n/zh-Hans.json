@@ -1241,6 +1241,8 @@
     "pricing.err.url_credentials_forbidden": "价格源地址不允许内嵌凭据",
     "pricing.err.https_trusted_only": "仅允许 HTTPS 官方或受信任价格源地址",
     "pricing.err.response_too_large": "价格源响应体积超出安全上限",
+    "pricing.err.too_many_redirects": "价格源重定向次数超出上限",
+    "pricing.err.feed_version_older": "远端价格源版本 {feedVersion} 旧于已同步版本 {syncedVersion}",
     "pricing.err.usage_or_rate_invalid": "用量或费率无效",
     "pricing.err.cache_write_unconfigured": "缓存写入费率未配置",
     "pricing.err.interval_entry_invalid": "价格区间条目无效：{key}",

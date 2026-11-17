@@ -2,7 +2,7 @@ import { compactNumber, compactPercent, compactRate, compactUsd, durationText, f
 export { formatTurnDurationCompact };
 import { bt } from '../i18n.js';
 import { lstat, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import type {
   ConversationHudMetrics,
@@ -27,7 +27,7 @@ import {
 } from '../pricing.js';
 import { loadRawPricingTable } from '../usage-pricing.js';
 import { resolveDatabaseModelFullName } from '../usage-types.js';
-import { runHudDbScanInWorker } from '../sqlite-read.js';
+import { runHudDbScanInWorker, runSummariesLookupInWorker } from '../sqlite-read.js';
 import type { HudWorkerRawStepRow } from '../sqlite-worker.js';
 import { decodeVarint64, skipProtobufField } from '../protobuf.js';
 
@@ -1873,7 +1873,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const lastCtx = contextSteps[contextSteps.length - 1];
   const lastCtxType = lastCtx ? (lastCtx.step_type ?? lastCtx.stepType ?? 0) : 0;
   const lastCtxStatus = lastCtx?.status ?? 3;
-  const lastTurnAborted = Boolean(!input.isStreaming && lastCtx && lastCtxType !== 14 && (lastCtxStatus === 6 || lastCtxStatus === 7));
+  const lastTurnAborted = Boolean(!input.isStreaming && lastCtx && lastCtxType !== 14 && (lastCtxStatus === 4 || lastCtxStatus === 6 || lastCtxStatus === 7));
   if (input.allowDbActiveStepInference !== false && !lastTurnAborted) {
     let turnFinished = false;
     for (let index = contextSteps.length - 1; index >= 0; index--) {
@@ -2563,6 +2563,7 @@ interface CachedConversationState {
  */
 export class ConversationMetricsEngine {
   private readonly conversationsDir: string;
+  private readonly summariesDbPath: string;
   private readonly remotePricingCachePath: string | null;
   private readonly pricingCachePath: string | null;
   private cachedPricingTable: { key: string; table: Record<string, ApiPricingEntry> } | null = null;
@@ -2573,6 +2574,8 @@ export class ConversationMetricsEngine {
   private readonly recentActiveChildUntilByDb = new Map<string, number>();
   private readonly coldSniffedByDb = new Map<string, { fileId: string; stepCount: number }>();
   private readonly rejectedSniffMtimeByKey = new Map<string, number>();
+  private readonly summariesChildCache = new Map<string, { sig: string; childIds: string[]; terminalChildIds: string[] }>();
+  private summariesMissingUntilMs = 0;
   private sniffDirCache: { at: number; dirMtimeMs: number; allEntries: Array<{ id: string; mtimeMs: number }> } | null = null;
   private sniffDirListCache: { dirMtimeMs: number; dbEntries: Array<{ file: string; id: string }> } | null = null;
   private sniffInFlight: Promise<Array<{ id: string; mtimeMs: number }>> | null = null;
@@ -2581,6 +2584,7 @@ export class ConversationMetricsEngine {
     const baseGemini = options?.geminiDir ?? join(homedir(), '.gemini');
     this.conversationsDir =
       options?.conversationsDir ?? join(baseGemini, 'antigravity', 'conversations');
+    this.summariesDbPath = join(dirname(this.conversationsDir), 'conversation_summaries.db');
     const cleanStateDir = typeof options?.stateDir === 'string' && options.stateDir.trim()
       ? options.stateDir.trim()
       : null;
@@ -2626,6 +2630,46 @@ export class ConversationMetricsEngine {
       throw new Error(bt('metrics.err.invalid_conversation_id'));
     }
     return join(this.conversationsDir, `${cleanId}.db`);
+  }
+
+  private async lookupIndexedChildrenFromSummariesDb(
+    parentIds: string[]
+  ): Promise<{ available: boolean; childIds: Set<string>; terminalChildIds: Set<string> }> {
+    const cleanParents = [...new Set(parentIds.map(p => p.trim().toLowerCase()).filter(Boolean))].sort();
+    if (cleanParents.length === 0) return { available: false, childIds: new Set(), terminalChildIds: new Set() };
+    const now = Date.now();
+    if (now < this.summariesMissingUntilMs) {
+      return { available: false, childIds: new Set(), terminalChildIds: new Set() };
+    }
+    let targetPath = this.summariesDbPath;
+    let st = await lstat(targetPath).catch(() => null);
+    if (!st || !st.isFile() || st.isSymbolicLink()) {
+      const altPath = join(this.conversationsDir, 'conversation_summaries.db');
+      st = await lstat(altPath).catch(() => null);
+      if (!st || !st.isFile() || st.isSymbolicLink()) {
+        this.summariesMissingUntilMs = now + 2000;
+        return { available: false, childIds: new Set(), terminalChildIds: new Set() };
+      }
+      targetPath = altPath;
+    }
+    const walSt = await lstat(`${targetPath}-wal`).catch(() => null);
+    const sig = `${targetPath}|${st.mtimeMs}:${st.size}:${walSt?.mtimeMs ?? 0}:${walSt?.size ?? 0}`;
+    const cacheKey = cleanParents.join('|');
+    const cached = this.summariesChildCache.get(cacheKey);
+    if (cached && cached.sig === sig) {
+      return { available: true, childIds: new Set(cached.childIds), terminalChildIds: new Set(cached.terminalChildIds) };
+    }
+    const res = await runSummariesLookupInWorker({ dbPath: targetPath, parentIds: cleanParents });
+    if (!res || !res.foundTable) {
+      return { available: false, childIds: new Set(), terminalChildIds: new Set() };
+    }
+    if (this.summariesChildCache.size >= MAX_CACHED_CONVERSATIONS && !this.summariesChildCache.has(cacheKey)) {
+      const oldest = this.summariesChildCache.keys().next().value;
+      if (oldest !== undefined) this.summariesChildCache.delete(oldest);
+    }
+    const terminalList = Array.isArray(res.terminalChildIds) ? res.terminalChildIds : [];
+    this.summariesChildCache.set(cacheKey, { sig, childIds: res.childIds, terminalChildIds: terminalList });
+    return { available: true, childIds: new Set(res.childIds), terminalChildIds: new Set(terminalList) };
   }
 
   private setCachedState(dbPath: string, state: CachedConversationState): void {
@@ -3165,6 +3209,7 @@ export class ConversationMetricsEngine {
     let activeChildSubagents = 0;
     let failedChildCount = 0;
     const verifiedChildIds = new Set<string>();
+    const activeVerifiedChildIds = new Set<string>();
 
     const persistedSniffEntry = this.verifiedSniffedChildrenByDb.get(dbPath);
     const candidateChildIds = new Set<string>(mainState.childConversationIds);
@@ -3186,8 +3231,6 @@ export class ConversationMetricsEngine {
       }
     }
 
-    // 反向子会话嗅探 (异步无阻塞，同时检查 .db 与 -wal 修改时间，2.5s 目录下钻缓存 + in-flight 去重；
-    // 同时覆盖实时运行期 5 分钟窗口与冷启动历史会话首次打开时的同周期反向嗅探)
     const hasActiveSubagentStep = mainIsRecent && mainState.steps.some(
       (s) =>
         (s.isSubagentStep || (s.toolCallName && SUBAGENT_TOOL_NAMES.has(s.toolCallName))) &&
@@ -3199,13 +3242,40 @@ export class ConversationMetricsEngine {
         s.stepType === 132 ||
         Boolean(s.toolCallName && SUBAGENT_TOOL_NAMES.has(s.toolCallName))
     );
+
+    // 优先通过官方 conversation_summaries.db 索引表 O(log N) 精确检索全量子会话（含超时 5 分钟的 Swarm Workers）
+    const indexedSummaryChildren = new Set<string>();
+    const terminalSummaryChildren = new Set<string>();
+    let summariesIndexAvailable = false;
+    if (!dbPathOverride && (isSubagentRunning || hasActiveSubagentStep || hasSubagentEvidenceInMain || candidateChildIds.size > 0)) {
+      const summaryLookup = await this.lookupIndexedChildrenFromSummariesDb(
+        mainTrajLower ? [mainIdLower, mainTrajLower] : [mainIdLower]
+      );
+      summariesIndexAvailable = summaryLookup.available;
+      for (const indexedId of summaryLookup.childIds) {
+        if (indexedId !== mainIdLower && indexedId !== mainTrajLower) {
+          indexedSummaryChildren.add(indexedId);
+          candidateChildIds.add(indexedId);
+        }
+      }
+      for (const termId of summaryLookup.terminalChildIds) {
+        terminalSummaryChildren.add(termId);
+      }
+    }
+
+    // 反向子会话文件嗅探回退：仅当官方 summaries 索引库不存在或运行期尚未登记任何子会话时启用
     const coldSniffRec = this.coldSniffedByDb.get(dbPath);
     const needsColdHistoricalSniff =
       !dbPathOverride &&
+      !summariesIndexAvailable &&
       !(isSubagentRunning || hasActiveSubagentStep) &&
       hasSubagentEvidenceInMain &&
       (!coldSniffRec || coldSniffRec.fileId !== mainState.fileId || coldSniffRec.stepCount !== mainState.steps.length);
-    if (!dbPathOverride && (isSubagentRunning || hasActiveSubagentStep || needsColdHistoricalSniff)) {
+    const needsActiveFallbackSniff =
+      !dbPathOverride &&
+      (isSubagentRunning || hasActiveSubagentStep) &&
+      (!summariesIndexAvailable || candidateChildIds.size === 0);
+    if (needsActiveFallbackSniff || needsColdHistoricalSniff) {
       try {
         const allEntries = await (this.sniffInFlight ??= (async () => {
           try {
@@ -3259,7 +3329,7 @@ export class ConversationMetricsEngine {
         })());
         let candidateEntries: Array<{ id: string; mtimeMs: number }>;
         if (isSubagentRunning || hasActiveSubagentStep) {
-          candidateEntries = allEntries.filter((e) => nowMs - e.mtimeMs <= 300_000);
+          candidateEntries = allEntries.filter((e) => nowMs - e.mtimeMs <= ACTIVE_DB_RECENCY_MS);
         } else {
           if (this.coldSniffedByDb.size >= MAX_CACHED_CONVERSATIONS && !this.coldSniffedByDb.has(dbPath)) {
             const oldestCold = this.coldSniffedByDb.keys().next().value;
@@ -3306,13 +3376,14 @@ export class ConversationMetricsEngine {
         childId,
         parentId: mainIdLower,
         explicit: mainState.childConversationIds.has(childId),
-        sniffed: !mainState.childConversationIds.has(childId),
+        indexed: indexedSummaryChildren.has(childId),
+        sniffed: !mainState.childConversationIds.has(childId) && !indexedSummaryChildren.has(childId),
       }));
       const processedEdges = new Set<string>();
       const SUBAGENT_READ_CONCURRENCY = 4;
       while (pendingChildren.length > 0) {
         const wave: Array<{
-          edge: { childId: string; parentId: string; explicit: boolean; sniffed: boolean };
+          edge: { childId: string; parentId: string; explicit: boolean; indexed: boolean; sniffed: boolean };
           childId: string;
           childDbPath: string;
         }> = [];
@@ -3356,7 +3427,12 @@ export class ConversationMetricsEngine {
             failedChildCount++;
             continue;
           }
-          if (!childState) continue;
+          if (!childState) {
+            if (item.edge.indexed) {
+              verifiedChildIds.add(item.childId);
+            }
+            continue;
+          }
           const { edge, childId } = item;
           if (verifiedChildIds.has(childId)) continue;
           if (childState.fromErrorFallback) {
@@ -3364,7 +3440,7 @@ export class ConversationMetricsEngine {
           }
           const belongsToParent =
             childState.referencedUuidsInMetaBlob.has(edge.parentId) ||
-            (edge.explicit &&
+            ((edge.explicit || edge.indexed) &&
               (childState.referencedUuidsInMetaBlob.has(mainIdLower) ||
                 (mainTrajLower !== '' && childState.referencedUuidsInMetaBlob.has(mainTrajLower)))) ||
             (edge.sniffed &&
@@ -3375,7 +3451,9 @@ export class ConversationMetricsEngine {
             continue;
           }
           if (childState.hasParentMetadataBlob) {
-            if (!belongsToParent) {
+            const indexedWithoutConflict =
+              edge.indexed && childState.referencedUuidsInMetaBlob.size === 0;
+            if (!belongsToParent && !indexedWithoutConflict) {
               if (edge.sniffed) {
                 const rejectKey = `${mainIdLower}::${mainTrajLower}::${childId}`;
                 const latestChildMtime = Math.max(childState.mtimeMs, childState.walMtimeMs);
@@ -3387,7 +3465,7 @@ export class ConversationMetricsEngine {
               }
               continue;
             }
-          } else if (!edge.explicit || childState.hasTrajectoryMeta) {
+          } else if (!edge.indexed && (!edge.explicit || childState.hasTrajectoryMeta)) {
             continue;
           }
           verifiedChildIds.add(childId);
@@ -3411,7 +3489,7 @@ export class ConversationMetricsEngine {
           const recent = nowMs - latestChildMtime <= ACTIVE_DB_RECENCY_MS;
           if (recent) {
             let childActive = false;
-            let childTurnTerminated = false;
+            let childTurnTerminated = terminalSummaryChildren.has(childId);
             for (let idx = childState.steps.length - 1; idx >= 0; idx--) {
               const step = childState.steps[idx]!;
               if (step.stepType === 14) break;
@@ -3452,6 +3530,7 @@ export class ConversationMetricsEngine {
             }
             if (childActive) {
               activeChildSubagents++;
+              activeVerifiedChildIds.add(childId);
             }
           }
           const cg = childState.genMetadata;
@@ -3479,7 +3558,7 @@ export class ConversationMetricsEngine {
             });
           }
           for (const nested of childState.childConversationIds) {
-            pendingChildren.push({ childId: nested, parentId: childId, explicit: true, sniffed: false });
+            pendingChildren.push({ childId: nested, parentId: childId, explicit: true, indexed: false, sniffed: false });
           }
         }
       }
@@ -3488,16 +3567,32 @@ export class ConversationMetricsEngine {
       }
     }
 
+    let latestMainModelStepPos = -1;
+    for (let i = mainState.steps.length - 1; i >= 0; i--) {
+      if (mainState.steps[i]!.stepType === 15) {
+        latestMainModelStepPos = i;
+        break;
+      }
+    }
     const normalizedContextSteps =
-      verifiedChildIds.size > 0 && activeChildSubagents === 0
-        ? mainState.steps.map((step) => {
-            if (
-              step.isSubagentStep &&
-              step.childConversationIds &&
-              step.childConversationIds.length > 0 &&
-              step.childConversationIds.every((cid) => verifiedChildIds.has(cid.toLowerCase())) &&
-              ACTIVE_STEP_STATUSES.has(step.status)
-            ) {
+      verifiedChildIds.size > 0
+        ? mainState.steps.map((step, idx) => {
+            if (!ACTIVE_STEP_STATUSES.has(step.status)) return step;
+            const isSubStep =
+              Boolean(step.isSubagentStep) ||
+              step.stepType === 127 ||
+              Boolean(step.toolCallName && SUBAGENT_TOOL_NAMES.has(step.toolCallName));
+            if (!isSubStep) return step;
+            if (step.childConversationIds && step.childConversationIds.length > 0) {
+              const allVerified = step.childConversationIds.every((cid) => verifiedChildIds.has(cid.toLowerCase()));
+              const noneActive = step.childConversationIds.every((cid) => !activeVerifiedChildIds.has(cid.toLowerCase()));
+              if (allVerified && noneActive) {
+                return { ...step, status: 3 };
+              }
+              return step;
+            }
+            // 无显式内联 UUID 的历史批次派发步（如通过 summaries/嗅探识别的 Swarm 步），若其后已有新的模型生成步或全部验证子库均已完结，不再重复占活跃位
+            if (failedChildCount === 0 && (activeChildSubagents === 0 || idx < latestMainModelStepPos)) {
               return { ...step, status: 3 };
             }
             return step;
@@ -3557,6 +3652,8 @@ export class ConversationMetricsEngine {
     this.recentActiveChildUntilByDb.clear();
     this.coldSniffedByDb.clear();
     this.rejectedSniffMtimeByKey.clear();
+    this.summariesChildCache.clear();
+    this.summariesMissingUntilMs = 0;
     this.sniffDirCache = null;
     this.sniffDirListCache = null;
     this.sniffInFlight = null;

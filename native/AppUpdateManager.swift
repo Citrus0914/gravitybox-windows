@@ -662,9 +662,40 @@ final class AppUpdateManager {
         }
     }
 
+    private struct CleanupRuntimeSnapshot {
+        let stateDir: URL
+        let currentVer: String
+        let isInstalling: Bool
+        let isDownloading: Bool
+        let lastCleanedVersion: String
+    }
+
+    private func captureCleanupSnapshot(currentVersionOverride: String?) -> CleanupRuntimeSnapshot {
+        let build = { () -> CleanupRuntimeSnapshot in
+            let ver = Self.normalizeVersion(currentVersionOverride ?? self.currentVersion)
+            let installing: Bool
+            if case .installing = self.state { installing = true } else { installing = false }
+            return CleanupRuntimeSnapshot(
+                stateDir: self.app.state,
+                currentVer: ver,
+                isInstalling: installing,
+                isDownloading: self.downloadInFlight,
+                lastCleanedVersion: self.app.configuration?.value.lastCleanedVersion ?? ""
+            )
+        }
+        if Thread.isMainThread {
+            return build()
+        }
+        return DispatchQueue.main.sync(execute: build)
+    }
+
     /// Invoked only after a successful backend status reply, never merely because the app started.
     func cleanupAfterSuccessfulLaunch() {
         #if !NATIVE_UI_TEST
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.cleanupAfterSuccessfulLaunch() }
+            return
+        }
         guard !cleanupInFlight, !launchCleanupCompleted, !installationInFlight else { return }
         let arguments = CommandLine.arguments, version = currentVersion, bundle = Bundle.main.bundleURL, stateDir = app.state
         let hasReceipt = arguments.contains("--update-receipt")
@@ -715,11 +746,12 @@ final class AppUpdateManager {
         detachMountedVolumes: Bool = false
     ) -> Int {
         guard successfulLaunchConfirmed else { return 0 }
+        let snapshot = captureCleanupSnapshot(currentVersionOverride: currentVersionOverride)
         let fm = FileManager.default
-        let currentVer = Self.normalizeVersion(currentVersionOverride ?? currentVersion)
+        let currentVer = snapshot.currentVer
         var cleanedCount = 0
 
-        let updatesDir = app.state.appendingPathComponent("updates", isDirectory: true)
+        let updatesDir = snapshot.stateDir.appendingPathComponent("updates", isDirectory: true)
         if let entries = try? fm.contentsOfDirectory(at: updatesDir, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) {
             for entryURL in entries {
                 let name = entryURL.lastPathComponent
@@ -728,7 +760,7 @@ final class AppUpdateManager {
                 let isDir = values?.isDirectory == true
 
                 if isDir && name.hasPrefix("install-") {
-                    if case .installing = state { continue }
+                    if snapshot.isInstalling { continue }
                     if fm.fileExists(atPath: entryURL.appendingPathComponent(UpdateInstaller.receiptName).path) { continue }
                     if (try? fm.removeItem(at: entryURL)) != nil {
                         cleanedCount += 1
@@ -737,7 +769,7 @@ final class AppUpdateManager {
                 }
 
                 if isDir && name == "transactions" {
-                    if case .installing = state { continue }
+                    if snapshot.isInstalling { continue }
                     if let txEntries = try? fm.contentsOfDirectory(at: entryURL, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) {
                         for txURL in txEntries {
                             let txValues = try? txURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -768,7 +800,7 @@ final class AppUpdateManager {
                         if (try? fm.removeItem(at: entryURL)) != nil {
                             cleanedCount += 1
                         }
-                    } else if !downloadInFlight,
+                    } else if !snapshot.isDownloading,
                               let children = try? fm.contentsOfDirectory(at: entryURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
                         for child in children where child.lastPathComponent.hasSuffix(".dmg.part") {
                             if (try? fm.removeItem(at: child)) != nil {
@@ -780,7 +812,7 @@ final class AppUpdateManager {
                 }
 
                 if !isDir {
-                    if !downloadInFlight && name.hasSuffix(".dmg.part") {
+                    if !snapshot.isDownloading && name.hasSuffix(".dmg.part") {
                         if (try? fm.removeItem(at: entryURL)) != nil {
                             cleanedCount += 1
                         }
@@ -794,7 +826,7 @@ final class AppUpdateManager {
             }
         }
 
-        let lastCleaned = app.configuration?.value.lastCleanedVersion ?? ""
+        let lastCleaned = snapshot.lastCleanedVersion
         let isVersionUpgrade = !currentVer.isEmpty && lastCleaned != currentVer
 
         if detachMountedVolumes && (restartedAfterUpdate || isVersionUpgrade) {
@@ -926,11 +958,12 @@ final class AppUpdateManager {
 
     private func executeInstall(release: AppReleaseInfo, dmgFile: URL) {
         let configuredLang = app.effectiveConfiguredLanguage()
+        let stateDir = app.state
         transition(.installing(release))
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let fm = FileManager.default
-            let workDir = self.app.state.appendingPathComponent("updates/transactions/install-\(UUID().uuidString)")
+            let workDir = stateDir.appendingPathComponent("updates/transactions/install-\(UUID().uuidString)")
             let mountDir = workDir.appendingPathComponent("mount")
             let stagedApp = workDir.appendingPathComponent("GravityBox.app")
             do {

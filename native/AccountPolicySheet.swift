@@ -292,6 +292,12 @@ final class AccountPolicySheet: NSObject {
         candidateSubLabel.stringValue = L10n.t("policy.row.candidate.sub", fallback: "备用配额 ≥ 此值才参与推荐")
         cancelButton.title = L10n.t("common.cancel", fallback: "取消")
         saveButton.title = L10n.t("common.save", fallback: "保存")
+        strategyPopup.invalidateIntrinsicContentSize()
+        modelPopup.invalidateIntrinsicContentSize()
+        let unifiedPopupWidth = min(216, max(104, Design.fittedPopUpWidth(strategyPopup), Design.fittedPopUpWidth(modelPopup)))
+        for constraint in popupWidthConstraints {
+            constraint.constant = unifiedPopupWidth
+        }
         monitoredScopeChanged()
     }
 

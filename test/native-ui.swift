@@ -635,6 +635,32 @@ import Cocoa
         check(assistant.currentPage == 2 && assistant.usageSelectedPeriod == 2, "Footer deep-link from Usage tab must navigate to UsagePage and carry selected period")
         check(assistant.usagePage!.donutChart.totalUsd == 23.78, "Donut chart must receive total equivalent USD")
         check(!assistant.usagePage!.donutChart.isHidden, "Donut chart must be visible when priced models exist")
+        do {
+            let sixModels: [[String: Any]] = models + [
+                ["model": "gemini-4-hydrogen", "totalTokens": 1200000, "promptTokens": 400000, "candidatesTokens": 50000, "requestCount": 14, "estimatedUsd": 2.40, "priced": true],
+                ["model": "gemini-4-carbon", "totalTokens": 800000, "promptTokens": 250000, "candidatesTokens": 40000, "requestCount": 9, "estimatedUsd": 1.15, "priced": true]
+            ]
+            let usage = assistant.usagePage!
+            usage.applyUsagePayload([
+                "ok": true, "period": "30d", "snapshotId": "six-model-snapshot",
+                "summary": totals.merging(["estimatedUsd": 27.33]) { _, n in n },
+                "byModel": sixModels, "todayHourly": [], "dailyTrends": []
+            ], period: "30d", segIdx: 2, requestKey: "six-model-test")
+            window.contentView?.layoutSubtreeIfNeeded(); pump()
+            func findRequestCard(_ v: NSView) -> NSView? {
+                if v.identifier?.rawValue == "requests-cache-card" { return v }
+                for s in v.subviews { if let found = findRequestCard(s) { return found } }
+                return nil
+            }
+            if let reqCard = findRequestCard(usage.view) {
+                let trackFrame = reqCard.convert(usage.cacheTrack.bounds, from: usage.cacheTrack)
+                let bottomGap = reqCard.isFlipped ? (reqCard.bounds.height - trackFrame.maxY) : trackFrame.minY
+                check(usage.donutLegendStack.arrangedSubviews.count == 5, "6 priced models must render 5 legend rows (got \(usage.donutLegendStack.arrangedSubviews.count))")
+                check(bottomGap <= 34, "requests-cache-card must distribute slack symmetrically instead of leaving large bottom gap below cacheTrack (bottomGap=\(bottomGap))")
+            } else {
+                check(false, "requests-cache-card must exist in UsagePage")
+            }
+        }
         // Verify rapid page switching does not leave blank view host or drop views
         assistant.selectPage(0); assistant.selectPage(1); assistant.selectPage(0); pump()
         check(assistant.currentPage == 0, "Rapid switching must end on page 0")
@@ -648,6 +674,20 @@ import Cocoa
             "todayHourly": todayHourly
         ]
         ov.update(force: true)
+        let curHour = Calendar.current.component(.hour, from: Date())
+        let expectedCurHourPrefix = String(format: "今日 %02d:00 · ", locale: Locale(identifier: "en_US_POSIX"), curHour)
+        check(ov.trendDetailLabel.stringValue.hasPrefix(expectedCurHourPrefix), "Overview trend detail must default to current hour (got \(ov.trendDetailLabel.stringValue))")
+        if ov.todayTrendChart.points.count == 24 {
+            ov.todayTrendChart.onHoverPoint?(ov.todayTrendChart.points[0])
+            check(ov.trendDetailLabel.stringValue == "今日 00:00 · 0 Token", "Overview trend detail must show 今日 00:00 · 0 Token when hovering 00:00 (got \(ov.trendDetailLabel.stringValue))")
+            ov.todayTrendChart.onHoverPoint?(ov.todayTrendChart.points[14])
+            check(ov.trendDetailLabel.stringValue == "今日 14:00 · 19.6M Token", "Overview trend detail must show 今日 14:00 · 19.6M Token when hovering 14:00 (got \(ov.trendDetailLabel.stringValue))")
+            ov.todayTrendChart.onHoverPoint?(nil)
+            check(ov.trendDetailLabel.stringValue.hasPrefix(expectedCurHourPrefix), "Overview trend detail must restore current hour when hover exits")
+        }
+        ov.syncTrendDetailLabel(currentHour: 3)
+        check(ov.trendDetailLabel.stringValue == "今日 03:00 · 0 Token" || ov.trendDetailLabel.stringValue == "今日 03:00 · 尚未到达", "Overview trend detail helper must format 03:00 accurately (got \(ov.trendDetailLabel.stringValue))")
+        ov.syncTrendDetailLabel()
         check(ov.rightBentoTitleLabel.stringValue == "今日活跃模型", "Overview right Bento card title must be 今日活跃模型")
         check(ov.rightBentoCountBadge.title == "Top 2 / 共 4 个", "Overview right Bento count badge must show Top 2 / 共 4 个")
         check(ov.bentoRightStack.arrangedSubviews.count == 2, "Overview Bento right stack must display 2 subrows")
@@ -1975,8 +2015,9 @@ import Cocoa
             check(ultraDash.standaloneDivider.isHidden && ultraDash.standaloneQuotaStack.isHidden, "Ultra overview must hide standalone divider and rows")
             check(!ultraDashTexts.contains(where: { $0.contains("Argon") || $0.contains("Carbon") || $0.contains("周期未知") }), "Ultra overview must not show Argon, Carbon, or 周期未知")
             check(ultraDash.trendTitleLabel.stringValue == "今日时段消耗" && ultraDash.trendTitleLabel.bounds.width >= 60, "Overview trend title must remain visible without collapsing to 0pt")
+            check(ultraDash.trendDetailLabel.stringValue.hasPrefix("今日 ") && ultraDash.trendDetailLabel.bounds.width >= 110, "Overview trend detail subtitle must have enough horizontal room without truncating at 920px (got width=\(ultraDash.trendDetailLabel.bounds.width))")
             check(ultraDash.todayPeakBadge.frame.minX > ultraDash.trendTitleLabel.frame.maxX + 8, "Overview peak pill badge must align to trailing edge after trend title")
-            check(ultraDash.todayTrendChart.bounds.height > 100, "Overview trend chart must expand vertically to fill card height")
+            check(ultraDash.todayTrendChart.bounds.height > 100 && ultraDash.todayTrendChart.bounds.height <= 114.5, "Overview trend chart must cap vertical bar height at <= 114pt while keeping compact clarity (got \(ultraDash.todayTrendChart.bounds.height))")
 
             let proDash = DashboardPage(app: dashHost)
             proDash.view.frame = NSRect(x: 0, y: 0, width: 920, height: 760)

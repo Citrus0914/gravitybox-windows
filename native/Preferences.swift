@@ -149,7 +149,7 @@ final class PreferencesController: NSObject {
         }
         maintenanceSheet?.show(in: window) { [weak self, weak app = self.app] in
             self?.maintenanceSheet = nil
-            if let app, app.pendingLocalizedRebuildAfterMaintenance, app.cachePage?.busy != true {
+            if let app, app.pendingLocalizedRebuildAfterMaintenance, self?.pricingSheet == nil, app.cachePage?.busy != true {
                 app.pendingLocalizedRebuildAfterMaintenance = false
                 app.cachePage = nil
                 app.preferencesController = nil
@@ -254,16 +254,44 @@ final class PreferencesController: NSObject {
     func update() {
         rebuildLanguagePopup()
         languageSubtitleField?.stringValue = languageSubtitleText()
+        languagePopup.setAccessibilityLabel(L10n.t("settings.language.title", fallback: "显示语言"))
         languagePopup.isEnabled = app.statusValue.mode != "unsupported"
         hudSwitch.state = app.effectiveHudEnabled() ? .on : .off
         hudSwitch.isEnabled = app.reachable && app.statusValue.mode != "unsupported"
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         syncLifecycleSwitch.state = app.configuration.value.syncAntigravityLifecycle ? .on : .off
+        let refreshTitles = [
+            L10n.t("settings.refresh.manual", fallback: "手动刷新"),
+            L10n.t("settings.refresh.5m", fallback: "每 5 分钟"),
+            L10n.t("settings.refresh.10m", fallback: "每 10 分钟"),
+            L10n.t("settings.refresh.15m", fallback: "每 15 分钟"),
+            L10n.t("settings.refresh.30m", fallback: "每 30 分钟"),
+            L10n.t("settings.refresh.60m", fallback: "每 60 分钟")
+        ]
+        for (idx, itemTitle) in refreshTitles.enumerated() where idx < refresh.numberOfItems {
+            refresh.item(at: idx)?.title = itemTitle
+        }
         refresh.selectItem(at: Self.refreshIntervals.firstIndex(of: app.configuration.value.quotaRefreshMinutes) ?? 0)
+        if refresh.cell is DesignPopUpCell {
+            Design.syncPopUpWidth(refresh)
+        } else {
+            refresh.invalidateIntrinsicContentSize()
+        }
+        manageCacheBtn?.title = L10n.t("settings.storage.manage_btn", fallback: "管理存储…")
+        if let cachedScan = app.lastMaintenanceScanPayload {
+            applyStorageScanPayload(cachedScan)
+        } else {
+            storageSubtitleLabel.stringValue = Self.defaultStorageSubtitle
+        }
         refreshStorageRowState()
         pricingSyncSwitch.state = app.configuration.value.autoPricingSyncEnabled ? .on : .off
         pricingSyncSwitch.isEnabled = app.reachable
-        pricingSyncCheckBtn?.setBusy(pricingSyncCheckBtn?.isBusy == true, available: app.reachable)
+        if let checkBtn = pricingSyncCheckBtn {
+            checkBtn.title = L10n.t("settings.pricing_sync.check_now", fallback: "立即检查")
+            checkBtn.invalidateIntrinsicContentSize()
+            checkBtn.setAccessibilityLabel(L10n.t("settings.pricing_sync.check_a11y", fallback: "检查价格更新"))
+            checkBtn.setBusy(checkBtn.isBusy, available: app.reachable)
+        }
     }
 
     @objc func languageChanged() {
@@ -306,8 +334,16 @@ final class PreferencesController: NSObject {
                     if self.pricingSheet == nil {
                         self.pricingSheet = PricingSyncSheetController(app: self.app)
                     }
-                    self.pricingSheet?.show(in: window, payload: payload) { [weak self] in
+                    self.pricingSheet?.show(in: window, payload: payload) { [weak self, weak app = self.app] in
                         self?.pricingSheet = nil
+                        if let app, app.pendingLocalizedRebuildAfterMaintenance, self?.maintenanceSheet == nil, app.cachePage?.busy != true {
+                            app.pendingLocalizedRebuildAfterMaintenance = false
+                            app.cachePage = nil
+                            app.preferencesController = nil
+                            if app.currentPage == 3 {
+                                app.navigate(3, force: true)
+                            }
+                        }
                     }
                 } else {
                     let count = (payload["status"] as? [String: Any])?["modelCount"] as? Int

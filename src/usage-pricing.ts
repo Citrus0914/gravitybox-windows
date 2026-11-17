@@ -213,7 +213,7 @@ async function fetchBoundedPricingFeed(initialUrl: string, signal: AbortSignal):
   }
   if (!res) throw new Error(bt('pricing.err.url_invalid'));
   if (res.status >= 300 && res.status < 400) {
-    throw new Error('Too many redirects');
+    throw new Error(bt('pricing.err.too_many_redirects'));
   }
   if (res.url) {
     const verifiedFinal = assertAllowedPricingFeedUrl(res.url);
@@ -281,7 +281,7 @@ export async function executeRemotePricingSync(options: {
       const feedVersion = (data && typeof data === 'object' && typeof data.version === 'string') ? data.version : 'unknown';
       const cmpToSynced = compareDatedFeedVersion(feedVersion, state.lastSyncedVersion);
       if (cmpToSynced !== null && cmpToSynced < 0) {
-        throw new Error(`Feed version ${feedVersion} is older than synced ${state.lastSyncedVersion}`);
+        throw new Error(bt('pricing.err.feed_version_older', { feedVersion, syncedVersion: state.lastSyncedVersion }));
       }
       const cmpToBuiltin = compareDatedFeedVersion(feedVersion, PRICING_METADATA.version);
       const isOlderDatedFeed = cmpToBuiltin !== null && cmpToBuiltin < 0;

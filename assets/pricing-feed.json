@@ -1,7 +1,7 @@
 {
-  "version": "2026-11-13",
+  "version": "2026-11-17",
   "schema": 1,
-  "updatedAt": "2026-11-13T00:00:00Z",
+  "updatedAt": "2026-11-17T00:00:00Z",
   "source": "https://raw.githubusercontent.com/Enzoo404/gravitybox/main/assets/pricing-feed.json",
   "aliases": {
     "gemini-pro-orchestrator-g1-pro": "gemini-4-argon",
@@ -15,6 +15,12 @@
     "gemini-flash-worker": "gemini-3.8-flash",
     "Gemini Flash": "gemini-3.8-flash",
     "gemini-flash": "gemini-3.8-flash",
+    "gemini-4-hydrogen-tiered": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-low": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-medium": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-high": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-xhigh": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-extra-high": "gemini-4-hydrogen",
     "MODEL_PLACEHOLDER_M667": "gemini-4-carbon",
     "MODEL_PLACEHOLDER_M668": "gemini-4-argon",
     "MODEL_PLACEHOLDER_M669": "gemini-3.8-flash",

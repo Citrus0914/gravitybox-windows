@@ -1092,6 +1092,12 @@
     "gemini-flash-worker": "gemini-3.8-flash",
     "Gemini Flash": "gemini-3.8-flash",
     "gemini-flash": "gemini-3.8-flash",
+    "gemini-4-hydrogen-tiered": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-low": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-medium": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-high": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-xhigh": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-extra-high": "gemini-4-hydrogen",
     "MODEL_PLACEHOLDER_M667": "gemini-4-carbon",
     "MODEL_PLACEHOLDER_M668": "gemini-4-argon",
     "MODEL_PLACEHOLDER_M669": "gemini-3.8-flash",
@@ -1126,6 +1132,6 @@
     "gpt-4o-mini",
     "gpt-oss-120b"
   ],
-  "pricingVersion": "2026-11-13",
-  "pricingUpdatedAt": "2026-11-13T00:00:00Z"
+  "pricingVersion": "2026-11-17",
+  "pricingUpdatedAt": "2026-11-17T00:00:00Z"
 }

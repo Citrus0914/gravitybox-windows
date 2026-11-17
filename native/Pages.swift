@@ -91,7 +91,10 @@ final class DashboardPage: NSObject {
     // Bento 双栏数据看板（左侧今日 24h 时段消耗趋势 + 右侧今日活跃模型速览）
     let todayTrendChart = UsageTrendChartView()
     let trendTitleLabel = text(L10n.t("overview.trend.title"), size: 13, weight: .semibold, color: .labelColor)
+    let trendDetailLabel = text("", size: 11, color: Design.secondary)
     let todayPeakBadge = pillBadge(L10n.t("overview.trend.24h_badge"), color: Design.inactivePill)
+    private(set) var currentTrendPoints: [UsageTrendChartView.Point] = []
+    private var hoveredTrendPoint: UsageTrendChartView.Point? = nil
     let rightBentoTitleLabel = text(L10n.t("overview.bento.active_models"), size: 13, weight: .semibold, color: .labelColor)
     let rightBentoCountBadge = pillBadge(L10n.t("overview.bento.no_calls_badge"), color: Design.inactivePill)
     let bentoRightStack = NSStackView()
@@ -211,9 +214,39 @@ final class DashboardPage: NSObject {
         trendHeader.setCustomSpacing(0, after: trendSpacer)
         trendHeader.alignment = .centerY
         trendHeader.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        todayTrendChart.useFlexibleHeight(minHeight: 84)
-        let trendCard = group([trendHeader, divider(), todayTrendChart], inset: 14, spacing: 8)
-        groupStack(trendCard)?.distribution = .fill
+
+        // 保持左右 Bento 顶栏与分割线严格等高对齐，将时段实时读数置于分割线下方图表区顶部
+        trendDetailLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
+        trendDetailLabel.lineBreakMode = .byTruncatingTail
+        trendDetailLabel.maximumNumberOfLines = 1
+        trendDetailLabel.setContentHuggingPriority(.required, for: .vertical)
+        trendDetailLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        trendDetailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        // 限制柱图最大高度避免大窗口下柱体拉得过长，余出空间由内置读数与宿主弹性留白平滑消化
+        todayTrendChart.useFlexibleHeight(minHeight: 84, maxHeight: 114)
+        let trendChartHost = NSView()
+        trendChartHost.translatesAutoresizingMaskIntoConstraints = false
+        trendChartHost.setContentHuggingPriority(NSLayoutConstraint.Priority(200), for: .vertical)
+        trendChartHost.addSubview(todayTrendChart)
+        let fillChartH = todayTrendChart.heightAnchor.constraint(equalTo: trendChartHost.heightAnchor)
+        // 必须显著低于 viewportMetricRatio(470) / tightQuotaHeight(480) / fitViewport(490)，避免限制柱图最大高度时反向抢占 Bento 高度导致 1-row FREE 无法自动展开 Top 3
+        fillChartH.priority = NSLayoutConstraint.Priority(210)
+        NSLayoutConstraint.activate([
+            trendChartHost.heightAnchor.constraint(greaterThanOrEqualToConstant: 84),
+            todayTrendChart.leadingAnchor.constraint(equalTo: trendChartHost.leadingAnchor),
+            todayTrendChart.trailingAnchor.constraint(equalTo: trendChartHost.trailingAnchor),
+            todayTrendChart.centerYAnchor.constraint(equalTo: trendChartHost.centerYAnchor),
+            todayTrendChart.topAnchor.constraint(greaterThanOrEqualTo: trendChartHost.topAnchor),
+            todayTrendChart.bottomAnchor.constraint(lessThanOrEqualTo: trendChartHost.bottomAnchor),
+            fillChartH
+        ])
+        let trendDivider = divider()
+        let trendCard = group([trendHeader, trendDivider, trendDetailLabel, trendChartHost], inset: 14, spacing: 8)
+        if let trendStack = groupStack(trendCard) {
+            trendStack.distribution = .fill
+            trendStack.setCustomSpacing(4, after: trendDetailLabel)
+        }
         trendCard.cornerRadius = Design.Radius.card
         trendCard.borderWidth = 0.5
         trendCard.borderColor = Design.border
@@ -254,6 +287,10 @@ final class DashboardPage: NSObject {
         view = dashboardScrollPage(stack, hero: heroCard, metrics: [token, cost, requests], bento: bento)
         super.init()
 
+        todayTrendChart.onHoverPoint = { [weak self] point in
+            self?.hoveredTrendPoint = point
+            self?.syncTrendDetailLabel()
+        }
         if let stickyScroll = view as? StickyHeaderScrollView {
             stickyScroll.onViewportHeightChanged = { [weak self] viewportH in
                 self?.syncBentoModelLimitForViewport(viewportH)
@@ -426,6 +463,26 @@ final class DashboardPage: NSObject {
         return box
     }
 
+    private func formatTrendDetail(_ point: UsageTrendChartView.Point) -> String {
+        if point.isFuture {
+            return L10n.t("menu_panel.hover.future", ["label": point.tooltipLabel], fallback: "\(point.tooltipLabel) · 尚未到达")
+        }
+        let tokens = InterfaceText.formatCompactTokens(point.tokens, formatSmallWithLocale: true)
+        return L10n.t("menu_panel.hover.tokens", ["label": point.tooltipLabel, "tokens": tokens], fallback: "\(point.tooltipLabel) · \(tokens) Token")
+    }
+
+    func syncTrendDetailLabel(currentHour: Int? = nil) {
+        let resolvedHour = currentHour ?? Calendar.current.component(.hour, from: Date())
+        let defaultPoint = currentTrendPoints.indices.contains(resolvedHour)
+            ? currentTrendPoints[resolvedHour]
+            : currentTrendPoints.last
+        if let target = hoveredTrendPoint ?? defaultPoint {
+            trendDetailLabel.stringValue = formatTrendDetail(target)
+        } else {
+            trendDetailLabel.stringValue = ""
+        }
+    }
+
     func updateReadinessMatrix() {
         let dashUsage = (lastSuccessfulSummary?["usage"] as? [String: Any]) ?? [:]
         let report = app.cachedUsageReportsByPeriod["today:all"]
@@ -438,7 +495,10 @@ final class DashboardPage: NSObject {
             ?? []
         let pts = UsageTrendChartView.todayPoints(hourly)
         trendTitleLabel.stringValue = L10n.t("overview.trend.title")
+        currentTrendPoints = pts
+        hoveredTrendPoint = nil
         todayTrendChart.points = pts
+        syncTrendDetailLabel()
         if let maxPt = pts.max(by: { $0.tokens < $1.tokens }), maxPt.tokens > 0 {
             let peakStr = InterfaceText.formatCompactTokens(maxPt.tokens)
             todayPeakBadge.title = L10n.t("overview.trend.peak_badge", ["label": maxPt.label, "peak": peakStr])
@@ -635,6 +695,7 @@ final class DashboardPage: NSObject {
                 if let old = self.lastSuccessfulSummary {
                     self.renderSummary(old, isStaleFallback: true)
                 } else {
+                    self.dataTimestampLabel.isHidden = false
                     self.dataTimestampLabel.stringValue = L10n.t("overview.status.fetch_failed", ["error": error.localizedDescription])
                     self.dataTimestampLabel.textColor = accessibleWarningColor()
                 }
@@ -900,6 +961,7 @@ final class DashboardPage: NSObject {
     private func renderUsageError(_ error: String) {
         let detail = Self.shortError(error)
         let retryDetail = L10n.t("overview.status.retry_later", ["detail": detail])
+        usageQualityLabel.isHidden = false
         usageQualityLabel.stringValue = L10n.t("overview.status.usage_error_banner"); usageQualityLabel.textColor = accessibleWarningColor()
         self.todayTokensMetric.stringValue = "—"
         self.todayTokensDetail.stringValue = retryDetail

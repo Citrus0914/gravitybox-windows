@@ -1241,6 +1241,8 @@
     "pricing.err.url_credentials_forbidden": "Pricing feed URL must not contain embedded credentials",
     "pricing.err.https_trusted_only": "Only trusted official HTTPS pricing feed URLs are allowed",
     "pricing.err.response_too_large": "Pricing feed response size exceeds safety limit",
+    "pricing.err.too_many_redirects": "Pricing feed exceeded redirect limit",
+    "pricing.err.feed_version_older": "Feed version {feedVersion} is older than synced {syncedVersion}",
     "pricing.err.usage_or_rate_invalid": "Invalid usage count or pricing rate",
     "pricing.err.cache_write_unconfigured": "Cache write rate is not configured",
     "pricing.err.interval_entry_invalid": "Invalid pricing interval entry: {key}",

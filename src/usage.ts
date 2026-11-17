@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { atomicJson, atomicText } from './files.js';
-import { bt } from './i18n.js';
+import { bt, getActiveLocale } from './i18n.js';
 import { createModelQueryMatcher, formatLocalDate, isUnpricedZeroSentinel, type LedgerSnapshot } from './usage-aggregate.js';
 import { UsageLedger, type LedgerEvent } from './usage-ledger.js';
 import {
@@ -98,6 +98,7 @@ export class UsageStatsManager {
   private usageLedgerLoading?: Promise<void>;
   private usageLedgerDirty = false;
   private usageLedgerEvents = new Map<string, LedgerEvent>();
+  private legacyKeyIndex = new Map<string, Set<string>>();
   private pendingLedgerEvents = new Map<string, LedgerEvent>();
   private largeLedger = false;
   private largeLedgerBaselinePresent = false;
@@ -597,7 +598,7 @@ export class UsageStatsManager {
         }
         if (event.account_confidence === 'legacy') this.storageWarnings.add(bt('usage.warn.legacy_account_confidence'));
         event.model = resolveDatabaseModelFullName(event.model, null);
-        this.usageLedgerEvents.set(event.event_key!, event);
+        this.setLedgerEventInMap(event.event_key!, event);
       }
       this.usageLedgerLoaded = true;
     } catch (error) {
@@ -619,6 +620,43 @@ export class UsageStatsManager {
     }
   }
 
+  private setLedgerEventInMap(key: string, event: LedgerEvent): void {
+    const prev = this.usageLedgerEvents.get(key);
+    if (prev?.legacy_event_key && prev.legacy_event_key !== event.legacy_event_key) {
+      const oldSet = this.legacyKeyIndex.get(prev.legacy_event_key);
+      if (oldSet) {
+        oldSet.delete(key);
+        if (oldSet.size === 0) this.legacyKeyIndex.delete(prev.legacy_event_key);
+      }
+    }
+    this.usageLedgerEvents.set(key, event);
+    if (event.legacy_event_key) {
+      let nextSet = this.legacyKeyIndex.get(event.legacy_event_key);
+      if (!nextSet) {
+        nextSet = new Set<string>();
+        this.legacyKeyIndex.set(event.legacy_event_key, nextSet);
+      }
+      nextSet.add(key);
+    }
+  }
+
+  private deleteLedgerEventFromMap(key: string): void {
+    const prev = this.usageLedgerEvents.get(key);
+    if (prev?.legacy_event_key) {
+      const oldSet = this.legacyKeyIndex.get(prev.legacy_event_key);
+      if (oldSet) {
+        oldSet.delete(key);
+        if (oldSet.size === 0) this.legacyKeyIndex.delete(prev.legacy_event_key);
+      }
+    }
+    this.usageLedgerEvents.delete(key);
+  }
+
+  private clearLedgerEventsMap(): void {
+    this.usageLedgerEvents.clear();
+    this.legacyKeyIndex.clear();
+  }
+
   private upsertLedger(event: LedgerEvent): void {
     const key = event.event_key;
     if (!key || event.db_file === 'recovered_session.db' || event.db_file === 'recovered_enterprise_session.db') return;
@@ -626,20 +664,25 @@ export class UsageStatsManager {
     let previous = sameKeyPrev;
     const migratedFromKeys: string[] = [];
     if (event.legacy_event_key) {
+      const indexedKeys = this.legacyKeyIndex.get(event.legacy_event_key);
       const legacyCandidates: Array<[string, LedgerEvent]> = [];
-      for (const [oldKey, candidate] of this.usageLedgerEvents.entries()) {
-        if (
-          oldKey !== key &&
-          candidate.legacy_event_key === event.legacy_event_key &&
-          (!event.db_file || !candidate.db_file || candidate.db_file === event.db_file)
-        ) {
-          legacyCandidates.push([oldKey, candidate]);
+      if (indexedKeys) {
+        for (const oldKey of indexedKeys) {
+          if (oldKey === key) continue;
+          const candidate = this.usageLedgerEvents.get(oldKey);
+          if (
+            candidate &&
+            candidate.legacy_event_key === event.legacy_event_key &&
+            (!event.db_file || !candidate.db_file || candidate.db_file === event.db_file)
+          ) {
+            legacyCandidates.push([oldKey, candidate]);
+          }
         }
       }
       legacyCandidates.sort((a, b) => (a[1].source_observed_at ?? 0) - (b[1].source_observed_at ?? 0));
       for (const [oldKey, candidate] of legacyCandidates) {
         migratedFromKeys.push(oldKey);
-        this.usageLedgerEvents.delete(oldKey);
+        this.deleteLedgerEventFromMap(oldKey);
         this.pendingLedgerEvents.delete(oldKey);
         if (this.rateLocks[oldKey] && !this.rateLocks[key]) {
           this.rateLocks[key] = this.rateLocks[oldKey]!;
@@ -686,7 +729,7 @@ export class UsageStatsManager {
       }
     }
     if (sameKeyPrev && migratedFromKeys.length === 0 && ledgerEventsEqual(sameKeyPrev, next)) return;
-    this.usageLedgerEvents.set(key, next);
+    this.setLedgerEventInMap(key, next);
     if (this.usageLedgerEvents.size > 50_000) this.largeLedger = true;
     this.pendingLedgerEvents.set(key, next);
     this.usageLedgerDirty = true;
@@ -739,7 +782,7 @@ export class UsageStatsManager {
       await this.saveUsageLedger();
     }
     if (this.largeLedger) {
-      this.usageLedgerEvents.clear();
+      this.clearLedgerEventsMap();
     }
     this.invalidateCache();
     return { captured };
@@ -820,7 +863,7 @@ export class UsageStatsManager {
     return resolvePricingFromTable(pricingTable, modelName, timestampSeconds);
   }
 
-  private calendarKey() { const d=new Date();return formatLocalDate(d)+':'+d.getTimezoneOffset()+':'+Intl.DateTimeFormat().resolvedOptions().timeZone; }
+  private calendarKey() { const d=new Date();return formatLocalDate(d)+':'+d.getTimezoneOffset()+':'+Intl.DateTimeFormat().resolvedOptions().timeZone+':'+getActiveLocale(); }
 
   async getRawPricingCatalog(): Promise<{ raw: Record<string, ApiPricingEntry>; publicKeys: Set<string> }> {
     const { merged, warnings, publicKeys } = await loadRawPricingTable(this.remotePricingCachePath, this.pricingCachePath);
@@ -1235,7 +1278,7 @@ export class UsageStatsManager {
           if (this.ledgerUnavailable) {
             for (const ev of res.events) allEvents.push(ev);
           } else {
-            this.usageLedgerEvents.clear();
+            this.clearLedgerEventsMap();
           }
         }
       } else {
@@ -1250,7 +1293,7 @@ export class UsageStatsManager {
             if (this.ledgerUnavailable) {
               for (const ev of batch) allEvents.push(ev);
             } else {
-              this.usageLedgerEvents.clear();
+              this.clearLedgerEventsMap();
             }
           }
         }
@@ -1356,7 +1399,7 @@ export class UsageStatsManager {
       this.lastAggregationKeysByAccount.set(accKey, JSON.stringify([ledgerVersion, this.calendarKey(), rawPricing, accountId ?? 'all', this.knownAccounts]));
       this.cachedSummariesByAccount.set(accKey, { data: result, expiresAt: Date.now() + (failedDatabasesCount > 0 ? 2000 : 30000) });
       this.periodKey = this.calendarKey();
-      this.usageLedgerEvents.clear();
+      this.clearLedgerEventsMap();
       this.pruneSnapshots();
       return result;
     }

@@ -593,6 +593,7 @@ async function run() {
   };
   const applyLocalePreference = async (requested: string, resolved: ReturnType<typeof resolveLocale>) => {
     setActiveLocale(resolved);
+    usageManager.invalidateCache();
     const nextDictInfo = await resolveDictionaryForLocale(baseDir, resolved);
     await store.setBaseDir(nextDictInfo.baseDir);
     const shouldTranslate = resolved !== 'en' && nextDictInfo.hasTargetDictionary;

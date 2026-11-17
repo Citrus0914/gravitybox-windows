@@ -57,6 +57,8 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
     let pageNumber = PageNumberField(string: "1")
     let pageCount = text(L10n.t("usage_log.page_count", ["pages": 1]), size: 11, color: Design.secondary)
     var listScope = ""
+    private var listScopeFromBackend = false
+    private var lastReadErrorMessage: String?
     let refreshButton = InlineRefreshButton(L10n.t("common.refresh"), width: 76, target: nil, action: #selector(reloadSnapshot))
     let exportButton = button(L10n.t("usage.export_btn"), target: nil, action: #selector(exportRows))
     private let headerTitleLabel = text(L10n.t("usage_log.title"), size: 18, weight: .semibold)
@@ -173,13 +175,29 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         clearFiltersButton.title = L10n.t("usage_log.clear_filters")
         clearFiltersButton.setAccessibilityLabel(L10n.t("usage_log.clear_filters_a11y"))
         pageNumber.setAccessibilityLabel(L10n.t("usage_log.page_a11y"))
+        if !listScopeFromBackend && !listScope.isEmpty {
+            listScope = L10n.t("usage_log.scope.default")
+        }
         let pages = max(1, (total + 199) / 200)
         pageCount.stringValue = L10n.t("usage_log.page_count", ["pages": InterfaceText.formatInteger(pages)])
         if loading {
             status.stringValue = L10n.t("usage_log.loading")
+        } else if let err = lastReadErrorMessage {
+            status.stringValue = L10n.t("usage_log.status.read_failed", ["error": err])
+        } else if rows.isEmpty {
+            if filterActive {
+                status.stringValue = L10n.t("usage_log.status.no_match")
+            } else if total == 0 {
+                status.stringValue = L10n.t("usage_log.status.no_records_period")
+            } else if offset > 0 {
+                status.stringValue = L10n.t("usage_log.status.page_empty", ["total": InterfaceText.formatInteger(total)])
+            } else {
+                status.stringValue = L10n.t("usage_log.status.total", ["total": InterfaceText.formatInteger(total)])
+            }
         } else {
             status.stringValue = pageStatus()
         }
+        updateEmptyState(failed: lastReadErrorMessage != nil)
         table.reloadData()
     }
     func show(in window: NSWindow, onDismiss: @escaping () -> Void) {
@@ -304,8 +322,10 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
             switch response {
             case .failure(let error):
                 self.snapshotID = nil
+                self.lastReadErrorMessage = error.localizedDescription
                 self.rows = []; self.table.reloadData(); self.status.stringValue = L10n.t("usage_log.status.read_failed", ["error": error.localizedDescription]); self.status.textColor = accessibleDangerColor(); self.emptyTitle.stringValue = L10n.t("usage_log.empty.failed"); self.updateEmptyState(failed:true)
             case .success(let value):
+                self.lastReadErrorMessage = nil
                 self.snapshotID = value["snapshot_id"] as? String
                 self.rows = value["rows"] as? [[String: Any]] ?? []; self.total = intVal(value, "total")
                 let animateTable = Design.shouldAnimate(in: self.table)
@@ -325,7 +345,9 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
                 }
                 self.previous.isEnabled = self.offset > 0; self.next.isEnabled = self.offset + self.rows.count < self.total
                 self.status.textColor = Design.secondary
-                let scope = value["scope"] as? String ?? L10n.t("usage_log.scope.default")
+                let rawScope = (value["scope"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                self.listScopeFromBackend = !rawScope.isEmpty
+                let scope = rawScope.isEmpty ? L10n.t("usage_log.scope.default") : rawScope
                 self.listScope = scope; self.pageNumber.stringValue = "\(self.offset / 200 + 1)"; self.pageNumber.isEnabled = self.total > 0; self.pageNumber.needsDisplay = true; self.pageCount.stringValue = L10n.t("usage_log.page_count", ["pages": InterfaceText.formatInteger(max(1, (self.total + 199) / 200))])
                 if self.rows.isEmpty {
                     // F08: never print "N 个 · 0 条 · 当前 0–0"; the footer must match the empty state.

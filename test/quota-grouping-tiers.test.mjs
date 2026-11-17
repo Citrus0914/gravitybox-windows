@@ -861,6 +861,69 @@ test('P0-04 & P1-16 & P2-20: 订阅到期 PRO/ULTRA->FREE 真实降级同步、�
   assert.equal(summaryProjected.credentialReadiness.state, 'ready');
 });
 
+test('1.1.1 终审回归: computeAccountRemaining 含 Argon 别名对齐与云端不完整刷新防套餐误降级', async t => {
+  const { manager, acc } = await createTempManager(t);
+  const nowMs = Date.now();
+  const nowSec = Math.floor(nowMs / 1000);
+  const reset5h = new Date(nowMs + 3 * 3600 * 1000).toISOString();
+  const resetWeekly = new Date(nowMs + 5 * 86400 * 1000).toISOString();
+
+  acc.quota = {
+    subscription_tier: 'PRO',
+    source: 'cloud',
+    last_updated: nowSec - 120,
+    is_forbidden: false,
+    model_forwarding_rules: {},
+    quota_groups: [
+      {
+        display_name: 'Gemini Models',
+        family: 'gemini',
+        buckets: [{ bucket_id: 'g-5h', window: '5h', remaining_fraction: 0.75, remaining_fraction_known: true, reset_time: reset5h, observed_at: nowSec, source: 'cloud' }],
+      },
+      {
+        display_name: 'Gemini 4 Argon',
+        family: 'argon',
+        buckets: [{ bucket_id: 'a-wk', window: 'weekly', remaining_fraction: 0.35, remaining_fraction_known: true, reset_time: resetWeekly, observed_at: nowSec, source: 'cloud' }],
+      },
+    ],
+    models: [
+      { name: 'gemini-3.8-flash', model_id: 'gemini-3.8-flash', family: 'gemini', percentage: 75, percentage_known: true, own_percentage: 75, own_percentage_known: true, own_reset_time: reset5h, own_observed_at: nowSec, reset_time: reset5h },
+      { name: 'gemini-4-argon', model_id: 'gemini-4-argon', family: 'argon', is_argon: true, quota_bucket_name: 'Gemini 4 Argon', percentage: 35, percentage_known: true, own_percentage: 35, own_percentage_known: true, own_reset_time: resetWeekly, own_observed_at: nowSec, reset_time: resetWeekly },
+    ],
+  };
+  await manager.saveAccount(acc);
+
+  // 1. P1-12: 含 Argon 的中英文全系别名与 gemini_all 结果严格一致
+  assert.equal(computeAccountRemaining(acc, 'Gemini 全系（含 Argon）'), 35);
+  assert.equal(computeAccountRemaining(acc, 'All Gemini (incl. Argon)'), 35);
+
+  // 2. P1-9: 云端生产端点失败仅 fallback 端点返回且 loadCodeAssist 临时返回 Starter/Free 时（complete=false），保留原 PRO 不误降级
+  const partialRefreshed = await manager.refreshQuota(acc.id, async (url) => {
+    const u = String(url);
+    if (u.includes('cloudcode-pa.googleapis.com') && !u.includes('daily-cloudcode-pa')) {
+      return new Response('Service Unavailable', { status: 503 });
+    }
+    if (u.includes('loadCodeAssist')) {
+      return Response.json({ currentTier: { id: 'starter', name: 'Starter' } });
+    }
+    if (u.includes('fetchAvailableModels')) {
+      return Response.json({
+        models: {
+          'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash', quotaInfo: { remainingFraction: 0.70, resetTime: reset5h } },
+        },
+      });
+    }
+    return Response.json({
+      groups: [
+        { displayName: 'Gemini Models', buckets: [{ bucketId: 'g-5h', window: '5h', remainingFraction: 0.70, resetTime: reset5h }] },
+      ],
+    });
+  });
+  assert.equal(partialRefreshed.quota?.refresh_state?.complete, false);
+  assert.equal(partialRefreshed.quota?.subscription_tier, 'PRO', '不完整云端回退刷新不得把已存 PRO 误降级为 FREE');
+});
+
+
 
 
 

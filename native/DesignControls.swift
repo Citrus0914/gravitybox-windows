@@ -633,7 +633,11 @@ final class DesignSegmentedControl: NSControl {
         let btn = segmentButtons[segment]
         btn.title = label
         btn.setAccessibilityLabel(label)
+        btn.updateMinimumWidth()
         btn.needsDisplay = true
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+        needsDisplay = true
     }
 
     var selectedSegment: Int {
@@ -649,6 +653,7 @@ final class DesignSegmentedControl: NSControl {
         var isSelectedSegment = false { didSet { if oldValue != isSelectedSegment { needsDisplay = true } } }
         private var hoverTracking: NSTrackingArea?
         var hovered = false { didSet { if oldValue != hovered { needsDisplay = true } } }
+        private var minWidthConstraint: NSLayoutConstraint?
 
         init(title: String, index: Int, target: AnyObject?, action: Selector) {
             self.index = index
@@ -665,9 +670,17 @@ final class DesignSegmentedControl: NSControl {
             setAccessibilityLabel(title)
             let w = ceil((title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold)]).width) + 22
             translatesAutoresizingMaskIntoConstraints = false
-            widthAnchor.constraint(greaterThanOrEqualToConstant: max(54, w)).isActive = true
+            let widthConstraint = widthAnchor.constraint(greaterThanOrEqualToConstant: max(54, w))
+            widthConstraint.isActive = true
+            self.minWidthConstraint = widthConstraint
         }
         required init?(coder: NSCoder) { fatalError() }
+
+        func updateMinimumWidth() {
+            let w = ceil((title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold)]).width) + 22
+            minWidthConstraint?.constant = max(54, w)
+            invalidateIntrinsicContentSize()
+        }
 
         override func updateTrackingAreas() {
             super.updateTrackingAreas()

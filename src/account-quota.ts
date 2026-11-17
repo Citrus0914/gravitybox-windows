@@ -909,7 +909,12 @@ export function computeAccountRemaining(account: Account, monitoredModel = 'all'
   const isCarbonTarget = trimmed === 'carbon' || trimmed === 'gemini 4 carbon' || trimmed === 'gemini-4-carbon';
   const isClaudeTarget = trimmed === 'claude' || trimmed === '3p' || trimmed === 'claude/gpt' || trimmed === 'gpt';
   const isGeminiTarget = trimmed === 'gemini';
-  const isGeminiAllTarget = trimmed === 'gemini_all' || trimmed === 'gemini 全系模型' || trimmed === 'all gemini models';
+  const isGeminiAllTarget =
+    trimmed === 'gemini_all'
+    || trimmed === 'gemini 全系模型'
+    || trimmed === 'all gemini models'
+    || trimmed === 'gemini 全系（含 argon）'
+    || trimmed === 'all gemini (incl. argon)';
   const isAllTarget = !trimmed || trimmed === 'all';
 
   const resolveStandaloneRemaining = (status: ArgonStatus): number | null => {

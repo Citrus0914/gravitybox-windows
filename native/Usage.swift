@@ -81,7 +81,7 @@ final class UsagePage: NSObject {
         root.addArrangedSubview(group([trend]))
         costTitle.font = .systemFont(ofSize: 13, weight: .semibold)
         usdMetric.font = .monospacedDigitSystemFont(ofSize: 24, weight: .semibold)
-        donutLegendStack.orientation = .vertical; donutLegendStack.alignment = .leading; donutLegendStack.spacing = 8
+        donutLegendStack.orientation = .vertical; donutLegendStack.alignment = .leading; donutLegendStack.spacing = 5
         donutLegendStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let costHeading = horizontal([costTitle, flexibleSpace(), usdMetric], spacing: 8)
         costHeading.alignment = .centerY
@@ -90,8 +90,23 @@ final class UsagePage: NSObject {
         donutBody.alignment = .centerY
         donutLegendStack.translatesAutoresizingMaskIntoConstraints = false
         donutLegendStack.widthAnchor.constraint(equalTo: donutBody.widthAnchor, constant: -114).isActive = true
+        let donutBodyHost = NSView()
+        donutBodyHost.translatesAutoresizingMaskIntoConstraints = false
+        donutBodyHost.setContentHuggingPriority(NSLayoutConstraint.Priority(200), for: .vertical)
+        donutBodyHost.addSubview(donutBody)
+        let donutBodyTight = donutBodyHost.heightAnchor.constraint(equalTo: donutBody.heightAnchor)
+        donutBodyTight.priority = NSLayoutConstraint.Priority(210)
+        NSLayoutConstraint.activate([
+            donutBody.leadingAnchor.constraint(equalTo: donutBodyHost.leadingAnchor),
+            donutBody.trailingAnchor.constraint(equalTo: donutBodyHost.trailingAnchor),
+            donutBody.centerYAnchor.constraint(equalTo: donutBodyHost.centerYAnchor),
+            donutBody.topAnchor.constraint(greaterThanOrEqualTo: donutBodyHost.topAnchor),
+            donutBody.bottomAnchor.constraint(lessThanOrEqualTo: donutBodyHost.bottomAnchor),
+            donutBodyTight
+        ])
         usdDetail.isHidden = true
-        let donutContent = vertical([costHeading, divider(), donutBody, usdDetail], spacing: 12)
+        let donutContent = vertical([costHeading, divider(), donutBodyHost, usdDetail], spacing: 12)
+        donutContent.detachesHiddenViews = true
         for row in donutContent.arrangedSubviews { fillWidth(row, in: donutContent) }
 
         requestsMetric.font = .monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
@@ -108,8 +123,38 @@ final class UsagePage: NSObject {
         cacheHeading.alignment = .centerY
         let cacheStats = vertical([cacheHeading, cacheTrack], spacing: 8)
         fillWidth(cacheHeading, in: cacheStats); fillWidth(cacheTrack, in: cacheStats)
-        let requestContent = vertical([requestHeading, divider(), requestStats, divider(), cacheStats], spacing: 14)
+
+        // 当左侧费用卡因 5 行图例变高时，将额外纵向空间对称平分给「请求总数」与「缓存命中率」两个区块的上下留白，消除底部大块空白
+        func makeBalancedSlot(for content: NSView) -> (host: NSView, padGuide: NSLayoutGuide) {
+            let host = NSView()
+            host.translatesAutoresizingMaskIntoConstraints = false
+            host.setContentHuggingPriority(NSLayoutConstraint.Priority(200), for: .vertical)
+            let topPad = NSLayoutGuide()
+            let bottomPad = NSLayoutGuide()
+            host.addLayoutGuide(topPad)
+            host.addLayoutGuide(bottomPad)
+            host.addSubview(content)
+            content.translatesAutoresizingMaskIntoConstraints = false
+            let zeroPad = topPad.heightAnchor.constraint(equalToConstant: 0)
+            zeroPad.priority = NSLayoutConstraint.Priority(210)
+            NSLayoutConstraint.activate([
+                topPad.topAnchor.constraint(equalTo: host.topAnchor),
+                content.topAnchor.constraint(equalTo: topPad.bottomAnchor),
+                bottomPad.topAnchor.constraint(equalTo: content.bottomAnchor),
+                bottomPad.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+                topPad.heightAnchor.constraint(equalTo: bottomPad.heightAnchor),
+                content.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+                zeroPad
+            ])
+            return (host, topPad)
+        }
+        let requestSlot = makeBalancedSlot(for: requestStats)
+        let cacheSlot = makeBalancedSlot(for: cacheStats)
+
+        let requestContent = vertical([requestHeading, divider(), requestSlot.host, divider(), cacheSlot.host], spacing: 12)
         for row in requestContent.arrangedSubviews { fillWidth(row, in: requestContent) }
+        requestSlot.padGuide.heightAnchor.constraint(equalTo: cacheSlot.padGuide.heightAnchor).isActive = true
         let costCard = group([donutContent], inset: 15); let requestCard = group([requestContent], inset: 15); requestCard.identifier = NSUserInterfaceItemIdentifier("requests-cache-card")
         let middle = horizontal([costCard, requestCard], spacing: 12); middle.distribution = .fill; middle.alignment = .top
         costCard.heightAnchor.constraint(equalTo: requestCard.heightAnchor).isActive = true
@@ -228,7 +273,7 @@ final class UsagePage: NSObject {
         }
     }
 
-    private func applyUsagePayload(_ value: [String: Any], period: String, segIdx: Int, requestKey: String) {
+    func applyUsagePayload(_ value: [String: Any], period: String, segIdx: Int, requestKey: String) {
         guard UsageQueryIdentity(period: period).matches(value) else {
             self.statusSummary.stringValue = L10n.t("usage.error.period_mismatch")
             self.statusSummary.textColor = accessibleWarningColor()
@@ -250,9 +295,14 @@ final class UsagePage: NSObject {
             for label in [self.totalTokensMetric, self.usdMetric, self.cacheRateMetric, self.requestsMetric] { label.stringValue = "—" }
             self.tokensDetail.stringValue = L10n.t("usage.unavailable.tokens")
             self.usdDetail.stringValue = L10n.t("usage.unavailable.cost")
+            self.usdDetail.textColor = .secondaryLabelColor
+            self.usdDetail.isHidden = false
             self.requestsDetail.stringValue = L10n.t("usage.unavailable.requests")
             self.cacheRateDetail.stringValue = L10n.t("usage.unavailable.cache")
+            self.cacheTrack.update(percent: 0)
             self.modelRows = []; self.trendChart.points = []; self.donutChart.slices = []
+            self.donutChart.isHidden = true
+            self.modelsCountLabel.stringValue = ""
             self.modelsBreakdownStack.arrangedSubviews.forEach { self.modelsBreakdownStack.removeArrangedSubview($0); $0.removeFromSuperview() }
             self.statusSummary.stringValue = L10n.t("usage.unavailable.banner"); self.statusSummary.textColor = accessibleWarningColor(); self.footerBox.isHidden = false
             return
@@ -464,7 +514,7 @@ final class UsagePage: NSObject {
             valLbl.lineBreakMode = .byTruncatingTail
             valLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             valLbl.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
-            let details = vertical([nameLbl, valLbl], spacing: 2)
+            let details = vertical([nameLbl, valLbl], spacing: 1.5)
             fillWidth(nameLbl, in: details); fillWidth(valLbl, in: details)
             let dotWrap = NSView()
             dotWrap.translatesAutoresizingMaskIntoConstraints = false

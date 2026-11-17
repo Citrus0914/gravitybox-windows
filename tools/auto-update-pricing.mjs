@@ -220,6 +220,48 @@ export function hasPendingFutureInterval(entry, nowMs = Date.now()) {
   });
 }
 
+function getPendingFutureIntervals(entry, nowMs = Date.now()) {
+  const intervals = Array.isArray(entry) ? entry : entry?.intervals;
+  if (!Array.isArray(intervals)) return [];
+  return intervals.filter((iv) => {
+    const f = iv?.validFrom ? Date.parse(iv.validFrom) : NaN;
+    return Number.isFinite(f) && f > nowMs;
+  });
+}
+
+function tupleMatchesRate(rate, inputVal, outputVal, cachedVal, cacheWriteVal) {
+  if (!rate) return false;
+  if (!ratesClose(rate.input, inputVal) || !ratesClose(rate.output, outputVal)) return false;
+  if (Number.isFinite(cachedVal) && !ratesClose(rate.cached, cachedVal)) return false;
+  if (rate.cacheWrite !== undefined && Number.isFinite(cacheWriteVal) && !ratesClose(rate.cacheWrite, cacheWriteVal)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 若本地已预设未来区间且上游出现的差异正好吻合该预设未来区间（同时未出现未预期的其它价格偏离），
+ * 说明属于已知且已排期生效的过渡期定价，无需每日重复报黄灯。
+ */
+export function isAccountedByFutureInterval({ local, entry, officialValid, official, litellm, nowMs = Date.now() }) {
+  const futureIntervals = getPendingFutureIntervals(entry, nowMs);
+  if (futureIntervals.length === 0) return false;
+
+  return futureIntervals.some((iv) => {
+    const officialMatchesLocalOrFuture =
+      !officialValid ||
+      tupleMatchesRate(local, official.inputPer1M, official.outputPer1M, official.cachedPer1M, official.cacheWritePer1M) ||
+      tupleMatchesRate(iv, official.inputPer1M, official.outputPer1M, official.cachedPer1M, official.cacheWritePer1M);
+
+    const litellmMatchesLocalOrFuture =
+      !litellm ||
+      tupleMatchesRate(local, litellm.input, litellm.output, litellm.cached, litellm.cacheWrite) ||
+      tupleMatchesRate(iv, litellm.input, litellm.output, litellm.cached, litellm.cacheWrite);
+
+    return officialMatchesLocalOrFuture && litellmMatchesLocalOrFuture;
+  });
+}
+
 export function ratesClose(a, b, tolerance = CONSENSUS_TOLERANCE) {
   if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
   const diff = Math.abs(a - b);
@@ -358,11 +400,12 @@ export async function extractPricesWithGemini({ url, vendor, cleanText, targetMo
       if (!res.ok) {
         const text = await res.text().catch(() => '');
         const err = new Error(`Gemini API HTTP ${res.status}: ${text.slice(0, 200)}`);
-        if (res.status === 429 || res.status >= 500) {
+        if (res.status === 408 || res.status === 429 || res.status >= 500) {
           lastError = err;
           await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
           continue;
         }
+        err.nonRetryable = true;
         throw err;
       }
       const payload = await res.json();
@@ -375,6 +418,7 @@ export async function extractPricesWithGemini({ url, vendor, cleanText, targetMo
       return parsed;
     } catch (err) {
       lastError = err;
+      if (err?.nonRetryable) throw err;
       if (attempt < 2) await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
     }
   }
@@ -423,6 +467,10 @@ export function evaluateModelConsensus({
         !ratesClose(local.cacheWrite, litellm.cacheWrite)));
 
   if (!officialDiffers && !litellmDiffers) {
+    return { key, status: 'unchanged', local, official, litellm, openrouter };
+  }
+
+  if (isAccountedByFutureInterval({ local, entry: localEntry, officialValid, official, litellm, nowMs })) {
     return { key, status: 'unchanged', local, official, litellm, openrouter };
   }
 
@@ -789,6 +837,7 @@ export async function runAutoUpdatePricing(options = {}) {
   try {
     const res = await fetchImpl(LITELLM_URL, { signal: AbortSignal.timeout(12_000) });
     if (res.ok) litellmMap = parseLiteLlmRates(await res.json());
+    else pageAlerts.push(`[LiteLLM] http_${res.status}: ${LITELLM_URL}`);
   } catch (err) {
     pageAlerts.push(`[LiteLLM] unreachable: ${err?.message ?? err}`);
   }
@@ -797,6 +846,7 @@ export async function runAutoUpdatePricing(options = {}) {
   try {
     const res = await fetchImpl(OPENROUTER_URL, { signal: AbortSignal.timeout(12_000) });
     if (res.ok) openrouterMap = parseOpenRouterRates(await res.json());
+    else pageAlerts.push(`[OpenRouter] http_${res.status}: ${OPENROUTER_URL}`);
   } catch (err) {
     pageAlerts.push(`[OpenRouter] unreachable: ${err?.message ?? err}`);
   }
@@ -847,13 +897,16 @@ export async function runAutoUpdatePricing(options = {}) {
     filesModified = true;
   }
 
-  // 6. 决策分流：no_change / green_auto_merge / yellow_needs_review
-  // 注：newModelsRadar 仅作信息雷达展示，不阻断已入库模型经过双源共识核实的自动合入
+  // 6. 决策分流：no_change / green_auto_merge / yellow_needs_review / fetch_failed
+  // 注：newModelsRadar 仅作信息雷达展示，不阻断已入库模型经过双源共识核实的自动合入；
+  // 若上游抓取存在异常告警且未产生绿/黄结论，返回 fetch_failed 防止工作流误关既有漂移告警 Issue
   let decision = 'no_change';
   if (yellowItems.length > 0 || expiring.length > 0) {
     decision = 'yellow_needs_review';
   } else if (greenUpdates.length > 0) {
     decision = 'green_auto_merge';
+  } else if (pageAlerts.length > 0) {
+    decision = 'fetch_failed';
   }
 
   const reviewRows = [...yellowItems, ...newModelsRadar.map((n) => ({ ...n, key: n.model, local: null, reasons: [n.note] }))].map(
@@ -907,6 +960,14 @@ export async function runAutoUpdatePricing(options = {}) {
           '#### Expiring Promotional Intervals',
           '',
           ...expiring.map((e) => `- \`${e.key}\`: validUntil \`${e.validUntil}\``),
+          '',
+        ]
+      : []),
+    ...(pageAlerts.length > 0
+      ? [
+          '#### Upstream Fetch Alerts',
+          '',
+          ...pageAlerts.map((a) => `- ${a}`),
           '',
         ]
       : []),

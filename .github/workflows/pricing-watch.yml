@@ -199,7 +199,7 @@ jobs:
                   body,
                 });
               }
-            } else if (match) {
+            } else if (match && process.env.DECISION !== 'fetch_failed') {
               const closeReason = process.env.MERGED === 'true'
                 ? '双源共识核验通过并已自动合入 `main`，上游价格分歧已消除，自动关闭本 Issue。'
                 : '当前所有受监控模型价格已与官网及 LiteLLM 保持一致，自动关闭本 Issue。';

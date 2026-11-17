@@ -99,6 +99,8 @@ test('资产与别名映射：ACTIVE_MODEL_KEYS 为 7 款，新增 orchestrator-
   assert.equal(FEED_MODEL_KEYS.length, 18);
   assert.equal(matchPricingKeys('gemini-pro-orchestrator-argon'), 'gemini-4-argon');
   assert.equal(matchPricingKeys('MODEL_PLACEHOLDER_M681'), 'gemini-4-argon');
+  assert.equal(matchPricingKeys('gemini-4-hydrogen-tiered-high'), 'gemini-4-hydrogen');
+  assert.equal(matchPricingKeys('gemini-4-hydrogen-tiered-xhigh'), 'gemini-4-hydrogen');
 
   for (const internalId of [
     'chat_20706',
@@ -109,6 +111,7 @@ test('资产与别名映射：ACTIVE_MODEL_KEYS 为 7 款，新增 orchestrator-
     'gemini-4-argon-trial',
     'gemini-3.8-flash-control',
     'gemini-3.8-flash-tiered',
+    'gemini-4-hydrogen-tiered-high',
     'gemini-2.5-flash-image',
   ]) {
     assert.equal(isInternalNonChatModelId(internalId), true, `${internalId} 必须判定为内部非对话模型`);

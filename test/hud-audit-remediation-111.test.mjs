@@ -1327,3 +1327,201 @@ test('P1-04 & P2-04: AntigravityHudManager 隔离嵌套子分栏/工具卡/语�
     mgr.dispose();
   }
 });
+
+test('1.1.1 终审回归: conversation_summaries.db 10 子代理精确发现、分批 runningSubagentCount=1、subagents/tasks 合并态、reconcile 重绑 ResizeObserver、未定价前缀与 status=4 中止', async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-111-batch2-'));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const convDir = path.join(baseDir, 'conversations');
+  fs.mkdirSync(convDir, { recursive: true });
+
+  const mainId = '10101010-1111-4111-8111-101010101010';
+  const childIds = Array.from({ length: 10 }, (_, idx) => {
+    const suffix = String(idx + 1).padStart(2, '0');
+    return `20202020-2222-4222-8222-2020202020${suffix}`;
+  });
+
+  const summariesDbPath = path.join(baseDir, 'conversation_summaries.db');
+  const summariesDb = new DatabaseSync(summariesDbPath);
+  t.after(() => {
+    try {
+      summariesDb.close();
+    } catch {}
+  });
+  summariesDb.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE conversation_parents (
+      child_id TEXT PRIMARY KEY,
+      parent_id TEXT NOT NULL
+    );
+    CREATE INDEX idx_conversation_parents_parent ON conversation_parents(parent_id);
+    CREATE TABLE conversation_summaries (
+      id TEXT PRIMARY KEY,
+      status TEXT,
+      updated_at INTEGER
+    );
+  `);
+  const insertParent = summariesDb.prepare('INSERT INTO conversation_parents (child_id, parent_id) VALUES (?, ?)');
+  const insertSummary = summariesDb.prepare('INSERT INTO conversation_summaries (id, status, updated_at) VALUES (?, ?, ?)');
+  childIds.forEach((cid, i) => {
+    insertParent.run(cid, mainId);
+    const st = i === 0 ? 'CASCADE_RUN_STATUS_RUNNING' : i <= 5 ? 'CASCADE_RUN_STATUS_IDLE' : 'CASCADE_RUN_STATUS_KILLED';
+    insertSummary.run(cid, st, 2000 + i);
+  });
+
+  const { db: mainDb } = createWalDb(t, convDir, mainId);
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(
+    Buffer.from(seconds(1, 2000))
+  );
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (1, 132, 1, ?)').run(
+    Buffer.from([
+      ...seconds(1, 2001),
+      ...message(4, [...string(2, 'invoke_subagent'), ...string(3, JSON.stringify({ conversation_id: childIds[1] }))]),
+    ])
+  );
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (2, 132, 1, ?)').run(
+    Buffer.from([
+      ...seconds(1, 2010),
+      ...message(4, [...string(2, 'invoke_subagent'), ...string(3, JSON.stringify({ conversation_id: childIds[0] }))]),
+    ])
+  );
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (3, 15, 3, ?)').run(
+    Buffer.from([...seconds(1, 2011), ...seconds(7, 2015), ...string(12, 'exec-priced')])
+  );
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (4, 15, 3, ?)').run(
+    Buffer.from([...seconds(1, 2016), ...seconds(7, 2019), ...string(12, 'exec-unpriced')])
+  );
+  const gPriced = generationBlob({
+    indices: [3],
+    execution: 'exec-priced',
+    responseModel: 'claude-sonnet-4-6',
+    modelDisplayName: 'Claude Sonnet 4.6',
+    modelEnum: 101,
+    rawInputTokens: 10_000,
+    cachedReadTokens: 0,
+    outputTokens: 1_000,
+  });
+  const gUnpriced = generationBlob({
+    indices: [4],
+    execution: 'exec-unpriced',
+    responseModel: 'future-unknown-model-99',
+    modelDisplayName: 'Future Unknown Model 99',
+    modelEnum: 9999,
+    rawInputTokens: 5_000,
+    cachedReadTokens: 0,
+    outputTokens: 500,
+  });
+  mainDb.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)').run(gPriced, gPriced.length);
+  mainDb.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)').run(gUnpriced, gUnpriced.length);
+
+  for (let i = 0; i < 6; i++) {
+    const { db: cDb } = createWalDb(t, convDir, childIds[i], mainId);
+    const st = i === 0 ? 1 : 3;
+    const meta = i === 0
+      ? Buffer.from([...seconds(1, 2012), ...message(9, usageBytes({ rawInputTokens: 400, cachedReadTokens: 0, outputTokens: 40 }))])
+      : Buffer.from([...seconds(1, 2002 + i), ...seconds(7, 2005 + i), ...message(9, usageBytes({ rawInputTokens: 300, cachedReadTokens: 0, outputTokens: 30 }))]);
+    cDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 15, ?, ?)').run(st, meta);
+  }
+
+  const engine = new ConversationMetricsEngine({ conversationsDir: convDir });
+  const m = await engine.getConversationMetrics({
+    conversationId: mainId,
+    isSubagentRunning: true,
+    runningSubagentCount: 1,
+    observedAt: 2_020_000,
+  });
+
+  assert.equal(m.session.subagentCount, 10, '通过 conversation_summaries.db 精确发现全部 10 个子智能体（含未落独立 .db 的已取消项）');
+  assert.equal(m.runningSubagentCount, 1, '第 1 批子代理已完结时不得把旧父步骤叠加成 ⑂ 2');
+  assert.equal(m.tokens.hasUnpricedSteps, true);
+  assert.equal(m.tokens.estimatedCostUsd > 0, true);
+
+  const abortedMetrics = buildConversationHudMetrics({
+    conversationId: 'conv-status4',
+    steps: [
+      { idx: 0, stepType: 14, status: 3, createdAtSeconds: 1000, completedAtSeconds: 1000, hasUsage: false },
+      { idx: 1, stepType: 15, status: 4, createdAtSeconds: 1001, completedAtSeconds: 1006, hasUsage: false },
+    ],
+  });
+  assert.equal(abortedMetrics.session.turnAborted, true);
+
+  const mgr = new AntigravityHudManager();
+  try {
+    const view = new FakeElement('div');
+    view.setAttribute('data-testid', 'conversation-view');
+    const idleText = new FakeElement('span');
+    idleText.setAttribute('data-testid', 'idle-status-text');
+    idleText.textContent = '2 subagents/tasks running';
+    view.appendChild(idleText);
+
+    const residualLoading = new FakeElement('div');
+    residualLoading.setAttribute('data-testid', 'agent-loading');
+    view.appendChild(residualLoading);
+
+    const subChip = new FakeElement('button');
+    subChip.setAttribute('aria-label', 'Open Subagent: Swarm Worker (fact-verifier)');
+    const subDot = new FakeElement('span');
+    subDot.setAttribute('data-agent-state-dot', 'running');
+    subChip.appendChild(subDot);
+    view.appendChild(subChip);
+
+    const bgTaskSpinner = new FakeElement('span');
+    bgTaskSpinner.setAttribute('data-testid', 'status-task-running');
+    view.appendChild(bgTaskSpinner);
+
+    const nestedSubTab = new FakeElement('div');
+    nestedSubTab.setAttribute('data-testid', 'subagent-tab-conversation');
+    nestedSubTab.setAttribute('data-cascade-id', childIds[0]);
+    view.appendChild(nestedSubTab);
+
+    const subState = mgr.resolveSubagentState(view, { isSubpane: false });
+    assert.equal(subState.isSubagentRunning, true);
+    assert.equal(subState.runningSubagentCount, 1, '合并文案 2 subagents/tasks running + 后台终端任务不得虚增为 2');
+    assert.equal(mgr.resolveActivityPhase(view, { isRunning: true }, { isSubpane: false }), 'idle', '无停止按钮且处于后台等待文案时，残留 agent-loading 不得把主圆点染蓝');
+  } finally {
+    mgr.dispose();
+  }
+
+  const observedTargets = [];
+  const disconnectedTargets = [];
+  const prevRO = globalThis.ResizeObserver;
+  globalThis.ResizeObserver = class {
+    constructor() {
+      this._target = null;
+    }
+    observe(el) {
+      this._target = el;
+      observedTargets.push(el);
+    }
+    disconnect() {
+      disconnectedTargets.push(this._target);
+    }
+  };
+  try {
+    const doc = new FakeElement('document');
+    doc.createElement = (tag) => new FakeElement(tag, doc);
+    const parent = new FakeElement('div', doc);
+    const comp1 = new FakeElement('div', doc);
+    const comp2 = new FakeElement('div', doc);
+    parent.appendChild(comp1);
+    parent.appendChild(comp2);
+
+    const inst = new HudInstance('pane-ro', { languageMode: 'en' });
+    try {
+      inst.mount(comp1);
+      assert.equal(observedTargets.at(-1), comp1);
+      inst.reconcile(comp2);
+      assert.equal(disconnectedTargets.includes(comp1), true);
+      assert.equal(observedTargets.at(-1), comp2, 'reconcile 迁移到新 composer 时必须重新绑定 ResizeObserver');
+
+      inst.currentConvId = mainId;
+      inst.updateMetrics(m);
+      assert.equal(inst.shadow.querySelector('#hud-txt-session .hud-subagent-count').textContent, '', '单子智能体运行态胶囊保持极简仅显示 ⑂ 图标而不显示虚高的 2');
+      assert.equal(inst.shadow.querySelector('#val-subagent-status').textContent, '1 running (6 steps)');
+      assert.match(inst.shadow.querySelector('#val-est-cost').textContent, /^≥ \$/);
+    } finally {
+      inst.dispose();
+    }
+  } finally {
+    globalThis.ResizeObserver = prevRO;
+  }
+});

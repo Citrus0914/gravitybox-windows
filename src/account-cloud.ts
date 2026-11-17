@@ -1,4 +1,4 @@
-import { CloudQuotaAuthorityError, type CloudProviderContext } from './account-probe.js';
+import { CloudQuotaAuthorityError, mergeSubscriptionTier, type CloudProviderContext } from './account-probe.js';
 import { bt } from './i18n.js';
 import {
   CodedAccountError,
@@ -145,12 +145,14 @@ export async function fetchCloudQuotaForAccount(params: {
       return `HTTP ${response.status}`;
     };
     let projectId = account.token.project_id || null;
-    let subscriptionTier: string | null = account.quota?.subscription_tier || null;
+    const savedSubscriptionTier: string | null = account.quota?.subscription_tier || null;
+    let observedSubscriptionTier: string | null = null;
+    let subscriptionTier: string | null = savedSubscriptionTier;
     let tierObserved = false;
     let loadReady: Promise<void> = Promise.resolve();
     const queryAll = async <T>(endpoints: string[], body: (projectId: string | null) => unknown): Promise<EndpointResult<T>[]> => {
       return Promise.all(ordered(endpoints).map(async endpoint => {
-        if (parentSignal.aborted) return { endpoint, ok: false, error: 'aborted' };
+        if (parentSignal.aborted) return { endpoint, ok: false, error: bt('account_cloud.err.aborted') };
         try {
           const response = await fetchImpl(endpoint, {
             method: 'POST', signal: requestSignal(6000),
@@ -189,7 +191,7 @@ export async function fetchCloudQuotaForAccount(params: {
           }
           return { endpoint, ok: true, data: await response.json() as T };
         } catch (error) {
-          return { endpoint, ok: false, error: error instanceof Error ? error.message : 'request failed' };
+          return { endpoint, ok: false, error: error instanceof Error ? error.message : bt('account_cloud.reason.read_failed') };
         }
       }));
     };
@@ -224,8 +226,9 @@ export async function fetchCloudQuotaForAccount(params: {
         const ultraTier = tierCandidates.find(v => /ultra/i.test(v));
         const rawTier = ultraTier ?? tierCandidates[0];
         if (typeof rawTier === 'string' && rawTier.trim()) {
-          if (!tierObserved || (ultraTier && !/ultra/i.test(subscriptionTier ?? ''))) {
-            subscriptionTier = String(rawTier);
+          if (!tierObserved || (ultraTier && !/ultra/i.test(observedSubscriptionTier ?? ''))) {
+            observedSubscriptionTier = String(rawTier);
+            subscriptionTier = observedSubscriptionTier;
             tierObserved = true;
           }
         }
@@ -397,11 +400,17 @@ export async function fetchCloudQuotaForAccount(params: {
       ...(deadlineFired ? { error: bt('account_cloud.refresh_state.budget_timeout') } : {}),
     };
 
+    const resolvedSubscriptionTier = mergeSubscriptionTier(
+      tierObserved ? observedSubscriptionTier : '',
+      savedSubscriptionTier,
+      { allowFreeDowngrade: complete && tierObserved }
+    ) ?? null;
+
     account.quota = {
       models: applied.map(modelQuotaFromNormalized),
       quota_groups: mergedGroups.map(groupToQuotaGroup),
       is_forbidden: false,
-      subscription_tier: subscriptionTier,
+      subscription_tier: resolvedSubscriptionTier,
       last_updated: lastUpdated,
       model_forwarding_rules: forwarding,
       source: 'cloud',

@@ -380,21 +380,35 @@ final class UsageTrendChartView: NSView {
                 hourMap[String(suffix), default: 0] += t
             }
         }
+        let currentHour = Calendar.current.component(.hour, from: Date())
         var pts: [Point] = []
         for hr in 0..<24 {
             let lbl = String(format: "%02d:00", locale: Locale(identifier: "en_US_POSIX"), hr)
+            let val = hourMap[lbl] ?? 0
+            let isFuture = (val == 0 && hr > currentHour)
             let hourText = L10n.t("menu_panel.trend.hour_label", ["hour": String(format: "%02d", locale: Locale(identifier: "en_US_POSIX"), hr)], fallback: String(format: "%02d时", locale: Locale(identifier: "en_US_POSIX"), hr))
-            pts.append(.init(label: hourText, tokens: hourMap[lbl] ?? 0))
+            let tipText = L10n.t("menu_panel.trend.today_key", ["time": lbl], fallback: "今日 \(lbl)")
+            pts.append(.init(label: hourText, tokens: val, tooltipLabel: tipText, isFuture: isFuture))
         }
         return pts
     }
 
     struct Point: Equatable {
         let label: String
+        let tooltipLabel: String
         let tokens: Int
+        let isFuture: Bool
+
+        init(label: String, tokens: Int, tooltipLabel: String? = nil, isFuture: Bool = false) {
+            self.label = label
+            self.tooltipLabel = tooltipLabel ?? label
+            self.tokens = tokens
+            self.isFuture = isFuture
+        }
     }
     private var fixedHeightConstraint: NSLayoutConstraint?
     private var minHeightConstraint: NSLayoutConstraint?
+    private var maxHeightConstraint: NSLayoutConstraint?
     private var revealProgress: CGFloat = 1.0
     private let revealMotion = DesignMotion()
     private let hoverMotion = DesignMotion()
@@ -437,12 +451,18 @@ final class UsageTrendChartView: NSView {
         setAccessibilityLabel(L10n.t("component.chart.bar_a11y", fallback: "Token 用量趋势柱状图"))
     }
 
-    func useFlexibleHeight(minHeight: CGFloat = 92) {
+    func useFlexibleHeight(minHeight: CGFloat = 92, maxHeight: CGFloat? = nil) {
         fixedHeightConstraint?.isActive = false
         minHeightConstraint?.isActive = false
+        maxHeightConstraint?.isActive = false
         let minH = heightAnchor.constraint(greaterThanOrEqualToConstant: minHeight)
         minH.isActive = true
         minHeightConstraint = minH
+        if let maxHeight {
+            let maxH = heightAnchor.constraint(lessThanOrEqualToConstant: maxHeight)
+            maxH.isActive = true
+            maxHeightConstraint = maxH
+        }
         setContentHuggingPriority(NSLayoutConstraint.Priority(200), for: .vertical)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -649,15 +669,17 @@ final class UsageTrendChartView: NSView {
             let cx = leftPad + (CGFloat(idx) + 0.5) * slotWidth
             let isHovered = (hoveredIndex == idx)
 
-            // 0 柱位浅灰基槽
-            let baseH: CGFloat = 2.5
-            let baseRect = NSRect(x: cx - barWidth / 2, y: chartBottom + 1, width: barWidth, height: baseH)
-            let basePath = NSBezierPath(roundedRect: baseRect, xRadius: min(1.25, barWidth / 2), yRadius: min(1.25, barWidth / 2))
-            baseSlotFill.setFill()
-            basePath.fill()
+            // 0 柱位浅灰基槽（未到达时段留空，对齐菜单栏表现）
+            if !pt.isFuture {
+                let baseH: CGFloat = 2.5
+                let baseRect = NSRect(x: cx - barWidth / 2, y: chartBottom + 1, width: barWidth, height: baseH)
+                let basePath = NSBezierPath(roundedRect: baseRect, xRadius: min(1.25, barWidth / 2), yRadius: min(1.25, barWidth / 2))
+                baseSlotFill.setFill()
+                basePath.fill()
+            }
 
             // 悬停即时跟随微光光标
-            if isHovered {
+            if isHovered && !pt.isFuture {
                 let cursorCenterX = animatedHoverX ?? cx
                 let cursorRect = NSRect(x: cursorCenterX - slotWidth * 0.44, y: chartBottom + 1, width: slotWidth * 0.88, height: chartHeight)
                 let cursorPath = NSBezierPath(roundedRect: cursorRect, xRadius: 4, yRadius: 4)
@@ -665,7 +687,7 @@ final class UsageTrendChartView: NSView {
                 cursorPath.fill()
             }
 
-            if pt.tokens > 0 {
+            if !pt.isFuture && pt.tokens > 0 {
                 let ratio = max(0.06, min(1, CGFloat(pt.tokens) / CGFloat(maxVal))) * revealProgress
                 let h = chartHeight * ratio
                 let r = min(3.0, barWidth / 2)
@@ -706,8 +728,10 @@ final class UsageTrendChartView: NSView {
             let pt = points[hIdx]
             let cx = animatedHoverX ?? (leftPad + (CGFloat(hIdx) + 0.5) * slotWidth)
             let ratio = maxVal > 0 ? max(0.06, min(1, CGFloat(pt.tokens) / CGFloat(maxVal))) : 0
-            let barH = pt.tokens > 0 ? chartHeight * ratio : 0
-            let capStr = "\(compactTokens(pt.tokens))" as NSString
+            let barH = (!pt.isFuture && pt.tokens > 0) ? chartHeight * ratio : 0
+            let capStr: NSString = pt.isFuture
+                ? (L10n.t("menu_panel.chart.future", fallback: "未到达") as NSString)
+                : ("\(compactTokens(pt.tokens))" as NSString)
             let capAttrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold),
                 .foregroundColor: NSColor.white

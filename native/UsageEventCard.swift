@@ -7,6 +7,10 @@ final class UsageEventCard: NSView {
     let outputLabel = text("", size: 11, weight: .medium)
     let cacheWriteLabel = text("", size: 11, weight: .medium)
     let cacheLabel = text("", size: 11, weight: .medium)
+    private let inputTitleLabel = text(L10n.t("usage_event.input"), size: 11, color: Design.secondary)
+    private let outputTitleLabel = text(L10n.t("usage_event.output"), size: 11, color: Design.secondary)
+    private let cacheReadTitleLabel = text(L10n.t("usage_event.cache_read"), size: 11, color: Design.secondary)
+    private let cacheWriteTitleLabel = text(L10n.t("usage_event.cache_write"), size: 11, color: Design.secondary)
     let modelIcon = symbol("sparkles", size: 16, color: Design.secondary)
     private let card = DesignCardBox()
     private var hoverTracking: NSTrackingArea?
@@ -41,8 +45,7 @@ final class UsageEventCard: NSView {
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
         timeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         timeLabel.setContentCompressionResistancePriority(.required, for: .vertical)
-        func metric(_ title: String, _ value: NSTextField) -> NSView {
-            let titleLbl = text(title, size: 11, color: Design.secondary)
+        func metric(_ titleLbl: NSTextField, _ value: NSTextField) -> NSView {
             titleLbl.setContentCompressionResistancePriority(.required, for: .vertical)
             value.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
             value.setContentCompressionResistancePriority(.required, for: .vertical)
@@ -53,10 +56,10 @@ final class UsageEventCard: NSView {
         let heading = horizontal([modelIcon, modelLabel, flexibleSpace(), timeLabel], spacing: 8)
         heading.alignment = .centerY
         let tokens = horizontal([
-            metric(L10n.t("usage_event.input"), inputLabel),
-            metric(L10n.t("usage_event.output"), outputLabel),
-            metric(L10n.t("usage_event.cache_read"), cacheLabel),
-            metric(L10n.t("usage_event.cache_write"), cacheWriteLabel)
+            metric(inputTitleLabel, inputLabel),
+            metric(outputTitleLabel, outputLabel),
+            metric(cacheReadTitleLabel, cacheLabel),
+            metric(cacheWriteTitleLabel, cacheWriteLabel)
         ], spacing: 10)
         tokens.distribution = .fillEqually
         tokens.alignment = .centerY
@@ -104,6 +107,10 @@ final class UsageEventCard: NSView {
         }
     }
     func configure(_ event: [String:Any], highlight: String = "") {
+        inputTitleLabel.stringValue = L10n.t("usage_event.input")
+        outputTitleLabel.stringValue = L10n.t("usage_event.output")
+        cacheReadTitleLabel.stringValue = L10n.t("usage_event.cache_read")
+        cacheWriteTitleLabel.stringValue = L10n.t("usage_event.cache_write")
         let model = InterfaceText.localizedModelLabel(event["model"] as? String)
         if !highlight.isEmpty, let range = model.range(of: highlight, options: .caseInsensitive) {
             let attr = NSMutableAttributedString(string: model, attributes: [

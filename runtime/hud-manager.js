@@ -288,9 +288,12 @@ export class AntigravityHudManager {
     }
 
     const panes = views.filter(Boolean).map((view, index) => {
+      const isMainConvView = view?.getAttribute?.('data-testid') === 'conversation-view';
       const subConvNode = view?.getAttribute?.('data-testid') === 'subagent-tab-conversation'
         ? view
-        : view?.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]') || null;
+        : !isMainConvView
+        ? view?.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]') || null
+        : null;
       const rawCascadeId = view.getAttribute?.('data-cascade-id') || subConvNode?.getAttribute?.('data-cascade-id');
       let slotId = this.viewToSlotId.get(view);
       if (!slotId) { slotId = `slot-${this.nextSlotSeq++}`; this.viewToSlotId.set(view, slotId); }
@@ -420,7 +423,8 @@ export class AntigravityHudManager {
       : Boolean(
           view?.getAttribute?.('data-media-drop-scope') === 'subpane' ||
           view?.getAttribute?.('data-testid') === 'subagent-tab-conversation' ||
-          view?.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]')
+          (view?.getAttribute?.('data-testid') !== 'conversation-view' &&
+            view?.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]'))
         );
     const allowUrl = totalViews === 1 && !subpaneDetected;
     if (view && typeof view.getAttribute === 'function') {
@@ -546,6 +550,7 @@ export class AntigravityHudManager {
           );
 
     let runningCount = 0;
+    let exactIdleSubagentCount = 0;
     let detected = false;
 
     const idleStatusNodes = view.querySelectorAll('[data-testid="idle-status-text"]');
@@ -557,14 +562,26 @@ export class AntigravityHudManager {
         }
         const txt = (node.textContent || '').replace(/\s+/g, ' ').trim();
         if (!txt) return;
-        const countMatch = txt.match(/(\d+)\s*(?:个)?\s*(?:subagents?(?:\/tasks?)?|子智能体|子代理)/i);
+        // 区分混合计数 ("2 subagents/tasks running" 含终端后台任务) 与官方纯子智能体计数 ("1 subagent running" / "6 subagents running")
+        const mixedCountMatch = txt.match(/(\d+)\s*(?:个)?\s*(?:subagents?\s*\/\s*tasks?|子智能体\s*\/\s*任务|子代理\s*\/\s*任务)/i);
+        const pureCountMatch = !mixedCountMatch
+          ? txt.match(/(\d+)\s*(?:个)?\s*(?:subagents?\b|子智能体|子代理)/i)
+          : null;
         if (
-          countMatch &&
+          pureCountMatch &&
           /(?:running|working|运行中|正在运行|执行中|处理中)/i.test(txt)
         ) {
           detected = true;
-          const parsed = parseInt(countMatch[1], 10);
+          const parsed = parseInt(pureCountMatch[1], 10);
+          if (parsed > exactIdleSubagentCount) exactIdleSubagentCount = parsed;
           if (parsed > runningCount) runningCount = parsed;
+        } else if (
+          mixedCountMatch &&
+          /(?:running|working|运行中|正在运行|执行中|处理中)/i.test(txt)
+        ) {
+          // 混合文案 y = f + n (至少 1 个子智能体 + 至少 1 个后台终端任务)，不可将终端任务数计入子智能体数量
+          detected = true;
+          if (runningCount < 1) runningCount = 1;
         } else if (
           /\bsubagents?(?:\/tasks?)?\s+(?:running|working)\b|(?:子智能体|子代理).*(?:运行|工作|执行)/i.test(
             txt
@@ -592,13 +609,13 @@ export class AntigravityHudManager {
           });
         }
         const markerCount = Math.max(1, markerContainers.size);
-        if (runningCount < markerCount) {
+        if (exactIdleSubagentCount === 0 && runningCount < markerCount) {
           runningCount = markerCount;
         }
       }
     }
 
-    // 检查子智能体引用芯片是否仍处于加载态（必须具备明确正向活跃指示器，排除权限来源标签、已完成/未读状态及无指示器的静态卡片）
+    // 检查子智能体引用芯片是否仍处于加载态（排除权限来源标签、已完成/未读状态、终端后台任务图标 status-task-running 及静态卡片）
     const agentRefs = view.querySelectorAll(
       '[aria-label^="Open Subagent:"], [aria-label^="打开子智能体："], [aria-label^="打开子智能体:"], [aria-label^="打开子代理："], [aria-label^="打开子代理:"]'
     );
@@ -628,19 +645,20 @@ export class AntigravityHudManager {
           hasActiveStateDot ||
           Boolean(
             ref.querySelector(
-              '[data-testid="status-loading-spinner"], [data-testid="status-task-running"], .animate-spin, .codicon-loading, .spinner'
+              '[data-testid="status-loading-spinner"], .animate-spin, .codicon-loading, .spinner'
             )
           );
         if (hasActiveDotOrSpinner) {
           const owner = ref.closest?.('[data-testid="browser-subagent-row"], [id^="subagentView-"]') || ref;
-          const id = owner.getAttribute?.('data-cascade-id') || owner.getAttribute?.('id');
+          const ariaIdentity = (ref.getAttribute?.('aria-label') || '').replace(/^(?:Open Subagent:|打开子智能体[：:]|打开子代理[：:])\s*/i, '').trim();
+          const id = owner.getAttribute?.('data-cascade-id') || owner.getAttribute?.('id') || ariaIdentity;
           activeRefOwners.add(id || owner);
         }
       });
       const activeRefCount = activeRefOwners.size;
       if (activeRefCount > 0) {
         detected = true;
-        if (activeRefCount > runningCount) runningCount = activeRefCount;
+        if (exactIdleSubagentCount === 0 && activeRefCount > runningCount) runningCount = activeRefCount;
       }
     }
 
@@ -690,7 +708,7 @@ export class AntigravityHudManager {
         const hasSpinner = Boolean(
           node.getAttribute?.('data-state') === 'running' ||
           node.querySelector?.(
-            '.animate-spin, .codicon-loading, .spinner, [data-testid="status-loading-spinner"], [data-testid="status-task-running"], [data-state="running"]'
+            '.animate-spin, .codicon-loading, .spinner, [data-testid="status-loading-spinner"], [data-state="running"]'
           )
         );
         if (hasSpinner) {
@@ -717,30 +735,52 @@ export class AntigravityHudManager {
           );
     void precomputedSubagentState;
 
-    // 仅认准当前分栏的前台轮次终止/流式信号（排除 .codicon-loading 与附件处理期的 send-button-loading/pending，避免闲置对话误判前台活跃）
+    let hasIdleStatusBanner = false;
+    if (!isSubpane) {
+      const idleBannerNodes = view.querySelectorAll('[data-testid="idle-status-text"]');
+      if (idleBannerNodes && typeof idleBannerNodes.forEach === 'function') {
+        idleBannerNodes.forEach((node) => {
+          if (hasIdleStatusBanner) return;
+          if (typeof node?.closest === 'function') {
+            const nestedSubpane = node.closest('[data-media-drop-scope="subpane"], [data-testid="subagent-tab-conversation"]');
+            if (nestedSubpane && nestedSubpane !== view) return;
+          }
+          if ((node.textContent || '').trim()) hasIdleStatusBanner = true;
+        });
+      }
+    }
+
+    // 仅认准当前分栏的前台轮次终止/流式信号（排除后台等待期的 idle-status-text 伴生 agent-loading 与附件处理状态）
     const foregroundTurnNodes = view.querySelectorAll(
       '[data-testid="input-cancel-button"], [data-testid="agent-loading"], [data-state="streaming"], [data-streaming="true"]'
     );
     let hasForegroundTurn = false;
+    let onlyAgentLoadingSeen = false;
     if (foregroundTurnNodes && foregroundTurnNodes.length > 0) {
       const nodeList = typeof foregroundTurnNodes.forEach === 'function'
         ? foregroundTurnNodes
         : Array.from(foregroundTurnNodes);
       nodeList.forEach((node) => {
         if (hasForegroundTurn) return;
+        const nodeTestId = node.getAttribute?.('data-testid') || '';
         if (!isSubpane && typeof node?.closest === 'function') {
           const nestedSubpane = node.closest('[data-media-drop-scope="subpane"], [data-testid="subagent-tab-conversation"]');
           if (nestedSubpane && nestedSubpane !== view) return;
-          if (node.getAttribute?.('data-testid') !== 'input-cancel-button') {
+          if (nodeTestId !== 'input-cancel-button') {
             const nestedCard = node.closest(
-              '[data-testid*="subagent-card"], [data-testid="browser-subagent-row"], [data-testid="tool-call"], [data-testid="tool-invocation"]'
+              '[data-testid*="subagent-card"], [data-testid="browser-subagent-row"], [data-testid="tool-call"], [data-testid="tool-invocation"], [data-testid="running-items-card"], [data-testid="idle-status-text"]'
             );
             if (nestedCard && nestedCard !== view) return;
           }
         }
+        if (!isSubpane && nodeTestId === 'agent-loading' && hasIdleStatusBanner) {
+          onlyAgentLoadingSeen = true;
+          return;
+        }
         hasForegroundTurn = true;
       });
     }
+    void onlyAgentLoadingSeen;
     let hasSubpaneThinkingMarker = false;
 
     if (isSubpane) {
@@ -828,9 +868,8 @@ export class AntigravityHudManager {
       });
     }
 
-    const taskRunningNodes = view.querySelectorAll(
-      '[data-testid="status-task-running"], [data-testid="status-loading-spinner"]'
-    );
+    // 注意：status-task-running 为后台终端任务图标 (>_) 而非前台工具 Spinner，此处仅匹配 status-loading-spinner
+    const taskRunningNodes = view.querySelectorAll('[data-testid="status-loading-spinner"]');
     const hasTaskSpinner = Boolean(taskRunningNodes && taskRunningNodes.length > 0);
 
     let hasToolCardShimmer = false;

@@ -1306,7 +1306,43 @@ export class AccountsManager {
     });
 
     if (liveQuota) {
-      account.quota = liveQuota;
+      if (account.quota) {
+        const old = account.quota;
+        const liveGroupsOk = (liveQuota.quota_groups?.length ?? 0) > 0;
+        const resolvedTier = mergeSubscriptionTier(liveQuota.subscription_tier, old.subscription_tier, {
+          allowFreeDowngrade: liveGroupsOk,
+        });
+        const { groups, staleGroups } = mergeGroupsWithPrevious(
+          normalizeStoredGroups(liveQuota.quota_groups, liveQuota.last_updated, 'live'),
+          normalizeStoredGroups(old.quota_groups, old.last_updated ?? liveQuota.last_updated),
+          Date.now()
+        );
+        const { models, carriedCount } = mergeModelsWithPrevious(
+          liveQuota.models.map(m => normalizedModelFromStored(m, 'live')),
+          (old.models ?? []).map(m => normalizedModelFromStored(m))
+        );
+        const missingWindows = groups.flatMap(g =>
+          g.buckets.filter(b => b.stale).map(b => ({ family: g.family, window: b.window }))
+        );
+        const baseState = this.getAccountQuotaOverview({ quota: { ...liveQuota, subscription_tier: resolvedTier } }).refreshState;
+        account.quota = {
+          ...liveQuota,
+          subscription_tier: resolvedTier,
+          source: 'live',
+          models: applyFamilyWindows(models, familyWindowsFromGroups(groups, Date.now())).map(modelQuotaFromNormalized),
+          quota_groups: groups.map(groupToQuotaGroup),
+          ...(staleGroups.length ? { stale_groups: staleGroups } : {}),
+          refresh_state: {
+            ...baseState,
+            complete: baseState.complete && staleGroups.length === 0,
+            missingWindows,
+            carriedGroups: staleGroups.length,
+            carriedModels: carriedCount,
+          },
+        };
+      } else {
+        account.quota = liveQuota;
+      }
       await this.saveAccount(account);
     }
 

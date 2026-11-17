@@ -1010,3 +1010,138 @@ test('跨 source_id 三轮以上归并、存量重复自愈、稳定 source_id �
   });
 });
 
+test('1.1.1 终审回归: 反向旧别名重入零自环零丢账、Protobuf 严格式时间戳检测抗 3 字节假阳性、语言切换失效日历缓存', async t => {
+  const { hasInlineGenerationTimestamp } = await import('../dist/sqlite-worker.js');
+  const prevLocale = getActiveLocale();
+  t.after(() => setActiveLocale(prevLocale));
+
+  // 1. P1-8: 包含 0x4a _ 0x22 子串的字符串字段不得被误判为拥有内联 started_at 时间戳
+  const falsePositiveBlob = Buffer.concat([
+    W.encodeLengthDelimited(
+      1,
+      Buffer.concat([
+        W.encodeString(19, `model-J${String.fromCharCode(6)}"-fake`),
+        W.encodeLengthDelimited(4, W.encodeVarintField(2, 500)),
+      ])
+    ),
+    W.encodeLengthDelimited(2, W.encodeVarint(1)),
+  ]);
+  assert.equal(hasInlineGenerationTimestamp(falsePositiveBlob), false, '普通文本内巧合出现的 0x4a _ 0x22 字节序不得误判为已含时间戳');
+
+  const realTimestampBlob = Buffer.concat([
+    W.encodeLengthDelimited(
+      1,
+      Buffer.concat([
+        W.encodeString(19, 'gemini-4-hydrogen'),
+        W.encodeLengthDelimited(9, W.encodeLengthDelimited(4, W.encodeVarintField(1, 1_760_000_000))),
+      ])
+    ),
+  ]);
+  assert.equal(hasInlineGenerationTimestamp(realTimestampBlob), true);
+
+  await withFixture(t, async ({ stateDir, geminiDir }) => {
+    const now = Math.floor(Date.now() / 1000);
+    // 2. P1-1: 旧 key (kOld) 被新 key (kNew) 遮蔽后若从归档缓存反向重入，绝不可产生 (kOld->kOld) 自环导致双双隐身
+    const reverseLedger = new UsageLedger(join(stateDir, 'reverse-alias-reentry'));
+    const legKey = createHash('sha256').update('reverse-reentry-leg').digest('hex');
+    const kOld = 'c'.repeat(64);
+    const kNew = 'd'.repeat(64);
+
+    await reverseLedger.save([
+      {
+        event_key: kOld,
+        source_id: 'src-old',
+        db_file: 'conv-rev.db',
+        generation_index: 0,
+        legacy_event_key: legKey,
+        model: 'gemini-4-hydrogen',
+        input_tokens: 1000,
+        output_tokens: 200,
+        cached_tokens: 0,
+        total_tokens: 1200,
+        timestamp_seconds: now - 60,
+        source_observed_at: 100,
+      },
+    ]);
+    await reverseLedger.save([
+      {
+        event_key: kNew,
+        source_id: 'src-new',
+        db_file: 'conv-rev.db',
+        generation_index: 0,
+        legacy_event_key: legKey,
+        model: 'gemini-4-hydrogen',
+        input_tokens: 1000,
+        output_tokens: 200,
+        cached_tokens: 0,
+        total_tokens: 1200,
+        timestamp_seconds: now - 60,
+        source_observed_at: 200,
+      },
+    ]);
+    // 模拟归档/旧缓存带着更新的 source_observed_at 重新送入 kOld 及 observed 归属
+    await reverseLedger.save([
+      {
+        event_key: kOld,
+        source_id: 'src-old',
+        db_file: 'conv-rev.db',
+        generation_index: 0,
+        legacy_event_key: legKey,
+        model: 'gemini-4-hydrogen',
+        input_tokens: 1000,
+        output_tokens: 200,
+        cached_tokens: 0,
+        total_tokens: 1200,
+        timestamp_seconds: now - 60,
+        account_id: 'acc-1',
+        account_email: 'alice@example.invalid',
+        account_confidence: 'observed',
+        source_observed_at: 300,
+      },
+    ]);
+
+    const loadedAfterReentry = await reverseLedger.load();
+    assert.equal(loadedAfterReentry.length, 1, '反向重入后记录不得因自环而丢失');
+    assert.equal(loadedAfterReentry[0].account_id, 'acc-1', '主记录应吸收重入旧记录的 observed 归属');
+    const aggAfterReentry = await reverseLedger.aggregate({
+      prices: {},
+      accountId: 'all',
+      accounts: [{ id: 'acc-1', email: 'alice@example.invalid', name: 'Alice' }],
+      now,
+    });
+    assert.equal(aggAfterReentry.all_time.totals.request_count, 1);
+    assert.equal(aggAfterReentry.all_time.totals.total_tokens, 1200);
+
+    // 3. P1-6 & P1-11: UsageStatsManager 切换激活语言后不命中旧语言缓存摘要，且 legacyKeyIndex 准确归并
+    setActiveLocale('zh-Hans');
+    const mgr = new UsageStatsManager({ stateDir: join(stateDir, 'locale-cache'), geminiDir });
+    mgr.discoverDatabaseFiles = async () => ['synthetic-locale.db'];
+    mgr.scanDatabaseEvents = async () => ({
+      events: [
+        {
+          event_key: 'e'.repeat(64),
+          source_id: 'src-loc-1',
+          db_file: 'synthetic-locale.db',
+          legacy_event_key: 'f'.repeat(64),
+          model: '未知模型',
+          input_tokens: 500,
+          output_tokens: 100,
+          cached_tokens: 0,
+          total_tokens: 600,
+          timestamp_seconds: now - 10,
+        },
+      ],
+      generationsScanned: 1,
+      skippedLargeRecords: 0,
+      cacheHit: true,
+    });
+    const zhSummary = await mgr.getUsageSummary(false);
+    assert.equal(zhSummary.available_accounts?.[0]?.label, '全部账号');
+
+    setActiveLocale('en');
+    const enSummary = await mgr.getUsageSummary(false);
+    assert.equal(enSummary.available_accounts?.[0]?.label, 'All Accounts', '切换语言后 calendarKey 变化应立即返回英文摘要而非复用中文缓存');
+  });
+});
+
+
