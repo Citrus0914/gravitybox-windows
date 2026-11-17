@@ -62,7 +62,7 @@ jobs:
           set +e
           (
             set -e
-            npm run build
+            npm run build --ignore-scripts
             node tools/sync-pricing-feed.mjs
             node --test test/pricing-*.test.mjs
           ) > pricing-gate.log 2>&1
