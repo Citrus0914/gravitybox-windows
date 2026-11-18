@@ -3,6 +3,9 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { readOptionalJson } from './files.js';
+import { isOwnedByCurrentUser, isWindows } from './platform/fs.js';
+import { bundleLayoutPaths } from './platform/paths.js';
+import { winExeInfo } from './platform/win-helper.js';
 import type { AccountsManager, LiveLanguageServerStatus } from './accounts.js';
 import type { UsageStatsManager } from './usage.js';
 import {
@@ -33,6 +36,18 @@ export interface LiveIdeModelsSnapshot {
 
 export async function readInstalledAppBundleVersion(appPath: string): Promise<string> {
   if (!appPath) return '';
+  if (isWindows && !appPath.endsWith('.app')) {
+    const layout = bundleLayoutPaths(appPath, 'Antigravity');
+    try {
+      const info = await winExeInfo(layout.executablePath);
+      if (info.fileVersion.trim()) return info.fileVersion.trim();
+    } catch {}
+    try {
+      const pkg = JSON.parse(await readFile(layout.unpackedPackageJsonPath, 'utf8'));
+      if (typeof pkg?.version === 'string' && pkg.version.trim()) return pkg.version.trim();
+    } catch {}
+    return '';
+  }
   const plistPath = join(appPath, 'Contents/Info.plist');
   try {
     const raw = await readFile(plistPath, 'utf8');
@@ -96,7 +111,7 @@ export async function readValidLiveIdeModelsSnapshot(
   const cleanInstalled = String(installedAppVersion || '').trim();
   if (!cleanInstalled) return null;
   const info = await lstat(snapshotPath).catch(() => null);
-  if (!info || !info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) {
+  if (!info || !info.isFile() || info.isSymbolicLink() || !isOwnedByCurrentUser(info)) {
     return null;
   }
   const data = await readOptionalJson<LiveIdeModelsSnapshot>(snapshotPath, 'live-ide-models.json');

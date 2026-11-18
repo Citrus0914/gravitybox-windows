@@ -4,6 +4,8 @@ import { mkdtemp, mkdir, rm, readFile, writeFile, readdir } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountsManager, normalizedModelFromStored, accountCredentialReadiness, cloudOriginFromCommand } from '../dist/accounts.js';
+import { applicationTarget } from '../dist/application-target.js';
+import { languageServerBinaryPath } from '../dist/platform/process.js';
 import { normalizeFraction, normalizeCloudModels, normalizeLiveModels, normalizeCloudGroups, normalizeLiveGroups,
   familyWindowsFromGroups, buildArgonStatus, buildCarbonStatus, buildStandaloneModels, applyFamilyWindows, mergeGroupSets,
   mergeGroupsWithPrevious, mergeModelsWithPrevious, mergeModelCatalogues, familyModelQuotaFromModels } from '../dist/quota.js';
@@ -372,7 +374,8 @@ test('正确服务拒绝额度时不回退到另一个环境的100%，旧错误�
 
 test('仅采纳官方进程的固定Google服务端点', () => {
   const origin = 'https://daily-cloudcode-pa.googleapis.com';
-  assert.equal(cloudOriginFromCommand('/Applications/Antigravity.app/Contents/Resources/bin/language_server --cloud_code_endpoint ' + origin), origin);
+  const lsBin = languageServerBinaryPath(applicationTarget().appPath);
+  assert.equal(cloudOriginFromCommand(lsBin + ' --cloud_code_endpoint ' + origin), origin);
   assert.equal(cloudOriginFromCommand('/tmp/fake --cloud_code_endpoint ' + origin), null);
-  assert.equal(cloudOriginFromCommand('/Applications/Antigravity.app/Contents/Resources/bin/language_server --cloud_code_endpoint https://attacker.invalid'), null);
+  assert.equal(cloudOriginFromCommand(lsBin + ' --cloud_code_endpoint https://attacker.invalid'), null);
 });

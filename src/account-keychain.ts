@@ -1,6 +1,8 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { bt } from './i18n.js';
+import { isWindows } from './platform/fs.js';
+import { winCredDelete, winCredRead, winCredWrite } from './platform/win-helper.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -10,8 +12,31 @@ export interface KeychainAdapter {
   deletePassword(service: string, account: string): Promise<void>;
 }
 
+/** Decode either macOS `go-keyring-base64:` wrapped JSON or Windows plain UTF-8 JSON. */
+export function decodeKeyringPayload(raw: string | null | undefined): Record<string, any> | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const jsonText = trimmed.startsWith('go-keyring-base64:')
+      ? Buffer.from(trimmed.slice('go-keyring-base64:'.length), 'base64').toString('utf8')
+      : trimmed;
+    const parsed = JSON.parse(jsonText);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, any>) : null;
+  } catch {
+    return null;
+  }
+}
+
 export class SystemKeychainAdapter implements KeychainAdapter {
   async readPassword(service: string, account: string): Promise<string | null> {
+    if (isWindows) {
+      try {
+        return await winCredRead(service, account);
+      } catch {
+        throw new Error(bt('keychain.err.read'));
+      }
+    }
     try {
       const { stdout } = await execFileAsync('/usr/bin/security', [
         'find-generic-password',
@@ -29,6 +54,14 @@ export class SystemKeychainAdapter implements KeychainAdapter {
   }
 
   async writePassword(service: string, account: string, password: string): Promise<void> {
+    if (isWindows) {
+      try {
+        await winCredWrite(service, account, password);
+        return;
+      } catch {
+        throw new Error(bt('keychain.err.write'));
+      }
+    }
     return new Promise((resolve, reject) => {
       const q = (val: string) => `"${String(val).replace(/[\\"\r\n]/g, m => (m === '\r' || m === '\n' ? '' : `\\${m}`))}"`;
       // 通过 security -i 批处理从 stdin 传入完整命令与密码，既不在 argv 暴露凭据，也不触发 /dev/tty getpass() 阻塞
@@ -61,6 +94,14 @@ export class SystemKeychainAdapter implements KeychainAdapter {
   }
 
   async deletePassword(service: string, account: string): Promise<void> {
+    if (isWindows) {
+      try {
+        await winCredDelete(service, account);
+        return;
+      } catch {
+        throw new Error(bt('keychain.err.delete'));
+      }
+    }
     try {
       await execFileAsync('/usr/bin/security', ['delete-generic-password', '-s', service, '-a', account], { timeout: 5000 });
     } catch (error) { if ((error as { code?: number }).code !== 44) throw new Error(bt('keychain.err.delete')); }
@@ -125,6 +166,10 @@ export async function syncAccountToKeychain(
     ...(acc.token.is_gcp_tos ? {} : { auth_method: 'consumer' }),
     id_token_email: acc.email,
   });
+  if (isWindows) {
+    await keychain.writePassword('gemini', 'antigravity', payload);
+    return;
+  }
   const b64 = Buffer.from(payload, 'utf8').toString('base64');
   await keychain.writePassword('gemini', 'antigravity', `go-keyring-base64:${b64}`);
 }

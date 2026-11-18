@@ -21,7 +21,7 @@ test('缓存清理只操作三个白名单目录，应用运行时拒绝，登�
 });
 test('缓存目录符号链接不会被跟随或清理',async()=>{
  const temp=await realpath(await mkdtemp(join(tmpdir(),'gravity-maint-link-')));try{
-  const profile=join(temp,'profile'),outside=join(temp,'outside');await mkdir(profile);await mkdir(outside);await writeFile(join(outside,'important'),'keep');await symlink(outside,join(profile,'Cache'));
+  const profile=join(temp,'profile'),outside=join(temp,'outside');await mkdir(profile);await mkdir(outside);await writeFile(join(outside,'important'),'keep');await symlink(outside,join(profile,'Cache'),process.platform==='win32'?'junction':undefined);
   const m=new CacheMaintenance(profile,join(temp,'trash'),async()=>false);const scan=await m.scan();assert.equal(scan.entries[0].clearable,false);await assert.rejects(m.clear(scan.token));assert.equal(await readFile(join(outside,'important'),'utf8'),'keep');
  }finally{await rm(temp,{recursive:true,force:true});}
 });
@@ -182,13 +182,21 @@ test('Phase 1 安全性: restore 预检阶段拦截目标路径符号链接及�
 
     // 场景 A: 目标路径下 CachedData-wal 被植入了符号链接
     const outsideTarget = join(temp, 'outside');
-    await writeFile(outsideTarget, 'malicious-file');
-    await (await import('node:fs/promises')).symlink(outsideTarget, join(profile, 'CachedData-wal'));
+    const fsPromises = await import('node:fs/promises');
+    try {
+      await writeFile(outsideTarget, 'malicious-file');
+      await fsPromises.symlink(outsideTarget, join(profile, 'CachedData-wal'));
+    } catch (error) {
+      if (error?.code !== 'EPERM') throw error;
+      await fsPromises.rm(outsideTarget, { force: true });
+      await mkdir(outsideTarget, { recursive: true });
+      await fsPromises.symlink(outsideTarget, join(profile, 'CachedData-wal'), 'junction');
+    }
 
     await assert.rejects(m.restore(basename(cleared.restorePath)), /CachedData-wal 存在符号链接/);
 
     // 移除符号链接后，测试场景 B: 快照清单包含重复条目
-    await (await import('node:fs/promises')).unlink(join(profile, 'CachedData-wal'));
+    await fsPromises.unlink(join(profile, 'CachedData-wal'));
     const manifestPath = join(cleared.restorePath, '恢复清单.json');
     const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
     manifest.moved.push({ ...manifest.moved[0] });

@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AccountsManager, formatResetCountdown, refreshResetDescription, accountCredentialReadiness, generateDeviceProfile, MockKeychainAdapter, syncAccountToKeychain } from "../dist/accounts.js";
+import { decodeKeyringPayload } from "../dist/account-keychain.js";
 import { buildDashboardAggregate } from "../dist/main.js";
 import { normalizeIndependentArgonQuota } from "../dist/quota.js";
 
@@ -916,8 +917,9 @@ test('Keychain 免密写入、倒计时格式化与 5 桶配额架构', async ()
 
     await syncAccountToKeychain(testAccount, mockKeychain);
     const kcVal = await mockKeychain.readPassword('gemini', 'antigravity');
-    assert.ok(kcVal?.startsWith('go-keyring-base64:'));
-    const decoded = JSON.parse(Buffer.from(kcVal.slice('go-keyring-base64:'.length), 'base64').toString('utf8'));
+    if (process.platform !== 'win32') assert.ok(kcVal?.startsWith('go-keyring-base64:'));
+    const decoded = decodeKeyringPayload(kcVal);
+    assert.ok(decoded);
     assert.equal(decoded.token.email, 'pilot@antigravity.dev');
     assert.equal(decoded.token.refresh_token, 'ref-token-456');
     // 回归：官方 Go 端按 oauth2.Token 解析，缺 expiry 会被视为永不过期而不刷新，约 1 小时后 401 并跳登录页。

@@ -560,9 +560,14 @@ let database: DatabaseSync | undefined;
 let sessionError: string | undefined;
 let sessionDataVersion = 0;
 
-function openSession(path: string) {
-  try { database?.exec('ROLLBACK;'); database?.close(); } catch {}
+function closeDatabaseHandle() {
+  try { database?.exec('ROLLBACK;'); } catch {}
+  try { database?.close(); } catch {}
   database = undefined;
+}
+
+function openSession(path: string) {
+  closeDatabaseHandle();
   sessionError = undefined;
   try {
     database = new DatabaseSync(path, { readOnly: true });
@@ -574,8 +579,7 @@ function openSession(path: string) {
 }
 
 function closeSession() {
-  try { database?.exec('ROLLBACK;'); database?.close(); } catch {}
-  database = undefined;
+  closeDatabaseHandle();
   sessionError = undefined;
 }
 

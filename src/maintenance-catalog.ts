@@ -1,7 +1,13 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { join, relative, resolve, sep } from 'node:path';
 import { bt } from './i18n.js';
+import { isWindows } from './platform/fs.js';
+import { defaultAppPath } from './platform/paths.js';
+import {
+  commandMatchesAppRoot,
+  commandMatchesLanguageServer,
+  listProcesses,
+  normalizePathForCompare,
+} from './platform/process.js';
 
 export type CacheCategory = 'safe' | 'stateful';
 export type CacheSection = 'runtime' | 'history';
@@ -227,7 +233,6 @@ export const CACHE_METADATA: Record<string, CacheItemMetadata> = new Proxy({} as
   },
 });
 
-const execFileAsync = promisify(execFile);
 const PROCESS_SNAPSHOT_TTL_MS = 250;
 let cachedProcessCommands: { at: number; commands: string[] | null } | null = null;
 let inFlightProcessCommands: Promise<string[] | null> | null = null;
@@ -242,8 +247,8 @@ export async function readProcessCommands(): Promise<string[] | null> {
   }
   const task = (async (): Promise<string[] | null> => {
     try {
-      const { stdout } = await execFileAsync('/bin/ps', ['-axo', 'command='], { timeout: 3000 });
-      const commands = stdout.split('\n').map(line => line.trim()).filter(Boolean);
+      const processes = await listProcesses();
+      const commands = processes.map(p => p.command.trim()).filter(Boolean);
       cachedProcessCommands = { at: Date.now(), commands };
       return commands;
     } catch {
@@ -261,24 +266,33 @@ export async function readProcessCommands(): Promise<string[] | null> {
   }
 }
 
-export function hasAntigravityCommand(commands: string[], appPath = '/Applications/Antigravity.app'): boolean {
-  const appRoots = Array.from(new Set([appPath, '/Applications/Antigravity.app']));
-  const macOsPrefixes = appRoots.map(p => p + '/Contents/MacOS/');
-  const frameworkPrefixes = appRoots.map(p => p + '/Contents/Frameworks/');
-  const lsPrefixes = appRoots.map(p => p + '/Contents/Resources/bin/language_server');
+export function hasAntigravityCommand(commands: string[], appPath = defaultAppPath()): boolean {
+  const appRoots = Array.from(new Set([appPath, defaultAppPath()]));
   return commands.some(trimmed =>
-    macOsPrefixes.some(prefix => trimmed.startsWith(prefix)) ||
-    frameworkPrefixes.some(prefix => trimmed.startsWith(prefix)) ||
-    lsPrefixes.some(prefix => trimmed.startsWith(prefix) || trimmed.includes(prefix))
+    appRoots.some(root => {
+      if (root.endsWith('.app') || !isWindows) {
+        const macOsPrefix = root + '/Contents/MacOS/';
+        const frameworkPrefix = root + '/Contents/Frameworks/';
+        const lsPrefix = root + '/Contents/Resources/bin/language_server';
+        return trimmed.startsWith(macOsPrefix) ||
+          trimmed.startsWith(frameworkPrefix) ||
+          trimmed.startsWith(lsPrefix) ||
+          trimmed.includes(lsPrefix);
+      }
+      return commandMatchesAppRoot(trimmed, root) || commandMatchesLanguageServer(trimmed, root);
+    })
   );
 }
 
 export function hasBrowserProfileCommand(commands: string[], browserProfileDir: string): boolean {
   if (!browserProfileDir) return false;
-  return commands.some(trimmed => trimmed.includes(browserProfileDir) && !trimmed.includes('/bin/ps'));
+  const targetNorm = normalizePathForCompare(browserProfileDir);
+  return commands.some(trimmed =>
+    normalizePathForCompare(trimmed).includes(targetNorm) && !trimmed.includes('/bin/ps')
+  );
 }
 
-export async function antigravityRunning(appPath = '/Applications/Antigravity.app') {
+export async function antigravityRunning(appPath = defaultAppPath()) {
   const commands = await readProcessCommands();
   return commands ? hasAntigravityCommand(commands, appPath) : false;
 }

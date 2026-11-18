@@ -1,8 +1,17 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { openAsarSync } from './asar.js';
 import { bt } from './i18n.js';
+import { isWindows } from './platform/fs.js';
+import {
+  bundleLayoutPaths,
+  defaultAppBundleName,
+  defaultApplicationsDir,
+  defaultAppPath,
+  defaultProfileDir,
+} from './platform/paths.js';
+import { commandMatchesLanguageServer } from './platform/process.js';
 
 export type ApplicationChannel = 'stable';
 export type ApplicationArchitecture = 'legacy-hub' | 'wcv-hub';
@@ -45,42 +54,60 @@ export function probeBundleCapabilities(
     supportsAccountSwitch: true,
   };
 
-  const asarPath = join(appPath, 'Contents', 'Resources', 'app.asar');
+  const layout = bundleLayoutPaths(appPath);
+  const asarPath = layout.asarPath;
   let archive: ReturnType<typeof openAsarSync> | undefined;
   try {
-    if (!existsSync(asarPath)) return fallback;
-    archive = openAsarSync(asarPath, 16_000_000);
-    const distFiles = archive.header.files?.dist?.files ?? {};
-    const hasWcvArchitecture = Boolean(
-      distFiles['wcvBrowserRegistry.js'] ||
-      distFiles['wcvIpcHandlers.js'] ||
-      distFiles['browserEngine'] ||
-      distFiles['windowState.js'],
-    );
+    if (existsSync(asarPath)) {
+      archive = openAsarSync(asarPath, 16_000_000);
+      const distFiles = archive.header.files?.dist?.files ?? {};
+      const hasWcvArchitecture = Boolean(
+        distFiles['wcvBrowserRegistry.js'] ||
+        distFiles['wcvIpcHandlers.js'] ||
+        distFiles['browserEngine'] ||
+        distFiles['windowState.js'],
+      );
 
-    let version = '';
-    let productName = fallback.productName;
-    const pkgBuf = archive.readEntryBuffer(archive.header.files?.['package.json'], 256_000, 1);
-    if (pkgBuf) {
-      const pkg = JSON.parse(pkgBuf.toString('utf8'));
-      if (typeof pkg?.version === 'string') version = pkg.version.trim();
-      if (typeof pkg?.productName === 'string' && pkg.productName.trim()) productName = pkg.productName.trim();
+      let version = '';
+      let productName = fallback.productName;
+      const pkgBuf = archive.readEntryBuffer(archive.header.files?.['package.json'], 256_000, 1);
+      if (pkgBuf) {
+        const pkg = JSON.parse(pkgBuf.toString('utf8'));
+        if (typeof pkg?.version === 'string') version = pkg.version.trim();
+        if (typeof pkg?.productName === 'string' && pkg.productName.trim()) productName = pkg.productName.trim();
+      }
+
+      const architecture: ApplicationArchitecture = hasWcvArchitecture ? 'wcv-hub' : 'legacy-hub';
+      const resolved: BundleCapabilities = {
+        architecture,
+        version,
+        productName,
+        dataDirectoryName: 'antigravity',
+        supportsAccountSwitch: true,
+      };
+      capabilityCache.set(appPath, { value: resolved, expiresAt: now + 30_000 });
+      return resolved;
     }
 
-    const architecture: ApplicationArchitecture = hasWcvArchitecture
-      ? 'wcv-hub'
-      : 'legacy-hub';
-    const dataDirectoryName: DataDirectoryName = 'antigravity';
+    if (existsSync(layout.unpackedPackageJsonPath)) {
+      const pkg = JSON.parse(readFileSync(layout.unpackedPackageJsonPath, 'utf8'));
+      const version = typeof pkg?.version === 'string' ? pkg.version.trim() : '';
+      const productName = typeof pkg?.productName === 'string' && pkg.productName.trim() ? pkg.productName.trim() : fallback.productName;
+      const unpackedDist = join(layout.unpackedPackageJsonPath, '..', 'dist');
+      const hasWcvArchitecture = ['wcvBrowserRegistry.js', 'wcvIpcHandlers.js', 'browserEngine', 'windowState.js']
+        .some(name => existsSync(join(unpackedDist, name)));
+      const resolved: BundleCapabilities = {
+        architecture: hasWcvArchitecture ? 'wcv-hub' : 'legacy-hub',
+        version,
+        productName,
+        dataDirectoryName: 'antigravity',
+        supportsAccountSwitch: true,
+      };
+      capabilityCache.set(appPath, { value: resolved, expiresAt: now + 30_000 });
+      return resolved;
+    }
 
-    const resolved: BundleCapabilities = {
-      architecture,
-      version,
-      productName,
-      dataDirectoryName,
-      supportsAccountSwitch: true,
-    };
-    capabilityCache.set(appPath, { value: resolved, expiresAt: now + 30_000 });
-    return resolved;
+    return fallback;
   } catch {
     return fallback;
   } finally {
@@ -100,19 +127,22 @@ export function savedApplicationChannel(value: unknown): ApplicationChannel {
 }
 
 function assertStablePaths(appPath: string, profile?: string): void {
-  if (basename(appPath) === 'Antigravity - Insiders.app' ||
-      (profile && basename(profile) === 'Antigravity - Insiders')) {
+  const appBase = basename(appPath);
+  const profileBase = profile ? basename(profile) : '';
+  if (appBase === 'Antigravity - Insiders.app' ||
+      appBase === 'Antigravity - Insiders' ||
+      profileBase === 'Antigravity - Insiders') {
     throw new Error(bt('app_target.stable_only'));
   }
 }
 
 export function detectInstalledChannels(
   preferredChannel: ApplicationChannel = 'stable',
-  applicationsDir = '/Applications',
+  applicationsDir = defaultApplicationsDir(),
 ): InstalledChannelsInfo {
   applicationChannel(preferredChannel);
   return {
-    channels: existsSync(join(applicationsDir, 'Antigravity.app')) ? ['stable'] : [],
+    channels: existsSync(join(applicationsDir, defaultAppBundleName())) ? ['stable'] : [],
     bothInstalled: false,
     effectiveChannel: 'stable',
   };
@@ -126,8 +156,8 @@ export function applicationTarget(
 ) {
   applicationChannel(channel);
   const name = 'Antigravity';
-  const applicationsDir = options?.applicationsDir ?? '/Applications';
-  const appPath = options?.appPath ?? join(applicationsDir, `${name}.app`);
+  const applicationsDir = options?.applicationsDir ?? defaultApplicationsDir(home);
+  const appPath = options?.appPath ?? defaultAppPath(home, applicationsDir);
   assertStablePaths(appPath, options?.profile);
   const capabilities = probeBundleCapabilities(appPath, channel);
   return {
@@ -136,8 +166,8 @@ export function applicationTarget(
     label: 'Antigravity',
     bundleId: 'com.google.antigravity',
     appPath,
-    executable: name,
-    profile: options?.profile ?? join(home, 'Library', 'Application Support', name),
+    executable: isWindows ? `${name}.exe` : name,
+    profile: options?.profile ?? defaultProfileDir(home),
     dataDirectoryName: capabilities.dataDirectoryName,
     architecture: capabilities.architecture,
     supportsAccountSwitch: true,
@@ -146,7 +176,7 @@ export function applicationTarget(
 
 export type ApplicationTarget = ReturnType<typeof applicationTarget>;
 
-export function allApplicationTargets(home = homedir(), applicationsDir = '/Applications'): ApplicationTarget[] {
+export function allApplicationTargets(home = homedir(), applicationsDir = defaultApplicationsDir(home)): ApplicationTarget[] {
   return [
     applicationTarget('stable', home, { applicationsDir }),
   ];
@@ -165,7 +195,7 @@ export function matchingTargetForLanguageServerCommand(
     ? [preferredTarget, ...allApplicationTargets(home).filter(t => t.appPath !== preferredTarget.appPath)]
     : allApplicationTargets(home);
   for (const candidate of candidates) {
-    if (!command.startsWith(candidate.appPath + '/Contents/Resources/bin/language_server ')) continue;
+    if (!commandMatchesLanguageServer(command, candidate.appPath)) continue;
     const dataDirectory = command.match(/(?:^|\s)--app_data_dir(?:=|\s+)([^\s"]+)/)?.[1];
     if (dataDirectory && dataDirectory !== candidate.dataDirectoryName) continue;
     return candidate;

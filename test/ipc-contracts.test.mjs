@@ -1,15 +1,16 @@
 import test from "node:test";
 import { describe as describeContractGroup } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createConnection } from "node:net";
+import { DatabaseSync } from "node:sqlite";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { AccountsManager } from "../dist/accounts.js";
 import { canonicalPayload, IdempotencyStore } from "../dist/ipc-idempotency.js";
-import { promisify } from "node:util";
+import { controlEndpointForStateDir } from "../dist/platform/paths.js";
 import { ProtobufWriter } from "../dist/protobuf.js";
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
@@ -48,7 +49,7 @@ async function makeManager() {
 
 function exchange(directory, request, { timeout = 8000 } = {}) {
   return new Promise((resolve, reject) => {
-    const socket = createConnection(join(directory, 'control.sock'));
+    const socket = createConnection(controlEndpointForStateDir(directory));
     let value = '';
     const timer = setTimeout(() => { socket.destroy(); reject(new Error('IPC 超时')); }, timeout);
     const finish = error => { clearTimeout(timer); socket.destroy(); error ? reject(error) : resolve(value); };
@@ -171,7 +172,6 @@ test('幂等性保留所有业务id，传输requestId可变，异目标必须冲
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("undefined · v090-engines", { concurrency: false }, async () => {
-const execFileAsync = promisify(execFile);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function until(fn, timeoutMs = 6000) {
@@ -186,7 +186,7 @@ async function until(fn, timeoutMs = 6000) {
 
 function rpc(directory, payload) {
   return new Promise((resolve, reject) => {
-    const socket = createConnection(join(directory, 'control.sock'));
+    const socket = createConnection(controlEndpointForStateDir(directory));
     let value = '';
     socket.setTimeout(4000, () => {
       socket.destroy();
@@ -240,12 +240,11 @@ test('Main IPC 集成测试: 0.9.0 账号管理、额度策略、Token 用量与
   const f9 = ProtobufWriter.encodeLengthDelimited(9, tInner);
   const genBlob = ProtobufWriter.encodeLengthDelimited(1, Buffer.concat([f19, f4, f9]));
 
-  await execFileAsync('/usr/bin/sqlite3', [
-    mockDbPath,
-    `CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);
-     CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
-     INSERT INTO gen_metadata (idx, data) VALUES (1, X'${genBlob.toString('hex')}');`,
-  ]);
+  const conn = new DatabaseSync(mockDbPath);
+  try {
+    conn.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB); CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);');
+    conn.prepare('INSERT INTO gen_metadata (idx, data) VALUES (1, ?);').run(genBlob);
+  } finally { conn.close(); }
 
   // 2. 注入沙箱独立凭据，供 account_save_current 提取
   const standaloneDir = join(mockHomeDir, '.gemini');
@@ -545,7 +544,7 @@ test('P0-02/P1-15/P1-17/P1-19/P1-20: 维护目录动态双语、resume切回中�
 
     const mainSource = await readFile(fileURLToPath(new URL('../src/main.ts', import.meta.url)), 'utf8');
     assert.ok(!/if\s*\(\s*\['pause',\s*'restore',\s*'stop'\]/.test(mainSource), 'pause/restore 不得无差别取消所有任务');
-    assert.ok(mainSource.includes("'/Applications/Antigravity - Insiders.app/Contents/'"), 'preflight 必须按 Insiders 目录前缀检测');
+    assert.ok(mainSource.includes('Antigravity - Insiders') && mainSource.includes('insidersRunning'), 'preflight 必须按 Insiders 目录前缀检测');
     assert.equal(stderr, '');
     await rpc(dir, { command: 'stop' });
     await until(async () => child.exitCode === 0, 10000);
