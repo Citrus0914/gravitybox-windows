@@ -333,7 +333,7 @@ Divides local disk usage into **Runtime Cache (Blue)**, **Background Logs (Orang
 
 ### System Requirements
 - **OS**: macOS 14 (Sonoma) or macOS 15+ (Sequoia)
-- **Architecture**: Apple Silicon (`arm64` — M1 / M2 / M3 / M4)
+- **Architecture**: Apple Silicon (`arm64` — all Apple M-series chips)
 - **Target App**: Official release `/Applications/Antigravity.app` (verified across `2.23.0` ~ `2.32.2`; *Insiders channel is neither supported nor modified*)
 - **Runtime**: **Zero dependencies** — self-contained Node 22 binary embedded inside the app bundle
 

@@ -363,7 +363,7 @@ HUD 静静挂载在每一个 Antigravity 对话输入框正下方（支持分栏
 
 ### 运行环境要求
 - **操作系统**：macOS 14 (Sonoma) 或 macOS 15+ (Sequoia)
-- **芯片架构**：Apple Silicon (`arm64`，M1 / M2 / M3 / M4 全系支持)
+- **芯片架构**：Apple Silicon (`arm64`，M 系列全系芯片支持)
 - **目标应用**：官方正式版 `/Applications/Antigravity.app`（已完整验证适配 `2.23.0` ~ `2.32.2`，*不支持也不干扰 Insiders 预览版*）
 - **外部依赖**：**零依赖** —— `.app` 内已自带独立 Node 22 运行时与原生宿主程序
 
