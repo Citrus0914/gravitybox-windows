@@ -6,7 +6,7 @@
 
 ## [Unreleased]
 
-## [1.1.1] - 2026-11-16
+## [1.1.1] - 2026-11-18
 
 ### Added
 - **Full App Localization (`简体中文` / `English`)**：新增 GravityBox 自身原生 Swift AppKit 界面（`native/L10n.swift`）、Node 后端（`src/i18n.ts`）与 IDE 会话状态栏（`runtime/hud-i18n.js`）完整中英双语支持，基于外置语言包 `assets/i18n/en.json` 与 `assets/i18n/zh-Hans.json` 实现零重启实时切换。
