@@ -1,8 +1,7 @@
+import { DatabaseSync } from 'node:sqlite';
 import { type ApplicationChannel, type ApplicationTarget, applicationTarget } from './application-target.js';
-import { spawn, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { readFile, mkdir, lstat, unlink, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { atomicJson, atomicText } from './files.js';
 import { withProcessLease } from './process-lock.js';
@@ -11,14 +10,14 @@ import { ProtobufWriter as Writer } from './protobuf.js';
 import { replaceTopicRow } from './account-state.js';
 export { replaceTopicRow } from './account-state.js';
 import { bt } from './i18n.js';
-
-const run = promisify(execFile);
+import { isOwnedByCurrentUser, isWindows } from './platform/fs.js';
+import { defaultApplicationsDir } from './platform/paths.js';
+import { commandMatchesAppRoot, listProcesses } from './platform/process.js';
 const TOKEN = 'antigravityUnifiedStateSync.oauthToken';
 const USER = 'antigravityUnifiedStateSync.userStatus';
 const INIT = 'jetskiStateSync.agentManagerInitState';
 const PROJECT = 'antigravityUnifiedStateSync.enterprisePreferences';
 const KEYS = [TOKEN, USER, INIT, PROJECT, 'antigravityOnboarding'];
-const quote = (s: string) => `'${s.replaceAll("'", "''")}'`;
 type Rows = Record<string, string>;
 type SavedFile = { path: string; before: string; after: string; afterDigest?: string };
 type Journal = {
@@ -53,55 +52,92 @@ function rowsDigest(rows: Rows): string {
   return sha256(JSON.stringify(Object.entries(rows || {}).sort()));
 }
 
-// sqlite3 stays in BEGIN IMMEDIATE while the other resources are committed. SQL goes through
-// stdin, so neither tokens nor database values appear in command arguments or diagnostics.
+// DatabaseSync stays in BEGIN IMMEDIATE while the other resources are committed.
 export class DatabaseTransaction {
-  private child;
-  private output = '';
-  private pending?: { marker: string; resolve: (s: string) => void; reject: (e: Error) => void };
+  private db?: DatabaseSync;
   private failed = false;
-  private exited: Promise<void>;
-  constructor(path: string) {
-    this.child = spawn('/usr/bin/sqlite3', ['-batch', '-bail', path], { stdio: ['pipe', 'pipe', 'pipe'] });
-    this.exited = new Promise(resolve => this.child.once('close', () => resolve()));
-    this.child.stdin.on('error', () => this.fail());
-    this.child.stderr.on('data', () => this.fail());
-    this.child.on('error', () => this.fail());
-    this.child.on('exit', () => this.fail());
-    this.child.stdout.on('data', chunk => {
-      this.output += chunk.toString();
-      if (this.output.length > 4_000_000) return this.fail();
-      const marker = this.pending?.marker;
-      if (marker && this.output.includes(marker)) {
-        const reply = this.output.slice(0, this.output.indexOf(marker)).trim();
-        this.output = this.output.slice(this.output.indexOf(marker) + marker.length).trimStart();
-        const pending = this.pending!; this.pending = undefined; pending.resolve(reply);
-      }
-    });
+  private closed = false;
+  private inTx = false;
+  constructor(dbPath: string) {
+    try {
+      this.db = new DatabaseSync(dbPath);
+    } catch {
+      this.failed = true;
+    }
   }
-  private fail() { this.failed = true; this.pending?.reject(new Error(bt('switch.err.db_tx_failed'))); this.pending = undefined; }
-  async sql(sql: string): Promise<string> {
-    if (this.failed) throw new Error(bt('switch.err.db_closed'));
-    const marker = `GB_${randomUUID()}`;
-    const response = new Promise<string>((resolve, reject) => { this.pending = { marker, resolve, reject }; });
-    this.child.stdin.write(`${sql}\n.print ${marker}\n`);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try { return await Promise.race([response, new Promise<never>((_, reject) => { timer = setTimeout(() => { this.child.kill(); reject(new Error(bt('switch.err.db_busy'))); }, 6000); })]); }
-    finally { clearTimeout(timer); }
+  private ensureOpen(): DatabaseSync {
+    if (this.failed || this.closed || !this.db) {
+      throw new Error(bt(this.closed ? 'switch.err.db_closed' : 'switch.err.db_tx_failed'));
+    }
+    return this.db;
   }
-  async begin() { await this.sql('.timeout 3000\n.mode json\nBEGIN IMMEDIATE;'); }
+  async begin() {
+    const db = this.ensureOpen();
+    try {
+      db.exec('PRAGMA busy_timeout = 3000;');
+      db.exec('BEGIN IMMEDIATE;');
+      this.inTx = true;
+    } catch (error) {
+      this.failed = true;
+      const msg = error instanceof Error ? error.message : String(error);
+      if (/SQLITE_BUSY|database is locked/i.test(msg)) throw new Error(bt('switch.err.db_busy'));
+      throw new Error(bt('switch.err.db_tx_failed'));
+    }
+  }
   async rows(): Promise<Rows> {
-    const raw = await this.sql(`SELECT key,value FROM ItemTable WHERE key IN (${KEYS.map(quote).join(',')});`);
-    return Object.fromEntries((JSON.parse(raw || '[]') as { key: string; value: string }[]).map(r => [r.key, r.value]));
+    const db = this.ensureOpen();
+    try {
+      const placeholders = KEYS.map(() => '?').join(',');
+      const stmt = db.prepare(`SELECT key, value FROM ItemTable WHERE key IN (${placeholders});`);
+      const list = stmt.all(...KEYS) as Array<{ key: string; value: string }>;
+      return Object.fromEntries(list.map(r => [String(r.key), String(r.value)]));
+    } catch {
+      this.failed = true;
+      throw new Error(bt('switch.err.db_tx_failed'));
+    }
   }
   async replace(rows: Rows) {
-    await this.sql(`DELETE FROM ItemTable WHERE key IN (${KEYS.map(quote).join(',')});\n${Object.entries(rows).map(([k, v]) => `INSERT INTO ItemTable(key,value) VALUES(${quote(k)},${quote(v)});`).join('\n')}`);
+    const db = this.ensureOpen();
+    try {
+      const placeholders = KEYS.map(() => '?').join(',');
+      db.prepare(`DELETE FROM ItemTable WHERE key IN (${placeholders});`).run(...KEYS);
+      const insert = db.prepare('INSERT INTO ItemTable(key, value) VALUES(?, ?);');
+      for (const [k, v] of Object.entries(rows)) {
+        insert.run(k, v);
+      }
+    } catch {
+      this.failed = true;
+      throw new Error(bt('switch.err.db_tx_failed'));
+    }
   }
-  async finish(commit: boolean) { try { await this.sql(commit ? 'COMMIT;' : 'ROLLBACK;'); } finally { this.child.stdin.end(); } }
+  async finish(commit: boolean) {
+    const db = this.ensureOpen();
+    try {
+      if (this.inTx) {
+        db.exec(commit ? 'COMMIT;' : 'ROLLBACK;');
+        this.inTx = false;
+      }
+    } catch {
+      this.failed = true;
+      throw new Error(bt('switch.err.db_tx_failed'));
+    } finally {
+      this.closeSync();
+    }
+  }
+  private closeSync() {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      if (this.inTx && this.db) {
+        try { this.db.exec('ROLLBACK;'); } catch {}
+        this.inTx = false;
+      }
+      this.db?.close();
+    } catch {}
+    this.db = undefined;
+  }
   async close() {
-    this.child.stdin.end();
-    const timer = setTimeout(() => this.child.kill(), 1500);
-    try { await this.exited; } finally { clearTimeout(timer); }
+    this.closeSync();
   }
 }
 
@@ -197,7 +233,7 @@ export class AccountSwitchService {
     const allowed = new Set([join(this.options.stateDir, 'accounts.json')]);
     if (record.version !== 1 || !['prepared', 'committed'].includes(record.phase) || record.databasePath !== dbPath ||
         !Array.isArray(record.files) || record.files.some(f => !allowed.has(f.path) &&
-          !(f.path.startsWith(join(this.options.stateDir, 'accounts') + '/') && /^[a-zA-Z0-9_-]+\.json$/.test(f.path.slice(join(this.options.stateDir, 'accounts').length + 1))))) {
+          !(f.path.startsWith(join(this.options.stateDir, 'accounts') + sep) && /^[a-zA-Z0-9_-]+\.json$/.test(f.path.slice(join(this.options.stateDir, 'accounts').length + 1))))) {
       throw new Error(bt('switch.err.rollback_identity'));
     }
     const currentJournal = JSON.parse(await readFile(this.journalPath, 'utf8')) as Journal;
@@ -237,15 +273,19 @@ export class AccountSwitchService {
     } finally { await tx?.close(); }
   }
   private async guardStopped() {
-    const candidatePrefixes = Array.from(
+    const appsDir = defaultApplicationsDir();
+    const candidateRoots = Array.from(
       // Insiders shares official credentials: block switching while it runs, without managing it.
-      new Set([this.target.appPath, '/Applications/Antigravity.app', '/Applications/Antigravity - Insiders.app']),
-    ).map(p => p + '/Contents/');
+      new Set([
+        this.target.appPath,
+        isWindows ? join(appsDir, 'Antigravity') : '/Applications/Antigravity.app',
+        isWindows ? join(appsDir, 'Antigravity - Insiders') : '/Applications/Antigravity - Insiders.app',
+      ]),
+    );
     const running = this.options.isRunning ? await this.options.isRunning() :
-      (await run('/bin/ps', ['-ax', '-ww', '-o', 'args='], { timeout: 3000 })).stdout.split('\n').some(line => {
-        const trimmed = line.trim();
-        return candidatePrefixes.some(prefix => trimmed.startsWith(prefix));
-      });
+      (await listProcesses()).some(proc =>
+        candidateRoots.some(root => commandMatchesAppRoot(proc.command, root, proc.exe))
+      );
     if (running) throw new Error(bt('switch.err.stop_app_first'));
   }
   private async archivePreviousJournal(previous: Journal) {
@@ -279,7 +319,7 @@ export class AccountSwitchService {
 
   private async regular(path: string) {
     const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error(bt('switch.err.invalid_login_file'));
+    if (!info.isFile() || info.isSymbolicLink() || !isOwnedByCurrentUser(info)) throw new Error(bt('switch.err.invalid_login_file'));
   }
   private async optionalRegular(path: string): Promise<boolean> {
     try {
@@ -374,7 +414,7 @@ export class AccountSwitchService {
           files: filesWithDigest.map(f => ({
             path: f.path,
             before: f.before,
-            after: f.path.includes('/accounts/') ? '[REDACTED_ACCOUNT]' : f.after,
+            after: f.path.includes('/accounts/') || f.path.includes('\\accounts\\') ? '[REDACTED_ACCOUNT]' : f.after,
             afterDigest: f.afterDigest,
           })),
         });

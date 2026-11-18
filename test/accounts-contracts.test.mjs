@@ -80,7 +80,7 @@ async function accountFile(dir, id) {
 
 // ---------- D02 删除复活 ----------
 
-test('D02: 账号删除受阻保留原文件与恢复日志，权限恢复后完整对账', async () => {
+test('D02: 账号删除受阻保留原文件与恢复日志，权限恢复后完整对账', { skip: process.platform === 'win32' }, async () => {
   const dir = await sandbox('gb-p2-delete-fail-');
   const accountsDir = join(dir, 'accounts');
   try {

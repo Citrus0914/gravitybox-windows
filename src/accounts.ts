@@ -4,9 +4,9 @@ import { inspectBundle } from './discovery.js';
 import { lstat, mkdir, readFile, readdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { homedir } from 'node:os';
+import { defaultAppSupportDir, defaultStateDir } from './platform/paths.js';
+import { listProcesses } from './platform/process.js';
 import { atomicJson, commitAccountAndIndex, recoverAccountCommit, commitFileSet, recoverFileSet, sanitizeError } from './files.js';
 import { ReentrantMutex } from './mutex.js';
 import { validateAccountPolicy } from './account-policy.js';
@@ -16,6 +16,7 @@ import { decodeTopicRow } from './account-state.js';
 import {
   MockKeychainAdapter,
   SystemKeychainAdapter,
+  decodeKeyringPayload,
   syncAccountToKeychain,
   type KeychainAdapter,
 } from './account-keychain.js';
@@ -145,8 +146,6 @@ export {
   getGoogleClientSecret,
 };
 
-const execFileAsync = promisify(execFile);
-
 export class AccountsManager {
   private target: ApplicationTarget;
   private accountsDir: string;
@@ -216,12 +215,12 @@ export class AccountsManager {
     if(this.inFlightProviderContext)return await this.inFlightProviderContext;
     const task=(async():Promise<CloudProviderContext>=>{
       const candidate = this.target;
-      const text=(await execFileAsync('/bin/ps',['-ax','-ww','-o','args='],{timeout:3000})).stdout;
+      const processes = await listProcesses();
       let version = '';
       try {
         version = (await inspectBundle(candidate.appPath)).version;
       } catch {}
-      const context = text.split('\n').map(line => cloudProviderContextFromCommand(line.trim(), version, candidate)).find(Boolean);
+      const context = processes.map(p => cloudProviderContextFromCommand(p.command.trim(), version, candidate)).find(Boolean);
       const providerCachePath = join(this.stateDir, 'quota-provider-stable.json');
       if (context) {
         await atomicJson(providerCachePath, context);
@@ -1130,7 +1129,7 @@ export class AccountsManager {
     appSupportDir?: string;
   }): Promise<Account> {
     const homeDir = options?.homeDir ?? homedir();
-    const appSupportDir = options?.appSupportDir ?? join(homedir(), 'Library', 'Application Support');
+    const appSupportDir = options?.appSupportDir ?? defaultAppSupportDir(homeDir);
     const keychain = options?.keychain ?? new SystemKeychainAdapter();
 
     const isSandboxHome = homeDir !== homedir();
@@ -1177,23 +1176,20 @@ export class AccountsManager {
     if (!extractedToken && (options?.keychain || !isSandboxHome)) {
       try {
         const pass = await keychain.readPassword('gemini', 'antigravity');
-        if (pass && pass.startsWith('go-keyring-base64:')) {
-          const raw = Buffer.from(pass.slice('go-keyring-base64:'.length), 'base64').toString('utf8');
-          const parsed = JSON.parse(raw);
-          if (parsed?.token?.refresh_token) {
-            extractedToken = {
-              access_token: parsed.token.access_token || '',
-              refresh_token: parsed.token.refresh_token,
-              expires_in: parsed.token.expires_in || 3600,
-              expiry_timestamp: parsed.token.expiry_timestamp || (Number.isFinite(Date.parse(parsed.token.expiry)) ? Math.floor(Date.parse(parsed.token.expiry) / 1000) : Math.floor(Date.now() / 1000) + 3600),
-              token_type: parsed.token.token_type || 'Bearer',
-              email: parsed.token.email || parsed.id_token_email || null,
-              project_id: parsed.token.project_id || null,
-              is_gcp_tos: parsed.token.is_gcp_tos || false,
-              id_token: parsed.token.id_token || null,
-            };
-            extractedEmail = parsed.token.email || parsed.id_token_email || null;
-          }
+        const parsed = decodeKeyringPayload(pass);
+        if (parsed?.token?.refresh_token) {
+          extractedToken = {
+            access_token: parsed.token.access_token || '',
+            refresh_token: parsed.token.refresh_token,
+            expires_in: parsed.token.expires_in || 3600,
+            expiry_timestamp: parsed.token.expiry_timestamp || (Number.isFinite(Date.parse(parsed.token.expiry)) ? Math.floor(Date.parse(parsed.token.expiry) / 1000) : Math.floor(Date.now() / 1000) + 3600),
+            token_type: parsed.token.token_type || 'Bearer',
+            email: parsed.token.email || parsed.id_token_email || null,
+            project_id: parsed.token.project_id || null,
+            is_gcp_tos: parsed.token.is_gcp_tos || false,
+            id_token: parsed.token.id_token || null,
+          };
+          extractedEmail = parsed.token.email || parsed.id_token_email || null;
         }
       } catch {}
     }
@@ -1584,7 +1580,7 @@ export class AccountsManager {
       const ls = await this.probeLiveLanguageServer().catch(() => null);
       if (ls?.email) return ls.email;
     }
-    const isDefaultStateDir = this.stateDir === join(homedir(), 'Library', 'Application Support', 'GravityBox');
+    const isDefaultStateDir = this.stateDir === defaultStateDir();
     if (!isDefaultStateDir) return null;
     const now = Date.now();
     if (this.desktopEmailCache && now < this.desktopEmailCache.expiresAt) {
@@ -1628,12 +1624,9 @@ export class AccountsManager {
     if (!detected) {
       try {
         const pass = await new SystemKeychainAdapter().readPassword('gemini', 'antigravity');
-        if (pass && pass.startsWith('go-keyring-base64:')) {
-          const raw = Buffer.from(pass.slice('go-keyring-base64:'.length), 'base64').toString('utf8');
-          const parsed = JSON.parse(raw);
-          const email = parsed?.token?.email || parsed?.id_token_email;
-          if (typeof email === 'string' && /^[^\s@]+@[^\s@]+$/.test(email)) detected = email;
-        }
+        const parsed = decodeKeyringPayload(pass);
+        const email = parsed?.token?.email || parsed?.id_token_email;
+        if (typeof email === 'string' && /^[^\s@]+@[^\s@]+$/.test(email)) detected = email;
       } catch {}
     }
     this.desktopEmailCache = { email: detected, expiresAt: now + 5000 };

@@ -1,7 +1,7 @@
 import { lstat, readdir, mkdir, readFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
-import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { defaultCacheDir, defaultTrashDir } from './platform/paths.js';
 import { ReentrantMutex } from './mutex.js';
 import { executeMoves, reconcileMoves, readMaintenanceManifest, type JournalMove } from './maintenance-journal.js';
 import {
@@ -78,7 +78,7 @@ export class CacheMaintenance {
 
   constructor(
     private profile: string,
-    private trash = join(homedir(), '.Trash'),
+    private trash = defaultTrashDir(),
     private running = antigravityRunning,
     private options: CacheMaintenanceOptions = {},
   ) {
@@ -104,7 +104,7 @@ export class CacheMaintenance {
     if (this.options.stateDir) {
       return join(resolve(this.options.stateDir), 'maintenance-trash');
     }
-    return join(homedir(), 'Library', 'Caches', 'GravityBox', 'maintenance-trash');
+    return join(defaultCacheDir(), 'maintenance-trash');
   }
 
   private candidateTrashDirs(): string[] {

@@ -3,13 +3,15 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, utimes, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { DatabaseSync } from 'node:sqlite';
 import { CacheMaintenance } from '../dist/maintenance.js';
 import { UsageStatsManager } from '../dist/usage.js';
 import { ProtobufWriter } from '../dist/protobuf.js';
 
-const execFileAsync = promisify(execFile);
+function execSql(dbPath, sql) {
+  const conn = new DatabaseSync(dbPath);
+  try { conn.exec(sql); } finally { conn.close(); }
+}
 
 async function setAgeDays(targetPath, daysAgo) {
   const sec = (Date.now() - daysAgo * 86_400_000) / 1000;
@@ -35,7 +37,7 @@ async function createUsageDb(dbPath, { model = 'gemini-3.8-flash', input = 1500,
     CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
     INSERT INTO gen_metadata (idx, data) VALUES (1, X'${hexBlob}');
   `;
-  await execFileAsync('/usr/bin/sqlite3', [dbPath, sql]);
+  execSql(dbPath, sql);
 }
 
 async function createSummariesDb(dbPath, summaries, archivedIds = []) {
@@ -51,7 +53,7 @@ async function createSummariesDb(dbPath, summaries, archivedIds = []) {
   for (const cid of archivedIds) {
     lines.push(`INSERT INTO conversations_fts (conversation_id, title, archived) VALUES ('${cid}', 'archived chat', 1);`);
   }
-  await execFileAsync('/usr/bin/sqlite3', [dbPath, lines.join('\n')]);
+  execSql(dbPath, lines.join('\n'));
 }
 
 test('v2 存储治理: PartitionsCache 与 AgentBrowserCache 精确剥离无状态缓存，保护登录态且绝不触碰 Insiders', async () => {
@@ -412,7 +414,7 @@ test('v2 存储治理: 独立浏览器沙箱占用时局部跳过 AgentBrowserCa
   }
 });
 
-test('v2 存储治理: macOS TCC ~/.Trash 受限(EPERM/EACCES)时退出重扫、清理、历史与原位恢复自动回退本地安全回收仓且不污染保护数据统计', async () => {
+test('v2 存储治理: macOS TCC ~/.Trash 受限(EPERM/EACCES)时退出重扫、清理、历史与原位恢复自动回退本地安全回收仓且不污染保护数据统计', { skip: process.platform === 'win32' }, async () => {
   const { chmod } = await import('node:fs/promises');
   const { hasAntigravityCommand } = await import('../dist/maintenance.js');
   const temp = await realpath(await mkdtemp(join(tmpdir(), 'gb-maint-v2-tcc-trash-')));
@@ -536,7 +538,7 @@ test('v3 三卡片双开关: scan 双桶聚合、smartClear 免令牌清理、�
     // 准备运行缓存：Cache 正常，GPUCache 为符号链接（应静默跳过而非阻断整桶），AgentBrowserCache 处于繁忙态
     await mkdir(join(profile, 'Cache'), { recursive: true });
     await writeFile(join(profile, 'Cache', 'chunk.bin'), Buffer.alloc(3072, 1));
-    await symlink(extTarget, join(profile, 'GPUCache'));
+    await symlink(extTarget, join(profile, 'GPUCache'), process.platform === 'win32' ? 'junction' : undefined);
     const bpCache = join(agentDir, 'browser_profile', 'Default', 'Cache');
     await mkdir(bpCache, { recursive: true });
     await writeFile(join(bpCache, 'web.bin'), Buffer.alloc(1024, 2));
@@ -569,7 +571,7 @@ test('v3 三卡片双开关: scan 双桶聚合、smartClear 免令牌清理、�
     assert.equal(clear1.clearedBytes, 3072);
     assert.ok(clear1.skipped.includes('GPUCache'));
     assert.ok(clear1.skipped.includes('AgentBrowserCache'));
-    assert.equal(clear1.usingFallbackTrash, true);
+    if (process.platform !== 'win32') assert.equal(clear1.usingFallbackTrash, true);
     assert.deepEqual(clear1.supersededSnapshotPaths, []);
     await assert.rejects(lstat(join(profile, 'Cache')));
     assert.ok((await lstat(join(profile, 'GPUCache'))).isSymbolicLink());
@@ -582,7 +584,9 @@ test('v3 三卡片双开关: scan 双桶聚合、smartClear 免令牌清理、�
     const clear2 = await m.smartClear({ scopes: ['history_logs'], retentionDays: 7, keepLocalSnapshots: 1 });
     assert.equal(clear2.ok, true);
     assert.equal(clear2.moved, 2);
-    assert.deepEqual(clear2.supersededSnapshotPaths, [clear1.restorePath]);
+    if (process.platform !== 'win32') {
+      assert.deepEqual(clear2.supersededSnapshotPaths, [clear1.restorePath]);
+    }
     await assert.rejects(lstat(subDb));
     assert.ok(await lstat(rootDb));
 
@@ -590,7 +594,9 @@ test('v3 三卡片双开关: scan 双桶聚合、smartClear 免令牌清理、�
     assert.equal(afterHistoryClearUsage.all_time.totals.total_tokens, baselineUsage.all_time.totals.total_tokens);
 
     // 模拟前端 FileManager.trashItem 移走 supersededSnapshotPaths 后，仅最新一次快照保留在本地支持一键撤回
-    await rm(clear1.restorePath, { recursive: true, force: true });
+    if (process.platform !== 'win32') {
+      await rm(clear1.restorePath, { recursive: true, force: true });
+    }
     const scanAfter = await m.scan({ retentionDays: 7 });
     assert.equal(scanAfter.latestRestorableSnapshot?.id, clear2.snapshotId);
     const undone = await m.restore(scanAfter.latestRestorableSnapshot.id);

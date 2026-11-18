@@ -4,12 +4,9 @@ import { mkdtemp, rm, readdir, readFile, writeFile, mkdir } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { DatabaseSync } from 'node:sqlite';
 import { AccountSwitchService } from '../dist/account-switch.js';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { AccountsManager, MockKeychainAdapter } from '../dist/accounts.js';
-
-const run = promisify(execFile);
 
 async function setupSandbox() {
   const dir = await mkdtemp(join(tmpdir(), 'gb-test-phase4-'));
@@ -19,7 +16,9 @@ async function setupSandbox() {
   await mkdir(stateDir, { recursive: true });
 
   const db = join(profile, 'User', 'globalStorage', 'state.vscdb');
-  await run('/usr/bin/sqlite3', [db, 'CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);']);
+  const conn = new DatabaseSync(db);
+  try { conn.exec('CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);'); }
+  finally { conn.close(); }
 
   const manager = new AccountsManager(stateDir);
   await manager.init();

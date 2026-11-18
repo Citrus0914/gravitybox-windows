@@ -1,4 +1,5 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { copyFile, readFile, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { Script, runInNewContext } from 'node:vm';
 
@@ -86,6 +87,12 @@ export async function copyRuntime(distUrl = new URL('../dist/', import.meta.url)
   const mergedSource = [...baseSources, hudBundle].join('\n');
   new Script(mergedSource, { filename: 'GravityBox-runtime.js' });
   await writeFile(new URL('engine.js', distUrl), mergedSource);
+  if (process.platform === 'win32') {
+    const winHelperSrc = new URL('../native-win/gb-win-helper/target/release/gb-win-helper.exe', import.meta.url);
+    if (existsSync(winHelperSrc)) {
+      await copyFile(winHelperSrc, new URL('gb-win-helper.exe', distUrl));
+    }
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await copyRuntime();

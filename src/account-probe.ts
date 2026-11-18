@@ -1,11 +1,15 @@
 import { existsSync } from 'node:fs';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import * as https from 'node:https';
 import * as http from 'node:http';
 import { applicationTarget, matchingTargetForLanguageServerCommand, type ApplicationTarget } from './application-target.js';
 import { resolveVerifiedLanguageServerPorts } from './discovery.js';
 import { SqliteReadSnapshot } from './sqlite-read.js';
+import {
+  commandMatchesLanguageServer,
+  languageServerBinaryPath,
+  listLoopbackListenerPortsForPid,
+  listProcesses,
+} from './platform/process.js';
 import {
   applyFamilyWindows,
   buildArgonStatus,
@@ -19,13 +23,11 @@ import {
 import type { LiveLanguageServerStatus, ModelQuota, QuotaData, QuotaGroup } from './accounts.js';
 import { bt } from './i18n.js';
 
-const execFileAsync = promisify(execFile);
-
 export type CloudProviderContext = { origin: string; userAgent: string; appVersion: string; clientSubType?: string; identityVersion?: 2 };
 const CLOUD_ORIGINS = new Set(['https://cloudcode-pa.googleapis.com', 'https://daily-cloudcode-pa.googleapis.com', 'https://daily-cloudcode-pa.sandbox.googleapis.com']);
 
 export function cloudOriginFromCommand(command: string, target = applicationTarget()): string | null {
-  if (!command.startsWith(target.appPath + '/Contents/Resources/bin/language_server ')) return null;
+  if (!commandMatchesLanguageServer(command, target.appPath)) return null;
   const dataDirectory = command.match(/(?:^|\s)--app_data_dir(?:=|\s+)([^\s"]+)/)?.[1];
   if (dataDirectory && dataDirectory !== target.dataDirectoryName) return null;
   const value = command.match(/(?:^|\s)--cloud_code_endpoint(?:=|\s+)([^\s"]+)/)?.[1];
@@ -54,7 +56,7 @@ export function validCachedCloudProviderContext(value: any, appVersion: string, 
   if (!value || value.identityVersion !== 2 || !CLOUD_ORIGINS.has(value.origin)
     || typeof value.clientSubType !== 'string'
     || (value.clientSubType !== '' && !/^[a-z][a-z0-9_-]{0,31}$/.test(value.clientSubType))) return false;
-  const expected = cloudProviderContextFromCommand(target.appPath + '/Contents/Resources/bin/language_server --cloud_code_endpoint '
+  const expected = cloudProviderContextFromCommand(languageServerBinaryPath(target.appPath) + ' --cloud_code_endpoint '
     + value.origin + (value.clientSubType ? ' --subclient_type ' + value.clientSubType : ''), appVersion, target);
   return !!expected && value.appVersion === expected.appVersion && value.userAgent === expected.userAgent;
 }
@@ -472,28 +474,22 @@ export async function probeLiveLanguageServerOnce(
       cachedLiveEndpoint = null;
     }
 
-    const { stdout: psOut } = await execFileAsync('/bin/ps', ['-ax', '-ww', '-o', 'pid=,args='], { timeout: 3000 });
-    const lines = psOut.split('\n');
+    const processes = await listProcesses();
     let targetPid = 0;
     let csrfToken = '';
     let matchedAppPath = target.appPath;
 
-    for (const line of lines) {
-      if (line.includes('--csrf_token')) {
-        const trimmed = line.trim();
-        const mPid = trimmed.match(/^(\d+)\s+(.+)$/);
-        if (mPid) {
-          const pid = parseInt(mPid[1]!, 10);
-          const cmd = mPid[2]!;
-          const matchedTarget = matchingTargetForLanguageServerCommand(cmd, target);
-          if (matchedTarget) {
-            const mCsrf = cmd.match(/--csrf_token[=\s]+([^\s]+)/);
-            if (mCsrf) {
-              targetPid = pid;
-              csrfToken = mCsrf[1]!;
-              matchedAppPath = matchedTarget.appPath;
-              break;
-            }
+    for (const proc of processes) {
+      const cmd = proc.command;
+      if (cmd.includes('--csrf_token')) {
+        const matchedTarget = matchingTargetForLanguageServerCommand(cmd, target);
+        if (matchedTarget) {
+          const mCsrf = cmd.match(/--csrf_token[=\s]+([^\s]+)/);
+          if (mCsrf) {
+            targetPid = proc.pid;
+            csrfToken = mCsrf[1]!;
+            matchedAppPath = matchedTarget.appPath;
+            break;
           }
         }
       }
@@ -507,13 +503,7 @@ export async function probeLiveLanguageServerOnce(
       if (!verifiedPorts || verifiedPorts.length === 0) return null;
       ports = verifiedPorts;
     } else {
-      const { stdout: lsofOut } = await execFileAsync(
-        '/usr/sbin/lsof',
-        ['-nP', '-a', '-p', String(targetPid), '-iTCP', '-sTCP:LISTEN', '-Fn'],
-        { timeout: 3000 }
-      );
-      const portMatches = Array.from(lsofOut.matchAll(/n127\.0\.0\.1:(\d+)/g)).map(m => parseInt(m[1]!, 10));
-      ports = Array.from(new Set(portMatches));
+      ports = await listLoopbackListenerPortsForPid(targetPid);
       if (ports.length === 0) return null;
     }
 

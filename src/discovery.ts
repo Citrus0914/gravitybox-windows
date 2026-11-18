@@ -1,12 +1,19 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { mkdir, readFile, stat as fsStat, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { openAsarArchive } from './asar.js';
 import { assertLoopback } from './cdp.js';
 import { targetForApp } from './application-target.js';
 import { bt } from './i18n.js';
+import { isWindows } from './platform/fs.js';
+import { bundleLayoutPaths, defaultAppPath, defaultCacheDir } from './platform/paths.js';
+import {
+  languageServerBinaryPath,
+  normalizePathForCompare,
+} from './platform/process.js';
+import { winExeInfo, winLsPorts, winTcpOwners } from './platform/win-helper.js';
 const execFileRaw = promisify(execFile);
 const execute = (file: string, args: string[], timeout = 3000) => execFileRaw(file, args, { timeout });
 export type Endpoint = { port: number; pid: number; browserURL: string; appVersion: string; legacyPatch: boolean; appPath?: string; profile?: string };
@@ -39,7 +46,7 @@ type PersistedBundleEntry = {
 
 const bundleCache = new Map<string, PersistedBundleEntry & { expiresAt: number; hardExpiresAt: number }>();
 const inFlightBundleInspect = new Map<string, Promise<{ version: string; legacyPatch: boolean }>>();
-const BUNDLE_DISK_CACHE_PATH = join(homedir(), 'Library', 'Caches', 'GravityBox', 'bundle-verify-cache-v1.json');
+const BUNDLE_DISK_CACHE_PATH = join(defaultCacheDir(), 'bundle-verify-cache-v1.json');
 let diskBundleCacheLoaded = false;
 
 async function ensureDiskBundleCacheLoaded(): Promise<void> {
@@ -90,6 +97,80 @@ export async function inspectBundle(appPath: string): Promise<{ version: string;
   const work = (async () => {
     await ensureDiskBundleCacheLoaded();
     const target = targetForApp(appPath);
+    if (isWindows && !appPath.endsWith('.app')) {
+      const layout = bundleLayoutPaths(appPath, 'Antigravity');
+      const execStat = await fsStat(layout.executablePath);
+      const exeInfo = await winExeInfo(layout.executablePath);
+      if (exeInfo.productName && exeInfo.productName !== 'Antigravity') {
+        throw new Error(bt('discovery.app_mismatch'));
+      }
+      if (process.env.GRAVITYBOX_REQUIRE_SIGNATURE === '1' && !exeInfo.signed) {
+        throw new Error(bt('discovery.signature_failed'));
+      }
+      let version = exeInfo.fileVersion.trim();
+      let legacyPatch = false;
+      let asarMtimeMs = 0;
+      let asarSize = 0;
+      if (existsSync(layout.asarPath)) {
+        const asarStat = await fsStat(layout.asarPath);
+        asarMtimeMs = asarStat.mtimeMs;
+        asarSize = asarStat.size;
+        const archive = await openAsarArchive(layout.asarPath, 16_000_000);
+        try {
+          if (!version) {
+            const pkgEntry = archive.header.files?.['package.json'];
+            if (pkgEntry && !pkgEntry.unpacked) {
+              const pkgBytes = await archive.readEntryBuffer(pkgEntry, 256_000, 1);
+              if (pkgBytes) {
+                const pkg = JSON.parse(pkgBytes.toString('utf8'));
+                if (typeof pkg?.version === 'string') version = pkg.version.trim();
+              }
+            }
+          }
+          for (const name of ['preload.js', 'main.js', 'utils.js']) {
+            const entry = archive.header.files?.dist?.files?.[name];
+            if (!entry || entry.unpacked) continue;
+            const bytes = await archive.readEntryBuffer(entry, 3_000_000, 1);
+            if (!bytes) continue;
+            legacyPatch ||= /ANTIGRAVITY CHINESE LOCALIZATION START|injectAntigravityI18n|__ANTIGRAVITY_I18N_DATA__|createI18nEngine|__ag_hanhua_engine__/.test(bytes.toString());
+          }
+        } finally {
+          await archive.close();
+        }
+      } else if (existsSync(layout.unpackedPackageJsonPath)) {
+        const pkgStat = await fsStat(layout.unpackedPackageJsonPath);
+        asarMtimeMs = pkgStat.mtimeMs;
+        asarSize = pkgStat.size;
+        const pkg = JSON.parse(await readFile(layout.unpackedPackageJsonPath, 'utf8'));
+        if (!version && typeof pkg?.version === 'string') version = pkg.version.trim();
+        const unpackedDist = join(layout.unpackedPackageJsonPath, '..', 'dist');
+        for (const name of ['preload.js', 'main.js', 'utils.js']) {
+          const p = join(unpackedDist, name);
+          if (!existsSync(p)) continue;
+          const text = await readFile(p, 'utf8').catch(() => '');
+          legacyPatch ||= /ANTIGRAVITY CHINESE LOCALIZATION START|injectAntigravityI18n|__ANTIGRAVITY_I18N_DATA__|createI18nEngine|__ag_hanhua_engine__/.test(text);
+        }
+      }
+      const val = { version, legacyPatch };
+      const completedAt = Date.now();
+      bundleCache.set(appPath, {
+        value: val,
+        verifiedAt: completedAt,
+        expiresAt: completedAt + 120_000,
+        hardExpiresAt: completedAt + 24 * 3600_000,
+        plistMtimeMs: 0,
+        plistSize: 0,
+        asarMtimeMs,
+        asarSize,
+        execMtimeMs: execStat.mtimeMs,
+        execSize: execStat.size,
+        codeResMtimeMs: 0,
+        codeResSize: 0,
+      });
+      void saveDiskBundleCache();
+      return val;
+    }
+
     const plist = join(appPath, 'Contents', 'Info.plist');
     const asarPath = join(appPath, 'Contents', 'Resources', 'app.asar');
     const execPath = join(appPath, 'Contents', 'MacOS', target.executable);
@@ -179,15 +260,33 @@ async function discoverSingle(appPath: string, profile: string): Promise<Endpoin
   try { contents = await readFile(join(profile, 'DevToolsActivePort'), 'utf8'); } catch { return undefined; }
   const port = Number(contents.split('\n')[0]);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
-  let listeners: string;
-  try { listeners = (await execute('/usr/sbin/lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpfn'])).stdout; } catch { return undefined; }
-  const owners = parseListeners(listeners, port);
-  if (owners.length !== 1) return undefined;
-  const owner = owners[0]!;
-  let executable: string;
-  try { executable = (await execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(owner.pid), '-d', 'txt', '-Fn'])).stdout; } catch { return undefined; }
-  const expected = join(appPath, 'Contents', 'MacOS', targetForApp(appPath).executable);
-  if (!executable.split('\n').includes(`n${expected}`)) return undefined;
+  let ownerPid = 0;
+  if (isWindows) {
+    let winOwners: Awaited<ReturnType<typeof winTcpOwners>>;
+    try { winOwners = await winTcpOwners(port); } catch { return undefined; }
+    for (const owner of winOwners) {
+      for (const name of owner.names) {
+        if (![`127.0.0.1:${port}`, `[::1]:${port}`].includes(name)) throw new Error(bt('discovery.non_loopback'));
+      }
+    }
+    const activeOwners = winOwners.filter(o => o.names.length > 0);
+    if (activeOwners.length !== 1) return undefined;
+    const owner = activeOwners[0]!;
+    const expected = bundleLayoutPaths(appPath, 'Antigravity').executablePath;
+    if (normalizePathForCompare(owner.exe) !== normalizePathForCompare(expected)) return undefined;
+    ownerPid = owner.pid;
+  } else {
+    let listeners: string;
+    try { listeners = (await execute('/usr/sbin/lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpfn'])).stdout; } catch { return undefined; }
+    const owners = parseListeners(listeners, port);
+    if (owners.length !== 1) return undefined;
+    const owner = owners[0]!;
+    let executable: string;
+    try { executable = (await execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(owner.pid), '-d', 'txt', '-Fn'])).stdout; } catch { return undefined; }
+    const expected = join(appPath, 'Contents', 'MacOS', targetForApp(appPath).executable);
+    if (!executable.split('\n').includes(`n${expected}`)) return undefined;
+    ownerPid = owner.pid;
+  }
   const bundle = await inspectBundle(appPath);
   let response: Response;
   try {
@@ -198,7 +297,7 @@ async function discoverSingle(appPath: string, profile: string): Promise<Endpoin
   if (!version.webSocketDebuggerUrl) return undefined;
   const ws = assertLoopback(version.webSocketDebuggerUrl);
   if (Number(ws.port) !== port) throw new Error(bt('discovery.port_mismatch'));
-  return { port, pid: owner.pid, browserURL: ws.href, appVersion: bundle.version, legacyPatch: bundle.legacyPatch, appPath, profile };
+  return { port, pid: ownerPid, browserURL: ws.href, appVersion: bundle.version, legacyPatch: bundle.legacyPatch, appPath, profile };
 }
 
 export async function discover(appPath: string, profile: string): Promise<Endpoint | undefined> {
@@ -232,20 +331,39 @@ export async function verifyPageService(url: string, appPath: string): Promise<b
   if (cached && cached.expiresAt > now) return cached.valid;
 
   try {
-    const listeners = (await execute('/usr/sbin/lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpfn'])).stdout;
-    const owners = parseListeners(listeners, port);
-    if (owners.length !== 1) {
-      verifiedPortCache.delete(cacheKey);
-      return false;
+    let valid = false;
+    if (isWindows) {
+      const owners = await winTcpOwners(port);
+      for (const owner of owners) {
+        for (const name of owner.names) {
+          if (![`127.0.0.1:${port}`, `[::1]:${port}`].includes(name)) throw new Error(bt('discovery.non_loopback'));
+        }
+      }
+      const activeOwners = owners.filter(o => o.names.length > 0);
+      if (activeOwners.length !== 1) {
+        verifiedPortCache.delete(cacheKey);
+        return false;
+      }
+      const binNorm = normalizePathForCompare(activeOwners[0]!.exe);
+      const lsNorm = normalizePathForCompare(languageServerBinaryPath(appPath));
+      const rootNorm = normalizePathForCompare(appPath);
+      valid = binNorm === lsNorm || binNorm.startsWith(rootNorm + '\\');
+    } else {
+      const listeners = (await execute('/usr/sbin/lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fpfn'])).stdout;
+      const owners = parseListeners(listeners, port);
+      if (owners.length !== 1) {
+        verifiedPortCache.delete(cacheKey);
+        return false;
+      }
+      const executable = (await execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(owners[0]!.pid), '-d', 'txt', '-Fn'])).stdout;
+      const lines = executable.split('\n');
+      valid = lines.some(line => {
+        if (!line.startsWith('n')) return false;
+        const binPath = line.slice(1);
+        return binPath === join(appPath, 'Contents', 'Resources', 'bin', 'language_server') ||
+          binPath.startsWith(appPath + '/Contents/');
+      });
     }
-    const executable = (await execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(owners[0]!.pid), '-d', 'txt', '-Fn'])).stdout;
-    const lines = executable.split('\n');
-    const valid = lines.some(line => {
-      if (!line.startsWith('n')) return false;
-      const binPath = line.slice(1);
-      return binPath === join(appPath, 'Contents', 'Resources', 'bin', 'language_server') ||
-        binPath.startsWith(appPath + '/Contents/');
-    });
     if (valid) verifiedPortCache.set(cacheKey, { valid: true, expiresAt: now + 60_000 });
     else verifiedPortCache.delete(cacheKey);
     return valid;
@@ -258,7 +376,7 @@ export async function verifyPageService(url: string, appPath: string): Promise<b
 const verifiedLsPidPortsCache = new Map<string, { ports: number[]; expiresAt: number }>();
 
 /** Verify the real executable and official bundle before trusting a language-server listener, returning verified loopback IPv4 ports. */
-export async function resolveVerifiedLanguageServerPorts(pid: number, appPath = '/Applications/Antigravity.app'): Promise<number[] | null> {
+export async function resolveVerifiedLanguageServerPorts(pid: number, appPath = defaultAppPath()): Promise<number[] | null> {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   const cacheKey = `${pid}:${appPath}`;
   const now = Date.now();
@@ -274,16 +392,33 @@ export async function resolveVerifiedLanguageServerPorts(pid: number, appPath = 
   }
   try {
     await inspectBundle(appPath);
-    const [execRes, listenerRes] = await Promise.all([
-      execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-d', 'txt', '-Fn']),
-      execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-iTCP', '-sTCP:LISTEN', '-Fn']),
-    ]);
-    if (!execRes.stdout.split('\n').includes('n' + join(appPath, 'Contents/Resources/bin/language_server'))) return null;
-    const listenerOut = listenerRes.stdout;
-    const listeners = listenerOut.split('\n').filter(line => line.startsWith('n'));
-    if (listeners.length === 0 || !listeners.every(line => /^n(?:127\.0\.0\.1|\[::1\]):\d+$/.test(line))) return null;
-    const portMatches = Array.from(listenerOut.matchAll(/n127\.0\.0\.1:(\d+)/g)).map(m => parseInt(m[1]!, 10));
-    const ports = Array.from(new Set(portMatches));
+    let ports: number[] = [];
+    if (isWindows) {
+      const info = await winLsPorts(pid);
+      if (normalizePathForCompare(info.exe) !== normalizePathForCompare(languageServerBinaryPath(appPath))) {
+        return null;
+      }
+      if (info.listeners.length === 0 || !info.listeners.every(l => /^(?:127\.0\.0\.1|\[::1\]):\d+$/.test(l))) {
+        return null;
+      }
+      ports = Array.from(new Set(
+        info.listeners
+          .map(l => l.match(/^127\.0\.0\.1:(\d+)$/)?.[1])
+          .filter((v): v is string => Boolean(v))
+          .map(v => parseInt(v, 10)),
+      ));
+    } else {
+      const [execRes, listenerRes] = await Promise.all([
+        execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-d', 'txt', '-Fn']),
+        execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-iTCP', '-sTCP:LISTEN', '-Fn']),
+      ]);
+      if (!execRes.stdout.split('\n').includes('n' + join(appPath, 'Contents/Resources/bin/language_server'))) return null;
+      const listenerOut = listenerRes.stdout;
+      const listeners = listenerOut.split('\n').filter(line => line.startsWith('n'));
+      if (listeners.length === 0 || !listeners.every(line => /^n(?:127\.0\.0\.1|\[::1\]):\d+$/.test(line))) return null;
+      const portMatches = Array.from(listenerOut.matchAll(/n127\.0\.0\.1:(\d+)/g)).map(m => parseInt(m[1]!, 10));
+      ports = Array.from(new Set(portMatches));
+    }
     if (ports.length > 0) {
       verifiedLsPidPortsCache.set(cacheKey, { ports, expiresAt: Date.now() + 15_000 });
     }

@@ -79,7 +79,6 @@ function createConvDb(t, dir, id, parentId) {
 
 test('OPT-01: 子智能体分栏在步间 status=3 空档期借助 conversation_summaries.db RUNNING 保持 HUD 流式计时与父会话活跃计数', async (t) => {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-opt01-'));
-  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
   const convDir = path.join(baseDir, 'conversations');
   fs.mkdirSync(convDir, { recursive: true });
 
@@ -116,6 +115,7 @@ test('OPT-01: 子智能体分栏在步间 status=3 空档期借助 conversation_
 
   // 子智能体前序步骤均为 status=3（正处于下一步落库前的步间过渡窗），且无 step_type=2 终结符
   const { db: childDb } = createConvDb(t, convDir, childId, mainId);
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
   childDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(
     Buffer.from(seconds(1, nowSec - 18))
   );

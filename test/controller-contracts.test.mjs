@@ -10,6 +10,7 @@ import { dictionaryFromEntries } from "../dist/dictionary.js";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createConnection } from "node:net";
+import { controlEndpointForStateDir } from "../dist/platform/paths.js";
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("连接与控制 · evolution", { concurrency: false }, async () => {
@@ -37,9 +38,9 @@ describeContractGroup("连接与控制 · optimization-20261022", { concurrency:
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 const fixture=async fn=>{const dir=await mkdtemp(join(tmpdir(),'gb-opt-'));try{return await fn(dir);}finally{await rm(dir,{recursive:true,force:true,maxRetries:10,retryDelay:50});}};
 
-async function stop(child){if(!child||child.exitCode!==null)return;child.kill('SIGTERM');await Promise.race([once(child,'exit'),pause(3000)]);if(child.exitCode===null){child.kill('SIGKILL');await once(child,'exit');}}
-const rpc=(dir,p)=>new Promise((resolve,reject)=>{const s=createConnection(join(dir,'control.sock'));let b='';s.on('error',reject);s.on('connect',()=>s.write(JSON.stringify(p)+'\n'));s.setTimeout(10000,()=>{s.destroy();reject(new Error('timeout'));});s.on('data',c=>{b+=c;if(b.includes('\n')){s.end();resolve(JSON.parse(b.split('\n')[0]));}});});
-async function ready(dir){for(let i=0;i<300;i++){try{await access(join(dir,'control.sock'));await new Promise((res,rej)=>{const s=createConnection(join(dir,'control.sock'));s.once('connect',()=>{s.destroy();res();});s.once('error',rej);});return;}catch{}await pause(20);}throw Error('backend not ready');}
+async function stop(child){if(!child||child.exitCode!==null||child.signalCode!==null)return;child.kill('SIGTERM');await Promise.race([once(child,'exit'),pause(3000)]);if(child.exitCode===null&&child.signalCode===null){child.kill('SIGKILL');await once(child,'exit');}}
+const rpc=(dir,p)=>new Promise((resolve,reject)=>{const s=createConnection(controlEndpointForStateDir(dir));let b='';s.on('error',reject);s.on('connect',()=>s.write(JSON.stringify(p)+'\n'));s.setTimeout(10000,()=>{s.destroy();reject(new Error('timeout'));});s.on('data',c=>{b+=c;if(b.includes('\n')){s.end();resolve(JSON.parse(b.split('\n')[0]));}});});
+async function ready(dir){const ep=controlEndpointForStateDir(dir);for(let i=0;i<300;i++){try{if(!ep.startsWith('\\\\.\\pipe\\'))await access(ep);await new Promise((res,rej)=>{const s=createConnection(ep);s.once('connect',()=>{s.destroy();res();});s.once('error',rej);});return;}catch{}await pause(20);}throw Error('backend not ready');}
 
 test('已暂停的汉化在重新启动时保持暂停，不为更新自动注入目标应用',()=>fixture(async dir=>{
  await writeFile(join(dir,'runtime-preferences.json'),JSON.stringify({translationEnabled:false,hudEnabled:false}));

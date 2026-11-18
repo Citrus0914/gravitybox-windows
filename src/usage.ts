@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
+import { defaultCacheDir, defaultStateDir } from './platform/paths.js';
 import { atomicJson, atomicText } from './files.js';
 import { bt, getActiveLocale } from './i18n.js';
 import { createModelQueryMatcher, formatLocalDate, isUnpricedZeroSentinel, type LedgerSnapshot } from './usage-aggregate.js';
@@ -144,11 +145,11 @@ export class UsageStatsManager {
 
   constructor(options?: { geminiDir?: string; stateDir?: string; remotePricingUrl?: string; fallbackPricingUrls?: string[]; dataDirectoryName?: DataDirectoryName }) {
     const defaultGeminiDir = join(homedir(), '.gemini');
-    const defaultStateDir = join(homedir(), 'Library', 'Application Support', 'GravityBox');
+    const resolvedDefaultStateDir = defaultStateDir();
     this.geminiDir = options?.geminiDir ?? defaultGeminiDir;
     if (options?.dataDirectoryName && !ALLOWED_DATA_DIRECTORY_NAMES.includes(options.dataDirectoryName)) throw new Error(bt('usage.err.official_only'));
     this.dataDirectoryNames = options?.dataDirectoryName ? [options.dataDirectoryName] : ALLOWED_DATA_DIRECTORY_NAMES;
-    const stateDir = options?.stateDir ?? (options?.geminiDir && options.geminiDir !== defaultGeminiDir ? join(options.geminiDir, '.gravitybox_state') : defaultStateDir);
+    const stateDir = options?.stateDir ?? (options?.geminiDir && options.geminiDir !== defaultGeminiDir ? join(options.geminiDir, '.gravitybox_state') : resolvedDefaultStateDir);
     this.observationsPath = join(stateDir, 'usage-account-observations.json');
     this.ledger = new UsageLedger(stateDir);
     this.rateLocksPath = join(stateDir, 'usage-rate-locks.json');
@@ -160,9 +161,9 @@ export class UsageStatsManager {
     this.customRemoteUrlConfigured = Boolean(options?.remotePricingUrl || process.env.GRAVITYBOX_PRICING_FEED_URL);
     this.fallbackPricingUrls = options?.fallbackPricingUrls ?? DEFAULT_PRICING_FEED_URLS;
     this.autoRemotePricingSync = false;
-    if (this.geminiDir === defaultGeminiDir && stateDir === defaultStateDir) {
+    if (this.geminiDir === defaultGeminiDir && stateDir === resolvedDefaultStateDir) {
       const cacheTag = options?.dataDirectoryName ?? 'antigravity';
-      this.persistCachePath = join(homedir(), 'Library', 'Caches', 'GravityBox', `usage-db-cache-${cacheTag}-v3.json`);
+      this.persistCachePath = join(defaultCacheDir(), `usage-db-cache-${cacheTag}-v3.json`);
     }
   }
 
@@ -365,10 +366,10 @@ export class UsageStatsManager {
     this.lastAggregationKeysByAccount.clear();
     this.discoveredStats.clear();
     const defaultGeminiDir = join(homedir(), '.gemini');
-    const defaultStateDir = join(homedir(), 'Library', 'Application Support', 'GravityBox');
-    if (this.geminiDir === defaultGeminiDir && this.pricingCachePath === join(defaultStateDir, 'api_pricing.json')) {
+    const resolvedDefaultStateDir = defaultStateDir();
+    if (this.geminiDir === defaultGeminiDir && this.pricingCachePath === join(resolvedDefaultStateDir, 'api_pricing.json')) {
       const cacheTag = name ?? 'antigravity';
-      this.persistCachePath = join(homedir(), 'Library', 'Caches', 'GravityBox', `usage-db-cache-${cacheTag}-v3.json`);
+      this.persistCachePath = join(defaultCacheDir(), `usage-db-cache-${cacheTag}-v3.json`);
       this.persistLoaded = false;
     }
   }

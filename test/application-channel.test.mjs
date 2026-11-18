@@ -18,6 +18,9 @@ import {
   targetForApp,
 } from '../dist/application-target.js';
 import { compareLayers } from '../dist/dictionary.js';
+import { decodeKeyringPayload } from '../dist/account-keychain.js';
+import { controlEndpointForStateDir, defaultAppBundleName, defaultProfileDir } from '../dist/platform/paths.js';
+import { languageServerBinaryPath } from '../dist/platform/process.js';
 import { UsageStatsManager } from '../dist/usage.js';
 import { AccountsManager, MockKeychainAdapter, cloudProviderContextFromCommand, validCachedCloudProviderContext } from '../dist/accounts.js';
 import { AccountSwitchService } from '../dist/account-switch.js';
@@ -45,26 +48,28 @@ test('仅正式版可作为运行目标，旧持久配置可迁移而显式 Insi
   assert.throws(() => applicationTarget('stable', undefined, { profile: '/tmp/Antigravity - Insiders' }), /仅支持/);
   const stable = applicationTarget('stable', '/synthetic-home');
   assert.equal(stable.bundleId, 'com.google.antigravity');
-  assert.equal(stable.profile, '/synthetic-home/Library/Application Support/Antigravity');
+  assert.equal(stable.profile, defaultProfileDir('/synthetic-home'));
   assert.equal(channelStateDirectory('/state', 'stable'), '/state');
   assert.equal(allApplicationTargets().length, 1);
 });
 
 test('只发现正式版，不向仅安装的 Insiders 回落；保留正式版 WCV 架构兼容', async t => {
   const appsDir = await temporary(t);
-  await mkdir(join(appsDir, 'Antigravity.app', 'Contents', 'Resources'), { recursive: true });
+  const stableDirName = defaultAppBundleName();
+  const insidersDirName = stableDirName.endsWith('.app') ? 'Antigravity - Insiders.app' : 'Antigravity - Insiders';
+  await mkdir(join(appsDir, stableDirName, 'Contents', 'Resources'), { recursive: true });
   const onlyStable = detectInstalledChannels('stable', appsDir);
   assert.equal(onlyStable.bothInstalled, false);
   assert.deepEqual(onlyStable.channels, ['stable']);
   assert.equal(onlyStable.effectiveChannel, 'stable');
 
-  await mkdir(join(appsDir, 'Antigravity - Insiders.app', 'Contents', 'Resources'), { recursive: true });
+  await mkdir(join(appsDir, insidersDirName, 'Contents', 'Resources'), { recursive: true });
   const both = detectInstalledChannels('stable', appsDir);
   assert.equal(both.bothInstalled, false);
   assert.deepEqual(both.channels, ['stable']);
   assert.equal(both.effectiveChannel, 'stable');
 
-  await rm(join(appsDir, 'Antigravity.app'), { recursive: true, force: true });
+  await rm(join(appsDir, stableDirName), { recursive: true, force: true });
   const onlyInsiders = detectInstalledChannels('stable', appsDir);
   assert.equal(onlyInsiders.bothInstalled, false);
   assert.deepEqual(onlyInsiders.channels, []);
@@ -106,7 +111,11 @@ test('仅统计正式版会话库，排除 Insiders、备份、IDE 和符号链�
     await writeFile(join(root, name, 'conversations', 'same.db'), 'synthetic');
     await writeFile(join(root, name, 'token_usage_archive.db'), 'synthetic');
   }
-  await symlink(join(root, 'antigravity-backup', 'conversations', 'same.db'), join(root, 'antigravity-insiders', 'conversations', 'linked.db'));
+  try {
+    await symlink(join(root, 'antigravity-backup', 'conversations', 'same.db'), join(root, 'antigravity-insiders', 'conversations', 'linked.db'));
+  } catch (error) {
+    if (error?.code !== 'EPERM') throw error;
+  }
 
   // Default discovery must never count Insiders data.
   const unifiedManager = new UsageStatsManager({ geminiDir: root, stateDir: root });
@@ -151,7 +160,8 @@ test('正式版 WCV 无 state.vscdb 时仍支持保存、切号和回滚', async
   const switched = await switchService.switchAccount(account.id);
   assert.equal(switched.switchedTo, account.email);
   const writtenKeychain = await keychain.readPassword('gemini', 'antigravity');
-  assert.match(writtenKeychain ?? '', /^go-keyring-base64:/);
+  if (process.platform === 'win32') assert.equal(decodeKeyringPayload(writtenKeychain)?.token?.email, account.email);
+  else assert.match(writtenKeychain ?? '', /^go-keyring-base64:/);
 
   // Rollback restores previous Keychain credential and account records even without state.vscdb
   const rolledBack = await switchService.rollback();
@@ -190,13 +200,13 @@ test('旧共享恢复记录原样保留，不能被正式版自动回滚', async
 test('语言服务只匹配正式版并保留 WCV hub 身份，拒绝 Insiders 进程', () => {
   const target = applicationTarget('stable');
   const version = '2.29.0';
-  const command = target.appPath + '/Contents/Resources/bin/language_server --cloud_code_endpoint https://daily-cloudcode-pa.googleapis.com --subclient_type hub --override_ide_version ' + version;
+  const command = languageServerBinaryPath(target.appPath) + ' --cloud_code_endpoint https://daily-cloudcode-pa.googleapis.com --subclient_type hub --override_ide_version ' + version;
   assert.equal(matchingTargetForLanguageServerCommand(command)?.channel, 'stable');
   const context = cloudProviderContextFromCommand(command, version, target);
   assert.equal(cloudProviderContextFromCommand(command + ' --app_data_dir antigravity-insiders', version, target), null);
   assert.equal(context.userAgent, 'antigravity/hub/' + version);
   assert.equal(validCachedCloudProviderContext(context, version, target), true);
-  const unsupported = command.replace('Antigravity.app', 'Antigravity - Insiders.app');
+  const unsupported = command.replace(target.appPath, target.appPath + ' - Insiders');
   assert.equal(matchingTargetForLanguageServerCommand(unsupported), null);
   assert.equal(cloudProviderContextFromCommand(unsupported, version), null);
 });
@@ -233,7 +243,7 @@ test('IPC 将旧 Insiders 配置备份后迁移到正式版，拒绝通道切换
     { env: { ...process.env, GRAVITYBOX_PROBE_LS: 'false' }, stdio: 'ignore' },
   );
   t.after(async () => { if (child.exitCode === null) { child.kill('SIGTERM'); await once(child, 'exit'); } });
-  const socket = join(state, 'control.sock');
+  const socket = controlEndpointForStateDir(state);
   let ready = false;
   for (let i = 0; i < 100; i++) {
     try { await request(socket, { command: 'ping' }); ready = true; break; } catch {}
