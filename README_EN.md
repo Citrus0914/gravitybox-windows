@@ -6,8 +6,8 @@
   <h1>GravityBox</h1>
 
   <p>
-    <strong>Lightweight Native macOS Companion for Antigravity on Apple Silicon</strong><br />
-    Native Bilingual Swift AppKit UI (EN / 中文) · In-IDE Telemetry HUD · Dual-Window Quota Monitor · Read-Only SQLite Usage &amp; Cost Engine · Non-Invasive Runtime Localization
+    <strong>Native macOS Companion for Google Antigravity on Apple Silicon</strong><br />
+    Zero App Modification · Bilingual UI (EN / 中文) · Live In-IDE Telemetry HUD · True 5h &amp; Weekly Quotas · Safe Multi-Account Switching · Reversible Cache Cleanup
   </p>
 
   <p>
@@ -22,13 +22,14 @@
   </p>
 
   <p>
-    <a href="#-why-gravitybox">Why GravityBox</a> ·
-    <a href="#-in-ide-telemetry-hud">Telemetry HUD</a> ·
-    <a href="#-key-capabilities">Capabilities</a> ·
+    <a href="#-what-is-gravitybox">What It Does</a> ·
+    <a href="#-3-minute-quick-start">Quick Start</a> ·
+    <a href="#-telemetry-hud-visual-guide">HUD Visual Guide</a> ·
+    <a href="#-complete-guide-to-every-option">All Options Explained</a> ·
     <a href="#-screenshots">Screenshots</a> ·
     <a href="#-installation--upgrades">Installation</a> ·
-    <a href="#-architecture--building-from-source">Architecture &amp; Build</a> ·
-    <a href="#-security--privacy-boundaries">Security</a>
+    <a href="#-security--privacy-boundaries">Security</a> ·
+    <a href="#-architecture--building-from-source">Build from Source</a>
   </p>
 </div>
 
@@ -39,63 +40,177 @@
     <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/hero-dark.png" />
     <img src="assets/screenshots/hero.png" alt="GravityBox Main Console and Menu Bar Panel" width="100%" />
   </picture>
-  <sub><em>Native macOS AppKit Console &amp; Menu Bar Panel (automatically adapts to macOS Light / Dark appearance)</em></sub>
+  <sub><em>Pure macOS Swift AppKit Console &amp; Menu Bar Panel (automatically adapts to macOS Light / Dark mode)</em></sub>
 </div>
 
 ---
 
-## ✨ Why GravityBox?
+## ✨ What Is GravityBox?
 
-GravityBox complements `/Applications/Antigravity.app` without altering official binaries or signatures—bringing multi-account safety, dual-cycle quota clarity, and local token accounting together in a native macOS experience:
+If you use Google **Antigravity** daily on macOS, you've probably hit a few blind spots: hitting rate limits without knowing whether your **5-hour rolling window** or **weekly cap** ran out, having zero visibility into live token burn or context compaction, juggling multiple Google accounts manually, or watching disk caches balloon over time.
 
-| Area | Default Experience | GravityBox Approach |
-| :--- | :--- | :--- |
-| **Account Switching** | Manual sign-out/sign-in with risk of stale state or accidental overwrites | **4-phase atomic snapshot transaction + automatic rollback**; validates no shared-credential conflict before user-confirmed switches |
-| **Quota Window Clarity** | Weekly allowances are easily mistaken for 5-hour rolling windows | **Strict Dual-Window Separation**; prioritizes true 5-hour windows and clearly labels reset times when missing |
-| **Live Session & Cost Visibility** | No real-time view into per-turn speed, TTFT, cache savings, or context composition | **In-IDE Telemetry HUD** + **Read-Only SQLite Accounting** using dated pricing-feed windows |
-| **Localization Integrity** | Static binary patches break app code signatures across every update | **CDP Runtime Injection** with DOM-protected boundaries—never unpacks or re-signs `/Applications/Antigravity.app` |
-| **Cache & Storage Cleanup** | Session logs accumulate over time with risk of irreversible manual deletion | Guided storage trim where all deletions **move safely to macOS Trash** with timestamped snapshots for one-click restore |
+**GravityBox** (latest `GravityBox v1.1.1`) is a lightweight, native macOS companion built to solve all of these **without modifying a single byte of `/Applications/Antigravity.app`**:
+
+| Everyday Pain Point | What GravityBox Does for You |
+| :--- | :--- |
+| **No live feedback on speed, token burn, cache savings, or context usage** | **In-IDE Telemetry HUD**: Mounts a sleek 3-capsule bar right below every chat input showing turns, speed, tokens, cache hit rate, and context fill—expanding upward on hover or click. |
+| **Confusing rate limits (mixing up 5-hour rolling windows vs. weekly caps)** | **True Dual-Window Quotas**: Separates **5-hour** and **Weekly** bars for Gemini, Claude/GPT, and standalone pools (like `Gemini 4 Argon`), with exact reset countdowns. |
+| **Tedious sign-out/sign-in loops across multiple accounts** | **Safe Multi-Account Manager**: Saves multiple accounts, recommends the best standby account when quota runs low, and switches atomically after Antigravity quits—with automatic rollback if anything fails. |
+| **Static language patches break official code signatures on every update** | **Zero-Patch Bilingual Adaptation**: Dynamically switches both GravityBox and Antigravity UI between **English** and **简体中文** (`2.23.0` ~ `2.32.2`) at runtime while leaving code, chats, and terminal output untouched. |
+| **Gigabytes of accumulated cache with fear of deleting chat history** | **Reversible Storage Trim**: Locks your credentials and conversations behind a strict allowlist, moves selected caches to **macOS Trash**, and lets you restore with one click. |
 
 ---
 
-## 📊 In-IDE Telemetry HUD
+## 🚀 3-Minute Quick Start
 
-Mounted cleanly beneath every Antigravity conversation composer—without overlapping input controls or stealing editor focus—the tri-capsule HUD expands upward on click or hover across multi-pane layouts and light/dark themes:
+1. **Download & Install**: Grab the latest `GravityBox-<version>-arm64.dmg` from [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases/latest) (self-contained runtime included—**no Node.js or external dependencies needed**), drag **GravityBox.app** into **Applications**, and run the one-line Gatekeeper command in [First-Time Installation](#first-time-installation) below.
+2. **Launch & Auto-Connect**: Open **GravityBox** and official **Antigravity**. GravityBox automatically connects to Antigravity windows—attaching the live Telemetry HUD right below your chat composer and applying your chosen display language.
+3. **Three Everyday Touchpoints**:
+   - **While coding → Glance below the chat box**: Watch the live HUD capsules; hover for quick inspection or **click any capsule to pin its upward card** (press `Esc` or click outside to close).
+   - **Quick checks → Click the Menu Bar icon**: Check `Usage · Quota · Accounts` anytime without leaving fullscreen, or use the top-right `···` menu to toggle HUD or switch languages.
+   - **Full management → Open Main Console**: Click **Open Main Window ↗** from the menu bar footer to access **Overview · Accounts · Usage · Settings · About**.
+
+---
+
+## 📊 Telemetry HUD Visual Guide
+
+The HUD sits cleanly beneath every Antigravity chat input (supporting split panes and Light/Dark themes) without overlapping controls or stealing keyboard focus.
 
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/hud-dark.png" />
-    <img src="assets/screenshots/hud.png" alt="In-IDE Telemetry HUD and upward token breakdown popover" width="92%" />
+    <img src="assets/screenshots/hud.png" alt="In-IDE Telemetry HUD and upward token breakdown popover" width="94%" />
   </picture>
 </div>
 
-- **Session & Throughput Capsule**: Tracks turns, model vs. tool execution duration, and Time-To-First-Token (TTFT, excluding thinking idle gaps for accurate `tok/s`), with subtle streaming and subagent activity indicators.
-- **Tokens & Cost Capsule**: Breaks down total, uncached input, cached read, and output tokens alongside cache hit rate, estimated API cost, and cache cost savings.
-- **Context Window Capsule**: Tracks live context utilization against each model's true capacity limit—breaking down Cached Context, New Uncached Input, and Latest Step Output alongside peak context and compaction badges.
+### 1. Reading the Always-On Bar (3 Capsules)
+
+```text
+[ ● 3T · Turn 18s · 90 tok/s · 2 Subagents ]  │  [ ✦ 59M tok · Cache Hit 97% ]  │  [ ②  ━━━░░  64% ]
+  └─────── Capsule 1: Session & Speed ───────┘     └── Capsule 2: Tokens & Cache ──┘   └─ Capsule 3: Context ─┘
+```
+
+| Element | What You See | What It Means |
+| :--- | :--- | :--- |
+| **Capsule 1 Dot** | ⚪ Gray / 🔵 Solid Blue / 💠 Breathing Blue | **Live Activity Indicator**:<br>• **Gray**: Idle, waiting for your prompt<br>• **Solid Blue**: Model is thinking or streaming text<br>• **Breathing Blue**: Agent is executing tools (reading/editing files, running shell commands, searching) |
+| **Capsule 1 Text** | `3T · Turn 18s · 90 tok/s` | • **`3T`**: Number of user turns in the main conversation<br>• **`Turn 18s`**: Live elapsed time for the current turn<br>• **`90 tok/s`**: Average output speed across completed model steps (`Measuring…` before first sample)<br>• **`Subagents`** *(when active)*: Number of background subagents currently running |
+| **Capsule 2 Text** | `✦ 59M tok · Cache Hit 97%` | • **`59M tok`**: Total tokens consumed in this session (including linked subagents)<br>• **`Cache Hit 97%`**: Share of input tokens served directly from prompt cache (higher = faster & cheaper) |
+| **Capsule 3 Badge** | Hidden / 🔵 `1` / 🟠 `2` / 🔴 `3+` | **Auto-Compaction Badge**:<br>• **Hidden**: No context compaction yet<br>• **Blue `1`**: Compacted once (Checkpoint)<br>• **Orange `2`**: Compacted twice<br>• **Red `3+`**: Compacted 3+ times—if the model starts forgetting early details, consider starting a fresh chat |
+| **Capsule 3 Meter** | `━━━░░ 64%` (or `~64%`) | **Current Context Fill**: Percentage of the active model's context window currently used (`~` indicates a reference capacity estimate when exact limit isn't reported). Displays a short model tag during multi-model or Orchestrator sessions. |
 
 ---
 
-## 🧭 Key Capabilities
+### 2. Every Field in the 3 Upward Popover Cards
 
-### 1. Multi-Account Management & 4-Phase Safe Switching
-- **Candidate Recommendations (User-Confirmed)**: Scores saved standby accounts by remaining quota, disabled flags, and freshness to surface recommendations while leaving switch execution under explicit user confirmation.
-- **No Force-Killing**: Never kills Antigravity in the background; verifies that the official app (and any credential-sharing Insiders instance) is closed before touching account state.
-- **Automatic In-Place Rollback**: Any error during backup, sync, or post-switch verification immediately restores the pre-switch snapshot.
+Hover over (or click to pin) any capsule to open its detailed breakdown card:
 
-### 2. Dual-Window Quota Monitor & Local Cost Engine
-- **Accurate Window Semantics**: Separates Gemini 5-hour rolling windows, weekly quotas, and Claude/GPT pools while preserving exact `Unknown`, `Disabled`, `Exhausted`, and `Stale` states.
-- **Non-Blocking SQLite Projection**: Scans local session state in batched read-only SQLite worker transactions with `Today`, `7 Days`, `30 Days`, and `All Time` charts plus hourly usage trends.
-- **Time-Boxed Pricing Feed**: Revalues historical consumption against dated model pricing intervals with optional GitHub release checks for pricing feed updates.
+#### Card 1: `Session Stats` (Capsule 1)
+> Header badge **`{X} turns {Y} steps`**: `X` user prompts sent in the main chat, and `Y` total thinking + tool execution steps (including linked subagents).
 
-### 3. Non-Invasive Bilingual Adaptation (`中文 / En`)
-- **Full Bilingual App Interface (`GravityBox v1.1.1`)**: GravityBox's native AppKit console, menu bar panel, backend status messages, and Telemetry HUD natively support **Follow System / English / 简体中文** live switching via bundled `assets/i18n/` language packs—requiring no restarts.
-- **Zero App Modification**: Injects isolated runtime localization over Chrome DevTools Protocol (`CDP`), adapting new Antigravity updates cleanly without modifying `/Applications/Antigravity.app`.
-- **Protected User Content**: Unsent drafts, chat history, code blocks, terminal output, workspace names, and brand terms are isolated behind DOM selectors.
-- **Graceful Fallback**: Automatically retains valid mappings or falls back cleanly to official English if DOM structure changes unexpectedly.
+| Field | Plain-English Meaning |
+| :--- | :--- |
+| **Model Duration** | Cumulative time the AI model spent thinking and generating responses in this chat. |
+| **Tool Duration** | Cumulative time spent running local tools (file edits, terminal commands, searches), deduplicated across parallel tool calls. |
+| **Avg TTFT** | Average **Time to First Token**—how many seconds it takes on average before the model starts responding. |
+| **Output Speed (TPS)** | Session-wide output throughput (`total output tokens ÷ host generation duration`, including thinking/waiting). |
+| **Turn Duration** *(below dashed line)* | Total elapsed wall-clock time for your current or most recent turn. |
+| **Latest Step TTFT** | Time to first token for the single most recently completed foreground model step. |
+| **Latest Step TPS** | Output speed (`tok/s`) of the single most recently completed foreground model step. |
+| **Subagents** *(shown when used)* | Shows how many subagents are currently running or how many were scheduled in total (with step count). |
 
-### 4. Reversible Maintenance & Menu Bar Companion
-- **Trash-First Cleanup**: Previews reclaimable cache and snapshot sizes before moving selected artifacts to the macOS Trash alongside one-click snapshot restoration.
-- **Menu Bar Efficiency**: Supports Launch at Login and synchronized launch/exit with Antigravity, providing instant access to `Usage · Quota · Accounts`.
+#### Card 2: `Token Usage` (Capsule 2)
+> Header badge shows total session tokens (`K` = thousand, `M` = million, `B` = billion).
+
+| Field | Plain-English Meaning |
+| :--- | :--- |
+| **Cache Hit** | Percentage of all input tokens satisfied by prompt cache reads (e.g., `96.7%`). |
+| **Uncached Input** | Fresh input tokens sent without cache reuse (new prompts, newly read files). |
+| **Cached Read** | Prior context tokens reused from cache (typically billed at 10%–25% of standard input rates). |
+| **Cache Write** *(shown when > 0)* | Tokens newly written into the prompt cache during this session. |
+| **Output** | Total tokens generated by the model (includes both internal reasoning and visible reply). |
+| **Reasoning / Reply** *(when split is recorded)* | Splits **Output** into **internal reasoning tokens** (left) vs. **visible reply tokens** (right). |
+| **Estimated Cost** *(below dashed line)* | Equivalent API dollar cost calculated per step using dated official model pricing (`≥ $X` if a newly launched model has no published price yet). *Note: Subscription plans deduct quota rather than billing per token; this shows equivalent API value.* |
+| **Cache Saved** | Estimated dollar amount saved thanks to prompt cache reads compared to resending uncached input every step. |
+
+#### Card 3: `Current Context` (Capsule 3)
+> Header badge shows **`Used Tokens / Model Capacity`** (e.g., `128K / 200K`) above a two-color segmented bar.
+
+| Field | Plain-English Meaning |
+| :--- | :--- |
+| **Cached Context** *(deep blue dot)* | Tokens in the latest request reused from prompt cache (deep blue bar segment). |
+| **New Uncached Input** *(sky blue dot)* | Fresh input and tool output added in the latest step (sky blue bar segment). |
+| **Latest Step Output** | Tokens just generated in the latest step (listed separately; joins context on the next turn). |
+| **Session Peak Context / Model Peak Context** | Highest input context size reached so far in this chat, plus `(Xx compacted)` if auto-compaction occurred. |
+| **Active Model** | Underlying model identifier for the current context reading. |
+| **Orchestrator Context / Prior Model Context** *(multi-model chats)* | When switching models mid-chat or running **Planner + Executor** stages, lists each model's context fill and compaction count separately. |
+
+---
+
+## 🧭 Complete Guide to Every Option
+
+### 1. Settings (`Settings`) — All 7 Controls Explained
+
+| Section | Option | Choices / Control | What It Does & When to Use It |
+| :--- | :--- | :--- | :--- |
+| **Antigravity Enhancement** | **Display Language** | `Follow System` (default)<br>`简体中文`<br>`English` | **Unified language selector**: Controls both GravityBox's own UI language and whether Antigravity's UI is dynamically localized into Simplified Chinese. Selecting `English` keeps both GravityBox and Antigravity in clean English immediately—no restart needed. |
+| **Antigravity Enhancement** | **Conversation HUD** | Toggle (default `On`) | Shows or hides the 3-capsule Telemetry HUD below Antigravity's chat box. **Independent of language**—you can keep Antigravity in English while enjoying the English HUD. |
+| **Quota & Pricing** | **Quota Refresh Interval** | `Manual Refresh` (default)<br>`Every 5 / 10 / 15 / 30 / 60 min` | How often GravityBox polls remaining quotas for saved accounts in the background. Leave on `Manual Refresh` for single-account use, or `10–15 min` when rotating accounts. |
+| **Quota & Pricing** | **Auto-Update Pricing Feed** | `Check Now` button + Toggle (default `Off`) | Syncs the public model pricing feed every 24 hours from GitHub / jsDelivr so newly launched models get accurate cost estimates without waiting for an app update.<br>Click **Check Now** to open the **Pricing Feed** sheet—inspect per-model input, cache read/write, and output rates with official source links, and automatically heal historical unpriced entries. |
+| **System & Storage** | **Launch at Login** | Toggle (default `Off`) | Starts GravityBox quietly in the macOS menu bar whenever you log in. |
+| **System & Storage** | **Sync with Antigravity** | Toggle (default `Off`) | Automatically launches GravityBox when Antigravity opens and quits when Antigravity closes. |
+| **System & Storage** | **Storage & Maintenance** | Status badge + `Manage Storage…` | Displays reclaimable cache size (`Reclaimable XX MB` or `Healthy`) and opens the safe cleanup sheet (see Section 5 below). |
+
+---
+
+### 2. Overview (`Overview`) — Daily Snapshot at a Glance
+- **Active Account Quota Card**: Displays your active account, plan badge (`PRO` / `ULTRA` / `FREE`), and separate **5-Hour** vs. **Weekly** remaining bars with reset countdowns for Gemini, Claude/GPT, and standalone high-tier pools (such as `Gemini 4 Argon`). Missing or unauthorized pools are labeled honestly—never padded with fake `100%` bars.
+- **Today's 3 Metric Cards**: Shows **Today's Token Usage**, **Today's Estimated Cost**, and **Today's Requests**, each paired with your all-time cumulative total.
+- **24-Hour Distribution & Active Models**: Hourly consumption bar chart (`00:00–23:00`) on the left, and top active models with request share and estimated cost on the right.
+
+---
+
+### 3. Accounts (`Accounts`) — Multi-Account Pool & Smart Switch
+- **Add Account…**:
+  - **Save Current Account** *(zero setup)*: One-click import of the account currently signed into Antigravity.
+  - **Sign in with Google…**: Browser OAuth flow to add standby accounts (requires optional custom OAuth credentials; see Installation section).
+- **Collapse / Expand Quotas**: Condenses multi-account cards into compact single-line summary pills (e.g., `Gemini 91%`).
+- **Smart Switch (Toggle + `Configure…` button)**:
+  Evaluates saved accounts and highlights a **`Recommended`** standby candidate when your current account runs low (**never force-kills Antigravity; switching always requires your confirmation**). Clicking **`Configure…`** exposes 4 rules:
+
+  | Smart Switch Rule | What It Controls |
+  | :--- | :--- |
+  | **Recommendation Order** | • **`Highest Quota First`** (default): Prioritizes higher subscription tiers (Ultra > Pro), then highest remaining percentage.<br>• **`Round Robin`**: Rotates evenly across qualifying standby accounts in list order. |
+  | **Monitored Scope** | Chooses which quota pool triggers a switch alert (adapts to your Free / Pro / Ultra tier): e.g., **Core Shared Pools (Gemini + Claude/GPT)**, **All Gemini (incl. Argon weekly)**, **Gemini Base Pool Only**, or **Claude/GPT Pool Only**. |
+  | **Switch Trigger Threshold** | Default `10%` (`1%–98%`). Recommends switching when your monitored quota drops to or below this percentage. |
+  | **Candidate Minimum** | Default `30%` (`2%–100%`, must exceed trigger threshold). Standby accounts must have at least this much quota left to be recommended. |
+
+- **Atomic Switch & One-Click Undo**: Verifies Antigravity is closed before running a snapshot-backed switch with automatic rollback on failure. If an earlier switch was interrupted, a **Revert & Restore Previous Account** banner appears at the top.
+
+---
+
+### 4. Usage (`Usage`) — Historical Ledger, Request Log & Export
+- **4 Time Ranges** (`Today` / `Last 7 Days` / `Last 30 Days` / `All Time`): Read-only SQLite worker scans local conversation databases in background batches without blocking the IDE.
+- **API Cost Donut & Model Breakdown**: Visualizes equivalent dollar spend and token share across every model.
+- **Requests & Cache + `Request Log…`**: Shows total calls, average tokens per call, and overall cache hit rate. Click **`Request Log…`** to search by model and inspect individual historical calls with exact timestamps and input / cache read / cache write / output counts.
+- **Export…**: Exports aggregated summaries or detailed request logs to local `.json` files.
+
+---
+
+### 5. Storage & Maintenance Sheet (`Settings → Manage Storage…`)
+Divides local disk usage into **Runtime Cache (Blue)**, **Background Logs (Orange)**, and **Protected Core Data (Gray, strictly untouched)**:
+
+| Option / Button | Default | What Happens When Cleaned? |
+| :--- | :--- | :--- |
+| **App Runtime Cache** | `On` | Clears temporary web, V8 bytecode, GPU shader caches, and crash dumps. **Zero side effects**—rebuilt automatically as needed. |
+| **Background Execution Logs** | `Off` (selectable: `Older than 7d` / `30d` / `All Inactive`) | Trims verbose background step logs, redundant transcript mirrors, and completed subagent databases from older inactive chats (archiving token usage into the permanent ledger first). **All chat messages, code files, and sign-in sessions remain 100% intact.** |
+| **Clean Now** | Primary button | Moves selected caches into a recovery snapshot and **macOS Trash** (offering a graceful restart if Antigravity is running). Nothing is permanently erased behind your back. |
+| **Undo Last Cleanup** | Available anytime after cleanup | Restores all items from the previous cleanup right back to their original paths in one click. |
+
+---
+
+### 6. Menu Bar Panel & About (`About`)
+- **Menu Bar Panel**: Instant 3-tab popover (**`Usage`** with `Tokens` / `Requests` trend toggle, **`Quota`**, and **`Accounts`**) plus a top-right `···` menu for quick **Display Language**, **Conversation HUD**, **Settings (`⌘,`)**, and **Quit (`⌘Q`)** access.
+- **About (`About`)**: Shows active GravityBox and Antigravity versions, reveals `~/Library/Application Support/GravityBox` in Finder, and provides **Check for Updates** / **Check Automatically** (off by default; when enabled, updates are verified via SHA-256 and offered via a gentle sidebar button rather than forced restarts).
 
 ---
 
@@ -186,13 +301,13 @@ Mounted cleanly beneath every Antigravity conversation composer—without overla
 
 ---
 
-## 🚀 Installation & Upgrades
+## 📦 Installation & Upgrades
 
 ### System Requirements
 - **OS**: macOS 14 (Sonoma) or macOS 15+ (Sequoia)
-- **Architecture**: Apple Silicon (`arm64`)
-- **Target App**: Official release `/Applications/Antigravity.app` (*Insiders channel is neither supported nor modified*)
-- **Runtime**: Self-contained Node 22 binary embedded inside the app bundle—zero prerequisites required
+- **Architecture**: Apple Silicon (`arm64` — M1 / M2 / M3 / M4)
+- **Target App**: Official release `/Applications/Antigravity.app` (verified across `2.23.0` ~ `2.32.2`; *Insiders channel is neither supported nor modified*)
+- **Runtime**: **Zero dependencies** — self-contained Node 22 binary embedded inside the app bundle
 
 ### First-Time Installation
 
@@ -278,10 +393,10 @@ gravitybox/
 ├── native/          # Swift 6 / AppKit Main Console, Menu Bar Panel, L10n runtime, and App Updater
 ├── src/             # TypeScript core engine (IPC, bilingual i18n, 4-phase switching, quota fusion, SQLite ledger, HUD state)
 ├── runtime/         # CDP-injected runtime scripts (localization engine, DOM guards, and bilingual Telemetry HUD)
-├── dict/            # Versioned bilingual dictionaries, frozen maps, and shared glossary rules
+├── dict/ & ui-strings/ # Versioned bilingual dictionaries, frozen maps, and official UI string snapshots (2.23.0 ~ 2.32.2)
 ├── assets/          # App icons, bilingual packs (i18n/), Retina screenshots, dated pricing feed, and model catalog
 ├── test/            # Unit, integration, bilingual foundation/native tests, headless Chromium, and Swift UI suites
-└── tools/           # Release integrity checks, Retina screenshot generator, and macOS DMG packager
+└── tools/           # Release integrity, privacy, doc consistency gates, screenshot generator, and macOS DMG packager
 ```
 
 </details>
@@ -291,23 +406,32 @@ gravitybox/
 ## ❓ FAQ
 
 <details>
-<summary><b>Why must Antigravity be closed before switching accounts?</b></summary>
+<summary><b>1. Why must Antigravity be closed before switching accounts?</b></summary>
 
-Overwriting account databases or keychain caches while the host IDE holds active file locks can corrupt SQLite state or authentication sessions. GravityBox checks running processes (never killing them silently) and executes a 4-phase atomic snapshot switch with automatic rollback.
-
-</details>
-
-<details>
-<summary><b>Do localization or HUD features alter my code, chats, or workspace files?</b></summary>
-
-No. All adjustments happen purely in the presentation layer with strict selector guards around editors, code blocks, chat content, terminal output, and workspace names. Disk project files remain completely untouched.
+Antigravity holds live SQLite and credential locks while running. Force-killing or overwriting files underneath a running IDE risks database corruption or lost drafts. GravityBox verifies a clean exit first, then runs an atomic snapshot switch with automatic rollback.
 
 </details>
 
 <details>
-<summary><b>How do I uninstall or revert changes?</b></summary>
+<summary><b>2. Can I use the Telemetry HUD while keeping Antigravity in English?</b></summary>
 
-Use **Settings → Manage Storage** to restore any trimmed cache from its snapshot, or quit GravityBox, move `/Applications/GravityBox.app` to the Trash, and optionally remove `~/Library/Application Support/GravityBox`.
+Yes! Set **Settings → Display Language** to **`English`** and keep **Conversation HUD** turned **`On`**. Antigravity stays 100% in original English while displaying the English HUD below the chat box.
+
+</details>
+
+<details>
+<summary><b>3. What happens when Antigravity auto-updates to a newer release?</b></summary>
+
+Because GravityBox never patches `/Applications/Antigravity.app`, official updates never break code signatures. For brand-new releases not yet fingerprinted, GravityBox enters **Adaptive Mode** using existing dictionaries while keeping quotas, account switching, HUD, and usage accounting working normally.
+
+</details>
+
+<details>
+<summary><b>4. How do I completely uninstall GravityBox?</b></summary>
+
+1. Quit GravityBox from the menu bar or main window (Antigravity remains untouched);
+2. Move `/Applications/GravityBox.app` to the Trash;
+3. Optionally delete `~/Library/Application Support/GravityBox` if you no longer want saved account metadata or usage history.
 
 </details>
 
@@ -315,8 +439,8 @@ Use **Settings → Manage Storage** to restore any trimmed cache from its snapsh
 
 ## 🤝 Contributing & License
 
-- Read [CONTRIBUTING.md](./CONTRIBUTING.md), [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md), and [SECURITY.md](./SECURITY.md) before opening an [Issue](https://github.com/Enzoo404/gravitybox/issues) or Pull Request.
-- Release notes and full version history are tracked in [CHANGELOG.md](./CHANGELOG.md) and [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases).
+- Please review [CONTRIBUTING.md](./CONTRIBUTING.md), [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md), and [SECURITY.md](./SECURITY.md) before opening an [Issue](https://github.com/Enzoo404/gravitybox/issues) or Pull Request.
+- Full release history is available in [CHANGELOG.md](./CHANGELOG.md) and [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases).
 
 <div align="center">
   <a href="https://star-history.com/#Enzoo404/gravitybox&Date">
