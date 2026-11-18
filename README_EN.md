@@ -85,16 +85,23 @@ The HUD sits cleanly beneath every Antigravity chat input (supporting split pane
 
 ### 1. Reading the Always-On Bar (3 Capsules)
 
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/hud-capsules-dark.png" />
+    <img src="assets/screenshots/hud-capsules.png" alt="Always-on 3-capsule Telemetry HUD bar beneath the chat input" width="88%" />
+  </picture>
+</div>
+
 ```text
-[ ● 3T · Turn 18s · 90 tok/s · 2 Subagents ]  │  [ ✦ 59M tok · Cache Hit 97% ]  │  [ ②  ━━━░░  64% ]
-  └─────── Capsule 1: Session & Speed ───────┘     └── Capsule 2: Tokens & Cache ──┘   └─ Capsule 3: Context ─┘
+[ ● 3T · Turn 18s · 90 tok/s · 2 ]  │  [ ✦ 58.6M tok · Cache Hit 97% ]  │  [ ②  ━━━░░  64% ]
+  └── Capsule 1: Session & Speed ──┘     └── Capsule 2: Tokens & Cache ──┘     └── Capsule 3: Context ─┘
 ```
 
 | Element | What You See | What It Means |
 | :--- | :--- | :--- |
-| **Capsule 1 Dot** | ⚪ Gray / 🔵 Solid Blue / 💠 Breathing Blue | **Live Activity Indicator**:<br>• **Gray**: Idle, waiting for your prompt<br>• **Solid Blue**: Model is thinking or streaming text<br>• **Breathing Blue**: Agent is executing tools (reading/editing files, running shell commands, searching) |
-| **Capsule 1 Text** | `3T · Turn 18s · 90 tok/s` | • **`3T`**: Number of user turns in the main conversation<br>• **`Turn 18s`**: Live elapsed time for the current turn<br>• **`90 tok/s`**: Average output speed across completed model steps (`Measuring…` before first sample)<br>• **`Subagents`** *(when active)*: Number of background subagents currently running |
-| **Capsule 2 Text** | `✦ 59M tok · Cache Hit 97%` | • **`59M tok`**: Total tokens consumed in this session (including linked subagents)<br>• **`Cache Hit 97%`**: Share of input tokens served directly from prompt cache (higher = faster & cheaper) |
+| **Capsule 1 Dot** | ⚪ Gray / 🔵 Solid Blue / 💠 Breathing Blue | **Live Activity Indicator**:<br>• **Gray**: Foreground pane is idle (waiting for your prompt), paused awaiting approval, or stalled mid-run with neither the model nor local tools actively working (also remains gray when only background subagents are running while the foreground pane is inactive)<br>• **Solid Blue**: Foreground AI model is thinking or streaming text<br>• **Breathing Blue**: Foreground agent is executing tools (reading/editing files, running shell commands, searching) |
+| **Capsule 1 Text** | `3T · Turn 18s · 90 tok/s` | • **`3T`**: Number of user turns in the main conversation<br>• **`Turn 18s`**: Live elapsed time for the current turn<br>• **`90 tok/s`**: Average output speed across completed model steps (`Measuring…` before first sample)<br>• **Branch icon + count (e.g. `2`)** *(when active)*: Number of background subagents currently running |
+| **Capsule 2 Text** | `✦ 58.6M tok · Cache Hit 97%` | • **`58.6M tok`**: Total tokens consumed in this session (including linked subagents)<br>• **`Cache Hit 97%`**: Share of input tokens served directly from prompt cache (higher = faster & cheaper) |
 | **Capsule 3 Badge** | Hidden / 🔵 `1` / 🟠 `2` / 🔴 `3+` | **Auto-Compaction Badge**:<br>• **Hidden**: No context compaction yet<br>• **Blue `1`**: Compacted once (Checkpoint)<br>• **Orange `2`**: Compacted twice<br>• **Red `3+`**: Compacted 3+ times—if the model starts forgetting early details, consider starting a fresh chat |
 | **Capsule 3 Meter** | `━━━░░ 64%` (or `~64%`) | **Current Context Fill**: Percentage of the active model's context window currently used (`~` indicates a reference capacity estimate when exact limit isn't reported). Displays a short model tag during multi-model or Orchestrator sessions. |
 
@@ -106,6 +113,13 @@ Hover over (or click to pin) any capsule to open its detailed breakdown card:
 
 #### Card 1: `Session Stats` (Capsule 1)
 > Header badge **`{X} turns {Y} steps`**: `X` user prompts sent in the main chat, and `Y` total thinking + tool execution steps (including linked subagents).
+
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/hud-card-session-dark.png" />
+    <img src="assets/screenshots/hud-card-session.png" alt="HUD Capsule 1 expanded: Session Stats popover card" width="86%" />
+  </picture>
+</div>
 
 | Field | Plain-English Meaning |
 | :--- | :--- |
@@ -121,6 +135,13 @@ Hover over (or click to pin) any capsule to open its detailed breakdown card:
 #### Card 2: `Token Usage` (Capsule 2)
 > Header badge shows total session tokens (`K` = thousand, `M` = million, `B` = billion).
 
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/hud-card-tokens-dark.png" />
+    <img src="assets/screenshots/hud-card-tokens.png" alt="HUD Capsule 2 expanded: Token Usage popover card" width="86%" />
+  </picture>
+</div>
+
 | Field | Plain-English Meaning |
 | :--- | :--- |
 | **Cache Hit** | Percentage of all input tokens satisfied by prompt cache reads (e.g., `96.7%`). |
@@ -134,6 +155,13 @@ Hover over (or click to pin) any capsule to open its detailed breakdown card:
 
 #### Card 3: `Current Context` (Capsule 3)
 > Header badge shows **`Used Tokens / Model Capacity`** (e.g., `128K / 200K`) above a two-color segmented bar.
+
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/hud-card-context-dark.png" />
+    <img src="assets/screenshots/hud-card-context.png" alt="HUD Capsule 3 expanded: Current Context popover card" width="86%" />
+  </picture>
+</div>
 
 | Field | Plain-English Meaning |
 | :--- | :--- |
