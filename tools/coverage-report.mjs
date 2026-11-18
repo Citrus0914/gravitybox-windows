@@ -31,7 +31,7 @@ import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { loadDictionaryLayers, compareLayers } from '../dist/dictionary.js';
-import { SUPPORTED_BUNDLES, extractUiStrings, normalizeText as normalized } from '../dist/bundle.js';
+import { SUPPORTED_BUNDLES, extractUiStrings, foldDictionaryKey, normalizeText as normalized } from '../dist/bundle.js';
 import { verifyExtractionSnapshot } from './extraction-snapshot.mjs';
 import { extractUiStringsAst } from './extract-ui-ast.mjs';
 import { PROPER_NOUNS } from '../dist/coverage.js';
@@ -183,15 +183,22 @@ export async function loadDictLayers(dictDir = join(root, 'dict')) {
 
 }
 
+function stripScopedPrefix(key) {
+  if (!key.startsWith('@ui:')) return key;
+  const parts = key.slice(4).split('|');
+  return parts.length >= 3 ? parts.slice(2).join('|') : key;
+}
+
 /** 专有名词违规：英文键里出现专名，但译文把这个专名丢了。 */
 export function properNounViolations(entries) {
   const violations = [];
   for (const [key, { value, file }] of entries) {
+    const rawKey = stripScopedPrefix(key).replace(/(?:https?|file):\/\/\S+/gi, ' ');
     // 只检查键里确实是独立词元出现的专名，避免 "Node" 命中 "Nodejs" 之类的噪声
     for (const noun of PROPER_NOUNS) {
-      const inKey = new RegExp(`(?:^|[^A-Za-z])${noun.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^A-Za-z])`).test(key);
+      const inKey = new RegExp(`(?:^|[^A-Za-z])${noun.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^A-Za-z])`, 'i').test(rawKey);
       if (!inKey) continue;
-      const inValue = value.includes(noun);
+      const inValue = value.toLowerCase().includes(noun.toLowerCase());
       // 译文里出现该专名的任何形式都算保留；中文里专名通常原样保留
       if (!inValue) { violations.push({ key, value, file, noun }); break; }
     }
@@ -209,14 +216,14 @@ export function reconcile(uiStrings, entries, bundleSource) {
   const foldedEntries = new Map();
   const scopedExact = new Set();
   for (const candidate of entries.keys()) {
-    const lc = candidate.toLowerCase();
+    const lc = foldDictionaryKey(candidate);
     if (!foldedEntries.has(lc)) foldedEntries.set(lc, candidate);
     if (candidate.startsWith('@ui:')) {
       const parts = candidate.slice(4).split('|');
       if (parts.length >= 3) {
         const rawKey = parts.slice(2).join('|');
         scopedExact.add(rawKey);
-        const rawLc = rawKey.toLowerCase();
+        const rawLc = foldDictionaryKey(rawKey);
         if (!foldedEntries.has(rawLc)) foldedEntries.set(rawLc, candidate);
       }
     }
@@ -229,7 +236,7 @@ export function reconcile(uiStrings, entries, bundleSource) {
     if (item.kinds?.includes('fragment')) { fragments.push({ text: item.text, count: item.count }); continue; }
     if (entries.has(key) || scopedExact.has(key)) { covered.push(key); continue; }
     // 大小写/结尾标点不同：引擎现在大小写不敏感，能命中，但键本身不规范
-    const foldedHit = foldedEntries.get(key.toLowerCase());
+    const foldedHit = foldedEntries.get(foldDictionaryKey(key));
     if (foldedHit !== undefined) {
       caseOnly.push({ text: item.text, dictKey: foldedHit });
     } else {
@@ -237,7 +244,7 @@ export function reconcile(uiStrings, entries, bundleSource) {
     }
   }
   const uiSet = new Set((uiStrings.strings ?? []).map(s => normalized(s.text)));
-  const uiFolded = new Set([...uiSet].map(s => s.toLowerCase()));
+  const uiFolded = new Set([...uiSet].map(s => foldDictionaryKey(s)));
   /* 词典词条不在本次提取结果里有两种完全不同的含义：
      - 键在整个界面包里都找不到  => 真的失效（应用已改文案），应从词典清理
      - 键在包里能找到但没被提取到 => 提取器的召回问题，词典仍然有效，不该当成死词条
@@ -245,9 +252,10 @@ export function reconcile(uiStrings, entries, bundleSource) {
   const obsolete = [];
   const notExtracted = [];
   for (const [key, meta] of entries) {
-    if (uiSet.has(key)) continue;
-    if (uiFolded.has(key.toLowerCase())) continue;
-    if (bundleSource && bundleSource.includes(key)) notExtracted.push({ key, value: meta.value, file: meta.file });
+    const rawKey = stripScopedPrefix(key);
+    if (uiSet.has(rawKey)) continue;
+    if (uiFolded.has(rawKey.toLowerCase())) continue;
+    if (bundleSource && (bundleSource.includes(key) || (rawKey !== key && bundleSource.includes(rawKey)))) notExtracted.push({ key, value: meta.value, file: meta.file });
     else obsolete.push({ key, value: meta.value, file: meta.file });
   }
   return { covered, missing, caseOnly, templates, fragments, obsolete, notExtracted };
@@ -307,10 +315,13 @@ async function main() {
     noVendor,
   });
   if (!sourceVerification.verified) console.error(`[coverage-report] 界面包来源未验证（fail-closed）：${sourceVerification.reason}`);
+  const skipAdvisoryScan = noVendor || args.includes('--skip-advisory-scan');
   let bundleSource;
-  const bundlePath = option('--bundle') ?? sourceVerification.bundleSource ?? resolveRecordedSource(uiStrings.source);
-  if (typeof bundlePath === 'string' && existsSync(bundlePath)) {
-    try { bundleSource = await readFile(bundlePath, 'utf8'); } catch { bundleSource = undefined; }
+  if (!skipAdvisoryScan) {
+    const bundlePath = option('--bundle') ?? sourceVerification.bundleSource ?? resolveRecordedSource(uiStrings.source);
+    if (typeof bundlePath === 'string' && existsSync(bundlePath)) {
+      try { bundleSource = await readFile(bundlePath, 'utf8'); } catch { bundleSource = undefined; }
+    }
   }
   const { covered, missing, caseOnly, templates, fragments, obsolete, notExtracted } = reconcile(uiStrings, entries, bundleSource);
   const violations = properNounViolations(entries);

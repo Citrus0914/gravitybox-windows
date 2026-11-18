@@ -411,3 +411,194 @@ test('v2 存储治理: 独立浏览器沙箱占用时局部跳过 AgentBrowserCa
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+test('v2 存储治理: macOS TCC ~/.Trash 受限(EPERM/EACCES)时退出重扫、清理、历史与原位恢复自动回退本地安全回收仓且不污染保护数据统计', async () => {
+  const { chmod } = await import('node:fs/promises');
+  const { hasAntigravityCommand } = await import('../dist/maintenance.js');
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'gb-maint-v2-tcc-trash-')));
+  const profile = join(temp, 'profile');
+  const geminiDir = join(temp, 'gemini');
+  const blockedTrash = join(temp, 'blocked-trash');
+  const stateDir = join(temp, 'state');
+  await Promise.all([mkdir(profile), mkdir(geminiDir), mkdir(blockedTrash), mkdir(stateDir)]);
+
+  try {
+    // 验证 Electron Helper (/Contents/Frameworks/) 与子进程 language_server 均被准确识别为运行态
+    assert.equal(
+      hasAntigravityCommand(['/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (GPU).app/Contents/MacOS/Antigravity Helper (GPU)']),
+      true
+    );
+
+    // 准备真实缓存与核心受保护数据
+    await mkdir(join(profile, 'Cache'), { recursive: true });
+    await writeFile(join(profile, 'Cache', 'a.bin'), Buffer.alloc(2048, 7));
+    await mkdir(join(profile, 'Code Cache'), { recursive: true });
+    await writeFile(join(profile, 'Code Cache', 'b.bin'), Buffer.alloc(1024, 9));
+    await writeFile(join(stateDir, 'config.json'), '{"schema":2}');
+
+    // 模拟 macOS TCC 对 ~/.Trash 拒绝 scandir / mkdir / rename (0o000 -> EACCES/EPERM)
+    await chmod(blockedTrash, 0o000);
+
+    let appIsRunning = true;
+    const m = new CacheMaintenance(profile, blockedTrash, async () => appIsRunning, {
+      geminiDir,
+      stateDir,
+      browserRunning: async () => false,
+    });
+
+    // 1. 运行态首次扫描正常，且自动标记使用本地回退安全回收仓
+    const runningScan = await m.scan();
+    assert.equal(runningScan.running, true);
+    assert.equal(runningScan.usingFallbackTrash, true);
+    assert.equal(runningScan.trashDir, join(stateDir, 'maintenance-trash'));
+
+    // 2. 模拟用户点击「退出并清理」：Antigravity 退出后执行重扫，绝不再抛 EPERM/EACCES scandir
+    appIsRunning = false;
+    const postQuitScan = await m.scan();
+    assert.equal(postQuitScan.running, false);
+    assert.equal(postQuitScan.usingFallbackTrash, true);
+    const baselineGravityBoxBytes = postQuitScan.protectedEntries.find(e => e.id === 'gravitybox')?.bytes ?? 0;
+    assert.ok(baselineGravityBoxBytes > 0);
+
+    // 3. 执行清理：自动落入 stateDir/maintenance-trash，且重扫时不会把回收快照计入 GravityBox 核心保护数据体积
+    const cleared = await m.clear(postQuitScan.token, ['Cache', 'Code Cache']);
+    assert.equal(cleared.moved, 2);
+    assert.equal(cleared.usingFallbackTrash, true);
+    assert.ok(cleared.restorePath.startsWith(join(stateDir, 'maintenance-trash')));
+    await assert.rejects(lstat(join(profile, 'Cache')));
+    await assert.rejects(lstat(join(profile, 'Code Cache')));
+
+    const afterClearScan = await m.scan();
+    const afterGravityBoxBytes = afterClearScan.protectedEntries.find(e => e.id === 'gravitybox')?.bytes ?? 0;
+    assert.equal(afterGravityBoxBytes, baselineGravityBoxBytes, '本地回退回收仓中的缓存快照绝不能虚增 GravityBox 受保护凭据体积');
+    assert.equal(afterClearScan.snapshots.length, 1);
+    assert.equal(afterClearScan.snapshots[0].restorable, true);
+    assert.equal(afterClearScan.snapshots[0].snapshotPath, cleared.restorePath);
+
+    // 4. 原位恢复：无需访问受限的 ~/.Trash 即可完整一键还原
+    const restored = await m.restore(afterClearScan.snapshots[0].id);
+    assert.equal(restored.restored, 2);
+    assert.equal((await lstat(join(profile, 'Cache', 'a.bin'))).size, 2048);
+    assert.equal((await lstat(join(profile, 'Code Cache', 'b.bin'))).size, 1024);
+
+    // 5. 若目标在退出后已自然为空（0 B / 不存在），clear 不会生成空快照目录
+    const emptyScan = await m.scan();
+    await rm(join(profile, 'GPUCache'), { recursive: true, force: true });
+    const emptyScan2 = await m.scan();
+    const zeroClear = await m.clear(emptyScan2.token, ['GPUCache']);
+    assert.equal(zeroClear.moved, 0);
+    assert.equal(zeroClear.restorePath, '');
+    assert.equal((await m.history()).length, 1, '0 字节无实际移动时不得生成新的空快照');
+  } finally {
+    await chmod(blockedTrash, 0o700).catch(() => {});
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v3 三卡片双开关: scan 双桶聚合、smartClear 免令牌清理、局部跳过符号链接/繁忙浏览器子项与回退仓单快照轮转', async () => {
+  const { chmod, symlink } = await import('node:fs/promises');
+  const temp = await realpath(await mkdtemp(join(tmpdir(), 'gb-maint-v3-smart-')));
+  const profile = join(temp, 'profile');
+  const geminiDir = join(temp, 'gemini');
+  const blockedTrash = join(temp, 'blocked-trash');
+  const stateDir = join(temp, 'state');
+  const extTarget = join(temp, 'outside-gpu');
+  await Promise.all([mkdir(profile), mkdir(geminiDir), mkdir(blockedTrash), mkdir(stateDir), mkdir(extTarget)]);
+
+  const agentDir = join(geminiDir, 'antigravity');
+  const convDir = join(agentDir, 'conversations');
+  const brainDir = join(agentDir, 'brain');
+  await mkdir(convDir, { recursive: true });
+  await mkdir(brainDir, { recursive: true });
+
+  const rootId = '10101010-1010-4010-8010-101010101010';
+  const subId = '20202020-2020-4020-8020-202020202020';
+
+  try {
+    await chmod(blockedTrash, 0o000);
+    await createSummariesDb(join(agentDir, 'conversation_summaries.db'), [
+      { id: rootId, parentId: '', status: 'CASCADE_RUN_STATUS_IDLE' },
+      { id: subId, parentId: rootId, status: 'CASCADE_RUN_STATUS_IDLE' },
+    ]);
+
+    const tenDaysAgoSec = Math.floor((Date.now() - 10 * 86_400_000) / 1000);
+    const rootDb = join(convDir, `${rootId}.db`);
+    const subDb = join(convDir, `${subId}.db`);
+    await createUsageDb(rootDb, { input: 1200, output: 800, cached: 2000, tsSec: tenDaysAgoSec });
+    await createUsageDb(subDb, { input: 2400, output: 1600, cached: 4000, tsSec: tenDaysAgoSec + 5 });
+    await setAgeDays(rootDb, 10);
+    await setAgeDays(subDb, 10);
+
+    await mkdir(join(brainDir, rootId, '.system_generated', 'tasks'), { recursive: true });
+    await writeFile(join(brainDir, rootId, '.system_generated', 'tasks', 'step.log'), Buffer.alloc(4096, 3));
+    await setAgeDays(join(brainDir, rootId), 10);
+
+    // 准备运行缓存：Cache 正常，GPUCache 为符号链接（应静默跳过而非阻断整桶），AgentBrowserCache 处于繁忙态
+    await mkdir(join(profile, 'Cache'), { recursive: true });
+    await writeFile(join(profile, 'Cache', 'chunk.bin'), Buffer.alloc(3072, 1));
+    await symlink(extTarget, join(profile, 'GPUCache'));
+    const bpCache = join(agentDir, 'browser_profile', 'Default', 'Cache');
+    await mkdir(bpCache, { recursive: true });
+    await writeFile(join(bpCache, 'web.bin'), Buffer.alloc(1024, 2));
+
+    const usageMgr = new UsageStatsManager({ geminiDir, stateDir });
+    const m = new CacheMaintenance(profile, blockedTrash, async () => false, {
+      geminiDir,
+      stateDir,
+      browserRunning: async () => true,
+      archiveDatabases: paths => usageMgr.archiveDatabasesBeforeClear(paths),
+      onMutated: () => usageMgr.invalidateCache(),
+    });
+
+    // 1. 验证 scan() 输出双桶投影且排除符号链接子项
+    const scan1 = await m.scan({ retentionDays: 7 });
+    assert.ok(scan1.buckets);
+    assert.equal(scan1.buckets.runtimeCache.id, 'runtime_cache');
+    assert.equal(scan1.buckets.runtimeCache.available, true);
+    assert.equal(scan1.buckets.runtimeCache.clearableBytes, 3072 + 1024);
+    assert.equal(scan1.buckets.historyLogs.id, 'history_logs');
+    assert.equal(scan1.buckets.historyLogs.available, true);
+    assert.equal(scan1.buckets.historyLogs.subagentCount, 1);
+    assert.equal(scan1.latestRestorableSnapshot, null);
+
+    // 2. 无需传入 scan token，直接执行第一轮 smartClear(['runtime_cache'])：
+    //    自动跳过符号链接 GPUCache 与繁忙的 AgentBrowserCache，成功清理 Cache
+    const clear1 = await m.smartClear({ scopes: ['runtime_cache'], retentionDays: 7, keepLocalSnapshots: 1 });
+    assert.equal(clear1.ok, true);
+    assert.equal(clear1.moved, 1);
+    assert.equal(clear1.clearedBytes, 3072);
+    assert.ok(clear1.skipped.includes('GPUCache'));
+    assert.ok(clear1.skipped.includes('AgentBrowserCache'));
+    assert.equal(clear1.usingFallbackTrash, true);
+    assert.deepEqual(clear1.supersededSnapshotPaths, []);
+    await assert.rejects(lstat(join(profile, 'Cache')));
+    assert.ok((await lstat(join(profile, 'GPUCache'))).isSymbolicLink());
+    assert.ok(await lstat(join(bpCache, 'web.bin')));
+
+    // 等待 5ms 确保快照时间戳递增，再执行第二轮 smartClear(['history_logs'])：
+    //    验证 SQLite 账单自动归档，且第一轮旧快照被列入 supersededSnapshotPaths 供系统废纸篓接管
+    await new Promise(r => setTimeout(r, 5));
+    const baselineUsage = await usageMgr.getUsageSummary(true);
+    const clear2 = await m.smartClear({ scopes: ['history_logs'], retentionDays: 7, keepLocalSnapshots: 1 });
+    assert.equal(clear2.ok, true);
+    assert.equal(clear2.moved, 2);
+    assert.deepEqual(clear2.supersededSnapshotPaths, [clear1.restorePath]);
+    await assert.rejects(lstat(subDb));
+    assert.ok(await lstat(rootDb));
+
+    const afterHistoryClearUsage = await usageMgr.getUsageSummary(true);
+    assert.equal(afterHistoryClearUsage.all_time.totals.total_tokens, baselineUsage.all_time.totals.total_tokens);
+
+    // 模拟前端 FileManager.trashItem 移走 supersededSnapshotPaths 后，仅最新一次快照保留在本地支持一键撤回
+    await rm(clear1.restorePath, { recursive: true, force: true });
+    const scanAfter = await m.scan({ retentionDays: 7 });
+    assert.equal(scanAfter.latestRestorableSnapshot?.id, clear2.snapshotId);
+    const undone = await m.restore(scanAfter.latestRestorableSnapshot.id);
+    assert.equal(undone.ok, true);
+    assert.ok(await lstat(subDb));
+  } finally {
+    await chmod(blockedTrash, 0o700).catch(() => {});
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+

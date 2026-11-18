@@ -3,27 +3,29 @@ import Cocoa
 enum ModelIcons {
     private static var cache: [String:NSImage] = [:]
     static func image(_ name:String) -> NSImage? {
-        if let image=cache[name] { return image }
+        let canonical = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let resolvedName = canonical == "gpt" ? "openai" : canonical
+        if let image=cache[resolvedName] { return image }
         #if NATIVE_UI_TEST
         let root = URL(fileURLWithPath:ProcessInfo.processInfo.environment["GRAVITYBOX_UI_RESOURCES"] ?? "assets")
         #else
         let root = Bundle.main.resourceURL!
         #endif
         let folder = root.appendingPathComponent("model-icons")
-        let file = name + ".png"
+        let file = resolvedName + ".png"
         guard let image=NSImage(contentsOf:folder.appendingPathComponent(file)) else { return nil }
-        image.isTemplate = (name == "openai")
-        cache[name]=image; return image
+        image.isTemplate = (resolvedName == "openai")
+        cache[resolvedName]=image; return image
     }
     static func tintColor(for image: NSImage) -> NSColor? {
         image.isTemplate ? .labelColor : nil
     }
     static func brands(for title:String) -> [String] {
         let lower=title.lowercased()
-        if lower.contains("gemini") { return ["gemini"] }
-        if lower.contains("claude") && lower.contains("gpt") { return ["claude","openai"] }
+        if lower.contains("claude") && (lower.contains("gpt") || lower.contains("openai")) { return ["claude","openai"] }
+        if lower.contains("gemini") || lower.contains("orchestrator") || lower.contains("argon") || lower.contains("carbon") || lower.contains("hydrogen") || lower.contains("neon") { return ["gemini"] }
         if lower.contains("claude") { return ["claude"] }
-        if lower.contains("gpt") || lower.contains("openai") { return ["openai"] }
+        if lower.contains("gpt") || lower.contains("openai") || lower.range(of: "(?:^|\\b)o[1-9](?:$|[-_\\s])", options: .regularExpression) != nil { return ["openai"] }
         return []
     }
 }

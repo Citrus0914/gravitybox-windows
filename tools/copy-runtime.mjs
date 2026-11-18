@@ -1,6 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
-import { Script } from 'node:vm';
+import { Script, runInNewContext } from 'node:vm';
 
 /**
  * 由 runtime/ 合并生成到 dist/ 的产物（无 src/*.ts 对应）。
@@ -9,6 +9,7 @@ import { Script } from 'node:vm';
 export const GENERATED_DIST_FILES = ['engine.js'];
 
 const HUD_RUNTIME_FILES = [
+  'hud-i18n.js',
   'hud-styles.js',
   'hud-popover.js',
   'hud-instance.js',
@@ -25,6 +26,48 @@ function stripEsmForClassicRuntime(code) {
     .replace(/^\s*export\s*\{[^}]*\};?\s*$/gm, '');
 }
 
+async function loadAndSyncHudI18n(rawHudI18nSource) {
+  const [zhJsonRaw, enJsonRaw] = await Promise.all([
+    readFile(new URL('../assets/i18n/zh-Hans.json', import.meta.url), 'utf8'),
+    readFile(new URL('../assets/i18n/en.json', import.meta.url), 'utf8'),
+  ]);
+  const jsonHud = {
+    'zh-Hans': JSON.parse(zhJsonRaw)?.hud ?? {},
+    en: JSON.parse(enJsonRaw)?.hud ?? {},
+  };
+  const sandbox = {};
+  const evalCode = stripEsmForClassicRuntime(rawHudI18nSource).replace(
+    /\bconst\s+(HUD_FALLBACK_LOCALE|HUD_I18N)\b/g,
+    'var $1'
+  );
+  runInNewContext(evalCode, sandbox, { filename: 'hud-i18n-sync-check.js' });
+  const runtimeHud = sandbox.HUD_I18N ?? {};
+  for (const locale of ['zh-Hans', 'en']) {
+    const expected = jsonHud[locale];
+    const actual = runtimeHud[locale] ?? {};
+    const expectedKeys = Object.keys(expected).sort();
+    const actualKeys = Object.keys(actual).sort();
+    if (
+      expectedKeys.length === 0 ||
+      expectedKeys.length !== actualKeys.length ||
+      expectedKeys.some((key, index) => key !== actualKeys[index] || expected[key] !== actual[key])
+    ) {
+      throw new Error(
+        `runtime/hud-i18n.js (${locale}) 与 assets/i18n/${locale}.json#hud 不一致，请先同步双源 HUD 词条`
+      );
+    }
+  }
+  const hudLiteral = JSON.stringify(jsonHud, null, 2);
+  const replaced = rawHudI18nSource.replace(
+    /export\s+const\s+HUD_I18N\s*=\s*\{[\s\S]*?\n\};/,
+    `export const HUD_I18N = ${hudLiteral};`
+  );
+  if (!replaced.includes(hudLiteral)) {
+    throw new Error('未能在 runtime/hud-i18n.js 中定位 HUD_I18N 注入点');
+  }
+  return replaced;
+}
+
 export async function copyRuntime(distUrl = new URL('../dist/', import.meta.url)) {
   const baseSources = await Promise.all(
     ['engine.js', 'deep-scan.js'].map((name) =>
@@ -34,7 +77,8 @@ export async function copyRuntime(distUrl = new URL('../dist/', import.meta.url)
   const hudSources = await Promise.all(
     HUD_RUNTIME_FILES.map(async (name) => {
       const raw = await readFile(new URL('../runtime/' + name, import.meta.url), 'utf8');
-      return stripEsmForClassicRuntime(raw);
+      const synced = name === 'hud-i18n.js' ? await loadAndSyncHudI18n(raw) : raw;
+      return stripEsmForClassicRuntime(synced);
     })
   );
   const formatSource = stripEsmForClassicRuntime(await readFile(new URL('metric-format.js', distUrl), 'utf8'));

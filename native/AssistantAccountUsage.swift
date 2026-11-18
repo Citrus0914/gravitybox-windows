@@ -1,9 +1,94 @@
 import Cocoa
 
 extension Assistant {
+    func loadUIBootstrapSnapshot() {
+        #if !NATIVE_UI_TEST
+        let url = state.appendingPathComponent("ui-bootstrap-cache-v1.json")
+        guard let data = try? Data(contentsOf: url),
+              let raw = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        if let dash = raw["dashboardSummary"] as? [String: Any] {
+            cachedDashboardBootstrapSummary = dash
+            if let usg = dash["usage"] as? [String: Any], let periodsMap = usg["periods"] as? [String: Any] {
+                for p in ["today", "7d", "30d", "all"] {
+                    if var item = periodsMap[p] as? [String: Any] {
+                        item.removeValue(forKey: "periods")
+                        cachedUsageReportsByPeriod[p] = item
+                        bootstrappedUsagePeriods.insert(p)
+                    }
+                }
+            }
+        }
+        if let accPayload = raw["accountsPayload"] as? [String: Any],
+           let list = accPayload["accounts"] as? [[String: Any]] {
+            cachedAccountsBootstrapPayload = accPayload
+            let resolvedActive = accPayload["activeId"] as? String ?? (accPayload["currentAccountId"] as? String ?? "")
+            activeAccountId = resolvedActive
+            cachedAccounts = list.enumerated().sorted { lhs, rhs in
+                let l = lhs.element["id"] as? String == resolvedActive
+                let r = rhs.element["id"] as? String == resolvedActive
+                return l == r ? lhs.offset < rhs.offset : l
+            }.map(\.element)
+            bootstrappedAccounts = true
+        }
+        if let usageByPeriod = raw["usageByPeriod"] as? [String: [String: Any]] {
+            for (p, var report) in usageByPeriod where ["today", "7d", "30d", "all"].contains(p) {
+                report.removeValue(forKey: "periods")
+                cachedUsageReportsByPeriod[p] = report
+                bootstrappedUsagePeriods.insert(p)
+            }
+        }
+        #endif
+    }
+
+    func scheduleUIBootstrapSave() {
+        #if !NATIVE_UI_TEST
+        uiBootstrapSaveWorkItem?.cancel()
+        let dashSnap = cachedDashboardBootstrapSummary
+        let accSnap = cachedAccountsBootstrapPayload
+        let usageSnap = cachedUsageReportsByPeriod
+        let targetURL = state.appendingPathComponent("ui-bootstrap-cache-v1.json")
+        let work = DispatchWorkItem { [weak self] in
+            guard self != nil else { return }
+            var doc: [String: Any] = ["schema": 1, "savedAt": Date().timeIntervalSince1970]
+            if let dashSnap, JSONSerialization.isValidJSONObject(dashSnap) {
+                doc["dashboardSummary"] = dashSnap
+            }
+            if let accSnap, JSONSerialization.isValidJSONObject(accSnap) {
+                doc["accountsPayload"] = accSnap
+            }
+            var validUsage: [String: Any] = [:]
+            for (k, v) in usageSnap where ["today", "7d", "30d", "all"].contains(k) && JSONSerialization.isValidJSONObject(v) {
+                validUsage[k] = v
+            }
+            if !validUsage.isEmpty {
+                doc["usageByPeriod"] = validUsage
+            }
+            guard JSONSerialization.isValidJSONObject(doc),
+                  let bytes = try? JSONSerialization.data(withJSONObject: doc) else { return }
+            try? bytes.write(to: targetURL, options: .atomic)
+            chmod(targetURL.path, 0o600)
+        }
+        uiBootstrapSaveWorkItem = work
+        uiBootstrapQueue.asyncAfter(deadline: .now() + 0.35, execute: work)
+        #endif
+    }
+
+    func ingestUsagePeriods(from rawPeriods: [String: Any]?, fetchedAt: Date) {
+        guard let rawPeriods else { return }
+        for p in ["today", "7d", "30d", "all"] {
+            guard var item = rawPeriods[p] as? [String: Any] else { continue }
+            item.removeValue(forKey: "periods")
+            cachedUsageReportsByPeriod[p] = item
+            usageLastFetchTimeByPeriod[p] = fetchedAt
+            usageFetchErrorsByPeriod[p] = nil
+            bootstrappedUsagePeriods.remove(p)
+        }
+    }
+
     func fetchUsageSummary(period: String, force: Bool = false, allowCached: Bool = true, completion: ((Result<[String: Any], Error>) -> Void)? = nil) {
         let cacheKey = period
         if !force && allowCached,
+           !bootstrappedUsagePeriods.contains(cacheKey),
            let cached = cachedUsageReportsByPeriod[cacheKey],
            let lastAt = usageLastFetchTimeByPeriod[cacheKey],
            Date().timeIntervalSince(lastAt) < 15.0,
@@ -43,16 +128,29 @@ extension Assistant {
             }
             self.usageInFlightByPeriod[cacheKey] = false
             self.usageManualRefreshPeriods.remove(cacheKey)
-            guard generation >= (self.usageGenerationByPeriod[cacheKey] ?? 0) else { return }
-            self.usageLastFetchTimeByPeriod[cacheKey] = Date()
+            guard generation >= (self.usageGenerationByPeriod[cacheKey] ?? 0) else {
+                self.menuPanelController?.syncHeaderRefreshState()
+                return
+            }
+            let fetchedAt = Date()
+            self.usageLastFetchTimeByPeriod[cacheKey] = fetchedAt
+            self.bootstrappedUsagePeriods.remove(cacheKey)
             let waiters = self.usageWaitersByPeriod.removeValue(forKey: cacheKey) ?? []
+            var resolvedResponse = response
             switch response {
             case .failure(let error):
                 self.usageFetchErrorsByPeriod[cacheKey] = error.localizedDescription
             case .success(let value):
                 self.usageFetchErrorsByPeriod[cacheKey] = nil
-                self.cachedUsageReportsByPeriod[cacheKey] = value
-                let failedCount = (value["summary"] as? [String: Any])?["failedDatabasesCount"] as? Int ?? 0
+                if let periodsMap = value["periods"] as? [String: Any] {
+                    self.ingestUsagePeriods(from: periodsMap, fetchedAt: fetchedAt)
+                }
+                var cleanValue = value
+                cleanValue.removeValue(forKey: "periods")
+                self.cachedUsageReportsByPeriod[cacheKey] = cleanValue
+                resolvedResponse = .success(cleanValue)
+                self.scheduleUIBootstrapSave()
+                let failedCount = (cleanValue["summary"] as? [String: Any])?["failedDatabasesCount"] as? Int ?? 0
                 if failedCount == 0 {
                     self.usageAutoHealAttemptsByPeriod[cacheKey] = 0
                 } else {
@@ -74,22 +172,23 @@ extension Assistant {
                     self.usagePage?.update(force: false)
                 }
             }
-            self.menuPanelController?.onUsageReportUpdated(period: period, result: response)
-            for waiter in waiters { waiter(response) }
+            self.menuPanelController?.onUsageReportUpdated(period: period, result: resolvedResponse)
+            self.menuPanelController?.syncHeaderRefreshState()
+            for waiter in waiters { waiter(resolvedResponse) }
         }
     }
 
     func refreshSingleAccountQuota(id: String, completion: ((Result<[String: Any], Error>) -> Void)? = nil) {
         guard !id.isEmpty else {
-            completion?(.failure(BackendFailure(message: "账号标识无效")))
+            completion?(.failure(BackendFailure(message: L10n.t("assistant_account.invalid_id"))))
             return
         }
         guard reachable else {
-            completion?(.failure(BackendFailure(message: "本机服务尚未就绪")))
+            completion?(.failure(BackendFailure(message: L10n.t("assistant_account.service_not_ready"))))
             return
         }
         guard !refreshingAccountIds.contains(id) else {
-            completion?(.failure(BackendFailure(message: "该账号配额正在刷新中")))
+            completion?(.failure(BackendFailure(message: L10n.t("assistant_account.refresh_in_progress"))))
             return
         }
         singleAccountRefreshErrors[id] = nil
@@ -117,10 +216,10 @@ extension Assistant {
     }
 
     func buildAccountSwitchMenu() -> NSMenu {
-        let switchSubmenu = NSMenu(title: "切换账号")
+        let switchSubmenu = NSMenu(title: L10n.t("assistant_account.switch_submenu"))
         switchSubmenu.showsStateColumn = true
         if cachedAccounts.isEmpty {
-            let emptyItem = NSMenuItem(title: "暂无可用账号快照", action: nil, keyEquivalent: "")
+            let emptyItem = NSMenuItem(title: L10n.t("assistant_account.no_snapshots"), action: nil, keyEquivalent: "")
             emptyItem.isEnabled = false
             switchSubmenu.addItem(emptyItem)
         } else {
@@ -131,7 +230,7 @@ extension Assistant {
             }.map(\.element)
             for acc in ordered {
                 let id = acc["id"] as? String ?? ""
-                let accEmail = acc["email"] as? String ?? "未知账号"
+                let accEmail = acc["email"] as? String ?? L10n.t("assistant_account.unknown_account")
                 let label = acc["name"] as? String ?? ""
                 let displayName = label.isEmpty ? accEmail : "\(label) · \(accEmail)"
                 let accTier = AccountIdentity.normalizeTier(acc["subscription_tier"] as? String)
@@ -139,20 +238,18 @@ extension Assistant {
                 let accItem = NSMenuItem(title: title, action: #selector(switchAccountFromMenu(_:)), keyEquivalent: "")
                 accItem.target = self
                 accItem.representedObject = id
-                accItem.isEnabled = acc["disabled"] as? Bool != true
-                if id == activeAccountId || (activeAccountId.isEmpty && accEmail == statusValue.activeAccountEmail) { accItem.state = .on }
+                let isBlocked = acc["disabled"] as? Bool == true || acc["validation_blocked"] as? Bool == true
+                let isCurrent = id == activeAccountId || (activeAccountId.isEmpty && accEmail == statusValue.activeAccountEmail)
+                accItem.isEnabled = !isBlocked && !isCurrent
+                if isCurrent { accItem.state = .on }
                 switchSubmenu.addItem(accItem)
             }
         }
         switchSubmenu.addItem(.separator())
-        let manageItem = NSMenuItem(title: "管理账号…", action: #selector(showAccountsFromMenuCard), keyEquivalent: "")
+        let manageItem = NSMenuItem(title: L10n.t("assistant_account.manage_accounts"), action: #selector(showAccountsFromMenuCard), keyEquivalent: "")
         manageItem.target = self
         switchSubmenu.addItem(manageItem)
         return switchSubmenu
-    }
-    func popUpAccountSwitchMenu(from anchorView: NSView) {
-        let submenu = buildAccountSwitchMenu()
-        Design.popUpMenu(submenu, below: anchorView)
     }
     @objc func showAccountsFromMenuCard() {
         closeMenuPopover()
@@ -171,12 +268,15 @@ extension Assistant {
         cachedUsageReportsByPeriod.removeAll()
         usageLastFetchTimeByPeriod.removeAll()
         usageFetchErrorsByPeriod.removeAll()
+        bootstrappedUsagePeriods.removeAll()
         overview?.metricsKey = ""
         usagePage?.metricsKey = ""
         if contentVisible && currentPage == 2 {
             usagePage?.fetch()
         }
         if menuTracking || menuPopover?.isShown == true {
+            let periodKey = menuPanelController.map { MenuPanelController.periods[$0.selectedPeriod] } ?? "today"
+            fetchUsageSummary(period: periodKey, force: true, allowCached: false)
             menuPanelController?.syncFromAssistant()
         }
     }
@@ -193,7 +293,7 @@ extension Assistant {
             guard case .success(let payload) = result else {
                 self.accountSwitchInFlight = false
                 if case .failure(let error) = result {
-                    self.showMessage("无法确认切换前置条件：" + error.localizedDescription, error: true)
+                    self.showMessage(L10n.t("assistant_account.preflight_failed", ["error": error.localizedDescription]), error: true)
                 }
                 return
             }
@@ -204,13 +304,13 @@ extension Assistant {
             let hasRunningTask = (payload["hasRunningTask"] as? Bool == true) || (payload["safe"] as? Bool == false)
             let display: String
             if !name.isEmpty && name.caseInsensitiveCompare(email) != .orderedSame && !email.isEmpty {
-                display = "\(name)（\(email)）"
+                display = L10n.shared.isEnglish ? "\(name) (\(email))" : "\(name)（\(email)）"
             } else {
-                display = email.isEmpty ? (name.isEmpty ? "目标账号" : name) : email
+                display = email.isEmpty ? (name.isEmpty ? L10n.t("assistant_account.target_fallback") : name) : email
             }
             if insidersRunning {
                 self.accountSwitchInFlight = false
-                self.showMessage("检测到 Antigravity Insiders 正在运行，请先保存工作并手动退出后再切换账号", error: true)
+                self.showMessage(L10n.t("assistant_account.insiders_running"), error: true)
                 return
             }
             let performSwitch = { [weak self] in
@@ -221,9 +321,9 @@ extension Assistant {
                     switch response {
                     case .failure(let error):
                         if shouldQuitAndRelaunch { self.relaunchAntigravityAfterSwitch() }
-                        self.showMessage("切换账号失败：" + error.localizedDescription, error: true)
+                        self.showMessage(L10n.t("assistant_account.switch_failed", ["error": error.localizedDescription]), error: true)
                     case .success(let value):
-                        self.showMessage(value["message"] as? String ?? "已切换至账号：\(email)")
+                        self.showMessage(value["message"] as? String ?? L10n.t("assistant_account.switched_to", ["email": email]))
                         if shouldQuitAndRelaunch { self.relaunchAntigravityAfterSwitch() }
                         self.invalidateUsageReportCache()
                         self.refresh(); self.accountsPage?.fetch(); self.overview?.fetch(); completion?()
@@ -238,7 +338,7 @@ extension Assistant {
                     self.bridge.send(["command": "account_switch", "id": id, "target": "all", "autoRefreshToken": true]) { [weak self] response in
                         guard let self else { return }; self.accountSwitchInFlight = false
                         if case .success(let value) = response {
-                            self.showMessage(value["message"] as? String ?? "已切换至账号：\(email)")
+                            self.showMessage(value["message"] as? String ?? L10n.t("assistant_account.switched_to", ["email": email]))
                             if shouldQuitAndRelaunch { self.relaunchAntigravityAfterSwitch() }
                             self.invalidateUsageReportCache()
                             self.refresh(); self.accountsPage?.fetch(); self.overview?.fetch(); completion?()
@@ -252,7 +352,7 @@ extension Assistant {
                         guard let self else { return }
                         guard exited else {
                             self.accountSwitchInFlight = false
-                            self.showMessage("请先在 Antigravity 中保存工作并退出应用，再切换账号", error: true)
+                            self.showMessage(L10n.t("assistant_account.quit_first"), error: true)
                             return
                         }
                         performSwitch()
@@ -270,10 +370,10 @@ extension Assistant {
                 #endif
                 let busyAlert = NSAlert()
                 busyAlert.alertStyle = .warning
-                busyAlert.messageText = "切换至 \(display)？"
-                busyAlert.informativeText = "检测到 Antigravity 有正在运行的任务，现在切换会中断当前任务并重启应用。"
-                busyAlert.addButton(withTitle: "仍要切换")
-                busyAlert.addButton(withTitle: "取消")
+                busyAlert.messageText = L10n.t("assistant_account.switch_prompt_title", ["display": display])
+                busyAlert.informativeText = L10n.t("assistant_account.switch_busy_body")
+                busyAlert.addButton(withTitle: L10n.t("assistant_account.switch_busy_confirm"))
+                busyAlert.addButton(withTitle: L10n.t("common.cancel"))
                 self.presentSheetAlert(busyAlert) { execute($0 == .alertFirstButtonReturn) }
                 return
             }
@@ -282,19 +382,19 @@ extension Assistant {
             #endif
             let alert = NSAlert()
             alert.alertStyle = .informational
-            alert.messageText = "切换至 \(display)？"
+            alert.messageText = L10n.t("assistant_account.switch_prompt_title", ["display": display])
             alert.informativeText = appRunning
-                ? "当前无正在运行的任务，确认后将自动重启 Antigravity 生效。"
-                : "Antigravity 当前未运行，确认后将直接切换账号。"
-            alert.addButton(withTitle: "确认切换")
-            alert.addButton(withTitle: "取消")
+                ? L10n.t("assistant_account.switch_ready_body")
+                : L10n.t("assistant_account.switch_stopped_body")
+            alert.addButton(withTitle: L10n.t("assistant_account.switch_confirm"))
+            alert.addButton(withTitle: L10n.t("common.cancel"))
             self.presentSheetAlert(alert) { execute($0 == .alertFirstButtonReturn) }
         }
     }
     @objc func refreshAccountQuotas() {
         guard !quotaRefreshing, pendingAccountTaskId == nil, reachable else { return }
         quotaRefreshing = true; quotaRefreshStartedAt = Date(); quotaRefreshError = nil; updateQuotaRefreshControls()
-        let poll = Timer(timeInterval: 0.75, repeats: true) { [weak self] _ in self?.refresh(taskPollOnly: true) }
+        let poll = Timer(timeInterval: 0.35, repeats: true) { [weak self] _ in self?.refresh(taskPollOnly: true) }
         quotaRefreshPollTimer?.invalidate(); quotaRefreshPollTimer = poll
         RunLoop.main.add(poll, forMode: .common); RunLoop.main.add(poll, forMode: .eventTracking)
         bridge.send(["command": "quota_refresh_start"]) { [weak self] response in
@@ -302,7 +402,7 @@ extension Assistant {
             switch response {
             case .failure(let error): self.finishQuotaRefresh(error: error.localizedDescription)
             case .success(let value):
-                guard let id = value["taskId"] as? String, !id.isEmpty else { self.finishQuotaRefresh(error: "未取得刷新任务，请重试"); return }
+                guard let id = value["taskId"] as? String, !id.isEmpty else { self.finishQuotaRefresh(error: L10n.t("assistant_account.refresh_task_missing")); return }
                 self.pendingAccountTaskId = id; self.refresh(taskPollOnly: true)
             }
         }
@@ -313,10 +413,15 @@ extension Assistant {
     }
     func updateQuotaRefreshControls() {
         let available = reachable && (pendingAccountTaskId == nil || quotaRefreshing)
+        let overviewActiveId = ((overview?.lastSuccessfulSummary?["accounts"] as? [String: Any])?["currentAccountId"] as? String) ?? activeAccountId
         func apply(_ view: NSView) {
             if let control = view as? QuotaRefreshButton {
                 let cid = control.identifier?.rawValue ?? ""
-                control.applyGlobalRefreshState(globalBusy: quotaRefreshing, available: available, error: quotaRefreshError, cardBusy: refreshingAccountIds.contains(cid))
+                let isOverviewHeroBtn = (control === overview?.refreshQuotaButton)
+                let targetId = isOverviewHeroBtn ? overviewActiveId : cid
+                let isCardBusy = !targetId.isEmpty && refreshingAccountIds.contains(targetId)
+                let resolvedErr = (isOverviewHeroBtn && !targetId.isEmpty ? singleAccountRefreshErrors[targetId] : nil) ?? quotaRefreshError
+                control.applyGlobalRefreshState(globalBusy: quotaRefreshing, available: available, error: resolvedErr, cardBusy: isCardBusy)
             }
             for child in view.subviews { apply(child) }
         }
@@ -342,6 +447,8 @@ extension Assistant {
             self.accountListWaiters.removeAll()
             self.accountListPendingNotifyPage = false
             if case .success(let val) = res, generation >= self.accountListGeneration, let list = val["accounts"] as? [[String: Any]] {
+                self.bootstrappedAccounts = false
+                self.cachedAccountsBootstrapPayload = val
                 self.lastFetchedAccountsRevision = self.statusValue.accountsRevision
                 self.lastFetchedLiveEmail = self.statusValue.liveAccountEmail
                 var resolvedActiveId = val["activeId"] as? String ?? (val["currentAccountId"] as? String ?? "")
@@ -356,11 +463,15 @@ extension Assistant {
                     let r = rhs.element["id"] as? String == resolvedActiveId
                     return l == r ? lhs.offset < rhs.offset : l
                 }.map(\.element)
+                if let cachedRec = self.cachedRecommendedAccountId,
+                   cachedRec == resolvedActiveId || !self.cachedAccounts.contains(where: { ($0["id"] as? String) == cachedRec }) {
+                    self.cachedRecommendedAccountId = nil
+                }
                 if let globalErr = self.quotaRefreshError, InterfaceText.isMultiAccountSummary(globalErr) {
                     let anyAccountHasIssue = self.cachedAccounts.contains { acc in
                         if acc["disabled"] as? Bool == true { return false }
                         let err = (acc["quota_refresh_error"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !err.isEmpty && !err.contains("双周期") { return true }
+                        if !err.isEmpty && !InterfaceText.isInternalDualWindowError(err) { return true }
                         if let quota = acc["quota"] as? [String: Any],
                            let stale = quota["stale_groups"] as? [[String: Any]], !stale.isEmpty {
                             return true
@@ -371,15 +482,20 @@ extension Assistant {
                         self.quotaRefreshError = nil
                     }
                 }
+                self.scheduleUIBootstrapSave()
                 self.updateQuotaRefreshControls()
                 if shouldNotifyPage { self.accountsPage?.fetch(val) }
             }
             for waiter in waiters { waiter(res) }
         }
     }
-    func failPendingQuotaRefresh(_ message: String) {
+    func failPendingQuotaRefresh(_ message: String, cancelBackendTask: Bool = false) {
         guard quotaRefreshing || pendingAccountTaskId != nil else { return }
+        let staleTaskId = pendingAccountTaskId
         quotaRefreshing = false; pendingAccountTaskId = nil; quotaRefreshStartedAt = nil
         quotaRefreshError = message; quotaRefreshPollTimer?.invalidate(); quotaRefreshPollTimer = nil
+        if cancelBackendTask, let staleTaskId, !staleTaskId.isEmpty, reachable {
+            bridge.send(["command": "task_cancel", "id": staleTaskId]) { _ in }
+        }
     }
 }

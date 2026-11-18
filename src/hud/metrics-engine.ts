@@ -1,29 +1,35 @@
-import { compactNumber, durationText, formatTurnDurationCompact } from '../metric-format.js';
+import { compactNumber, compactPercent, compactRate, compactUsd, durationText, formatTurnDurationCompact } from '../metric-format.js';
 export { formatTurnDurationCompact };
+import { bt } from '../i18n.js';
 import { lstat, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import type {
   ConversationHudMetrics,
   HudActivityPhase,
   HudCapacitySource,
+  HudContextStageRole,
   HudDataAvailability,
+  HudModelContextStage,
   ParsedConversationStep,
   ParsedGenMetadata,
 } from './types.js';
 import { resolveModelCapacity } from './model-catalog.js';
+import { resetAndRegisterRemoteModelMetadata } from '../model-catalog.js';
 import {
   DEFAULT_API_PRICES,
+  isTemporalPricingEntry,
+  lookupPricingEntry,
+  resolveContextTierPricing,
   resolvePricingFromTable,
   calculateEstimatedUsd,
   type ApiPricingEntry,
 } from '../pricing.js';
 import { loadRawPricingTable } from '../usage-pricing.js';
 import { resolveDatabaseModelFullName } from '../usage-types.js';
-import { runHudDbScanInWorker } from '../sqlite-read.js';
+import { runHudDbScanInWorker, runSummariesLookupInWorker } from '../sqlite-read.js';
 import type { HudWorkerRawStepRow } from '../sqlite-worker.js';
 import { decodeVarint64, skipProtobufField } from '../protobuf.js';
-export { decodeVarint64 };
 
 const UUID_REGEX_GLOBAL = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const ACTIVE_STEP_STATUSES = new Set([1, 2, 8, 9]);
@@ -34,8 +40,9 @@ const SUBAGENT_TOOL_NAMES = new Set([
   'start_subagent',
   'spawn_subagent',
 ]);
-const MAX_CACHED_CONVERSATIONS = 24;
+const MAX_CACHED_CONVERSATIONS = 128;
 const ACTIVE_DB_RECENCY_MS = 60 * 60 * 1000;
+const TURN_STEP_HANDOFF_GRACE_SEC = 600;
 const INLINE_BLOB_LIMIT_BYTES = 65_536;
 const UTF8_DECODER = new TextDecoder('utf-8');
 
@@ -208,6 +215,124 @@ function extractUuidsFromBlob(buf: Uint8Array | null | undefined, maxBytes = 655
   return [...found];
 }
 
+const EXACT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function walkStrictProtobufFields(
+  buf: Uint8Array,
+  onLengthDelimited: (fieldNum: number, subBuf: Uint8Array) => void
+): boolean {
+  if (!buf || buf.length === 0) return false;
+  const cursor = { pos: 0 };
+  const pending: Array<{ fieldNum: number; subBuf: Uint8Array }> = [];
+  while (cursor.pos < buf.length) {
+    let tagNum: number;
+    try {
+      tagNum = Number(decodeVarint64(buf, cursor));
+    } catch {
+      return false;
+    }
+    if (!tagNum) return false;
+    const fieldNum = tagNum >>> 3;
+    const wireType = tagNum & 0x07;
+    if (fieldNum < 1 || fieldNum > 16384) return false;
+    if (wireType === 2) {
+      let len: number;
+      try {
+        len = Number(decodeVarint64(buf, cursor));
+      } catch {
+        return false;
+      }
+      if (!Number.isSafeInteger(len) || len < 0 || cursor.pos + len > buf.length) return false;
+      pending.push({ fieldNum, subBuf: buf.subarray(cursor.pos, cursor.pos + len) });
+      cursor.pos += len;
+    } else if (wireType === 0 || wireType === 1 || wireType === 5) {
+      if (!skipProtobufField(buf, cursor, wireType)) return false;
+    } else {
+      return false;
+    }
+  }
+  if (cursor.pos !== buf.length) return false;
+  for (const item of pending) {
+    onLengthDelimited(item.fieldNum, item.subBuf);
+  }
+  return true;
+}
+
+function extractAgentRefConversationId(agentRefBuf: Uint8Array): string | null {
+  let foundUuid: string | null = null;
+  const valid = walkStrictProtobufFields(agentRefBuf, (fieldNum, subBuf) => {
+    if (fieldNum === 1 && subBuf.length === 36 && !foundUuid) {
+      const candidate = UTF8_DECODER.decode(subBuf);
+      if (EXACT_UUID_RE.test(candidate)) {
+        foundUuid = candidate.toLowerCase();
+      }
+    }
+  });
+  return valid ? foundUuid : null;
+}
+
+/**
+ * 从 StepRenderInfo (exa.cortex_pb.StepRenderInfo) 中结构化提取并行子智能体 AgentRef.conversation_id：
+ * - field 9: title_parts (TitlePart.field 5 -> AgentRef.field 1)
+ * - field 10: content_blocks (ContentBlock.field 4 -> AgentRef.field 1, ContentBlock.field 5 -> StepBlock.field 1 -> StepRenderInfo)
+ * 严格验证完整 Protobuf 边界与精确 36 字节 UUID，对 run_command 等普通工具的纯文本/JSON 载荷零误判。
+ */
+function collectAgentRefsFromStepRenderInfo(
+  renderInfoBuf: Uint8Array,
+  out: Set<string>,
+  depth = 0
+): void {
+  if (depth > 4 || !renderInfoBuf || renderInfoBuf.length === 0) return;
+  walkStrictProtobufFields(renderInfoBuf, (fieldNum, subBuf) => {
+    if (fieldNum === 9) {
+      walkStrictProtobufFields(subBuf, (partField, partSub) => {
+        if (partField === 5) {
+          const uuid = extractAgentRefConversationId(partSub);
+          if (uuid) out.add(uuid);
+        }
+      });
+    } else if (fieldNum === 10) {
+      walkStrictProtobufFields(subBuf, (blockField, blockSub) => {
+        if (blockField === 4) {
+          const uuid = extractAgentRefConversationId(blockSub);
+          if (uuid) out.add(uuid);
+        } else if (blockField === 5) {
+          walkStrictProtobufFields(blockSub, (stepBlockField, nestedRenderInfo) => {
+            if (stepBlockField === 1) {
+              collectAgentRefsFromStepRenderInfo(nestedRenderInfo, out, depth + 1);
+            }
+          });
+        }
+      });
+    }
+  });
+}
+
+function collectAgentRefsFromStepPayloadOrData(blob: Uint8Array, out: Set<string>): void {
+  if (!blob || blob.length === 0) return;
+  const beforeSize = out.size;
+  collectAgentRefsFromStepRenderInfo(blob, out, 0);
+  if (out.size > beforeSize) return;
+  // CortexStepGeneric: field 2 (GenericStepResult) -> field 3 (StepRenderInfo)，或外层 oneof 包装
+  walkStrictProtobufFields(blob, (outerField, outerSub) => {
+    if (outerField === 3) {
+      collectAgentRefsFromStepRenderInfo(outerSub, out, 0);
+    } else if (outerField === 2 || outerField >= 10) {
+      walkStrictProtobufFields(outerSub, (innerField, innerSub) => {
+        if (innerField === 3) {
+          collectAgentRefsFromStepRenderInfo(innerSub, out, 0);
+        } else if (innerField === 2) {
+          walkStrictProtobufFields(innerSub, (resField, resSub) => {
+            if (resField === 3) {
+              collectAgentRefsFromStepRenderInfo(resSub, out, 0);
+            }
+          });
+        }
+      });
+    }
+  });
+}
+
 function parentReferences(buf: Uint8Array): Set<string> {
   const references = new Set<string>();
   const cursor = { pos: 0 };
@@ -268,7 +393,7 @@ export function parseStepMetadataBlob(
     reasoningTokens: 0,
     candidateTokens: 0,
     hasUsage: false,
-    isSubagentStep: stepType === 127,
+    isSubagentStep: stepType === 85 || stepType === 127,
   };
 
   const childIds = new Set<string>();
@@ -368,6 +493,26 @@ export function parseStepMetadataBlob(
         result.startTimeSeconds = field32StartedTs;
       } else {
         result.startTimeSeconds = field1CreatedTs ?? field32StartedTs;
+      }
+    }
+  }
+
+  // 对 step_type = 85 / 127 / 132（含并行子智能体审计团队 GENERIC 步骤）结构化提取 StepRenderInfo.AgentRef
+  if (stepType === 85 || stepType === 127 || stepType === 132) {
+    const agentRefIds = new Set<string>();
+    if (extraSubagentBlobs && extraSubagentBlobs.length > 0) {
+      for (const extra of extraSubagentBlobs) {
+        if (!extra || extra.length === 0) continue;
+        collectAgentRefsFromStepPayloadOrData(extra, agentRefIds);
+      }
+    }
+    if (dataBlob && dataBlob.length > 0) {
+      collectAgentRefsFromStepPayloadOrData(dataBlob, agentRefIds);
+    }
+    if (agentRefIds.size > 0) {
+      result.isSubagentStep = true;
+      for (const cid of agentRefIds) {
+        childIds.add(cid);
       }
     }
   }
@@ -494,7 +639,7 @@ export function parseLatestGenMetadataBlob(
                 out.streamingDurationSeconds = streamSec;
               }
             } else if (fn1 === 9) {
-              // ChatStartMetadata -> field 10: ContextWindowMetadata
+              // ChatStartMetadata -> field 4: started_at (Timestamp), field 10: ContextWindowMetadata
               const startBuf = fieldSlice;
               const cStart = { pos: 0 };
               while (cStart.pos < startBuf.length) {
@@ -502,7 +647,15 @@ export function parseLatestGenMetadataBlob(
                 if (!tS) break;
                 const fnS = tS >>> 3;
                 const wtS = tS & 0x07;
-                if (wtS === 2 && fnS === 10) {
+                if (wtS === 2 && fnS === 4) {
+                  const lTs = Number(decodeVarint64(startBuf, cStart));
+                  if (!Number.isSafeInteger(lTs) || lTs < 0 || cStart.pos + lTs > startBuf.length) break;
+                  const tsSec = parseProtobufTimestamp(startBuf.subarray(cStart.pos, cStart.pos + lTs));
+                  if (tsSec >= 946684800 && Number.isFinite(tsSec)) {
+                    out.startedAtSeconds = tsSec;
+                  }
+                  cStart.pos += lTs;
+                } else if (wtS === 2 && fnS === 10) {
                   const lS = Number(decodeVarint64(startBuf, cStart));
                   if (!Number.isSafeInteger(lS) || lS < 0 || cStart.pos + lS > startBuf.length) break;
                   const cwBuf = startBuf.subarray(cStart.pos, cStart.pos + lS);
@@ -517,56 +670,6 @@ export function parseLatestGenMetadataBlob(
                       const val = Number(decodeVarint64(cwBuf, cCw));
                       if (fnCw === 1 && val > 0) out.estimatedTokensUsed = val;
                       else if (fnCw === 4 && val > 0) out.maxContextTokens = val;
-                    } else if (wtCw === 2 && fnCw === 3) {
-                      // TokenBreakdown -> repeated field 1: TopLevelTokenGroup (field 2: type, field 4: num_tokens)
-                      const lTb = Number(decodeVarint64(cwBuf, cCw));
-                      if (!Number.isSafeInteger(lTb) || lTb < 0 || cCw.pos + lTb > cwBuf.length) break;
-                      const tbBuf = cwBuf.subarray(cCw.pos, cCw.pos + lTb);
-                      cCw.pos += lTb;
-                      const cTb = { pos: 0 };
-                      let sysTok = 0;
-                      let toolTok = 0;
-                      let msgTok = 0;
-                      while (cTb.pos < tbBuf.length) {
-                        const tTb = Number(decodeVarint64(tbBuf, cTb));
-                        if (!tTb) break;
-                        const fnTb = tTb >>> 3;
-                        const wtTb = tTb & 0x07;
-                        if (wtTb === 2 && fnTb === 1) {
-                          const lGrp = Number(decodeVarint64(tbBuf, cTb));
-                          if (!Number.isSafeInteger(lGrp) || lGrp < 0 || cTb.pos + lGrp > tbBuf.length) break;
-                          const grpBuf = tbBuf.subarray(cTb.pos, cTb.pos + lGrp);
-                          cTb.pos += lGrp;
-                          const cGrp = { pos: 0 };
-                          let gType = 0;
-                          let gTokens = 0;
-                          while (cGrp.pos < grpBuf.length) {
-                            const tG = Number(decodeVarint64(grpBuf, cGrp));
-                            if (!tG) break;
-                            const fnG = tG >>> 3;
-                            const wtG = tG & 0x07;
-                            if (wtG === 0) {
-                              const vG = Number(decodeVarint64(grpBuf, cGrp));
-                              if (fnG === 2) gType = vG;
-                              else if (fnG === 4 && vG > 0) gTokens = vG;
-                            } else {
-                              if (!skipProtobufField(grpBuf, cGrp, wtG)) break;
-                            }
-                          }
-                          if (gTokens > 0) {
-                            if (gType === 1 || gType === 3) sysTok += gTokens; // SYSTEM_PROMPT / RULES
-                            else if (gType === 2 || gType === 4 || gType === 5 || gType === 6) toolTok += gTokens; // TOOLS / MCP / SKILLS / SUBAGENTS
-                            else if (gType === 7) msgTok += gTokens; // CHAT_MESSAGES
-                          }
-                        } else {
-                          if (!skipProtobufField(tbBuf, cTb, wtTb)) break;
-                        }
-                      }
-                      if (sysTok + toolTok + msgTok > 0) {
-                        out.systemTokens = sysTok;
-                        out.toolTokens = toolTok;
-                        out.messageTokens = msgTok;
-                      }
                     } else {
                       if (!skipProtobufField(cwBuf, cCw, wtCw)) break;
                     }
@@ -625,51 +728,6 @@ export function parseLatestGenMetadataBlob(
 }
 
 /**
- * 级联独立裁剪数学模型 (保留纯数学导出以兼容边界测试套件)
- * 严格保证 T_i >= 0, W_i >= 0, sum(T_i) === U, sum(W_i) === Ratio_total
- */
-export function computeCascadeContextBreakdown(
-  usedTokens: number,
-  capacityLimit: number,
-  K_sys: number = 1900,
-  K_tool: number = 7600
-): {
-  T_sys: number;
-  T_tool: number;
-  T_msg: number;
-  W_sys: number;
-  W_tool: number;
-  W_msg: number;
-  Ratio_total: number;
-  sumT: number;
-  sumW: number;
-} {
-  const U = Math.max(0, Math.floor(Number.isFinite(usedTokens) ? usedTokens : 0));
-  const C_limit = Math.max(1, Math.floor(Number.isFinite(capacityLimit) ? capacityLimit : 1));
-
-  const T_sys = Math.min(U, K_sys);
-  const T_tool = Math.min(Math.max(0, U - T_sys), K_tool);
-  const T_msg = Math.max(0, U - T_sys - T_tool);
-
-  const W_sys = (T_sys / C_limit) * 100;
-  const W_tool = (T_tool / C_limit) * 100;
-  const W_msg = (T_msg / C_limit) * 100;
-  const Ratio_total = (Math.min(U, C_limit) / C_limit) * 100;
-
-  return {
-    T_sys,
-    T_tool,
-    T_msg,
-    W_sys,
-    W_tool,
-    W_msg,
-    Ratio_total,
-    sumT: T_sys + T_tool + T_msg,
-    sumW: W_sys + W_tool + W_msg,
-  };
-}
-
-/**
  * 有效输出速度：只对匹配的 Token 与完整正耗时计算，保留未舍入结果。
  */
 export function computeTps(
@@ -695,7 +753,7 @@ export function computeTps(
     status: 'calculated',
     rawTps,
     outputTps: rawTps,
-    formatted: `${rawTps.toFixed(2)} tok/s`,
+    formatted: `${compactRate(rawTps)} tok/s`,
   };
 }
 
@@ -728,13 +786,10 @@ export function formatTurnDurationCard(seconds: number, lang: 'zh' | 'en' = 'zh'
 }
 
 /**
- * 格式化 HUD 卡片美元估算金额（>= $0.01 保留 2 位小数；(0, $0.01) 保留 4 位小数避免微额误显 ~$0.00）
+ * 格式化 HUD 卡片美元估算金额（0 显示 $0；微额至多 4/6 位小数去尾零；常规至多 2 位小数去尾零；>= $1000 进位）
  */
 export function formatHudUsd(usd: number): string {
-  if (!Number.isFinite(usd) || usd < 0) return '—';
-  if (usd === 0) return '~$0.00';
-  if (usd < 0.01) return `~$${usd.toFixed(4)}`;
-  return `~$${usd.toFixed(2)}`;
+  return compactUsd(usd);
 }
 
 
@@ -756,10 +811,16 @@ export interface ComputeHudMetricsInput {
   subagentSteps?: number;
   totalStepsOverride?: number;
   allowDbActiveStepInference?: boolean;
+  isSubagentTrajectory?: boolean;
   modelId?: string;
   modelCapacity?: number;
   pricingTable?: Record<string, ApiPricingEntry>;
   genMetadata?: ParsedGenMetadata;
+  extraUsageGenerations?: Array<{
+    generation: ParsedGenMetadata;
+    isChildStep?: boolean;
+    timestampSeconds?: number | null;
+  }>;
   contextSteps?: ComputeHudMetricsInput['steps'];
   steps: Array<{
     idx?: number;
@@ -858,6 +919,722 @@ function mergeDurationIntervals(intervals: ReadonlyArray<readonly [number, numbe
   return total;
 }
 
+interface ClassifiedContextSlot {
+  slotKey: string;
+  role: HudContextStageRole;
+  modelId: string;
+  displayName: string;
+  shortLabel: string;
+  compactLabel: string;
+  capacityTokens: number;
+  isFallbackModel: boolean;
+  hasExplicitEvidence: boolean;
+}
+
+interface StageAccumulator {
+  slot: ClassifiedContextSlot;
+  latestStep?: ComputeHudMetricsInput['steps'][number];
+  latestPrompt: number;
+  peakContextTokens: number;
+  explicitCapacity?: number;
+  compactionCount?: number;
+}
+
+const COMPACT_MODEL_LABEL_RULES: ReadonlyArray<readonly [RegExp, string, string]> = [
+  [/^gemini-4-carbon/, 'Carbon', 'C'],
+  [/^gemini-4-argon/, 'Argon', 'A'],
+  [/^gemini-4-hydrogen/, 'Hydrogen', 'H'],
+  [/^gemini-(?:[\d.]+-)?pro|^gemini-pro/, 'Pro', 'P'],
+  [/^gemini-(?:[\d.]+-)?flash|^gemini-flash/, 'Flash', 'F'],
+  [/^claude-(?:.*-)?opus/, 'Opus', 'O'],
+  [/^claude-(?:.*-)?sonnet/, 'Sonnet', 'S'],
+  [/^claude-(?:.*-)?haiku/, 'Haiku', 'H'],
+  [/^gpt-oss/, 'GPT-OSS', 'G'],
+];
+
+function buildCompactModelLabel(modelId: string, displayName: string): { shortLabel: string; compactLabel: string } {
+  const lower = modelId.toLowerCase();
+  for (const [pattern, shortLabel, compactLabel] of COMPACT_MODEL_LABEL_RULES) {
+    if (pattern.test(lower)) return { shortLabel, compactLabel };
+  }
+  const dynamicGemini = lower.match(/^gemini-(?:[4-9](?:\.\d+)?)-([a-z][a-z0-9]*)/);
+  if (dynamicGemini?.[1]) {
+    const code = dynamicGemini[1].charAt(0).toUpperCase() + dynamicGemini[1].slice(1);
+    return { shortLabel: code, compactLabel: code.charAt(0).toUpperCase() };
+  }
+  const cleaned = displayName.trim() || modelId.trim() || 'Model';
+  const shortLabel = cleaned.length <= 10 ? cleaned : (cleaned.split(/\s+/).slice(0, 2).join(' ').slice(0, 10) || cleaned.slice(0, 10));
+  const compactLabel = shortLabel.match(/[A-Za-z0-9]/)?.[0]?.toUpperCase() || 'M';
+  return { shortLabel, compactLabel };
+}
+
+function classifyContextModelSlot(params: {
+  responseModel?: string;
+  modelDisplayName?: string;
+  plannerModelName?: string;
+  stepModelName?: string;
+  modelEnum?: number;
+  fallbackInputModelId?: string;
+  hasPriorOrchestrator?: boolean;
+}): ClassifiedContextSlot {
+  const responseModel = (params.responseModel || '').trim();
+  const modelDisplayName = (params.modelDisplayName || '').trim();
+  const plannerModelName = (params.plannerModelName || '').trim();
+  const stepModelName = (params.stepModelName || '').trim();
+  const modelEnum = params.modelEnum;
+  const fallbackInputModelId = (params.fallbackInputModelId || '').trim();
+  const combinedRaw = [responseModel, modelDisplayName, plannerModelName, stepModelName].filter(Boolean).join(' ');
+
+  const isExecutorHint =
+    modelEnum === 1669 ||
+    /^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M669$/i.test(responseModel) ||
+    /^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M669$/i.test(plannerModelName) ||
+    /^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M669$/i.test(stepModelName) ||
+    /Gemini\s+4\s+Hydrogen\s*\(\s*Orchestrator\s*\)/i.test(modelDisplayName);
+
+  if (isExecutorHint) {
+    const isHydrogen = /\bhydrogen\b/i.test(combinedRaw);
+    const modelKey = isHydrogen ? 'gemini-4-hydrogen' : 'gemini-3.8-flash';
+    const spec = resolveModelCapacity(modelKey);
+    return {
+      slotKey: isHydrogen ? 'orchestrator:hydrogen' : 'orchestrator:flash',
+      role: 'executor',
+      modelId: spec.modelId,
+      displayName: modelDisplayName || stepModelName || (isHydrogen ? 'Gemini 4 Hydrogen (Orchestrator)' : 'Gemini 3.8 Flash'),
+      shortLabel: isHydrogen ? 'Hydrogen' : 'Flash',
+      compactLabel: isHydrogen ? 'H' : 'F',
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: spec.isFallback,
+      hasExplicitEvidence: true,
+    };
+  }
+
+  const isPlannerHint =
+    modelEnum === 1667 ||
+    modelEnum === 1668 ||
+    /\borchestrator\b|^MODEL_PLACEHOLDER_M66[78]$/i.test(responseModel) ||
+    /\borchestrator\b/i.test(modelDisplayName) ||
+    /\borchestrator\b/i.test(plannerModelName) ||
+    /\borchestrator\b/i.test(stepModelName);
+
+  if (isPlannerHint || (!combinedRaw && /\borchestrator\b|^MODEL_PLACEHOLDER_M66[78]$/i.test(fallbackInputModelId))) {
+    const hasCodenameInStep = /\b(?:carbon|argon|hydrogen)\b/i.test(combinedRaw);
+    const isCarbon = /\bcarbon\b/i.test(combinedRaw) || modelEnum === 1667 || /M667$/i.test(responseModel) || (!hasCodenameInStep && /\bcarbon\b/i.test(fallbackInputModelId));
+    const isArgon = !isCarbon && (/\bargon\b/i.test(combinedRaw) || modelEnum === 1668 || /M668$/i.test(responseModel) || (!hasCodenameInStep && /\bargon\b/i.test(fallbackInputModelId)));
+    const dynMatch = !isCarbon && !isArgon ? `${combinedRaw} ${fallbackInputModelId}`.match(/Orchestrator\s*\(\s*([A-Za-z][A-Za-z0-9._-]{1,31})\s*\)/i) : null;
+    const rawCode = isCarbon ? 'Carbon' : isArgon ? 'Argon' : dynMatch?.[1] || 'Argon';
+    const lowerCode = rawCode.toLowerCase();
+    const shortLabel = rawCode.charAt(0).toUpperCase() + rawCode.slice(1);
+    const spec = resolveModelCapacity(`gemini-4-${lowerCode}`);
+    return {
+      slotKey: `orchestrator:${lowerCode}`,
+      role: 'planner',
+      modelId: spec.modelId,
+      displayName: modelDisplayName || stepModelName || `Orchestrator (${shortLabel})`,
+      shortLabel,
+      compactLabel: shortLabel.charAt(0).toUpperCase(),
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: spec.isFallback,
+      hasExplicitEvidence: true,
+    };
+  }
+
+  if (!combinedRaw && /^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M669$/i.test(fallbackInputModelId)) {
+    const spec = resolveModelCapacity('gemini-3.8-flash');
+    return {
+      slotKey: 'orchestrator:flash',
+      role: 'executor',
+      modelId: spec.modelId,
+      displayName: 'Gemini 3.8 Flash',
+      shortLabel: 'Flash',
+      compactLabel: 'F',
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: spec.isFallback,
+      hasExplicitEvidence: true,
+    };
+  }
+
+  const rawModelInput = modelDisplayName || responseModel || plannerModelName || stepModelName || fallbackInputModelId;
+  if (!rawModelInput) {
+    const spec = resolveModelCapacity('');
+    return {
+      slotKey: 'model:unknown',
+      role: 'model',
+      modelId: 'unknown',
+      displayName: '—',
+      shortLabel: '',
+      compactLabel: '',
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: true,
+      hasExplicitEvidence: false,
+    };
+  }
+
+  const spec = resolveModelCapacity(rawModelInput);
+  if (params.hasPriorOrchestrator && (spec.modelId === 'gemini-4-hydrogen' || spec.modelId === 'gemini-3.8-flash')) {
+    const isHydrogen = spec.modelId === 'gemini-4-hydrogen';
+    return {
+      slotKey: isHydrogen ? 'orchestrator:hydrogen' : 'orchestrator:flash',
+      role: 'executor',
+      modelId: spec.modelId,
+      displayName: modelDisplayName || spec.displayName,
+      shortLabel: isHydrogen ? 'Hydrogen' : 'Flash',
+      compactLabel: isHydrogen ? 'H' : 'F',
+      capacityTokens: spec.capacityTokens,
+      isFallbackModel: spec.isFallback,
+      hasExplicitEvidence: true,
+    };
+  }
+
+  const { shortLabel, compactLabel } = buildCompactModelLabel(spec.modelId, modelDisplayName || spec.displayName);
+  return {
+    slotKey: `model:${spec.modelId}`,
+    role: 'model',
+    modelId: spec.modelId,
+    displayName: modelDisplayName || spec.displayName,
+    shortLabel,
+    compactLabel,
+    capacityTokens: spec.capacityTokens,
+    isFallbackModel: spec.isFallback,
+    hasExplicitEvidence: true,
+  };
+}
+
+function createPendingExecutorSlot(
+  capacityTokens: number,
+  isFallbackModel: boolean
+): ClassifiedContextSlot {
+  return {
+    slotKey: 'orchestrator:executor_pending',
+    role: 'executor',
+    modelId: 'pending',
+    displayName: '',
+    shortLabel: '',
+    compactLabel: '',
+    capacityTokens,
+    isFallbackModel,
+    hasExplicitEvidence: false,
+  };
+}
+
+function createStageSnapshot(
+  acc: StageAccumulator,
+  isActive: boolean,
+  inheritedExplicitCapacity?: number,
+  section?: 'primary' | 'history'
+): HudModelContextStage {
+  const hasUsageData = Boolean(acc.latestStep);
+  const effectiveExplicitCap = acc.explicitCapacity ?? inheritedExplicitCapacity;
+  const capacityTokens = effectiveExplicitCap ?? acc.slot.capacityTokens;
+  const capacityTokensCompact = effectiveExplicitCap !== undefined
+    ? formatCompactTokenNumber(effectiveExplicitCap)
+    : `~${formatCompactTokenNumber(capacityTokens)}`;
+  const capacitySource: HudCapacitySource = effectiveExplicitCap !== undefined
+    ? 'explicit'
+    : acc.slot.isFallbackModel
+    ? 'unknown'
+    : 'reference';
+  const usedTokens = hasUsageData ? acc.latestPrompt : 0;
+  const usedRatio = hasUsageData && capacityTokens > 0 ? usedTokens / capacityTokens : 0;
+  return {
+    slotKey: acc.slot.slotKey,
+    role: acc.slot.role,
+    ...(section ? { section } : {}),
+    modelId: acc.slot.modelId,
+    modelDisplayName: acc.slot.displayName,
+    shortLabel: acc.slot.shortLabel,
+    compactLabel: acc.slot.compactLabel,
+    hasUsageData,
+    isActive,
+    ...(acc.compactionCount && acc.compactionCount > 0 ? { compactionCount: acc.compactionCount } : {}),
+    usedTokens,
+    usedTokensCompact: formatCompactTokenNumber(usedTokens),
+    usedTokensFormatted: formatThousandsTokens(usedTokens),
+    peakContextTokens: acc.peakContextTokens,
+    peakContextCompact: formatCompactTokenNumber(acc.peakContextTokens),
+    peakContextFormatted: formatThousandsTokens(acc.peakContextTokens),
+    capacityTokens,
+    capacityTokensCompact,
+    isFallbackCapacity: effectiveExplicitCap === undefined,
+    capacitySource,
+    usedRatio,
+    usedRatioFormatted: compactPercent(usedRatio),
+  };
+}
+
+function resolveContextStagesAndActiveSlot(
+  usageContextEntries: ReadonlyArray<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number; turnIndex?: number }>,
+  input: ComputeHudMetricsInput,
+  compactionContextEntries: ReadonlyArray<{
+    step: ComputeHudMetricsInput['steps'][number];
+    precedingUsageIndex: number;
+    turnIndex: number;
+  }> = []
+): {
+  latestStep?: ComputeHudMetricsInput['steps'][number];
+  latestGenMeta?: ParsedGenMetadata;
+  sessionPeakContextTokens: number;
+  activeStage: HudModelContextStage;
+  hasExplicitModelEvidence: boolean;
+  isMultiModel: boolean;
+  isOrchestrator: boolean;
+  modelStages?: HudModelContextStage[];
+  defaultFallbackModel: string;
+} {
+  const trimmedInputModel = typeof input.modelId === 'string' ? input.modelId.trim() : '';
+  const inputAsStandaloneSlot = trimmedInputModel
+    ? classifyContextModelSlot({ fallbackInputModelId: trimmedInputModel })
+    : null;
+  const inputIsOrchestrator = Boolean(
+    trimmedInputModel && /\borchestrator\b|^MODEL_PLACEHOLDER_M66[789]$/i.test(trimmedInputModel)
+  );
+  const inputExplicitCapacity =
+    typeof input.modelCapacity === 'number' && Number.isSafeInteger(input.modelCapacity) && input.modelCapacity > 0
+      ? input.modelCapacity
+      : undefined;
+
+  if (usageContextEntries.length === 0) {
+    const emptySlot = classifyContextModelSlot({
+      responseModel: input.genMetadata?.responseModel,
+      modelDisplayName: input.genMetadata?.modelDisplayName,
+      plannerModelName: input.genMetadata?.plannerModelName,
+      modelEnum: input.genMetadata?.modelEnum,
+      fallbackInputModelId: trimmedInputModel,
+    });
+    const emptyExplicitCap = [inputExplicitCapacity, input.genMetadata?.maxContextTokens].find(
+      (v): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0
+    );
+    const emptyAcc: StageAccumulator = {
+      slot: emptySlot,
+      latestStep: undefined,
+      latestPrompt: 0,
+      peakContextTokens: 0,
+      explicitCapacity: emptyExplicitCap,
+    };
+    const isOrchestrator = emptySlot.role === 'planner' || emptySlot.role === 'executor' || inputIsOrchestrator;
+    if (isOrchestrator) {
+      const pair: StageAccumulator[] = [];
+      let historyModelAcc: StageAccumulator | undefined;
+      if (emptySlot.role === 'executor') {
+        const plannerSlot =
+          inputAsStandaloneSlot && inputAsStandaloneSlot.role === 'planner'
+            ? inputAsStandaloneSlot
+            : classifyContextModelSlot({ fallbackInputModelId: 'Orchestrator (Carbon)' });
+        pair.push({ slot: plannerSlot, latestPrompt: 0, peakContextTokens: 0, explicitCapacity: emptyExplicitCap });
+        pair.push(emptyAcc);
+      } else if (emptySlot.role === 'planner') {
+        pair.push(emptyAcc);
+        if (emptySlot.shortLabel !== 'Hydrogen') {
+          pair.push({
+            slot: createPendingExecutorSlot(emptySlot.capacityTokens, emptySlot.isFallbackModel),
+            latestPrompt: 0,
+            peakContextTokens: 0,
+            explicitCapacity: emptyExplicitCap,
+          });
+        }
+      } else {
+        const plannerSlot =
+          inputAsStandaloneSlot && inputAsStandaloneSlot.role === 'planner'
+            ? inputAsStandaloneSlot
+            : classifyContextModelSlot({ fallbackInputModelId: 'Orchestrator (Carbon)' });
+        const plannerExplicitCap = inputExplicitCapacity ?? plannerSlot.capacityTokens;
+        pair.push({
+          slot: plannerSlot,
+          latestPrompt: 0,
+          peakContextTokens: 0,
+          explicitCapacity: plannerExplicitCap,
+        });
+        if (plannerSlot.shortLabel !== 'Hydrogen') {
+          pair.push({
+            slot: createPendingExecutorSlot(plannerExplicitCap, plannerSlot.isFallbackModel),
+            latestPrompt: 0,
+            peakContextTokens: 0,
+            explicitCapacity: plannerExplicitCap,
+          });
+        }
+        if (emptySlot.hasExplicitEvidence && emptySlot.modelId !== 'unknown') {
+          historyModelAcc = emptyAcc;
+        }
+      }
+      const fallbackTargetAcc = pair[0] ?? emptyAcc;
+      for (const cpEntry of compactionContextEntries) {
+        const cpGen = cpEntry.step.generation;
+        let targetAcc: StageAccumulator | undefined;
+        if (
+          cpGen?.responseModel ||
+          cpGen?.modelDisplayName ||
+          cpGen?.plannerModelName ||
+          cpGen?.modelEnum ||
+          cpEntry.step.modelName
+        ) {
+          const cpSlot = classifyContextModelSlot({
+            responseModel: cpGen?.responseModel,
+            modelDisplayName: cpGen?.modelDisplayName,
+            plannerModelName: cpGen?.plannerModelName,
+            stepModelName: cpEntry.step.modelName,
+            modelEnum: cpGen?.modelEnum,
+            hasPriorOrchestrator: true,
+          });
+          if (cpSlot.hasExplicitEvidence && cpSlot.modelId !== 'unknown') {
+            targetAcc =
+              pair.find((a) => a.slot.slotKey === cpSlot.slotKey || a.slot.modelId === cpSlot.modelId) ??
+              (historyModelAcc &&
+              (historyModelAcc.slot.slotKey === cpSlot.slotKey || historyModelAcc.slot.modelId === cpSlot.modelId)
+                ? historyModelAcc
+                : undefined);
+          }
+        }
+        const resolved = targetAcc ?? (emptySlot.role === 'model' && historyModelAcc ? historyModelAcc : fallbackTargetAcc);
+        resolved.compactionCount = (resolved.compactionCount ?? 0) + 1;
+      }
+      const stages = [
+        ...pair.map((acc) => createStageSnapshot(acc, acc.slot.slotKey === emptySlot.slotKey, emptyExplicitCap, 'primary')),
+        ...(historyModelAcc
+          ? [createStageSnapshot(historyModelAcc, historyModelAcc.slot.slotKey === emptySlot.slotKey, undefined, 'history')]
+          : []),
+      ];
+      const activeStage = stages.find((s) => s.isActive) ?? stages[0]!;
+      return {
+        latestStep: undefined,
+        latestGenMeta: input.genMetadata,
+        sessionPeakContextTokens: 0,
+        activeStage,
+        hasExplicitModelEvidence: emptySlot.hasExplicitEvidence,
+        isMultiModel: stages.length >= 2,
+        isOrchestrator: true,
+        modelStages: stages.length >= 2 ? stages : undefined,
+        defaultFallbackModel: emptySlot.hasExplicitEvidence ? (emptySlot.role === 'model' ? emptySlot.displayName : emptySlot.modelId) : '',
+      };
+    }
+    if (compactionContextEntries.length > 0) {
+      emptyAcc.compactionCount = compactionContextEntries.length;
+    }
+    const activeStage = createStageSnapshot(emptyAcc, true);
+    return {
+      latestStep: undefined,
+      latestGenMeta: input.genMetadata,
+      sessionPeakContextTokens: 0,
+      activeStage,
+      hasExplicitModelEvidence: emptySlot.hasExplicitEvidence,
+      isMultiModel: false,
+      isOrchestrator: false,
+      defaultFallbackModel: emptySlot.hasExplicitEvidence ? emptySlot.displayName : '',
+    };
+  }
+
+  const stageMap = new Map<string, StageAccumulator & { lastSeenSeq: number }>();
+  const slotKeyByUsageIndex: string[] = [];
+  const orchestratorTurns = new Set<number>();
+  let sessionPeakContextTokens = 0;
+  let latestEntry!: {
+    step: ComputeHudMetricsInput['steps'][number];
+    slot: ClassifiedContextSlot;
+    genMeta?: ParsedGenMetadata;
+  };
+  const hasAnyExplicitUsageModel = usageContextEntries.some((entry, idx) => {
+    const isGlobalLatest = idx === usageContextEntries.length - 1;
+    const gm = entry.step.generation ?? (isGlobalLatest ? input.genMetadata : undefined);
+    return Boolean(
+      gm?.responseModel || gm?.modelDisplayName || gm?.plannerModelName || gm?.modelEnum || entry.step.modelName
+    );
+  });
+  let lastExplicitFallbackModel = '';
+
+  for (let i = 0; i < usageContextEntries.length; i++) {
+    const entry = usageContextEntries[i]!;
+    const turnIndex = entry.turnIndex ?? 0;
+    const isGlobalLatest = i === usageContextEntries.length - 1;
+    const stepGenMeta = entry.step.generation ?? (isGlobalLatest ? input.genMetadata : undefined);
+    const hasStepExplicitModel = Boolean(
+      stepGenMeta?.responseModel ||
+        stepGenMeta?.modelDisplayName ||
+        stepGenMeta?.plannerModelName ||
+        stepGenMeta?.modelEnum ||
+        entry.step.modelName
+    );
+    const stepFallbackModel =
+      !hasAnyExplicitUsageModel || (isGlobalLatest && !isStepCompleted(entry.step))
+        ? trimmedInputModel
+        : lastExplicitFallbackModel;
+    const slot = classifyContextModelSlot({
+      responseModel: stepGenMeta?.responseModel,
+      modelDisplayName: stepGenMeta?.modelDisplayName,
+      plannerModelName: stepGenMeta?.plannerModelName,
+      stepModelName: entry.step.modelName,
+      modelEnum: stepGenMeta?.modelEnum,
+      fallbackInputModelId: stepFallbackModel,
+      hasPriorOrchestrator: orchestratorTurns.has(turnIndex),
+    });
+    if (hasStepExplicitModel && slot.hasExplicitEvidence && slot.modelId !== 'unknown') {
+      lastExplicitFallbackModel = slot.role === 'model' ? slot.displayName : slot.modelId;
+    }
+    if (slot.role === 'planner' || slot.role === 'executor') {
+      orchestratorTurns.add(turnIndex);
+    }
+    const stepExplicitCap = [inputExplicitCapacity, stepGenMeta?.maxContextTokens, entry.step.modelMaxTokens].find(
+      (v): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0
+    );
+    const prev = stageMap.get(slot.slotKey);
+    stageMap.set(slot.slotKey, {
+      slot,
+      latestStep: entry.step,
+      latestPrompt: entry.prompt,
+      peakContextTokens: Math.max(prev?.peakContextTokens ?? 0, entry.prompt),
+      explicitCapacity: stepExplicitCap ?? prev?.explicitCapacity,
+      ...(prev?.compactionCount ? { compactionCount: prev.compactionCount } : {}),
+      lastSeenSeq: i,
+    });
+    slotKeyByUsageIndex.push(slot.slotKey);
+    sessionPeakContextTokens = Math.max(sessionPeakContextTokens, entry.prompt);
+    latestEntry = { step: entry.step, slot, genMeta: stepGenMeta };
+  }
+
+  for (const cpEntry of compactionContextEntries) {
+    let targetSlotKey: string | undefined;
+    const cpGen = cpEntry.step.generation;
+    if (
+      cpGen?.responseModel ||
+      cpGen?.modelDisplayName ||
+      cpGen?.plannerModelName ||
+      cpGen?.modelEnum ||
+      cpEntry.step.modelName
+    ) {
+      const cpSlot = classifyContextModelSlot({
+        responseModel: cpGen?.responseModel,
+        modelDisplayName: cpGen?.modelDisplayName,
+        plannerModelName: cpGen?.plannerModelName,
+        stepModelName: cpEntry.step.modelName,
+        modelEnum: cpGen?.modelEnum,
+        hasPriorOrchestrator: orchestratorTurns.has(cpEntry.turnIndex),
+      });
+      if (cpSlot.hasExplicitEvidence && cpSlot.modelId !== 'unknown') {
+        if (stageMap.has(cpSlot.slotKey)) {
+          targetSlotKey = cpSlot.slotKey;
+        } else {
+          const matchedByModelId = [...stageMap.values()].find((a) => a.slot.modelId === cpSlot.modelId);
+          if (matchedByModelId) targetSlotKey = matchedByModelId.slot.slotKey;
+        }
+      }
+    }
+    if (!targetSlotKey) {
+      if (cpEntry.precedingUsageIndex >= 0 && cpEntry.precedingUsageIndex < slotKeyByUsageIndex.length) {
+        targetSlotKey = slotKeyByUsageIndex[cpEntry.precedingUsageIndex];
+      } else {
+        targetSlotKey = slotKeyByUsageIndex[0] ?? latestEntry.slot.slotKey;
+      }
+    }
+    const targetAcc = targetSlotKey ? stageMap.get(targetSlotKey) : undefined;
+    if (targetAcc) {
+      targetAcc.compactionCount = (targetAcc.compactionCount ?? 0) + 1;
+    }
+  }
+
+  let effectiveActiveSlotKey = latestEntry.slot.slotKey;
+  const activeAcc = stageMap.get(effectiveActiveSlotKey)!;
+  const allAccs = [...stageMap.values()];
+  const isOrchestrator =
+    latestEntry.slot.role === 'planner' ||
+    latestEntry.slot.role === 'executor' ||
+    inputIsOrchestrator;
+
+  let orderedEntries: Array<{ acc: StageAccumulator; section: 'primary' | 'history' }>;
+  let inheritedOrchCap: number | undefined;
+  const hasPendingInputSlot = (accs: ReadonlyArray<StageAccumulator>): boolean =>
+    Boolean(
+      inputAsStandaloneSlot &&
+      inputAsStandaloneSlot.hasExplicitEvidence &&
+      inputAsStandaloneSlot.modelId !== 'unknown' &&
+      !accs.some(
+        (a) => a.slot.slotKey === inputAsStandaloneSlot.slotKey || a.slot.modelId === inputAsStandaloneSlot.modelId
+      )
+    );
+
+  if (isOrchestrator) {
+    const planners = allAccs.filter((a) => a.slot.role === 'planner');
+    const executors = allAccs.filter((a) => a.slot.role === 'executor');
+    const others = allAccs.filter((a) => a.slot.role === 'model');
+    inheritedOrchCap = [...planners, ...executors].find((a) => a.explicitCapacity !== undefined)?.explicitCapacity;
+
+    if (planners.length === 0) {
+      const fallbackPlannerSlot =
+        inputAsStandaloneSlot && inputAsStandaloneSlot.role === 'planner'
+          ? inputAsStandaloneSlot
+          : classifyContextModelSlot({ fallbackInputModelId: 'Orchestrator (Carbon)' });
+      planners.push({
+        slot: fallbackPlannerSlot,
+        latestPrompt: 0,
+        peakContextTokens: 0,
+        explicitCapacity: inheritedOrchCap ?? inputExplicitCapacity,
+        lastSeenSeq: -1,
+      });
+    }
+    const primaryPlanner = planners[0]!;
+    if (executors.length === 0 && primaryPlanner.slot.shortLabel !== 'Hydrogen') {
+      executors.push({
+        slot: createPendingExecutorSlot(
+          primaryPlanner.slot.capacityTokens,
+          primaryPlanner.slot.isFallbackModel
+        ),
+        latestPrompt: 0,
+        peakContextTokens: 0,
+        explicitCapacity: inheritedOrchCap ?? inputExplicitCapacity,
+        lastSeenSeq: -1,
+      });
+    }
+
+    const activePeByModelId = new Map<string, StageAccumulator & { lastSeenSeq?: number }>();
+    for (const pe of [...planners, ...executors]) {
+      if (Boolean(pe.latestStep)) {
+        activePeByModelId.set(pe.slot.modelId, pe);
+      }
+    }
+    const filteredOthersRaw: Array<StageAccumulator & { lastSeenSeq: number }> = [];
+    for (const other of others) {
+      if (!Boolean(other.latestStep)) continue;
+      const absorbedTarget = activePeByModelId.get(other.slot.modelId);
+      if (absorbedTarget) {
+        absorbedTarget.peakContextTokens = Math.max(absorbedTarget.peakContextTokens, other.peakContextTokens);
+        if (other.compactionCount && other.compactionCount > 0) {
+          absorbedTarget.compactionCount = (absorbedTarget.compactionCount ?? 0) + other.compactionCount;
+        }
+        if (other.slot.slotKey === effectiveActiveSlotKey) {
+          effectiveActiveSlotKey = absorbedTarget.slot.slotKey;
+        }
+        continue;
+      }
+      filteredOthersRaw.push(other);
+    }
+    const filteredOthersSorted = [...filteredOthersRaw].sort((a, b) => a.lastSeenSeq - b.lastSeenSeq);
+    let filteredOthers: StageAccumulator[];
+    if (filteredOthersSorted.length > 3) {
+      const tail = filteredOthersSorted.slice(-3);
+      const activeInOthers = filteredOthersSorted.find((a) => a.slot.slotKey === effectiveActiveSlotKey);
+      if (activeInOthers && !tail.includes(activeInOthers)) {
+        filteredOthers = [activeInOthers, ...tail.slice(1)];
+      } else {
+        filteredOthers = tail;
+      }
+    } else {
+      filteredOthers = filteredOthersSorted;
+    }
+
+    const primaryAccs: StageAccumulator[] = [...planners, ...executors];
+    if (hasPendingInputSlot([...primaryAccs, ...filteredOthers]) && inputAsStandaloneSlot) {
+      primaryAccs.push({
+        slot: inputAsStandaloneSlot,
+        latestPrompt: 0,
+        peakContextTokens: 0,
+        explicitCapacity: inputExplicitCapacity,
+      });
+    }
+    orderedEntries = [
+      ...primaryAccs.map((acc) => ({ acc, section: 'primary' as const })),
+      ...filteredOthers.map((acc) => ({ acc, section: 'history' as const })),
+    ];
+  } else {
+    const dedupByModelId = new Map<string, StageAccumulator & { lastSeenSeq: number }>();
+    for (const acc of allAccs) {
+      const key = acc.slot.modelId || acc.slot.slotKey;
+      const existing = dedupByModelId.get(key);
+      const mergedCompactions = (existing?.compactionCount ?? 0) + (acc.compactionCount ?? 0);
+      const mergedPeak = Math.max(existing?.peakContextTokens ?? 0, acc.peakContextTokens);
+      if (!existing || acc.lastSeenSeq > existing.lastSeenSeq) {
+        if (existing && existing.slot.slotKey === effectiveActiveSlotKey) {
+          effectiveActiveSlotKey = acc.slot.slotKey;
+        }
+        dedupByModelId.set(key, {
+          ...acc,
+          peakContextTokens: mergedPeak,
+          ...(mergedCompactions > 0 ? { compactionCount: mergedCompactions } : {}),
+        });
+      } else {
+        if (acc.slot.slotKey === effectiveActiveSlotKey) {
+          effectiveActiveSlotKey = existing.slot.slotKey;
+        }
+        dedupByModelId.set(key, {
+          ...existing,
+          peakContextTokens: mergedPeak,
+          ...(mergedCompactions > 0 ? { compactionCount: mergedCompactions } : {}),
+        });
+      }
+    }
+    const orderedAccs: StageAccumulator[] = [...dedupByModelId.values()].sort(
+      (a, b) => a.lastSeenSeq - b.lastSeenSeq
+    );
+    if (hasPendingInputSlot(orderedAccs) && inputAsStandaloneSlot) {
+      orderedAccs.push({
+        slot: inputAsStandaloneSlot,
+        latestPrompt: 0,
+        peakContextTokens: 0,
+        explicitCapacity: inputExplicitCapacity,
+      });
+    }
+    let finalAccs: StageAccumulator[];
+    if (orderedAccs.length > 4) {
+      const tail = orderedAccs.slice(-4);
+      const pinnedInput =
+        inputAsStandaloneSlot &&
+        inputAsStandaloneSlot.hasExplicitEvidence &&
+        inputAsStandaloneSlot.modelId !== 'unknown'
+          ? orderedAccs.find(
+              (a) =>
+                a.slot.slotKey === inputAsStandaloneSlot.slotKey ||
+                a.slot.modelId === inputAsStandaloneSlot.modelId
+            )
+          : undefined;
+      if (pinnedInput && !tail.includes(pinnedInput)) {
+        const dropIdx = tail.findIndex((a) => a.slot.slotKey !== effectiveActiveSlotKey);
+        if (dropIdx >= 0) {
+          tail.splice(dropIdx, 1);
+          finalAccs = [pinnedInput, ...tail];
+        } else {
+          finalAccs = tail;
+        }
+      } else {
+        finalAccs = tail;
+      }
+    } else {
+      finalAccs = orderedAccs;
+    }
+    orderedEntries = finalAccs.map((acc) => ({ acc, section: 'primary' as const }));
+  }
+
+  const primaryNonPending = orderedEntries.filter(({ acc }) => Boolean(acc.latestStep));
+  const isMultiModel =
+    orderedEntries.length >= 2 &&
+    (isOrchestrator ||
+      primaryNonPending.length >= 2 ||
+      orderedEntries.some(({ acc }) => !acc.latestStep));
+  const modelStages = isMultiModel
+    ? orderedEntries.map(({ acc, section }) => {
+        const inheritCap =
+          !acc.latestStep && isOrchestrator && (acc.slot.role === 'planner' || acc.slot.role === 'executor')
+            ? inheritedOrchCap
+            : undefined;
+        return createStageSnapshot(acc, acc.slot.slotKey === effectiveActiveSlotKey, inheritCap, section);
+      })
+    : undefined;
+  const activeStage =
+    modelStages?.find((s) => s.isActive) ??
+    createStageSnapshot(orderedEntries[0]?.acc ?? activeAcc, true);
+
+  return {
+    latestStep: latestEntry.step,
+    latestGenMeta: latestEntry.genMeta,
+    sessionPeakContextTokens,
+    activeStage,
+    hasExplicitModelEvidence: latestEntry.slot.hasExplicitEvidence,
+    isMultiModel,
+    isOrchestrator,
+    modelStages,
+    defaultFallbackModel: latestEntry.slot.hasExplicitEvidence
+      ? latestEntry.slot.role === 'model'
+        ? latestEntry.slot.displayName
+        : latestEntry.slot.modelId
+      : '',
+  };
+}
+
 export function buildConversationHudMetrics(input: ComputeHudMetricsInput): ConversationHudMetrics {
   const steps = input.steps || [];
   const contextSteps = input.contextSteps ?? steps;
@@ -866,6 +1643,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   let toolSteps = 0;
   let mainCompletedModelDuration = 0;
   let unanchoredChildModelDuration = 0;
+  const mainCompletedModelIntervals: Array<readonly [number, number]> = [];
   const childCompletedModelIntervals: Array<readonly [number, number]> = [];
   const completedToolIntervals: Array<readonly [number, number]> = [];
   let timedOutputTokens = 0;
@@ -941,6 +1719,9 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
           }
         } else {
           mainCompletedModelDuration += duration;
+          if (validSeconds(start)) {
+            mainCompletedModelIntervals.push([start, start + duration]);
+          }
         }
         if (step.hasUsage !== false && Number.isSafeInteger(step.outputTokens) && step.outputTokens! >= 0) {
           timedOutputTokens += output;
@@ -963,10 +1744,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       if (complete && ttft !== null) {
         validTtftSum += ttft;
         validTtftCount++;
+        const ttftText = compactRate(ttft);
         const ttftSnapshot = {
           seconds: ttft,
-          formatted: `${ttft.toFixed(2)} 秒`,
-          formattedEn: `${ttft.toFixed(2)}s`,
+          formatted: bt('metrics.ttft_seconds', { value: ttftText }),
+          formattedEn: `${ttftText}s`,
         };
         if (!isChildStep) {
           latestForegroundStepTtft = ttftSnapshot;
@@ -980,57 +1762,103 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       }
     }
   }
-  const childCompletedAnchoredTotal = mergeDurationIntervals(childCompletedModelIntervals);
-  const childCompletedModelDuration = childCompletedAnchoredTotal + unanchoredChildModelDuration;
+  if (Array.isArray(input.extraUsageGenerations) && input.extraUsageGenerations.length > 0) {
+    for (const extra of input.extraUsageGenerations) {
+      const u = extra?.generation?.usage;
+      if (!u) continue;
+      const rawInput = safeTokens(u.rawInputTokens);
+      const cached = safeTokens(u.cachedReadTokens);
+      const written = safeTokens(u.cacheWriteTokens);
+      const output = safeTokens(u.outputTokens);
+      if (rawInput + cached + written + output <= 0) continue;
+      usageSampleCount++;
+      uncachedInputTokens += rawInput;
+      cachedReadTokens += cached;
+      cacheWriteTokens += written;
+      outputTokens += output;
+      reasoningTokens += safeTokens(u.reasoningTokens);
+      candidateTokens += safeTokens(u.candidateTokens);
+      const ts = validSeconds(extra.timestampSeconds) && extra.timestampSeconds > 0
+        ? extra.timestampSeconds
+        : validSeconds(extra.generation.startedAtSeconds) && extra.generation.startedAtSeconds > 0
+        ? extra.generation.startedAtSeconds
+        : null;
+      usageStepsForCost.push({
+        step: {
+          stepType: 15,
+          hasUsage: true,
+          startTimeSeconds: ts,
+          rawInputTokens: rawInput,
+          cachedReadTokens: cached,
+          cacheWriteTokens: written,
+          outputTokens: output,
+          generation: extra.generation,
+        },
+        isChildStep: Boolean(extra.isChildStep),
+        rawInput,
+        cached,
+        written,
+        output,
+      });
+    }
+  }
+  const mainCompletedAnchoredTotal = mergeDurationIntervals(mainCompletedModelIntervals);
+  const allCompletedModelIntervals = [
+    ...mainCompletedModelIntervals,
+    ...childCompletedModelIntervals,
+  ];
+  const allCompletedAnchoredTotal = mergeDurationIntervals(allCompletedModelIntervals);
+  const incrementalChildAnchoredDuration = Math.max(
+    0,
+    allCompletedAnchoredTotal - mainCompletedAnchoredTotal
+  );
+  const childCompletedModelDuration = incrementalChildAnchoredDuration + unanchoredChildModelDuration;
   const modelDurationSeconds = mainCompletedModelDuration + childCompletedModelDuration;
   const toolDurationSeconds = mergeDurationIntervals(completedToolIntervals);
 
-  let latestStep: ComputeHudMetricsInput['steps'][number] | undefined;
-  let peakContextTokens = 0;
+  const usageContextEntries: Array<{ step: ComputeHudMetricsInput['steps'][number]; prompt: number; turnIndex: number }> = [];
+  const compactionContextEntries: Array<{
+    step: ComputeHudMetricsInput['steps'][number];
+    precedingUsageIndex: number;
+    turnIndex: number;
+  }> = [];
   let turns = 0;
   let compactionCount = 0;
   for (const step of contextSteps) {
     const stepType = step.step_type ?? step.stepType ?? 0;
     const rawStatus = step.status ?? 3;
     if (stepType === 14) turns++;
-    if (stepType === 23 && (rawStatus === 3 || rawStatus === 5)) compactionCount++;
+    if (stepType === 23 && (rawStatus === 3 || rawStatus === 5)) {
+      compactionCount++;
+      compactionContextEntries.push({
+        step,
+        precedingUsageIndex: usageContextEntries.length - 1,
+        turnIndex: turns,
+      });
+    }
     if (stepType !== 15 || step.hasUsage === false) continue;
     const prompt = safeTokens(step.rawInput ?? step.rawInputTokens) +
       safeTokens(step.cachedTokens ?? step.cachedReadTokens) + safeTokens(step.cacheWriteTokens);
     if (step.hasUsage === true || prompt > 0) {
-      latestStep = step;
-      peakContextTokens = Math.max(peakContextTokens, prompt);
+      usageContextEntries.push({ step, prompt, turnIndex: turns });
     }
   }
-  const genMeta = latestStep?.generation ?? input.genMetadata;
-  const needsGenDisambiguation = Boolean(
-    genMeta && (
-      (genMeta.responseModel && /\borchestrator\b|^gemini-flash-worker|^MODEL_PLACEHOLDER_M66[789]$/i.test(genMeta.responseModel)) ||
-      (genMeta.modelDisplayName && /\borchestrator\b/i.test(genMeta.modelDisplayName)) ||
-      genMeta.modelEnum === 1667 ||
-      genMeta.modelEnum === 1668 ||
-      genMeta.modelEnum === 1669
-    )
-  );
-  const disambiguatedGenModel = needsGenDisambiguation
-    ? resolveDatabaseModelFullName(genMeta?.responseModel, genMeta?.modelDisplayName, genMeta?.modelEnum ?? null)
-    : '';
-  const historicalModel = disambiguatedGenModel || genMeta?.modelDisplayName || genMeta?.responseModel ||
-    genMeta?.plannerModelName || latestStep?.modelName;
-  const hasExplicitModelEvidence = Boolean(historicalModel || (typeof input.modelId === 'string' && input.modelId.trim()));
-  const modelSpec = resolveModelCapacity(historicalModel || input.modelId);
-  const explicitCapacity = [
-    input.modelCapacity, genMeta?.maxContextTokens, latestStep?.modelMaxTokens,
-  ].find(value => typeof value === 'number' && Number.isSafeInteger(value) && value > 0);
-  const capacityTokens = explicitCapacity ?? modelSpec.capacityTokens;
-  const capacityTokensCompact = explicitCapacity
-    ? formatCompactTokenNumber(explicitCapacity)
-    : `~${formatCompactTokenNumber(capacityTokens)}`;
-  const capacitySource: HudCapacitySource = explicitCapacity !== undefined
-    ? 'explicit'
-    : modelSpec.isFallback
-    ? 'unknown'
-    : 'reference';
+  const {
+    latestStep,
+    sessionPeakContextTokens,
+    activeStage,
+    hasExplicitModelEvidence,
+    isMultiModel,
+    isOrchestrator,
+    modelStages,
+    defaultFallbackModel: stageFallbackModel,
+  } = resolveContextStagesAndActiveSlot(usageContextEntries, input, compactionContextEntries);
+  const activeModelCompactionCount = activeStage.compactionCount ?? 0;
+  const peakContextTokens = activeStage.peakContextTokens;
+  const capacityTokens = activeStage.capacityTokens;
+  const capacityTokensCompact = activeStage.capacityTokensCompact;
+  const capacitySource = activeStage.capacitySource;
+  const hasExplicitDbCapacity = !activeStage.isFallbackCapacity;
   const stepCached = safeTokens(latestStep?.cachedTokens ?? latestStep?.cachedReadTokens);
   const stepUncached = safeTokens(latestStep?.rawInput ?? latestStep?.rawInputTokens) +
     safeTokens(latestStep?.cacheWriteTokens);
@@ -1042,7 +1870,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const uncachedBarRatio = stepUncached / denominator * 100;
   const latestOutput = safeTokens(latestStep?.outputTokens);
   let latestActiveForegroundKind: 'model' | 'tool' | null = null;
-  if (input.allowDbActiveStepInference !== false) {
+  const lastCtx = contextSteps[contextSteps.length - 1];
+  const lastCtxType = lastCtx ? (lastCtx.step_type ?? lastCtx.stepType ?? 0) : 0;
+  const lastCtxStatus = lastCtx?.status ?? 3;
+  const lastTurnAborted = Boolean(!input.isStreaming && lastCtx && lastCtxType !== 14 && (lastCtxStatus === 4 || lastCtxStatus === 6 || lastCtxStatus === 7));
+  if (input.allowDbActiveStepInference !== false && !lastTurnAborted) {
     let turnFinished = false;
     for (let index = contextSteps.length - 1; index >= 0; index--) {
       const candidate = contextSteps[index]!;
@@ -1076,10 +1908,10 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const isSubagentRunning = Boolean(input.isSubagentRunning || runningSubagentCount > 0);
   const dbForegroundActive = input.allowDbActiveStepInference === true && latestActiveForegroundKind !== null;
   const isStreaming = Boolean(input.isStreaming || isSubagentRunning || dbForegroundActive);
-  // 小圆点活动阶段严格绑定当前分栏前台模型状态（input.isStreaming）：
-  // 前台模型停止或等待审批时，即使仍有后台工具或独立子智能体运行，小圆点也保持 idle（灰色），同时保留 isStreaming 维持 300ms 轮询与计时。
+  // 小圆点活动阶段默认绑定当前分栏前台流式状态（input.isStreaming）；
+  // 独立子智能体轨迹分栏因宿主 DOM 常无内部停止按钮，允许由底层数据库实锤的前台活跃步骤驱动状态圆点。
   let activityPhase: HudActivityPhase = 'idle';
-  if (input.isStreaming) {
+  if (input.isStreaming || (input.isSubagentTrajectory === true && dbForegroundActive)) {
     if (input.activityPhase === 'executing' || latestActiveForegroundKind === 'tool') {
       activityPhase = 'executing';
     } else {
@@ -1087,7 +1919,8 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     }
   }
   const tpsInfo = computeTps(timedOutputSeconds, timedOutputTokens);
-  const outputTpsFormatted = timedOutputCount > 0 ? tpsInfo.formatted : isStreaming ? '计算中...' : '—';
+  const outputTpsPending = timedOutputCount === 0 && isStreaming;
+  const outputTpsFormatted = timedOutputCount > 0 ? tpsInfo.formatted : isStreaming ? bt('metrics.calculating') : '—';
   const latestStepTpsInfo = timedOutputCount > 0 ? (latestForegroundStepTps ?? latestAnyStepTps) : null;
   const latestStepTtftInfo = validTtftCount > 0 ? (latestForegroundStepTtft ?? latestAnyStepTtft) : null;
   const averageTtftSeconds = validTtftCount > 0 ? validTtftSum / validTtftCount : 0;
@@ -1102,12 +1935,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   let pricedUsageSteps = 0;
   let unpricedUsageSteps = 0;
   const defaultFallbackModel =
-    (typeof historicalModel === 'string' && historicalModel.trim()) ||
+    (typeof stageFallbackModel === 'string' && stageFallbackModel.trim()) ||
     (typeof input.modelId === 'string' && input.modelId.trim()) ||
     '';
   const defaultPriceTsSeconds = Math.floor(nowMs / 1000);
-  for (const item of usageStepsForCost) {
-    const step = item.step;
+  const resolveExplicitStepModel = (step: ComputeHudMetricsInput['steps'][number]): string => {
     const resolvedStepGenModel =
       step.generation && (step.generation.responseModel || step.generation.modelDisplayName || step.generation.modelEnum)
         ? resolveDatabaseModelFullName(
@@ -1116,11 +1948,43 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
             step.generation.modelEnum ?? null
           )
         : '';
-    const stepModel =
-      (resolvedStepGenModel && resolvedStepGenModel !== '未知模型' ? resolvedStepGenModel : '') ||
+    return (
+      (resolvedStepGenModel &&
+      resolvedStepGenModel !== '未知模型' &&
+      resolvedStepGenModel !== 'Unknown Model' &&
+      resolvedStepGenModel !== bt('usage.unknown_model')
+        ? resolvedStepGenModel
+        : '') ||
       step.generation?.plannerModelName ||
       step.modelName ||
-      (item.isChildStep ? '' : defaultFallbackModel);
+      ''
+    );
+  };
+  let firstExplicitMainStepModel = '';
+  for (const candidate of usageStepsForCost) {
+    if (candidate.isChildStep) continue;
+    const explicit = resolveExplicitStepModel(candidate.step);
+    if (explicit) {
+      firstExplicitMainStepModel = explicit;
+      break;
+    }
+  }
+  let lastExplicitMainStepModel = '';
+  for (const item of usageStepsForCost) {
+    const step = item.step;
+    const explicitStepModel = resolveExplicitStepModel(step);
+    if (!item.isChildStep && explicitStepModel) {
+      lastExplicitMainStepModel = explicitStepModel;
+    }
+    const isLiveLatestStep = Boolean(
+      input.isStreaming && latestStep && step === latestStep && !isStepCompleted(step)
+    );
+    const contextualMainFallback = isLiveLatestStep
+      ? defaultFallbackModel
+      : lastExplicitMainStepModel || firstExplicitMainStepModel || defaultFallbackModel;
+    const stepModel =
+      explicitStepModel ||
+      (item.isChildStep ? '' : contextualMainFallback);
     const stepTs = [
       step.t_start,
       step.startTimeSeconds,
@@ -1129,18 +1993,26 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       step.endTimeSeconds,
       step.completedAtSeconds,
     ].find((ts) => validSeconds(ts) && ts > 0);
-    const price = stepModel
-      ? resolvePricingFromTable(pricingTable, stepModel, stepTs ?? defaultPriceTsSeconds)
+    const rawPricingEntry = stepModel ? lookupPricingEntry(pricingTable, stepModel) : null;
+    const price = !stepModel
+      ? null
+      : stepTs
+        ? resolvePricingFromTable(pricingTable, stepModel, stepTs)
+        : rawPricingEntry && !isTemporalPricingEntry(rawPricingEntry.entry)
+          ? resolvePricingFromTable(pricingTable, stepModel, defaultPriceTsSeconds)
+          : null;
+    const effectivePrice = price
+      ? resolveContextTierPricing(price, item.rawInput + item.cached + item.written)
       : null;
-    if (!price || (item.written > 0 && !Number.isFinite(price.cacheWrite))) {
+    if (!effectivePrice || (item.written > 0 && !Number.isFinite(effectivePrice.cacheWrite))) {
       if (item.rawInput + item.cached + item.written + item.output > 0) {
         unpricedUsageSteps++;
       }
       continue;
     }
     try {
-      estimatedCostUsd += calculateEstimatedUsd(item.rawInput, item.output, item.cached, price, item.written);
-      const unitSaved = Math.max(0, price.input - price.cached);
+      estimatedCostUsd += calculateEstimatedUsd(item.rawInput, item.output, item.cached, effectivePrice, item.written);
+      const unitSaved = Math.max(0, effectivePrice.input - effectivePrice.cached);
       if (item.cached > 0 && unitSaved > 0) {
         cacheSavedUsd += (item.cached * unitSaved) / 1_000_000;
       }
@@ -1153,11 +2025,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   cacheSavedUsd = Math.round(cacheSavedUsd * 1e8) / 1e8;
   const observedAt = input.observedAt !== undefined ? input.observedAt : (availability === 'unavailable' ? null : nowMs);
   const lastSuccessAt = input.lastSuccessAt !== undefined ? input.lastSuccessAt : observedAt;
-  const resolvedModelId = !hasExplicitModelEvidence ? 'unknown' : modelSpec.modelId;
+  const resolvedModelId = !hasExplicitModelEvidence ? 'unknown' : activeStage.modelId;
   const resolvedModelDisplayName =
     !hasExplicitModelEvidence
       ? '—'
-      : genMeta?.modelDisplayName || modelSpec.displayName;
+      : activeStage.modelDisplayName;
 
   // 计算本轮起步点与当轮耗时 (Turn Duration)
   let lastTurnStartIndex = -1;
@@ -1183,7 +2055,20 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   let hasActiveStepInTurn = false;
   let hasSubagentStepInTurn = false;
   const nowSeconds = nowMs / 1000;
-  const allowActiveInference = input.allowDbActiveStepInference !== false;
+  const allowActiveInference = availability !== 'cached' && input.allowDbActiveStepInference !== false;
+  const lastTurnStep = turnSteps[turnSteps.length - 1];
+  const lastTurnStepAborted =
+    lastTurnStep !== undefined &&
+    (lastTurnStep.status === 4 || lastTurnStep.status === 6 || lastTurnStep.status === 7);
+  const lastTurnStepAbortedMissingEnd =
+    lastTurnStepAborted &&
+    !validSeconds(
+      lastTurnStep!.t_end ??
+        lastTurnStep!.endTimeSeconds ??
+        lastTurnStep!.completedAtSeconds ??
+        lastTurnStep!.finishedGeneratingSeconds
+    );
+  const allowForegroundActiveInTurn = allowActiveInference && !(!input.isStreaming && lastTurnStepAborted);
 
   const trackWallStart = (ts: number | null | undefined) => {
     if (validSeconds(ts)) {
@@ -1213,12 +2098,17 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       hasSubagentStepInTurn = true;
     }
     const complete = isStepCompleted(step);
-    const activeNow = isStepActiveNow(step, isStreaming, allowActiveInference);
+    const activeNow = availability !== 'cached' && isStepActiveNow(step, isStreaming, allowForegroundActiveInTurn);
     const hasInterval = validSeconds(start) && validSeconds(end) && end > start;
     if (complete) {
       trackWallEnd(end ?? step.finishedGeneratingSeconds ?? step.completedAtSeconds ?? start);
     } else if (activeNow) {
       hasActiveStepInTurn = true;
+    } else if (rawStatus === 4 || rawStatus === 6 || rawStatus === 7) {
+      const terminalEndedTs = end ?? step.completedAtSeconds ?? step.finishedGeneratingSeconds;
+      if (validSeconds(terminalEndedTs) && (!validSeconds(start) || terminalEndedTs >= start)) {
+        trackWallEnd(terminalEndedTs);
+      }
     }
 
     if (stepType === 15) {
@@ -1251,6 +2141,24 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     }
   }
 
+  let prevTurnBoundarySeconds: number | null = null;
+  if (lastTurnStartIndex > 0) {
+    for (let index = lastTurnStartIndex - 1; index >= 0; index--) {
+      const prev = contextSteps[index]!;
+      const prevEnd =
+        prev.t_end ??
+        prev.endTimeSeconds ??
+        prev.finishedGeneratingSeconds ??
+        prev.completedAtSeconds ??
+        prev.t_start ??
+        prev.startTimeSeconds ??
+        prev.createdAtSeconds;
+      if (validSeconds(prevEnd)) {
+        prevTurnBoundarySeconds =
+          prevTurnBoundarySeconds === null ? prevEnd : Math.max(prevTurnBoundarySeconds, prevEnd);
+      }
+    }
+  }
   const childStepsAll = steps.length > contextSteps.length ? steps.slice(contextSteps.length) : [];
   const childStepsInTurn = childStepsAll.filter((step) => {
     const start = step.t_start ?? step.startTimeSeconds ?? step.createdAtSeconds;
@@ -1258,26 +2166,80 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     if (turnWallStart !== null) {
       if (validSeconds(start)) return start >= turnWallStart - 1;
       if (validSeconds(end)) return end >= turnWallStart - 1;
-      return false;
+      const activeChildNow =
+        availability !== 'cached' && isStepActiveNow(step, isStreaming, allowActiveInference);
+      return Boolean(hasSubagentStepInTurn && activeChildNow);
+    }
+    if (prevTurnBoundarySeconds !== null) {
+      const activeChildNow =
+        availability !== 'cached' && isStepActiveNow(step, isStreaming, allowActiveInference);
+      if (!hasSubagentStepInTurn && !activeChildNow) {
+        return false;
+      }
+      if (validSeconds(start)) return start >= prevTurnBoundarySeconds;
+      if (validSeconds(end)) return end >= prevTurnBoundarySeconds;
+      return activeChildNow;
     }
     return isSubagentRunning;
   });
   for (const childStep of childStepsInTurn) {
     const stepType = childStep.step_type ?? childStep.stepType ?? 0;
+    const rawStatus = childStep.status ?? 3;
     const start = childStep.t_start ?? childStep.startTimeSeconds ?? childStep.createdAtSeconds;
     const end = childStep.t_end ?? childStep.endTimeSeconds ?? childStep.finishedGeneratingSeconds ?? childStep.completedAtSeconds;
     const rawStart = childStep.t_start ?? childStep.startTimeSeconds;
     const rawEnd = childStep.t_end ?? childStep.endTimeSeconds;
+    const hasInterval = validSeconds(rawStart) && validSeconds(rawEnd) && rawEnd > rawStart;
     trackWallStart(start);
-    if (stepType !== 14 && isStepActiveNow(childStep, isStreaming, allowActiveInference)) {
+    if (availability !== 'cached' && stepType !== 14 && isStepActiveNow(childStep, isStreaming, allowActiveInference)) {
       hasActiveStepInTurn = true;
       if (validSeconds(rawStart)) {
-        turnChildIntervals.push([rawStart, Math.max(rawStart, nowSeconds)]);
+        const activeInterval: readonly [number, number] = [rawStart, Math.max(rawStart, nowSeconds)];
+        turnChildIntervals.push(activeInterval);
+        if (stepType === 15) {
+          turnModelIntervals.push(activeInterval);
+        } else if (!NON_TOOL_STEP_TYPES.has(stepType)) {
+          turnToolIntervals.push(activeInterval);
+        }
       }
-    } else {
-      trackWallEnd(end ?? start);
-      if (stepType !== 14 && validSeconds(rawStart) && validSeconds(rawEnd) && rawEnd > rawStart) {
-        turnChildIntervals.push([rawStart, rawEnd]);
+    } else if (stepType !== 14) {
+      const childCompleted =
+        stepType === 15
+          ? isStepCompleted(childStep)
+          : (rawStatus === 3 || rawStatus === 5 || !ACTIVE_STEP_STATUSES.has(rawStatus)) && rawStatus !== 4 && rawStatus !== 6 && rawStatus !== 7;
+      if (childCompleted) {
+        trackWallEnd(end ?? start);
+        if (stepType === 15) {
+          const gen = childStep.generation;
+          const rawTtft = gen?.timeToFirstTokenSeconds;
+          const rawStreaming = gen?.streamingDurationSeconds;
+          const duration = validSeconds(rawTtft) && validSeconds(rawStreaming) && rawTtft + rawStreaming > 0
+            ? rawTtft + rawStreaming
+            : hasInterval ? rawEnd! - rawStart! : null;
+          if (duration !== null) {
+            if (validSeconds(rawStart)) {
+              const modelInterval: readonly [number, number] = [rawStart, rawStart + duration];
+              turnModelIntervals.push(modelInterval);
+              turnChildIntervals.push(modelInterval);
+            } else {
+              unanchoredTurnModelDuration += duration;
+            }
+          } else if (hasInterval) {
+            turnChildIntervals.push([rawStart!, rawEnd!]);
+          }
+        } else if (hasInterval) {
+          const toolInterval: readonly [number, number] = [rawStart!, rawEnd!];
+          turnChildIntervals.push(toolInterval);
+          if (!NON_TOOL_STEP_TYPES.has(stepType)) {
+            turnToolIntervals.push(toolInterval);
+          }
+        }
+      } else if (rawStatus === 4 || rawStatus === 6 || rawStatus === 7) {
+        const terminalEndedTs =
+          rawEnd ?? childStep.completedAtSeconds ?? childStep.finishedGeneratingSeconds;
+        if (validSeconds(terminalEndedTs) && (!validSeconds(start) || terminalEndedTs >= start)) {
+          trackWallEnd(terminalEndedTs);
+        }
       }
     }
   }
@@ -1287,25 +2249,42 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const activeToolIntervals: Array<readonly [number, number]> = [];
   let activeModelStepCount = 0;
   let activeToolStepCount = 0;
-  for (const step of [...turnSteps, ...childStepsInTurn]) {
-    const stepType = step.step_type ?? step.stepType ?? 0;
-    if (stepType === 14) continue;
-    const start = step.t_start ?? step.startTimeSeconds;
-    if (!validSeconds(start)) continue;
-    if (!isStepActiveNow(step, isStreaming, allowActiveInference)) continue;
-    const interval: readonly [number, number] = [start, Math.max(start, nowSeconds)];
-    if (stepType === 15) {
-      activeModelIntervals.push(interval);
-      activeModelStepCount++;
-    } else if (!NON_TOOL_STEP_TYPES.has(stepType)) {
-      activeToolIntervals.push(interval);
-      activeToolStepCount++;
+  if (availability !== 'cached') {
+    for (const step of turnSteps) {
+      const stepType = step.step_type ?? step.stepType ?? 0;
+      if (stepType === 14) continue;
+      const start = step.t_start ?? step.startTimeSeconds;
+      if (!validSeconds(start)) continue;
+      if (!isStepActiveNow(step, isStreaming, allowForegroundActiveInTurn)) continue;
+      const interval: readonly [number, number] = [start, Math.max(start, nowSeconds)];
+      if (stepType === 15) {
+        activeModelIntervals.push(interval);
+        activeModelStepCount++;
+      } else if (!NON_TOOL_STEP_TYPES.has(stepType)) {
+        activeToolIntervals.push(interval);
+        activeToolStepCount++;
+      }
+    }
+    for (const step of childStepsInTurn) {
+      const stepType = step.step_type ?? step.stepType ?? 0;
+      if (stepType === 14) continue;
+      const start = step.t_start ?? step.startTimeSeconds;
+      if (!validSeconds(start)) continue;
+      if (!isStepActiveNow(step, isStreaming, allowActiveInference)) continue;
+      const interval: readonly [number, number] = [start, Math.max(start, nowSeconds)];
+      if (stepType === 15) {
+        activeModelIntervals.push(interval);
+        activeModelStepCount++;
+      } else if (!NON_TOOL_STEP_TYPES.has(stepType)) {
+        activeToolIntervals.push(interval);
+        activeToolStepCount++;
+      }
     }
   }
   const inFlightModelDurationSeconds = Math.max(
     0,
-    mergeDurationIntervals([...childCompletedModelIntervals, ...activeModelIntervals]) -
-      childCompletedAnchoredTotal
+    mergeDurationIntervals([...allCompletedModelIntervals, ...activeModelIntervals]) -
+      allCompletedAnchoredTotal
   );
   const inFlightToolDurationSeconds = Math.max(
     0,
@@ -1321,11 +2300,36 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     mergeDurationIntervals([...turnModelIntervals, ...turnToolIntervals, ...turnChildIntervals]) +
     unanchoredTurnModelDuration;
   let currentTurnDurationSeconds = mergedTurnDuration;
-  if (hasSubagentInTurn && turnWallStart !== null) {
+  // 本轮用时按挂钟时间展示：覆盖上下文压缩、步骤间调度/排队等不属于任何步骤区间的空档；
+  // 仅在能定位到本轮起点（存在用户输入步）或独立子智能体轨迹中启用，避免把轮次之间的空闲时间算入。
+  if ((hasSubagentInTurn || input.isSubagentTrajectory === true || lastTurnStartIndex >= 0) && turnWallStart !== null) {
     const completedWallSpan = turnCompletedEnd !== null && turnCompletedEnd > turnWallStart
       ? turnCompletedEnd - turnWallStart
       : 0;
-    if (isStreaming || isSubagentRunning || hasActiveStepInTurn) {
+    const lastTurnStepType = lastTurnStep ? (lastTurnStep.step_type ?? lastTurnStep.stepType ?? 0) : 0;
+    const lastTurnStepStatus = lastTurnStep?.status ?? 3;
+    const lastTurnExplicitlyClosed =
+      lastTurnStep !== undefined &&
+      lastTurnStepType === 2 &&
+      (lastTurnStepStatus === 3 || lastTurnStepStatus === 5);
+    const lastTurnStepStaleCompleted =
+      lastTurnStep !== undefined &&
+      lastTurnStepType !== 14 &&
+      isStepCompleted(lastTurnStep) &&
+      turnCompletedEnd !== null &&
+      nowSeconds - turnCompletedEnd > TURN_STEP_HANDOFF_GRACE_SEC;
+    // 前台流式中但末步已被中止/取消、轮次已明确收尾 (stepType=2)，或上轮末步已完结且超出步间交接宽限期 (600s) 时，
+    // 视为上轮已终止，不再因前端瞬时 isStreaming 信号或新轮未落盘而把跨轮空闲时间外推累加到上轮用时；
+    // 主库处于错误回退缓存态 (availability === 'cached') 时快照已冻结，不再把旧轮起始时间外推到当前时刻。
+    const wallClockRunning =
+      availability !== 'cached' &&
+      (isSubagentRunning ||
+        hasActiveStepInTurn ||
+        (isStreaming &&
+          !lastTurnStepAborted &&
+          !lastTurnExplicitlyClosed &&
+          !lastTurnStepStaleCompleted));
+    if (wallClockRunning) {
       currentTurnDurationSeconds = Math.max(mergedTurnDuration, nowSeconds - turnWallStart, completedWallSpan);
     } else if (completedWallSpan > 0) {
       currentTurnDurationSeconds = Math.max(mergedTurnDuration, completedWallSpan);
@@ -1339,14 +2343,55 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     ? formatTurnDurationCard(currentTurnDurationSeconds, 'en')
     : '—';
   const currentTurnTpsInfo = computeTps(currentTurnTimedOutputSeconds, currentTurnTimedOutputTokens);
+  const currentTurnOutputTpsPending = currentTurnTimedSamples === 0 && isStreaming;
   const currentTurnOutputTpsFormatted =
-    currentTurnTimedSamples > 0 ? currentTurnTpsInfo.formatted : isStreaming ? '计算中...' : '—';
+    currentTurnTimedSamples > 0 ? currentTurnTpsInfo.formatted : isStreaming ? bt('metrics.calculating') : '—';
+  const TRANSPARENT_HANDOFF_STEP_TYPES = new Set([81, 98, 99, 101, 102, 104]);
+  let effectiveLastCtxIdx = contextSteps.length - 1;
+  while (effectiveLastCtxIdx > lastTurnStartIndex && effectiveLastCtxIdx >= 0) {
+    const candidate = contextSteps[effectiveLastCtxIdx]!;
+    const candidateType = candidate.step_type ?? candidate.stepType ?? 0;
+    if (!TRANSPARENT_HANDOFF_STEP_TYPES.has(candidateType)) break;
+    effectiveLastCtxIdx--;
+  }
+  const lastContextStep = effectiveLastCtxIdx >= 0 ? contextSteps[effectiveLastCtxIdx] : undefined;
+  const lastContextStepType = lastContextStep ? (lastContextStep.step_type ?? lastContextStep.stepType ?? 0) : 0;
+  const lastContextStepStatus = lastContextStep?.status ?? 3;
+  const lastContextToolCompleted =
+    Boolean(lastContextStep) &&
+    !NON_TOOL_STEP_TYPES.has(lastContextStepType) &&
+    (lastContextStepStatus === 3 ||
+      lastContextStepStatus === 5 ||
+      (!ACTIVE_STEP_STATUSES.has(lastContextStepStatus) &&
+        lastContextStepStatus !== 4 &&
+        lastContextStepStatus !== 6 &&
+        lastContextStepStatus !== 7 &&
+        validSeconds(lastContextStep!.t_end ?? lastContextStep!.endTimeSeconds)));
+  const awaitingFirstTurnStep = Boolean(
+    input.isStreaming &&
+      !isSubagentRunning &&
+      activeModelStepCount === 0 &&
+      activeToolStepCount === 0 &&
+      (contextSteps.length === 0 ||
+        lastTurnStartIndex === effectiveLastCtxIdx ||
+        ((lastContextStepType === 2 || lastContextStepType === 23) &&
+          (lastContextStepStatus === 3 || lastContextStepStatus === 5)) ||
+        lastContextToolCompleted)
+  );
   const currentTurnDurationCompactZh = hasTurnDuration
     ? formatTurnDurationCompact(currentTurnDurationSeconds, 'zh')
-    : '本轮 0s';
+    : formatTurnDurationCompact(0, 'zh');
   const currentTurnDurationCompactEn = hasTurnDuration
     ? formatTurnDurationCompact(currentTurnDurationSeconds, 'en')
-    : 'Turn 0s';
+    : formatTurnDurationCompact(0, 'en');
+
+  const resolvedSubagentSteps =
+    input.subagentSteps ?? (input.contextSteps ? Math.max(0, steps.length - contextSteps.length) : 0);
+  const resolvedTotalSteps =
+    input.totalStepsOverride ??
+    (input.contextSteps
+      ? contextSteps.length + Math.max(steps.length - contextSteps.length, resolvedSubagentSteps)
+      : steps.length + Math.max(0, resolvedSubagentSteps));
 
   return {
     conversationId: input.conversationId || 'default',
@@ -1366,7 +2411,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     runningSubagentCount,
     session: {
       turns,
-      steps: input.totalStepsOverride ?? steps.length + Math.max(0, input.subagentSteps ?? 0),
+      steps: resolvedTotalSteps,
       modelSteps,
       samples: { usage: usageSampleCount,
         timed: timedOutputCount, ttft: validTtftCount },
@@ -1374,7 +2419,12 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       compactionCount,
       subagentCount: Math.max(input.subagentCount ?? detectedSubagents, runningSubagentCount),
       runningSubagentCount,
-      subagentSteps: input.subagentSteps ?? 0,
+      subagentSteps: resolvedSubagentSteps,
+      hasSubagentInTurn,
+      ...(lastTurnStepAborted ? { turnAborted: true } : {}),
+      ...(lastTurnStepAbortedMissingEnd ? { turnAbortedMissingEnd: true } : {}),
+      ...(input.isSubagentTrajectory ? { isSubagentTrajectory: true } : {}),
+      ...(awaitingFirstTurnStep ? { awaitingFirstTurnStep: true } : {}),
       modelDurationSeconds,
       modelDurationFormatted: formatDurationSeconds(modelDurationSeconds, 'zh'),
       modelDurationFormattedEn: formatDurationSeconds(modelDurationSeconds, 'en'),
@@ -1382,10 +2432,11 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       toolDurationFormatted: formatDurationSeconds(toolDurationSeconds, 'zh'),
       toolDurationFormattedEn: formatDurationSeconds(toolDurationSeconds, 'en'),
       averageTtftSeconds,
-      averageTtftFormatted: validTtftCount > 0 ? `${averageTtftSeconds.toFixed(2)} 秒` : '—',
-      averageTtftFormattedEn: validTtftCount > 0 ? `${averageTtftSeconds.toFixed(2)}s` : '—',
+      averageTtftFormatted: validTtftCount > 0 ? bt('metrics.ttft_seconds', { value: compactRate(averageTtftSeconds) }) : '—',
+      averageTtftFormattedEn: validTtftCount > 0 ? `${compactRate(averageTtftSeconds)}s` : '—',
       outputTps: tpsInfo.outputTps,
       outputTpsFormatted,
+      outputTpsPending,
       ...(latestStepTpsInfo
         ? {
             latestStepOutputTps: latestStepTpsInfo.outputTps,
@@ -1401,6 +2452,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
         : {}),
       currentTurnOutputTps: currentTurnTpsInfo.outputTps,
       currentTurnOutputTpsFormatted,
+      currentTurnOutputTpsPending,
       currentTurnTimedSamples,
       currentTurnDurationSeconds,
       currentTurnDurationFormatted,
@@ -1419,7 +2471,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       totalTokensCompact: `${formatCompactTokenNumber(totalTokens)} tok`,
       totalTokensFormatted: formatThousandsTokens(totalTokens),
       cacheHitRate,
-      cacheHitRateFormatted: `${(cacheHitRate * 100).toFixed(2)}%`,
+      cacheHitRateFormatted: compactPercent(cacheHitRate),
       uncachedInputTokens,
       uncachedInputFormatted: formatThousandsTokens(uncachedInputTokens),
       cachedReadTokens,
@@ -1444,6 +2496,17 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       hasUsageData: Boolean(latestStep),
       modelId: resolvedModelId,
       modelDisplayName: resolvedModelDisplayName,
+      ...(hasExplicitModelEvidence && activeStage.shortLabel
+        ? {
+            modelShortLabel: activeStage.shortLabel,
+            modelCompactLabel: activeStage.compactLabel,
+          }
+        : {}),
+      ...(isMultiModel ? { isMultiModel: true } : {}),
+      ...(isOrchestrator ? { isOrchestrator: true } : {}),
+      ...(sessionPeakContextTokens > 0 ? { sessionPeakContextTokens } : {}),
+      ...(compactionCount > 0 ? { activeModelCompactionCount } : {}),
+      ...(modelStages ? { modelStages } : {}),
       usedTokens,
       usedTokensCompact: formatCompactTokenNumber(usedTokens),
       usedTokensFormatted: formatThousandsTokens(usedTokens),
@@ -1452,13 +2515,13 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       peakContextFormatted: formatThousandsTokens(peakContextTokens),
       capacityTokens,
       capacityTokensCompact,
-      hasExplicitDbCapacity: explicitCapacity !== undefined,
-      isFallbackCapacity: explicitCapacity === undefined,
+      hasExplicitDbCapacity,
+      isFallbackCapacity: !hasExplicitDbCapacity,
       capacitySource,
       usedRatio,
-      usedRatioFormatted: `${(usedRatio * 100).toFixed(2)}%`,
+      usedRatioFormatted: compactPercent(usedRatio),
       stepCacheRatio,
-      stepCacheRatioFormatted: `${(stepCacheRatio * 100).toFixed(2)}%`,
+      stepCacheRatioFormatted: compactPercent(stepCacheRatio),
       breakdown: {
         cachedContextTokens: stepCached,
         cachedContextFormatted: formatThousandsTokens(stepCached),
@@ -1507,11 +2570,16 @@ interface CachedConversationState {
   hasParentMetadataBlob?: boolean;
   trajectoryId?: string;
   referencedUuidsInMetaBlob: Set<string>;
+  rawSteps: ParsedConversationStep[];
   steps: ParsedConversationStep[];
   childConversationIds: Set<string>;
   verifiedSniffedChildren: Set<string>;
   genMetadata?: ParsedGenMetadata;
   generations: Map<number, ParsedGenMetadata>;
+  unmatchedUsageGenerations: Array<{
+    generation: ParsedGenMetadata;
+    timestampSeconds: number | null;
+  }>;
 }
 
 /**
@@ -1520,18 +2588,28 @@ interface CachedConversationState {
  */
 export class ConversationMetricsEngine {
   private readonly conversationsDir: string;
+  private readonly summariesDbPath: string;
   private readonly remotePricingCachePath: string | null;
   private readonly pricingCachePath: string | null;
   private cachedPricingTable: { key: string; table: Record<string, ApiPricingEntry> } | null = null;
+  private pricingResolveInFlight: Promise<Record<string, ApiPricingEntry>> | null = null;
   private readonly cache = new Map<string, CachedConversationState>();
   private readonly pendingReads = new Map<string, Promise<CachedConversationState | null>>();
-  private sniffDirCache: { at: number; recentIds: string[] } | null = null;
+  private readonly verifiedSniffedChildrenByDb = new Map<string, { fileId: string; stepCount: number; children: Set<string> }>();
+  private readonly recentActiveChildUntilByDb = new Map<string, number>();
+  private readonly coldSniffedByDb = new Map<string, { fileId: string; stepCount: number }>();
+  private readonly rejectedSniffMtimeByKey = new Map<string, number>();
+  private readonly summariesChildCache = new Map<string, { sig: string; childIds: string[]; terminalChildIds: string[]; runningChildIds: string[]; selfRunning: boolean }>();
+  private summariesMissingUntilMs = 0;
+  private sniffDirCache: { at: number; dirMtimeMs: number; allEntries: Array<{ id: string; mtimeMs: number }> } | null = null;
   private sniffDirListCache: { dirMtimeMs: number; dbEntries: Array<{ file: string; id: string }> } | null = null;
+  private sniffInFlight: Promise<Array<{ id: string; mtimeMs: number }>> | null = null;
 
   constructor(options?: { geminiDir?: string; conversationsDir?: string; stateDir?: string }) {
     const baseGemini = options?.geminiDir ?? join(homedir(), '.gemini');
     this.conversationsDir =
       options?.conversationsDir ?? join(baseGemini, 'antigravity', 'conversations');
+    this.summariesDbPath = join(dirname(this.conversationsDir), 'conversation_summaries.db');
     const cleanStateDir = typeof options?.stateDir === 'string' && options.stateDir.trim()
       ? options.stateDir.trim()
       : null;
@@ -1543,33 +2621,97 @@ export class ConversationMetricsEngine {
     if (!this.remotePricingCachePath || !this.pricingCachePath) {
       return DEFAULT_API_PRICES;
     }
-    const [remoteStat, customStat] = await Promise.all([
-      lstat(this.remotePricingCachePath).catch(() => null),
-      lstat(this.pricingCachePath).catch(() => null),
-    ]);
-    const key = `${remoteStat ? `${remoteStat.mtimeMs}:${remoteStat.size}` : 'none'}|${customStat ? `${customStat.mtimeMs}:${customStat.size}` : 'none'}`;
-    if (key === 'none|none') {
-      this.cachedPricingTable = null;
-      return DEFAULT_API_PRICES;
-    }
-    if (this.cachedPricingTable?.key === key) {
-      return this.cachedPricingTable.table;
-    }
-    try {
-      const { merged } = await loadRawPricingTable(this.remotePricingCachePath, this.pricingCachePath);
-      this.cachedPricingTable = { key, table: merged };
-      return merged;
-    } catch {
-      return DEFAULT_API_PRICES;
-    }
+    return (this.pricingResolveInFlight ??= (async () => {
+      try {
+        const [remoteStat, customStat] = await Promise.all([
+          lstat(this.remotePricingCachePath!).catch(() => null),
+          lstat(this.pricingCachePath!).catch(() => null),
+        ]);
+        const key = `${remoteStat ? `${remoteStat.mtimeMs}:${remoteStat.size}` : 'none'}|${customStat ? `${customStat.mtimeMs}:${customStat.size}` : 'none'}`;
+        if (key === 'none|none') {
+          if (this.cachedPricingTable !== null) {
+            this.cachedPricingTable = null;
+            resetAndRegisterRemoteModelMetadata({});
+          }
+          return DEFAULT_API_PRICES;
+        }
+        if (this.cachedPricingTable?.key === key) {
+          return this.cachedPricingTable.table;
+        }
+        const { merged } = await loadRawPricingTable(this.remotePricingCachePath!, this.pricingCachePath!);
+        this.cachedPricingTable = { key, table: merged };
+        return merged;
+      } catch {
+        return DEFAULT_API_PRICES;
+      } finally {
+        this.pricingResolveInFlight = null;
+      }
+    })());
   }
 
   public resolveDbPath(conversationId: string): string {
     const cleanId = conversationId.replace(/[^a-zA-Z0-9_-]/g, '');
     if (!cleanId) {
-      throw new Error('无效的会话 ID');
+      throw new Error(bt('metrics.err.invalid_conversation_id'));
     }
     return join(this.conversationsDir, `${cleanId}.db`);
+  }
+
+  private async lookupIndexedChildrenFromSummariesDb(
+    parentIds: string[],
+    selfIds: string[] = []
+  ): Promise<{ available: boolean; childIds: Set<string>; terminalChildIds: Set<string>; runningChildIds: Set<string>; selfRunning: boolean }> {
+    const cleanParents = [...new Set(parentIds.map(p => p.trim().toLowerCase()).filter(Boolean))].sort();
+    const cleanSelf = [...new Set(selfIds.map(s => s.trim().toLowerCase()).filter(Boolean))].sort();
+    const emptyRes = () => ({ available: false, childIds: new Set<string>(), terminalChildIds: new Set<string>(), runningChildIds: new Set<string>(), selfRunning: false });
+    if (cleanParents.length === 0 && cleanSelf.length === 0) return emptyRes();
+    const now = Date.now();
+    if (now < this.summariesMissingUntilMs) {
+      return emptyRes();
+    }
+    let targetPath = this.summariesDbPath;
+    let st = await lstat(targetPath).catch(() => null);
+    if (!st || !st.isFile() || st.isSymbolicLink()) {
+      const altPath = join(this.conversationsDir, 'conversation_summaries.db');
+      st = await lstat(altPath).catch(() => null);
+      if (!st || !st.isFile() || st.isSymbolicLink()) {
+        this.summariesMissingUntilMs = now + 2000;
+        return emptyRes();
+      }
+      targetPath = altPath;
+    }
+    const walSt = await lstat(`${targetPath}-wal`).catch(() => null);
+    const sig = `${targetPath}|${st.mtimeMs}:${st.size}:${walSt?.mtimeMs ?? 0}:${walSt?.size ?? 0}`;
+    const cacheKey = `p:${cleanParents.join('|')}#s:${cleanSelf.join('|')}`;
+    const cached = this.summariesChildCache.get(cacheKey);
+    if (cached && cached.sig === sig) {
+      return {
+        available: true,
+        childIds: new Set(cached.childIds),
+        terminalChildIds: new Set(cached.terminalChildIds),
+        runningChildIds: new Set(cached.runningChildIds),
+        selfRunning: cached.selfRunning,
+      };
+    }
+    const res = await runSummariesLookupInWorker({ dbPath: targetPath, parentIds: cleanParents, selfIds: cleanSelf });
+    if (!res || !res.foundTable) {
+      return emptyRes();
+    }
+    if (this.summariesChildCache.size >= MAX_CACHED_CONVERSATIONS && !this.summariesChildCache.has(cacheKey)) {
+      const oldest = this.summariesChildCache.keys().next().value;
+      if (oldest !== undefined) this.summariesChildCache.delete(oldest);
+    }
+    const terminalList = Array.isArray(res.terminalChildIds) ? res.terminalChildIds : [];
+    const runningList = Array.isArray(res.runningChildIds) ? res.runningChildIds : [];
+    const selfRunning = Boolean(res.selfRunning);
+    this.summariesChildCache.set(cacheKey, { sig, childIds: res.childIds, terminalChildIds: terminalList, runningChildIds: runningList, selfRunning });
+    return {
+      available: true,
+      childIds: new Set(res.childIds),
+      terminalChildIds: new Set(terminalList),
+      runningChildIds: new Set(runningList),
+      selfRunning,
+    };
   }
 
   private setCachedState(dbPath: string, state: CachedConversationState): void {
@@ -1680,7 +2822,7 @@ export class ConversationMetricsEngine {
         workerRes = await runHudDbScanInWorker(scanParams);
       } catch (firstErr) {
         const msg = (firstErr as Error)?.message ?? '';
-        if (!/busy|locked|投影失败|工作线程|预算|no such table|unable to open/i.test(msg)) {
+        if (!/busy|locked|投影失败|工作线程|预算|projection|worker|budget|timeout|no such table|unable to open/i.test(msg)) {
           throw firstErr;
         }
         await new Promise(resolve => setTimeout(resolve, 60));
@@ -1729,12 +2871,10 @@ export class ConversationMetricsEngine {
       const selfTrajLower = trajectoryId?.toLowerCase() ?? '';
 
       const parseStepRow = (row: HudWorkerRawStepRow): ParsedConversationStep => {
-        const extraBlobs =
-          row.render_info && row.render_info.length > 0
-            ? [row.render_info]
-            : row.step_payload && row.step_payload.length > 0
-            ? [row.step_payload]
-            : undefined;
+        const extraList = [row.render_info, row.step_payload].filter(
+          (b): b is Uint8Array => Boolean(b && b.length > 0)
+        );
+        const extraBlobs = extraList.length > 0 ? extraList : undefined;
         const parsed = parseStepMetadataBlob(
           Number(row.idx),
           Number(row.step_type),
@@ -1747,15 +2887,17 @@ export class ConversationMetricsEngine {
         return parsed;
       };
 
-      const baseSteps: ParsedConversationStep[] =
+      const rawSteps: ParsedConversationStep[] =
         stepsMode === 'append' && existing && prevStepPrefixCutoffIdx !== undefined
-          ? existing.steps
-              .filter(s => s.idx < prevStepPrefixCutoffIdx)
-              .map(s => ({ ...s, generation: undefined }))
+          ? existing.rawSteps.filter(s => s.idx < prevStepPrefixCutoffIdx)
           : [];
       for (const row of appendedSteps) {
-        baseSteps.push(parseStepRow(row));
+        rawSteps.push(parseStepRow(row));
       }
+      const baseSteps: ParsedConversationStep[] = rawSteps.map(s => ({
+        ...s,
+        ...(s.childConversationIds ? { childConversationIds: [...s.childConversationIds] } : {}),
+      }));
       let lastIdx = baseSteps.length > 0 ? baseSteps[baseSteps.length - 1]!.idx : -1;
       if (maxIdx > lastIdx) {
         lastIdx = maxIdx;
@@ -1780,22 +2922,212 @@ export class ConversationMetricsEngine {
       }
 
       const stepByIndex = new Map(baseSteps.map(step => [step.idx, step]));
-      for (const generation of generations.values()) {
-        const linked = [...new Set(generation.stepIndices ?? [])]
-          .map(index => stepByIndex.get(index)).filter(step => step?.stepType === 15);
-        if (linked.length !== 1 || !generation.usage || !generation.executionId) continue;
-        const step = linked[0]!;
-        if (!step.hasUsage || step.executionId !== generation.executionId) continue;
-        const usageKeys = ['rawInputTokens', 'outputTokens', 'cachedReadTokens', 'cacheWriteTokens',
-          'reasoningTokens', 'candidateTokens'] as const;
-        if (!usageKeys.every(key => step[key] === generation.usage![key])) continue;
-        step.generation = generation;
+      const sortedGenerations = [...generations.entries()].sort((a, b) => a[0] - b[0]);
+      const claimedUsageStepIdxs = new Set<number>();
+      const matchedGenIdxs = new Set<number>();
+      const resolveCandidate15Steps = (generation: ParsedGenMetadata): ParsedConversationStep[] => {
+        const fromIndices = [...new Set(generation.stepIndices ?? [])]
+          .map(index => stepByIndex.get(index))
+          .filter((step): step is ParsedConversationStep => step?.stepType === 15);
+        if (fromIndices.length > 0) return fromIndices;
+        if (generation.executionId && (!generation.stepIndices || generation.stepIndices.length === 0)) {
+          return baseSteps.filter(step => step.stepType === 15 && step.executionId === generation.executionId);
+        }
+        return [];
+      };
+
+      const stripTimingFromGeneration = (gen: ParsedGenMetadata): ParsedGenMetadata => {
+        const { timeToFirstTokenSeconds: _ttft, streamingDurationSeconds: _stream, ...rest } = gen;
+        return rest;
+      };
+      const canAttachAuthoritativeTiming = (
+        gen: ParsedGenMetadata,
+        candidate15Count: number,
+        step: ParsedConversationStep
+      ): boolean =>
+        candidate15Count === 1 &&
+        Boolean(gen.executionId) &&
+        Boolean(step.executionId) &&
+        step.executionId === gen.executionId;
+
+      // 第 1 遍：精确对齐 steps.metadata.field 9 与 gen_metadata.usage 一致的模型步（1:1 认领，防止同轮多次 API 调用被误吞）
+      const attachCompactionStepModel = (generation: ParsedGenMetadata): void => {
+        if (
+          !(
+            generation.responseModel ||
+            generation.modelDisplayName ||
+            generation.plannerModelName ||
+            generation.modelEnum ||
+            generation.maxContextTokens
+          )
+        ) {
+          return;
+        }
+        const modelOnlyGen: ParsedGenMetadata = {
+          ...(generation.responseModel ? { responseModel: generation.responseModel } : {}),
+          ...(generation.modelDisplayName ? { modelDisplayName: generation.modelDisplayName } : {}),
+          ...(generation.plannerModelName ? { plannerModelName: generation.plannerModelName } : {}),
+          ...(generation.modelEnum ? { modelEnum: generation.modelEnum } : {}),
+          ...(generation.maxContextTokens ? { maxContextTokens: generation.maxContextTokens } : {}),
+        };
+        for (const stepIdx of new Set(generation.stepIndices ?? [])) {
+          const cpStep = stepByIndex.get(stepIdx);
+          if (
+            cpStep &&
+            cpStep.stepType === 23 &&
+            !cpStep.generation &&
+            (!generation.executionId || !cpStep.executionId || cpStep.executionId === generation.executionId)
+          ) {
+            cpStep.generation = modelOnlyGen;
+          }
+        }
+      };
+
+      for (const [genIdx, generation] of sortedGenerations) {
+        const linked = resolveCandidate15Steps(generation);
+        if (generation.usage) {
+          const u = generation.usage;
+          const uTotal = u.rawInputTokens + u.cachedReadTokens + u.cacheWriteTokens + u.outputTokens;
+          if (uTotal > 0) {
+            const exactMatch = linked.find(
+              step =>
+                !claimedUsageStepIdxs.has(step.idx) &&
+                step.hasUsage &&
+                (!generation.executionId || !step.executionId || step.executionId === generation.executionId) &&
+                step.rawInputTokens === u.rawInputTokens &&
+                step.outputTokens === u.outputTokens &&
+                step.cachedReadTokens === u.cachedReadTokens &&
+                step.cacheWriteTokens === u.cacheWriteTokens
+            );
+            if (exactMatch) {
+              if (exactMatch.reasoningTokens === 0 && u.reasoningTokens > 0) {
+                exactMatch.reasoningTokens = u.reasoningTokens;
+              }
+              if (exactMatch.candidateTokens === 0 && u.candidateTokens > 0) {
+                exactMatch.candidateTokens = u.candidateTokens;
+              }
+              exactMatch.generation = canAttachAuthoritativeTiming(generation, linked.length, exactMatch)
+                ? generation
+                : stripTimingFromGeneration(generation);
+              attachCompactionStepModel(generation);
+              claimedUsageStepIdxs.add(exactMatch.idx);
+              matchedGenIdxs.add(genIdx);
+              continue;
+            }
+          }
+        }
+        if (generation.responseModel || generation.modelDisplayName || generation.plannerModelName || generation.modelEnum || generation.maxContextTokens) {
+          const modelOnlyGen: ParsedGenMetadata = {
+            ...(generation.responseModel ? { responseModel: generation.responseModel } : {}),
+            ...(generation.modelDisplayName ? { modelDisplayName: generation.modelDisplayName } : {}),
+            ...(generation.plannerModelName ? { plannerModelName: generation.plannerModelName } : {}),
+            ...(generation.modelEnum ? { modelEnum: generation.modelEnum } : {}),
+            ...(generation.maxContextTokens ? { maxContextTokens: generation.maxContextTokens } : {}),
+          };
+          for (const step of linked) {
+            if (!step.generation && (!generation.executionId || !step.executionId || step.executionId === generation.executionId)) {
+              step.generation = modelOnlyGen;
+            }
+          }
+          attachCompactionStepModel(generation);
+        }
+      }
+
+      // 第 2 遍：回填缺失内联 field 9 / cacheWriteTokens 的 stepType=15，并收集压缩步 (step_type=23)、重试/中断等独立计费 gen_metadata
+      const unmatchedUsageGenerations: Array<{ generation: ParsedGenMetadata; timestampSeconds: number | null }> = [];
+      const genCountByStepIdx = new Map<number, number>();
+      for (const [, generation] of sortedGenerations) {
+        const u = generation.usage;
+        if (!u || u.rawInputTokens + u.cachedReadTokens + u.cacheWriteTokens + u.outputTokens <= 0) continue;
+        for (const step of resolveCandidate15Steps(generation)) {
+          genCountByStepIdx.set(step.idx, (genCountByStepIdx.get(step.idx) ?? 0) + 1);
+        }
+      }
+      for (const [genIdx, generation] of sortedGenerations) {
+        if (matchedGenIdxs.has(genIdx) || !generation.usage) continue;
+        const u = generation.usage;
+        const uTotal = u.rawInputTokens + u.cachedReadTokens + u.cacheWriteTokens + u.outputTokens;
+        if (uTotal <= 0) continue;
+        const linked = resolveCandidate15Steps(generation);
+        const missingUsageStep = linked.find(
+          step =>
+            !claimedUsageStepIdxs.has(step.idx) &&
+            !step.hasUsage &&
+            (!generation.executionId || !step.executionId || step.executionId === generation.executionId)
+        );
+        if (missingUsageStep) {
+          missingUsageStep.hasUsage = true;
+          missingUsageStep.rawInputTokens = u.rawInputTokens;
+          missingUsageStep.outputTokens = u.outputTokens;
+          missingUsageStep.cacheWriteTokens = u.cacheWriteTokens;
+          missingUsageStep.cachedReadTokens = u.cachedReadTokens;
+          missingUsageStep.reasoningTokens = u.reasoningTokens;
+          missingUsageStep.candidateTokens = u.candidateTokens;
+          missingUsageStep.generation = canAttachAuthoritativeTiming(generation, linked.length, missingUsageStep)
+            ? generation
+            : stripTimingFromGeneration(generation);
+          claimedUsageStepIdxs.add(missingUsageStep.idx);
+          matchedGenIdxs.add(genIdx);
+          continue;
+        }
+        if (linked.length === 1) {
+          const soleStep = linked[0]!;
+          if (
+            !claimedUsageStepIdxs.has(soleStep.idx) &&
+            (genCountByStepIdx.get(soleStep.idx) ?? 0) === 1 &&
+            soleStep.hasUsage &&
+            (!generation.executionId || !soleStep.executionId || soleStep.executionId === generation.executionId)
+          ) {
+            if (
+              soleStep.rawInputTokens === u.rawInputTokens &&
+              soleStep.outputTokens === u.outputTokens &&
+              soleStep.cachedReadTokens === u.cachedReadTokens &&
+              soleStep.cacheWriteTokens === 0 &&
+              u.cacheWriteTokens > 0
+            ) {
+              soleStep.cacheWriteTokens = u.cacheWriteTokens;
+              if (soleStep.reasoningTokens === 0 && u.reasoningTokens > 0) soleStep.reasoningTokens = u.reasoningTokens;
+              if (soleStep.candidateTokens === 0 && u.candidateTokens > 0) soleStep.candidateTokens = u.candidateTokens;
+              soleStep.generation = canAttachAuthoritativeTiming(generation, linked.length, soleStep)
+                ? generation
+                : stripTimingFromGeneration(generation);
+              claimedUsageStepIdxs.add(soleStep.idx);
+              matchedGenIdxs.add(genIdx);
+              continue;
+            }
+            if (Boolean(generation.executionId) && soleStep.executionId === generation.executionId) {
+              claimedUsageStepIdxs.add(soleStep.idx);
+              matchedGenIdxs.add(genIdx);
+              continue;
+            }
+          }
+        }
+        let fallbackStepTs: number | null = generation.startedAtSeconds ?? null;
+        if (fallbackStepTs === null && generation.stepIndices?.length) {
+          for (const sIdx of generation.stepIndices) {
+            const anyStep = stepByIndex.get(sIdx);
+            const ts = anyStep?.startTimeSeconds ?? anyStep?.createdAtSeconds ?? anyStep?.completedAtSeconds ?? null;
+            if (ts !== null && ts > 0) {
+              fallbackStepTs = ts;
+              break;
+            }
+          }
+        }
+        unmatchedUsageGenerations.push({ generation, timestampSeconds: fallbackStepTs });
       }
       const latestModelStep = [...baseSteps].reverse().find(step => step.stepType === 15 && step.hasUsage);
       let genMetadata = latestModelStep?.generation;
       if (!genMetadata && generations.size > 0) {
         const fallbackGens = [...generations.entries()].sort((a, b) => a[0] - b[0]);
-        genMetadata = fallbackGens[fallbackGens.length - 1]?.[1];
+        const lastGen = fallbackGens[fallbackGens.length - 1]?.[1];
+        const indices = lastGen?.stepIndices;
+        const compatible = !latestModelStep
+          ? true
+          : (!indices?.length || indices.includes(latestModelStep.idx)) &&
+            (!lastGen?.executionId || !latestModelStep.executionId || lastGen.executionId === latestModelStep.executionId);
+        if (lastGen && compatible) {
+          genMetadata = lastGen;
+        }
       }
       for (const step of baseSteps) {
         for (const childId of step.childConversationIds ?? []) {
@@ -1803,10 +3135,18 @@ export class ConversationMetricsEngine {
         }
       }
 
-      const timelineShrunk = existing && baseSteps.length < existing.steps.length;
+      const persistedSniff = this.verifiedSniffedChildrenByDb.get(dbPath);
+      const timelineShrunk =
+        (existing && baseSteps.length < existing.steps.length) ||
+        (persistedSniff && (persistedSniff.fileId !== dbStat.fileId || baseSteps.length < persistedSniff.stepCount));
       const verifiedSniffedChildren = new Set<string>(
-        timelineShrunk ? [] : existing?.verifiedSniffedChildren ?? []
+        timelineShrunk ? [] : (persistedSniff?.children ?? existing?.verifiedSniffedChildren ?? [])
       );
+      if (timelineShrunk) {
+        this.verifiedSniffedChildrenByDb.delete(dbPath);
+      } else if (persistedSniff) {
+        persistedSniff.stepCount = Math.max(persistedSniff.stepCount, baseSteps.length);
+      }
 
       const nowMs = Date.now();
       const observedAt = Math.max(Math.round(dbStat.mtimeMs), Math.round(walMtimeMs)) || nowMs;
@@ -1835,11 +3175,13 @@ export class ConversationMetricsEngine {
         hasParentMetadataBlob,
         trajectoryId,
         referencedUuidsInMetaBlob,
+        rawSteps,
         steps: baseSteps,
         childConversationIds,
         verifiedSniffedChildren,
         genMetadata,
         generations,
+        unmatchedUsageGenerations,
       };
       this.setCachedState(dbPath, nextState);
       return nextState;
@@ -1886,7 +3228,7 @@ export class ConversationMetricsEngine {
         paneSlotId,
         sessionRevision,
         metricsSequence,
-        availability: 'unavailable',
+        availability: isStreaming || isSubagentRunning ? 'ready' : 'unavailable',
         observedAt: null,
         lastSuccessAt: null,
         isStreaming,
@@ -1903,15 +3245,23 @@ export class ConversationMetricsEngine {
     const mainIdLower = conversationId.toLowerCase();
     const mainTrajLower = mainState.trajectoryId?.toLowerCase() ?? '';
 
-    let combinedSteps = mainState.steps;
+    let descendants: ParsedConversationStep[] = [];
+    const childUnmatchedGenerations: Array<{ generation: ParsedGenMetadata; isChildStep: true; timestampSeconds: number | null }> = [];
     let totalSubagentSteps = 0;
     let activeChildSubagents = 0;
     let failedChildCount = 0;
     const verifiedChildIds = new Set<string>();
+    const activeVerifiedChildIds = new Set<string>();
 
+    const persistedSniffEntry = this.verifiedSniffedChildrenByDb.get(dbPath);
     const candidateChildIds = new Set<string>(mainState.childConversationIds);
     for (const persistedChild of mainState.verifiedSniffedChildren) {
       candidateChildIds.add(persistedChild);
+    }
+    if (persistedSniffEntry && persistedSniffEntry.fileId === mainState.fileId) {
+      for (const persistedChild of persistedSniffEntry.children) {
+        candidateChildIds.add(persistedChild);
+      }
     }
     if (Array.isArray(domHintChildIds)) {
       for (const rawHint of domHintChildIds) {
@@ -1923,61 +3273,154 @@ export class ConversationMetricsEngine {
       }
     }
 
-    // 反向子会话嗅探 (异步无阻塞，同时检查 .db 与 -wal 修改时间，1s 目录下钻缓存)
-    const hasActiveSubagentStep = mainState.steps.some(
+    const hasActiveSubagentStep = mainIsRecent && mainState.steps.some(
       (s) =>
         (s.isSubagentStep || (s.toolCallName && SUBAGENT_TOOL_NAMES.has(s.toolCallName))) &&
         ACTIVE_STEP_STATUSES.has(s.status)
     );
-    if (!dbPathOverride && (isSubagentRunning || hasActiveSubagentStep)) {
-      try {
-        let recentIds: string[];
-        if (this.sniffDirCache && nowMs - this.sniffDirCache.at < 2500) {
-          recentIds = this.sniffDirCache.recentIds;
-        } else {
-          const dirStat = await lstat(this.conversationsDir).catch(() => null);
-          let dbEntries: Array<{ file: string; id: string }>;
-          if (dirStat && this.sniffDirListCache && this.sniffDirListCache.dirMtimeMs === dirStat.mtimeMs) {
-            dbEntries = this.sniffDirListCache.dbEntries;
-          } else {
-            const files = await readdir(this.conversationsDir).catch(() => [] as string[]);
-            dbEntries = [];
-            for (const file of files) {
-              if (!file.endsWith('.db') || file.length < 39) continue;
-              const potentialChildId = file.slice(0, -3).toLowerCase();
-              if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(potentialChildId)) {
-                dbEntries.push({ file, id: potentialChildId });
-              }
-            }
-            if (dirStat) {
-              this.sniffDirListCache = { dirMtimeMs: dirStat.mtimeMs, dbEntries };
-            }
-          }
-          const found: string[] = [];
-          for (let i = 0; i < dbEntries.length; i += 48) {
-            const batch = dbEntries.slice(i, i + 48);
-            await Promise.all(batch.map(async ({ file, id: potentialChildId }) => {
-              const fullChildPath = join(this.conversationsDir, file);
-              const [st, walSt] = await Promise.all([
-                lstat(fullChildPath).catch(() => null),
-                lstat(`${fullChildPath}-wal`).catch(() => null),
-              ]);
-              if (!st || !st.isFile() || st.isSymbolicLink()) return;
-              const latestMtime = Math.max(st.mtimeMs, walSt?.mtimeMs ?? 0);
-              if (nowMs - latestMtime <= 30_000) {
-                found.push(potentialChildId);
-              }
-            }));
-          }
-          recentIds = found;
-          this.sniffDirCache = { at: nowMs, recentIds: found };
+    const hasSubagentEvidenceInMain = mainState.steps.some(
+      (s) =>
+        s.isSubagentStep ||
+        s.stepType === 132 ||
+        Boolean(s.toolCallName && SUBAGENT_TOOL_NAMES.has(s.toolCallName))
+    );
+
+    const isSubagentTrajectory = Boolean(
+      dbPathOverride || (mainState.hasParentMetadataBlob && mainState.referencedUuidsInMetaBlob.size > 0)
+    );
+    // 优先通过官方 conversation_summaries.db 索引表 O(log N) 精确检索全量子会话与分屏子智能体自身运行态
+    const indexedSummaryChildren = new Set<string>();
+    const terminalSummaryChildren = new Set<string>();
+    const runningSummaryChildren = new Set<string>();
+    let selfSummaryRunning = false;
+    let summariesIndexAvailable = false;
+    const shouldQueryChildrenInSummaries =
+      !dbPathOverride && (isSubagentRunning || hasActiveSubagentStep || hasSubagentEvidenceInMain || candidateChildIds.size > 0);
+    const shouldQuerySelfInSummaries = isSubagentTrajectory && mainIsRecent && !isStreaming;
+    if (shouldQueryChildrenInSummaries || shouldQuerySelfInSummaries) {
+      const selfIdentityIds = mainTrajLower ? [mainIdLower, mainTrajLower] : [mainIdLower];
+      const summaryLookup = await this.lookupIndexedChildrenFromSummariesDb(
+        shouldQueryChildrenInSummaries ? selfIdentityIds : [],
+        shouldQuerySelfInSummaries ? selfIdentityIds : []
+      );
+      summariesIndexAvailable = summaryLookup.available;
+      for (const indexedId of summaryLookup.childIds) {
+        if (indexedId !== mainIdLower && indexedId !== mainTrajLower) {
+          indexedSummaryChildren.add(indexedId);
+          candidateChildIds.add(indexedId);
         }
-        for (const potentialChildId of recentIds) {
+      }
+      for (const termId of summaryLookup.terminalChildIds) {
+        terminalSummaryChildren.add(termId);
+      }
+      for (const runId of summaryLookup.runningChildIds) {
+        runningSummaryChildren.add(runId);
+      }
+      selfSummaryRunning = summaryLookup.selfRunning;
+    }
+
+    // 反向子会话文件嗅探回退：仅当官方 summaries 索引库不存在或运行期尚未登记任何子会话时启用
+    const coldSniffRec = this.coldSniffedByDb.get(dbPath);
+    const needsColdHistoricalSniff =
+      !dbPathOverride &&
+      !summariesIndexAvailable &&
+      !(isSubagentRunning || hasActiveSubagentStep) &&
+      hasSubagentEvidenceInMain &&
+      (!coldSniffRec || coldSniffRec.fileId !== mainState.fileId || coldSniffRec.stepCount !== mainState.steps.length);
+    const needsActiveFallbackSniff =
+      !dbPathOverride &&
+      (isSubagentRunning || hasActiveSubagentStep) &&
+      (!summariesIndexAvailable || candidateChildIds.size === 0);
+    if (needsActiveFallbackSniff || needsColdHistoricalSniff) {
+      try {
+        const allEntries = await (this.sniffInFlight ??= (async () => {
+          try {
+            const dirStat = await lstat(this.conversationsDir).catch(() => null);
+            const dirMtimeMs = dirStat?.mtimeMs ?? -1;
+            const checkNow = Date.now();
+            const sniffCacheWindowMs = isSubagentRunning || hasActiveSubagentStep ? 800 : 2500;
+            if (
+              this.sniffDirCache &&
+              checkNow - this.sniffDirCache.at < sniffCacheWindowMs &&
+              this.sniffDirCache.dirMtimeMs === dirMtimeMs
+            ) {
+              return this.sniffDirCache.allEntries;
+            }
+            let dbEntries: Array<{ file: string; id: string }>;
+            if (dirStat && this.sniffDirListCache && this.sniffDirListCache.dirMtimeMs === dirStat.mtimeMs) {
+              dbEntries = this.sniffDirListCache.dbEntries;
+            } else {
+              const files = await readdir(this.conversationsDir).catch(() => [] as string[]);
+              dbEntries = [];
+              for (const file of files) {
+                if (!file.endsWith('.db') || file.length < 39) continue;
+                const potentialChildId = file.slice(0, -3).toLowerCase();
+                if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(potentialChildId)) {
+                  dbEntries.push({ file, id: potentialChildId });
+                }
+              }
+              if (dirStat) {
+                this.sniffDirListCache = { dirMtimeMs: dirStat.mtimeMs, dbEntries };
+              }
+            }
+            const found: Array<{ id: string; mtimeMs: number }> = [];
+            for (let i = 0; i < dbEntries.length; i += 48) {
+              const batch = dbEntries.slice(i, i + 48);
+              await Promise.all(batch.map(async ({ file, id: potentialChildId }) => {
+                const fullChildPath = join(this.conversationsDir, file);
+                const [st, walSt] = await Promise.all([
+                  lstat(fullChildPath).catch(() => null),
+                  lstat(`${fullChildPath}-wal`).catch(() => null),
+                ]);
+                if (!st || !st.isFile() || st.isSymbolicLink()) return;
+                const latestMtime = Math.max(st.mtimeMs, walSt?.mtimeMs ?? 0);
+                found.push({ id: potentialChildId, mtimeMs: latestMtime });
+              }));
+            }
+            this.sniffDirCache = { at: checkNow, dirMtimeMs, allEntries: found };
+            return found;
+          } finally {
+            this.sniffInFlight = null;
+          }
+        })());
+        let candidateEntries: Array<{ id: string; mtimeMs: number }>;
+        if (isSubagentRunning || hasActiveSubagentStep) {
+          candidateEntries = allEntries.filter((e) => nowMs - e.mtimeMs <= ACTIVE_DB_RECENCY_MS);
+        } else {
+          if (this.coldSniffedByDb.size >= MAX_CACHED_CONVERSATIONS && !this.coldSniffedByDb.has(dbPath)) {
+            const oldestCold = this.coldSniffedByDb.keys().next().value;
+            if (oldestCold !== undefined) this.coldSniffedByDb.delete(oldestCold);
+          }
+          this.coldSniffedByDb.set(dbPath, { fileId: mainState.fileId, stepCount: mainState.steps.length });
+          const mainLatestMs = Math.max(mainState.mtimeMs, mainState.walMtimeMs);
+          let minEpochSec = Number.POSITIVE_INFINITY;
+          let maxEpochSec = 0;
+          for (const stp of mainState.steps) {
+            for (const ts of [stp.startTimeSeconds, stp.createdAtSeconds, stp.endTimeSeconds, stp.completedAtSeconds, stp.finishedGeneratingSeconds]) {
+              if (typeof ts === 'number' && Number.isFinite(ts) && ts >= 946_684_800) {
+                if (ts < minEpochSec) minEpochSec = ts;
+                if (ts > maxEpochSec) maxEpochSec = ts;
+              }
+            }
+          }
+          const windowStartMs = Number.isFinite(minEpochSec)
+            ? Math.min(minEpochSec * 1000, mainLatestMs) - 120_000
+            : mainLatestMs - 3_600_000;
+          const windowEndMs = (maxEpochSec > 0 ? Math.max(maxEpochSec * 1000, mainLatestMs) : mainLatestMs) + 900_000;
+          candidateEntries = allEntries
+            .filter((e) => e.mtimeMs >= windowStartMs && e.mtimeMs <= windowEndMs)
+            .sort((a, b) => Math.abs(a.mtimeMs - mainLatestMs) - Math.abs(b.mtimeMs - mainLatestMs))
+            .slice(0, 32);
+        }
+        for (const { id: potentialChildId, mtimeMs: candidateMtime } of candidateEntries) {
           if (
             potentialChildId !== mainIdLower &&
             potentialChildId !== mainTrajLower &&
             !candidateChildIds.has(potentialChildId)
           ) {
+            const rejectKey = `${mainIdLower}::${mainTrajLower}::${potentialChildId}`;
+            const rejectedMtime = this.rejectedSniffMtimeByKey.get(rejectKey);
+            if (rejectedMtime !== undefined && rejectedMtime >= candidateMtime) continue;
             candidateChildIds.add(potentialChildId);
           }
         }
@@ -1989,29 +3432,35 @@ export class ConversationMetricsEngine {
         childId,
         parentId: mainIdLower,
         explicit: mainState.childConversationIds.has(childId),
-        sniffed: !mainState.childConversationIds.has(childId),
+        indexed: indexedSummaryChildren.has(childId),
+        sniffed: !mainState.childConversationIds.has(childId) && !indexedSummaryChildren.has(childId),
       }));
-      const descendants: ParsedConversationStep[] = [];
       const processedEdges = new Set<string>();
       const SUBAGENT_READ_CONCURRENCY = 4;
       while (pendingChildren.length > 0) {
         const wave: Array<{
-          edge: { childId: string; parentId: string; explicit: boolean; sniffed: boolean };
+          edge: { childId: string; parentId: string; explicit: boolean; indexed: boolean; sniffed: boolean };
           childId: string;
           childDbPath: string;
         }> = [];
         const waveChildIds = new Set<string>();
+        const deferredEdges: typeof pendingChildren = [];
         while (wave.length < SUBAGENT_READ_CONCURRENCY && pendingChildren.length > 0) {
-          const edge = pendingChildren[0]!;
+          const edge = pendingChildren.shift()!;
           const childId = edge.childId.toLowerCase();
-          if (waveChildIds.has(childId)) break;
-          pendingChildren.shift();
+          if (waveChildIds.has(childId)) {
+            deferredEdges.push(edge);
+            continue;
+          }
           const edgeKey = `${edge.parentId}::${childId}`;
           if (processedEdges.has(edgeKey) || verifiedChildIds.has(childId) ||
               childId === mainIdLower || childId === mainTrajLower) continue;
           processedEdges.add(edgeKey);
           waveChildIds.add(childId);
           wave.push({ edge, childId, childDbPath: this.resolveDbPath(childId) });
+        }
+        if (deferredEdges.length > 0) {
+          pendingChildren.unshift(...deferredEdges);
         }
         if (wave.length === 0) continue;
         const results = await Promise.all(wave.map(async (item) => {
@@ -2034,7 +3483,12 @@ export class ConversationMetricsEngine {
             failedChildCount++;
             continue;
           }
-          if (!childState) continue;
+          if (!childState) {
+            if (item.edge.indexed) {
+              verifiedChildIds.add(item.childId);
+            }
+            continue;
+          }
           const { edge, childId } = item;
           if (verifiedChildIds.has(childId)) continue;
           if (childState.fromErrorFallback) {
@@ -2042,7 +3496,7 @@ export class ConversationMetricsEngine {
           }
           const belongsToParent =
             childState.referencedUuidsInMetaBlob.has(edge.parentId) ||
-            (edge.explicit &&
+            ((edge.explicit || edge.indexed) &&
               (childState.referencedUuidsInMetaBlob.has(mainIdLower) ||
                 (mainTrajLower !== '' && childState.referencedUuidsInMetaBlob.has(mainTrajLower)))) ||
             (edge.sniffed &&
@@ -2053,55 +3507,159 @@ export class ConversationMetricsEngine {
             continue;
           }
           if (childState.hasParentMetadataBlob) {
-            if (!belongsToParent) continue;
-          } else if (!edge.explicit || childState.hasTrajectoryMeta) {
+            const indexedWithoutConflict =
+              edge.indexed && childState.referencedUuidsInMetaBlob.size === 0;
+            if (!belongsToParent && !indexedWithoutConflict) {
+              if (edge.sniffed) {
+                const rejectKey = `${mainIdLower}::${mainTrajLower}::${childId}`;
+                const latestChildMtime = Math.max(childState.mtimeMs, childState.walMtimeMs);
+                if (this.rejectedSniffMtimeByKey.size >= 1024 && !this.rejectedSniffMtimeByKey.has(rejectKey)) {
+                  const oldestReject = this.rejectedSniffMtimeByKey.keys().next().value;
+                  if (oldestReject !== undefined) this.rejectedSniffMtimeByKey.delete(oldestReject);
+                }
+                this.rejectedSniffMtimeByKey.set(rejectKey, latestChildMtime);
+              }
+              continue;
+            }
+          } else if (!edge.indexed && (!edge.explicit || childState.hasTrajectoryMeta)) {
             continue;
           }
           verifiedChildIds.add(childId);
           if (edge.sniffed) {
             mainState.verifiedSniffedChildren.add(childId);
+            let sniffRecord = this.verifiedSniffedChildrenByDb.get(dbPath);
+            if (!sniffRecord || sniffRecord.fileId !== mainState.fileId) {
+              sniffRecord = { fileId: mainState.fileId, stepCount: mainState.steps.length, children: new Set() };
+              if (this.verifiedSniffedChildrenByDb.size >= MAX_CACHED_CONVERSATIONS) {
+                const oldestSniffKey = this.verifiedSniffedChildrenByDb.keys().next().value;
+                if (oldestSniffKey !== undefined) this.verifiedSniffedChildrenByDb.delete(oldestSniffKey);
+              }
+            } else {
+              this.verifiedSniffedChildrenByDb.delete(dbPath);
+            }
+            sniffRecord.children.add(childId);
+            this.verifiedSniffedChildrenByDb.set(dbPath, sniffRecord);
           }
           totalSubagentSteps += childState.steps.length;
-          const recent = nowMs - Math.max(childState.mtimeMs, childState.walMtimeMs) <= ACTIVE_DB_RECENCY_MS;
+          const latestChildMtime = Math.max(childState.mtimeMs, childState.walMtimeMs);
+          const recent = nowMs - latestChildMtime <= ACTIVE_DB_RECENCY_MS;
           if (recent) {
             let childActive = false;
+            let childTurnTerminated = terminalSummaryChildren.has(childId);
             for (let idx = childState.steps.length - 1; idx >= 0; idx--) {
               const step = childState.steps[idx]!;
               if (step.stepType === 14) break;
-              if (step.stepType === 2 && step.status === 3) break;
+              if (step.stepType === 2 && (step.status === 3 || step.status === 5)) {
+                childTurnTerminated = true;
+                break;
+              }
+              if (idx === childState.steps.length - 1 && (step.status === 4 || step.status === 6 || step.status === 7)) {
+                childTurnTerminated = true;
+                break;
+              }
               if (ACTIVE_STEP_STATUSES.has(step.status)) {
                 childActive = true;
                 break;
               }
             }
+            if (!childTurnTerminated && runningSummaryChildren.has(childId)) {
+              childActive = true;
+            }
+            if (childActive) {
+              if (this.recentActiveChildUntilByDb.has(item.childDbPath)) {
+                this.recentActiveChildUntilByDb.delete(item.childDbPath);
+              } else if (this.recentActiveChildUntilByDb.size >= MAX_CACHED_CONVERSATIONS * 2) {
+                const oldestActiveKey = this.recentActiveChildUntilByDb.keys().next().value;
+                if (oldestActiveKey !== undefined) this.recentActiveChildUntilByDb.delete(oldestActiveKey);
+              }
+              this.recentActiveChildUntilByDb.set(item.childDbPath, nowMs + 12_000);
+  // 在活跃多子智能体并行期内，只要还有兄弟子库真正处于运行中且主库无否定收尾，保留刚写入且无 step_type=2 终结符的子库短过渡窗（仅防 15s 步间落库抖动，避免兄弟已彻底落定很久后拖尾虚高）
+            } else if (!childTurnTerminated && childState.steps.length > 0) {
+              const holdUntil = this.recentActiveChildUntilByDb.get(item.childDbPath) ?? 0;
+              const parentCorroboratesActive = Boolean(
+                isSubagentRunning || hasActiveSubagentStep || activeChildSubagents > 0 || runningSummaryChildren.size > 0
+              );
+              const childMidStepTransition =
+                nowMs - latestChildMtime <= 15_000 && parentCorroboratesActive;
+              if ((holdUntil > nowMs && parentCorroboratesActive) || childMidStepTransition) {
+                childActive = true;
+              } else if (holdUntil > 0 && !parentCorroboratesActive) {
+                this.recentActiveChildUntilByDb.delete(item.childDbPath);
+              }
+            } else if (childTurnTerminated) {
+              this.recentActiveChildUntilByDb.delete(item.childDbPath);
+            }
             if (childActive) {
               activeChildSubagents++;
+              activeVerifiedChildIds.add(childId);
             }
           }
-          descendants.push(...childState.steps);
+          const cg = childState.genMetadata;
+          const childFallbackGen: ParsedGenMetadata | undefined =
+            cg && (cg.responseModel || cg.modelDisplayName || cg.plannerModelName || cg.modelEnum)
+              ? {
+                  ...(cg.responseModel ? { responseModel: cg.responseModel } : {}),
+                  ...(cg.modelDisplayName ? { modelDisplayName: cg.modelDisplayName } : {}),
+                  ...(cg.plannerModelName ? { plannerModelName: cg.plannerModelName } : {}),
+                  ...(cg.modelEnum ? { modelEnum: cg.modelEnum } : {}),
+                }
+              : undefined;
+          for (const cStep of childState.steps) {
+            if (childFallbackGen && cStep.stepType === 15 && cStep.hasUsage && !cStep.generation && !cStep.modelName) {
+              descendants.push({ ...cStep, generation: childFallbackGen });
+            } else {
+              descendants.push(cStep);
+            }
+          }
+          for (const extraGen of childState.unmatchedUsageGenerations) {
+            childUnmatchedGenerations.push({
+              generation: extraGen.generation,
+              isChildStep: true,
+              timestampSeconds: extraGen.timestampSeconds,
+            });
+          }
           for (const nested of childState.childConversationIds) {
-            pendingChildren.push({ childId: nested, parentId: childId, explicit: true, sniffed: false });
+            pendingChildren.push({ childId: nested, parentId: childId, explicit: true, indexed: false, sniffed: false });
           }
         }
       }
-      combinedSteps = [...mainState.steps, ...descendants];
+      if (!mainState.fromErrorFallback && this.cache.has(dbPath)) {
+        this.setCachedState(dbPath, mainState);
+      }
     }
 
+    let latestMainModelStepPos = -1;
+    for (let i = mainState.steps.length - 1; i >= 0; i--) {
+      if (mainState.steps[i]!.stepType === 15) {
+        latestMainModelStepPos = i;
+        break;
+      }
+    }
     const normalizedContextSteps =
-      verifiedChildIds.size > 0 && activeChildSubagents === 0
-        ? mainState.steps.map((step) => {
-            if (
-              step.isSubagentStep &&
-              step.childConversationIds &&
-              step.childConversationIds.length > 0 &&
-              step.childConversationIds.every((cid) => verifiedChildIds.has(cid.toLowerCase())) &&
-              ACTIVE_STEP_STATUSES.has(step.status)
-            ) {
+      verifiedChildIds.size > 0
+        ? mainState.steps.map((step, idx) => {
+            if (!ACTIVE_STEP_STATUSES.has(step.status)) return step;
+            const isSubStep =
+              Boolean(step.isSubagentStep) ||
+              step.stepType === 127 ||
+              Boolean(step.toolCallName && SUBAGENT_TOOL_NAMES.has(step.toolCallName));
+            if (!isSubStep) return step;
+            if (step.childConversationIds && step.childConversationIds.length > 0) {
+              const allVerified = step.childConversationIds.every((cid) => verifiedChildIds.has(cid.toLowerCase()));
+              const noneActive = step.childConversationIds.every((cid) => !activeVerifiedChildIds.has(cid.toLowerCase()));
+              if (allVerified && noneActive) {
+                return { ...step, status: 3 };
+              }
+              return step;
+            }
+            // 无显式内联 UUID 的历史批次派发步（如通过 summaries/嗅探识别的 Swarm 步），若其后已有新的模型生成步或全部验证子库均已完结，不再重复占活跃位
+            if (failedChildCount === 0 && (activeChildSubagents === 0 || idx < latestMainModelStepPos)) {
               return { ...step, status: 3 };
             }
             return step;
           })
         : mainState.steps;
+    const combinedSteps = dbPathOverride ? normalizedContextSteps : [...normalizedContextSteps, ...descendants];
 
     const effectiveRunningSubagents = Math.max(runningSubagentCount, activeChildSubagents);
     const effectiveSubagentRunning = Boolean(isSubagentRunning || effectiveRunningSubagents > 0);
@@ -2121,18 +3679,37 @@ export class ConversationMetricsEngine {
       observedAt: mainState.observedAt,
       lastSuccessAt: mainState.lastSuccessAt,
       failedChildCount,
-      // 传入原始前台 isStreaming，使 buildConversationHudMetrics 能准确区分“前台模型生成（常亮蓝）”与“仅后台子智能体运行（呼吸蓝）”
-      isStreaming,
+      // 传入前台流式信号（分屏子智能体无独立停止按钮时结合 summaries.db 实锤 RUNNING 且末步未完结信号保活）
+      isStreaming: Boolean(
+        isStreaming ||
+          (selfSummaryRunning &&
+            mainIsRecent &&
+            !(() => {
+              const tail = normalizedContextSteps[normalizedContextSteps.length - 1];
+              if (!tail) return false;
+              if (tail.stepType === 2 && (tail.status === 3 || tail.status === 5)) return true;
+              return tail.status === 4 || tail.status === 6 || tail.status === 7;
+            })())
+      ),
       activityPhase,
       isSubagentRunning: effectiveSubagentRunning,
       runningSubagentCount: effectiveRunningSubagents,
       subagentCount: dbPathOverride ? undefined : verifiedChildIds.size,
       subagentSteps: totalSubagentSteps,
       totalStepsOverride: mainState.steps.length + totalSubagentSteps,
-      allowDbActiveStepInference: mainIsRecent || isStreaming || effectiveSubagentRunning,
+      allowDbActiveStepInference: mainIsRecent || isStreaming || effectiveSubagentRunning || selfSummaryRunning,
+      isSubagentTrajectory,
       modelId,
       pricingTable,
       genMetadata: mainState.genMetadata,
+      extraUsageGenerations: [
+        ...mainState.unmatchedUsageGenerations.map(item => ({
+          generation: item.generation,
+          isChildStep: false,
+          timestampSeconds: item.timestampSeconds,
+        })),
+        ...(dbPathOverride ? [] : childUnmatchedGenerations),
+      ],
       contextSteps: normalizedContextSteps,
       steps: combinedSteps,
     });
@@ -2142,6 +3719,16 @@ export class ConversationMetricsEngine {
 
   public clearCache(): void {
     this.cache.clear();
+    this.verifiedSniffedChildrenByDb.clear();
+    this.recentActiveChildUntilByDb.clear();
+    this.coldSniffedByDb.clear();
+    this.rejectedSniffMtimeByKey.clear();
+    this.summariesChildCache.clear();
+    this.summariesMissingUntilMs = 0;
     this.sniffDirCache = null;
+    this.sniffDirListCache = null;
+    this.sniffInFlight = null;
+    this.cachedPricingTable = null;
+    this.pricingResolveInFlight = null;
   }
 }

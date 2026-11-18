@@ -46,4 +46,44 @@ test('已暂停的汉化在重新启动时保持暂停，不为更新自动注�
  const child=spawn(process.execPath,['dist/main.js','--state-dir',dir,'--app','/nonexistent','--profile',dir,'--home-dir',dir,'--app-support-dir',dir,'--gemini-dir',dir],{stdio:'ignore',env:{...process.env,GRAVITYBOX_PROBE_LS:'false'}});
  try{await ready(dir);let status;for(let i=0;i<100;i++){status=await rpc(dir,{command:'status',includeTasks:false});if(status.status.mode==='paused')break;await pause(20);}assert.equal(status.status.mode,'paused');assert.equal(status.status.windows,0);assert.equal(JSON.parse(await readFile(join(dir,'runtime-preferences.json'),'utf8')).translationEnabled,false);}finally{await stop(child);}
 }));
+
+test('P0-01/P1-31：Controller 状态与错误不含未解析 backend 前缀，切语种清空旧错误并串行收敛', async () => {
+  const published = [];
+  const c = new Controller({
+    appPath: '/tmp/gravitybox-nonexistent-app.app',
+    profile: '/tmp/gravitybox-nonexistent-profile',
+    dictionary: dictionaryFromEntries({ Settings: '设置' }),
+    hudEnabled: false,
+    locale: 'zh-Hans',
+    configuredLanguage: 'zh-Hans',
+    onStatus: (s) => published.push(structuredClone(s)),
+  });
+  try {
+    assert.equal(c.status.message.includes('backend.status.'), false);
+    assert.notEqual(c.status.message, 'status.starting');
+    assert.equal(c.status.locale, 'zh-Hans');
+
+    c.status.errors = ['残留的旧语种错误'];
+    await c.setLocale('en', 'en', { hasTargetDictionary: false });
+    assert.equal(c.status.locale, 'en');
+    assert.equal(c.status.mode, 'paused');
+    assert.deepEqual(c.status.errors, []);
+    assert.equal(c.status.message.includes('backend.status.'), false);
+    assert.notEqual(c.status.message, 'status.paused');
+    assert.equal(/[\u3400-\u9fff]/.test(c.status.message), false);
+
+    await Promise.all([
+      c.configureShortcut(false),
+      c.pause(),
+      c.configureHud(false),
+      c.setLocale('zh-Hans', 'zh-Hans', { hasTargetDictionary: false }),
+      c.setLocale('en', 'en', { hasTargetDictionary: false }),
+    ]);
+    assert.equal(c.status.locale, 'en');
+    assert.equal(c.status.mode, 'paused');
+    assert.equal(published.every((s) => !s.message.includes('backend.status.')), true);
+  } finally {
+    await c.stop();
+  }
+});
 });

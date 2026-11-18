@@ -1,10 +1,17 @@
 import Cocoa
 
 final class MenuPanelController: NSViewController {
-    static let panelWidth: CGFloat = 396
+    static let panelWidth: CGFloat = 424
     static let defaultPanelHeight: CGFloat = 535
     static let periods = ["today", "7d", "30d", "all"]
-    static let periodLabels = ["今日", "近 7 天", "近 30 天", "全部"]
+    static var periodLabels: [String] {
+        [
+            L10n.t("menu_panel.period.today", fallback: "今日"),
+            L10n.t("menu_panel.period.7d", fallback: "近 7 天"),
+            L10n.t("menu_panel.period.30d", fallback: "近 30 天"),
+            L10n.t("menu_panel.period.all", fallback: "全部")
+        ]
+    }
 
     unowned let app: Assistant
 
@@ -23,12 +30,12 @@ final class MenuPanelController: NSViewController {
 
     // Tab 0: Usage Controls
     let periodSelector: MenuSegmentedTabsView
-    let usageScopeLabel = text("本机历史用量 · 非按账号归属", size: 11, color: Design.secondary, wrap: true)
+    let usageScopeLabel = text(L10n.t("menu_panel.usage_scope_default", fallback: "本机历史用量 · 非按账号归属"), size: 11, color: Design.secondary, wrap: true)
     let tokensTile: MenuMetricTileView
     let requestsTile: MenuMetricTileView
     let costTile: MenuMetricTileView
     let cacheTile: MenuMetricTileView
-    let trendTitleLabel = text("今日趋势", size: 12.5, weight: .semibold, color: .labelColor)
+    let trendTitleLabel = text(L10n.t("menu_panel.trend.today", fallback: "今日趋势"), size: 12.5, weight: .semibold, color: .labelColor)
     let trendCoverageLabel = text("", size: 10.5, color: Design.secondary)
     let chartDimensionToggle: MenuSegmentedTabsView
     let trendChart = MenuTrendChartView()
@@ -37,35 +44,34 @@ final class MenuPanelController: NSViewController {
     private var modelRowViewsByName: [String: MenuModelUsageItemView] = [:]
     private var modelDividerViewsByName: [String: NSView] = [:]
     private var renderedModelNames: [String] = []
-    let toggleModelsButton = button("展开其余模型", target: nil, action: #selector(toggleAllModelsPressed))
+    let toggleModelsButton = button(L10n.t("menu_panel.expand_other_models", fallback: "展开其余模型"), target: nil, action: #selector(toggleAllModelsPressed))
     let usageFooterLabel = text("", size: 11, color: Design.secondary, wrap: true)
 
     // Tab 1: Quota Controls
-    let quotaAccountNameLabel = text("正在读取账号…", size: 15, weight: .semibold, color: .labelColor)
-    let quotaTierBadge = pillBadge("", color: Design.blue)
-    let quotaStatusBadge = pillBadge("已选记录", color: Design.blue)
+    let quotaAccountNameLabel = text(L10n.t("menu_panel.quota.loading", fallback: "正在读取账号…"), size: 15, weight: .semibold, color: .labelColor)
+    let quotaTierBadge = tierBadge("", scale: .regular)
+    let quotaStatusBadge = pillBadge("", color: Design.blue)
     let quotaEmailLabel = text("", size: 11, color: .secondaryLabelColor, wrap: true)
-    let quotaGemini5h = MenuMeterRow(title: "5 小时")
-    let quotaGeminiWeekly = MenuMeterRow(title: "每周")
-    let quotaClaude5h = MenuMeterRow(title: "5 小时")
-    let quotaClaudeWeekly = MenuMeterRow(title: "每周")
-    let quotaArgon = MenuMeterRow(title: "每周")
-    let quotaCarbon = MenuMeterRow(title: "每周")
-    let quotaExtraStandaloneStack = NSStackView()
+    /// @testonly 保留供 native-ui 单测读取首个配额进度条快照，生产界面统一通过 quotaGroupsContainer 渲染。
+    private(set) var quotaGemini5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时"))
+    private(set) var quotaGeminiWeekly = MenuMeterRow(title: L10n.t("common.period.weekly", fallback: "每周"))
+    private(set) var quotaClaude5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时"))
+    private(set) var quotaClaudeWeekly = MenuMeterRow(title: L10n.t("common.period.weekly", fallback: "每周"))
+    let quotaUnifiedContentStack = NSStackView()
     let quotaWarningLabel = text("", size: 11, color: accessibleWarningColor(), wrap: true)
     let quotaFooterLabel = text("", size: 11, color: .secondaryLabelColor, wrap: true)
     let quotaGroupsContainer = NSStackView()
-    let quotaEmptyButton = button("前往账号页添加…", target: nil, action: #selector(openAccountsFromQuotaEmpty))
+    let quotaEmptyButton = button(L10n.t("menu_panel.quota.go_add_account", fallback: "前往账号页添加…"), target: nil, action: #selector(openAccountsFromQuotaEmpty))
 
     // Tab 2: Accounts Controls
-    let accountsCountLabel = text("0 个", size: 11, color: Design.secondary)
+    let accountsCountLabel = text(L10n.t("menu_panel.accounts.count", ["count": 0], fallback: "0 个账号"), size: 11, color: Design.secondary)
     let accountsCardsStack = NSStackView()
     private var accountCardsById: [String: MenuExpandableAccountCardView] = [:]
     private var renderedAccountIds: [String] = []
 
     // Bottom Bar
-    let openAntigravityBtn = button("打开 Antigravity", target: nil, action: #selector(openAntigravityFromFooter))
-    let openMainBtn = button("打开主界面 ↗", target: nil, action: #selector(openMainFromFooter))
+    let openAntigravityBtn = button(L10n.t("sidebar.open_antigravity", fallback: "打开 Antigravity"), target: nil, action: #selector(openAntigravityFromFooter))
+    let openMainBtn = button(L10n.t("menu_panel.footer.open_main", fallback: "打开主界面 ↗"), target: nil, action: #selector(openMainFromFooter))
 
     // State
     private(set) var selectedTab: Int = 0
@@ -76,6 +82,8 @@ final class MenuPanelController: NSViewController {
     private var hasInitializedExpandedAccount = false
     private var renderedUsageSnapshotKey = ""
     private var renderedUsageModelKey = ""
+    private var renderedQuotaTabKey = ""
+    private var lastMeasuredContentFingerprint = ""
     private var quotaHeaderEmail: String = ""
     private var activePeriodTrendNote: String = ""
 
@@ -91,18 +99,35 @@ final class MenuPanelController: NSViewController {
         self.selectedPeriod = initialPeriod
         self.selectedChartDimension = initialDim
 
-        self.headerRefreshButton = InlineRefreshButton("刷新", width: 68, target: nil, action: #selector(refreshPressed))
+        self.headerRefreshButton = InlineRefreshButton(L10n.t("common.refresh", fallback: "刷新"), width: 78, target: nil, action: #selector(refreshPressed))
         self.moreButton = DesignButton(title: "", target: nil, action: #selector(morePressed))
-        self.moreButton.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "更多操作")
+        self.moreButton.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: L10n.t("menu.more_actions", fallback: "更多操作"))
         self.moreButton.imagePosition = .imageOnly
-        self.tabSelector = MenuSegmentedTabsView(items: ["用量", "配额", "账号"], style: .primaryTabs, selected: initialTab, accessibilityLabel: "菜单栏一级分页")
-        self.periodSelector = MenuSegmentedTabsView(items: Self.periodLabels, style: .secondaryRange, selected: initialPeriod, accessibilityLabel: "用量统计时间范围")
-        self.chartDimensionToggle = MenuSegmentedTabsView(items: ["Token", "请求"], style: .compactToggle, selected: initialDim == .requests ? 1 : 0, accessibilityLabel: "趋势图统计维度")
+        self.tabSelector = MenuSegmentedTabsView(
+            items: [
+                L10n.t("menu_panel.tab.usage", fallback: "用量"),
+                L10n.t("menu_panel.tab.quota", fallback: "配额"),
+                L10n.t("menu_panel.tab.accounts", fallback: "账号")
+            ],
+            style: .primaryTabs,
+            selected: initialTab,
+            accessibilityLabel: L10n.t("menu_panel.tabs_a11y", fallback: "菜单栏一级分页")
+        )
+        self.periodSelector = MenuSegmentedTabsView(items: Self.periodLabels, style: .secondaryRange, selected: initialPeriod, accessibilityLabel: L10n.t("menu_panel.period_a11y", fallback: "用量统计时间范围"))
+        self.chartDimensionToggle = MenuSegmentedTabsView(
+            items: [
+                L10n.t("menu_panel.dim.tokens", fallback: "Token"),
+                L10n.t("menu_panel.dim.requests", fallback: "请求")
+            ],
+            style: .compactToggle,
+            selected: initialDim == .requests ? 1 : 0,
+            accessibilityLabel: L10n.t("menu_panel.dim_a11y", fallback: "趋势图统计维度")
+        )
 
-        self.tokensTile = MenuMetricTileView(key: "tokens", title: "Token 用量")
-        self.requestsTile = MenuMetricTileView(key: "requests", title: "请求数")
-        self.costTile = MenuMetricTileView(key: "cost", title: "API 费用估算")
-        self.cacheTile = MenuMetricTileView(key: "cache", title: "缓存命中率")
+        self.tokensTile = MenuMetricTileView(key: "tokens", title: L10n.t("menu_panel.tile.tokens", fallback: "Token 用量"))
+        self.requestsTile = MenuMetricTileView(key: "requests", title: L10n.t("menu_panel.tile.requests", fallback: "请求数"))
+        self.costTile = MenuMetricTileView(key: "cost", title: L10n.t("menu_panel.tile.cost", fallback: "API 费用估算"))
+        self.cacheTile = MenuMetricTileView(key: "cache", title: L10n.t("menu_panel.tile.cache", fallback: "缓存命中率"))
 
         super.init(nibName: nil, bundle: nil)
 
@@ -110,7 +135,7 @@ final class MenuPanelController: NSViewController {
         headerRefreshButton.refusesFirstResponder = false
         moreButton.target = self
         moreButton.refusesFirstResponder = false
-        moreButton.setAccessibilityLabel("更多操作")
+        moreButton.setAccessibilityLabel(L10n.t("menu.more_actions", fallback: "更多操作"))
         moreButton.toolTip = nil
         moreButton.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -122,7 +147,7 @@ final class MenuPanelController: NSViewController {
         toggleModelsButton.controlSize = .small
         quotaEmptyButton.target = self
         quotaEmptyButton.controlSize = .small
-        openAntigravityBtn.title = "打开 Antigravity"
+        openAntigravityBtn.title = L10n.t("sidebar.open_antigravity", fallback: "打开 Antigravity")
         openAntigravityBtn.target = self
         openAntigravityBtn.controlSize = .small
         openMainBtn.target = self
@@ -137,11 +162,11 @@ final class MenuPanelController: NSViewController {
             guard let self else { return }
             if let b = bucket {
                 if b.isFuture {
-                    self.trendCoverageLabel.stringValue = "\(b.tooltipLabel) · 尚未到达"
+                    self.trendCoverageLabel.stringValue = L10n.t("menu_panel.hover.future", ["label": b.tooltipLabel], fallback: "\(b.tooltipLabel) · 尚未到达")
                 } else if self.selectedChartDimension == .tokens {
-                    self.trendCoverageLabel.stringValue = "\(b.tooltipLabel) · \(InterfaceText.formatCompactTokens(b.value, formatSmallWithLocale: true)) Token"
+                    self.trendCoverageLabel.stringValue = L10n.t("menu_panel.hover.tokens", ["label": b.tooltipLabel, "tokens": InterfaceText.formatCompactTokens(b.value, formatSmallWithLocale: true)], fallback: "\(b.tooltipLabel) · \(InterfaceText.formatCompactTokens(b.value, formatSmallWithLocale: true)) Token")
                 } else {
-                    self.trendCoverageLabel.stringValue = "\(b.tooltipLabel) · \(b.value.formatted()) 次请求"
+                    self.trendCoverageLabel.stringValue = L10n.t("menu_panel.hover.requests", ["label": b.tooltipLabel, "count": InterfaceText.formatInteger(b.value)], fallback: "\(b.tooltipLabel) · \(InterfaceText.formatInteger(b.value)) 次请求")
                 }
                 self.trendCoverageLabel.alphaValue = 1.0
             } else {
@@ -322,7 +347,7 @@ final class MenuPanelController: NSViewController {
         trendCard.borderColor = Design.popoverCardBorder
 
         modelsHeaderCountLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        let modelsHeader = horizontal([text("模型用量", size: 12.5, weight: .semibold, color: .labelColor), flexibleSpace(), modelsHeaderCountLabel], spacing: 8)
+        let modelsHeader = horizontal([text(L10n.t("menu_panel.models_header", fallback: "模型用量"), size: 12.5, weight: .semibold, color: .labelColor), flexibleSpace(), modelsHeaderCountLabel], spacing: 8)
         modelsHeader.alignment = .centerY
         modelsListStack.orientation = .vertical
         modelsListStack.alignment = .leading
@@ -364,7 +389,7 @@ final class MenuPanelController: NSViewController {
         quotaEmailLabel.lineBreakMode = .byTruncatingMiddle
 
         let copyMenu = NSMenu()
-        let copyItem = NSMenuItem(title: "复制完整邮箱", action: #selector(copyQuotaHeaderEmail), keyEquivalent: "")
+        let copyItem = NSMenuItem(title: L10n.t("common.copy_full_email", fallback: "复制完整邮箱"), action: #selector(copyQuotaHeaderEmail), keyEquivalent: "")
         copyItem.target = self
         copyMenu.addItem(copyItem)
         quotaEmailLabel.menu = copyMenu
@@ -380,50 +405,12 @@ final class MenuPanelController: NSViewController {
         identityCard.fillColor = Design.popoverCardBackground
         identityCard.borderColor = Design.popoverCardBorder
 
-        let geminiHeader = MenuQuotaHelpers.groupHeader("Gemini", brands: ["gemini"])
-        let geminiStack = vertical([geminiHeader, quotaGemini5h, quotaGeminiWeekly], spacing: 6)
-        fillWidth(geminiHeader, in: geminiStack)
-        fillWidth(quotaGemini5h, in: geminiStack)
-        fillWidth(quotaGeminiWeekly, in: geminiStack)
+        quotaUnifiedContentStack.orientation = .vertical
+        quotaUnifiedContentStack.alignment = .leading
+        quotaUnifiedContentStack.spacing = 8
+        quotaUnifiedContentStack.detachesHiddenViews = true
 
-        let claudeHeader = MenuQuotaHelpers.groupHeader("Claude/GPT", brands: ["claude", "openai"])
-        let claudeStack = vertical([claudeHeader, quotaClaude5h, quotaClaudeWeekly], spacing: 6)
-        fillWidth(claudeHeader, in: claudeStack)
-        fillWidth(quotaClaude5h, in: claudeStack)
-        fillWidth(quotaClaudeWeekly, in: claudeStack)
-
-        quotaArgon.accessibilityGroupName = "Gemini 4 Argon"
-        let argonHeader = MenuQuotaHelpers.groupHeader("Gemini 4 Argon", brands: ["gemini"])
-        let argonStack = vertical([argonHeader, quotaArgon], spacing: 6)
-        fillWidth(argonHeader, in: argonStack)
-        fillWidth(quotaArgon, in: argonStack)
-
-        quotaCarbon.accessibilityGroupName = "Gemini 4 Carbon"
-        let carbonHeader = MenuQuotaHelpers.groupHeader("Gemini 4 Carbon", brands: ["gemini"])
-        let carbonStack = vertical([carbonHeader, quotaCarbon], spacing: 6)
-        fillWidth(carbonHeader, in: carbonStack)
-        fillWidth(quotaCarbon, in: carbonStack)
-
-        quotaExtraStandaloneStack.orientation = .vertical
-        quotaExtraStandaloneStack.alignment = .leading
-        quotaExtraStandaloneStack.spacing = 8
-        quotaExtraStandaloneStack.isHidden = true
-        quotaExtraStandaloneStack.detachesHiddenViews = true
-
-        let unifiedQuotaContent = vertical([
-            geminiStack,
-            divider(),
-            claudeStack,
-            divider(),
-            argonStack,
-            divider(),
-            carbonStack,
-            quotaExtraStandaloneStack
-        ], spacing: 8)
-        unifiedQuotaContent.detachesHiddenViews = true
-        for v in unifiedQuotaContent.arrangedSubviews { fillWidth(v, in: unifiedQuotaContent) }
-
-        let quotaUnifiedCard = group([unifiedQuotaContent], inset: 12)
+        let quotaUnifiedCard = group([quotaUnifiedContentStack], inset: 12)
         quotaUnifiedCard.cornerRadius = Design.Radius.medium
         quotaUnifiedCard.fillColor = Design.popoverCardBackground
         quotaUnifiedCard.borderColor = Design.popoverCardBorder
@@ -453,7 +440,7 @@ final class MenuPanelController: NSViewController {
         accountsRoot.detachesHiddenViews = true
 
         accountsCountLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        let topRow = horizontal([text("已保存账号", size: 12.5, weight: .semibold, color: .labelColor), flexibleSpace(), accountsCountLabel], spacing: 8)
+        let topRow = horizontal([text(L10n.t("menu_panel.accounts.section_title", fallback: "已保存账号"), size: 12.5, weight: .semibold, color: .labelColor), flexibleSpace(), accountsCountLabel], spacing: 8)
         topRow.alignment = .centerY
 
         accountsCardsStack.orientation = .vertical
@@ -595,15 +582,15 @@ final class MenuPanelController: NSViewController {
         usageRoot.isHidden = (selectedTab != 0)
         quotaRoot.isHidden = (selectedTab != 1)
         accountsRoot.isHidden = (selectedTab != 2)
-        headerRefreshButton.title = "刷新"
+        headerRefreshButton.title = L10n.t("common.refresh", fallback: "刷新")
         headerRefreshButton.toolTip = nil
         switch selectedTab {
         case 0:
-            openMainBtn.title = "打开用量页 ↗"
+            openMainBtn.title = L10n.t("menu_panel.footer.open_usage", fallback: "打开用量页 ↗")
         case 1:
-            openMainBtn.title = "打开总览页 ↗"
+            openMainBtn.title = L10n.t("menu_panel.footer.open_overview", fallback: "打开总览页 ↗")
         default:
-            openMainBtn.title = "打开账号页 ↗"
+            openMainBtn.title = L10n.t("menu_panel.footer.open_accounts", fallback: "打开账号页 ↗")
         }
         if resetScroll {
             contentScroll.contentView.scroll(to: .zero)
@@ -618,7 +605,7 @@ final class MenuPanelController: NSViewController {
             let periodKey = Self.periods[selectedPeriod]
             app.fetchUsageSummary(period: periodKey, force: force)
         case 1:
-            if app.cachedAccounts.isEmpty {
+            if app.cachedAccounts.isEmpty || app.bootstrappedAccounts {
                 app.fetchAccountList(notifyPage: true)
             } else if force {
                 if let active = app.resolvedMenuAccount(), let id = active["id"] as? String, !id.isEmpty {
@@ -628,7 +615,7 @@ final class MenuPanelController: NSViewController {
                 }
             }
         default:
-            if app.cachedAccounts.isEmpty {
+            if app.cachedAccounts.isEmpty || app.bootstrappedAccounts {
                 app.fetchAccountList(notifyPage: true)
             } else if force {
                 app.refreshAccountQuotas()
@@ -673,11 +660,11 @@ final class MenuPanelController: NSViewController {
     func onUsageReportUpdated(period: String, result: Result<[String: Any], Error>) {
         guard isViewLoaded else { return }
         let currentPeriodKey = Self.periods[selectedPeriod]
-        if period == currentPeriodKey, selectedTab == 0 {
-            performWithoutAnimation {
+        performWithoutAnimation {
+            if period == currentPeriodKey, selectedTab == 0 {
                 syncUsageTabFromCache()
-                syncHeaderRefreshState()
             }
+            syncHeaderRefreshState()
         }
     }
 
@@ -692,6 +679,13 @@ final class MenuPanelController: NSViewController {
                 syncQuotaTab()
             default:
                 syncAccountsTab()
+            }
+        }
+        if app.reachable && (app.menuTracking || app.menuPopover?.isShown == true) && selectedTab == 0 {
+            let periodKey = Self.periods[selectedPeriod]
+            let needsInitialOrLiveUsage = app.cachedUsageReportsByPeriod[periodKey] == nil || app.bootstrappedUsagePeriods.contains(periodKey)
+            if needsInitialOrLiveUsage && app.usageInFlightByPeriod[periodKey] != true && app.usageFetchErrorsByPeriod[periodKey] == nil {
+                app.fetchUsageSummary(period: periodKey, force: false)
             }
         }
     }
@@ -719,22 +713,29 @@ final class MenuPanelController: NSViewController {
     private func syncUsageTabFromCache() {
         let periodKey = Self.periods[selectedPeriod]
         let periodLabel = Self.periodLabels[selectedPeriod]
-        trendTitleLabel.stringValue = selectedPeriod == 0 ? "今日趋势" : (selectedPeriod == 3 ? "全部趋势" : "\(periodLabel)趋势")
+        if selectedPeriod == 0 {
+            trendTitleLabel.stringValue = L10n.t("menu_panel.trend.today", fallback: "今日趋势")
+        } else if selectedPeriod == 3 {
+            trendTitleLabel.stringValue = L10n.t("menu_panel.trend.all", fallback: "全部趋势")
+        } else {
+            trendTitleLabel.stringValue = L10n.t("menu_panel.trend.period", ["period": periodLabel], fallback: "\(periodLabel)趋势")
+        }
 
         guard let report = app.cachedUsageReportsByPeriod[periodKey] else {
+            clearMenuUsageChartsAndModels()
             if let err = app.usageFetchErrorsByPeriod[periodKey], !err.isEmpty {
-                usageScopeLabel.stringValue = "读取失败：\(err)"
+                usageScopeLabel.stringValue = L10n.t("menu_panel.usage.read_failed", ["error": err], fallback: "读取失败：\(err)")
                 usageScopeLabel.textColor = accessibleWarningColor()
                 usageScopeLabel.isHidden = false
                 for tile in [tokensTile, requestsTile, costTile, cacheTile] { tile.setValueText("—") }
-                usageFooterLabel.stringValue = "无法读取统计 · 点击右上角「刷新」重试"
+                usageFooterLabel.stringValue = L10n.t("menu_panel.usage.retry_footer", fallback: "无法读取统计 · 点击右上角「刷新」重试")
                 usageFooterLabel.textColor = accessibleWarningColor()
             } else if !app.reachable {
-                usageScopeLabel.stringValue = "正在等待本机服务…"
+                usageScopeLabel.stringValue = L10n.t("menu_panel.usage.waiting_service", fallback: "正在等待本机服务…")
                 usageScopeLabel.textColor = Design.secondary
                 usageScopeLabel.isHidden = false
                 for tile in [tokensTile, requestsTile, costTile, cacheTile] { tile.setValueText("—") }
-                usageFooterLabel.stringValue = "本机服务离线"
+                usageFooterLabel.stringValue = L10n.t("menu_panel.usage.service_offline", fallback: "本机服务离线")
                 usageFooterLabel.textColor = accessibleWarningColor()
             } else {
                 usageScopeLabel.isHidden = true
@@ -745,14 +746,12 @@ final class MenuPanelController: NSViewController {
         let summary = report["summary"] as? [String: Any] ?? [:]
         let availability = summary["availability"] as? String ?? "complete"
         if availability == "unavailable" {
-            usageScopeLabel.stringValue = "所选会话数据库均读取失败"
+            usageScopeLabel.stringValue = L10n.t("menu_panel.usage.db_unavailable", fallback: "所选会话数据库均读取失败")
             usageScopeLabel.textColor = accessibleWarningColor()
             usageScopeLabel.isHidden = false
             for tile in [tokensTile, requestsTile, costTile, cacheTile] { tile.setValueText("—", warning: true) }
-            trendChart.buckets = []
-            modelsListStack.arrangedSubviews.forEach { modelsListStack.removeArrangedSubview($0); $0.removeFromSuperview() }
-            renderedModelNames.removeAll()
-            usageFooterLabel.stringValue = "统计暂不可用 · 可打开主界面查看诊断详情"
+            clearMenuUsageChartsAndModels()
+            usageFooterLabel.stringValue = L10n.t("menu_panel.usage.stats_unavailable", fallback: "统计暂不可用 · 可打开主界面查看诊断详情")
             usageFooterLabel.textColor = accessibleWarningColor()
             return
         }
@@ -762,7 +761,8 @@ final class MenuPanelController: NSViewController {
         let usd = doubleVal(summary, "estimatedUsd")
         let prompt = intVal(summary, "promptTokens")
         let cached = intVal(summary, "cachedTokens")
-        let denom = prompt + cached
+        let cacheWrite = intVal(summary, "cacheWriteTokens", fallback: intVal(summary, "cache_write_tokens"))
+        let denom = prompt + cached + cacheWrite
         let cacheHit = doubleVal(summary, "cacheHitRate", fallback: denom > 0 ? (Double(cached) / Double(denom)) * 100.0 : 0.0)
         let pricedCount = intVal(summary, "pricedModels", fallback: intVal(summary, "priced_models"))
         let unpricedCount = intVal(summary, "unpricedModels", fallback: intVal(summary, "unpriced_models"))
@@ -783,10 +783,11 @@ final class MenuPanelController: NSViewController {
 
         tokensTile.setValueText(InterfaceText.formatCompactTokens(total, formatSmallWithLocale: true))
         tokensTile.toolTip = nil
-        requestsTile.setValueText("\(requests.formatted())")
+        requestsTile.setValueText(InterfaceText.formatInteger(requests))
         let isAllUnpriced = unpricedCount > 0 && pricedCount == 0 && total > 0 && usd == 0
-        costTile.setValueText(isAllUnpriced ? "未计价" : (unpricedCount > 0 ? "部分 " : "") + InterfaceText.formatUsd(usd))
-        cacheTile.setValueText(denom > 0 ? String(format: "%.1f%%", cacheHit) : "—")
+        let partialPrefix = unpricedCount > 0 ? L10n.t("menu_panel.usage.partial_prefix", fallback: "部分 ") : ""
+        costTile.setValueText(isAllUnpriced ? L10n.t("menu_panel.usage.unpriced", fallback: "未计价") : partialPrefix + InterfaceText.formatUsd(usd))
+        cacheTile.setValueText(denom > 0 ? String(format: "%.1f%%", locale: Locale(identifier: "en_US_POSIX"), cacheHit) : "—")
 
         let snapKey = "\(report["snapshotId"] ?? ""):\(periodKey):\(selectedChartDimension.rawValue):\(total):\(requests):\(failed):\(unknown)"
         if snapKey != renderedUsageSnapshotKey {
@@ -795,26 +796,44 @@ final class MenuPanelController: NSViewController {
         }
 
         let models = (report["byModel"] as? [[String: Any]]) ?? (report["models"] as? [[String: Any]]) ?? []
-        let modelKey = "\(report["snapshotId"] ?? ""):\(periodKey):\(models.count):\(showAllModels):\(total)"
+        let modelKey = "\(L10n.shared.currentLocale):\(report["snapshotId"] ?? ""):\(periodKey):\(models.count):\(showAllModels):\(total)"
         if modelKey != renderedUsageModelKey {
             renderedUsageModelKey = modelKey
             rebuildMenuModelList(models: models, totalTokens: total)
         }
 
         let lastScan = doubleVal(summary, "lastScannedAt", fallback: doubleVal(summary, "generated_at"))
-        let timeStr = lastScan > 0 ? Self.timeFormatter.string(from: Date(timeIntervalSince1970: lastScan)) : "刚刚"
-        var footerParts: [String] = ["更新于 \(timeStr)"]
+        let timeStr = lastScan > 0 ? Self.timeFormatter.string(from: Date(timeIntervalSince1970: lastScan)) : L10n.t("common.just_now", fallback: "刚刚")
+        var footerParts: [String] = [L10n.t("common.updated_at", ["time": timeStr], fallback: "更新于 \(timeStr)")]
         if let fetchErr = app.usageFetchErrorsByPeriod[periodKey], !fetchErr.isEmpty {
-            footerParts.append("刷新失败 · 沿用上次记录")
+            footerParts.append(L10n.t("menu_panel.usage.refresh_failed_cached", fallback: "刷新失败 · 沿用上次记录"))
         } else if availability == "cached" {
-            footerParts.append("沿用缓存快照")
+            footerParts.append(L10n.t("menu_panel.usage.cached_snapshot", fallback: "沿用缓存快照"))
         } else if failed > 0 {
-            footerParts.append("\(failed) 个会话库异常")
+            footerParts.append(L10n.t("menu_panel.usage.failed_dbs", ["count": failed], fallback: "\(failed) 个会话库异常"))
         }
         usageFooterLabel.stringValue = footerParts.joined(separator: " · ")
         usageFooterLabel.textColor = (app.usageFetchErrorsByPeriod[periodKey] != nil || failed > 0 || availability == "cached")
             ? accessibleWarningColor()
             : Design.secondary
+    }
+
+    private func clearMenuUsageChartsAndModels() {
+        renderedUsageSnapshotKey = ""
+        renderedUsageModelKey = ""
+        trendChart.buckets = []
+        activePeriodTrendNote = ""
+        trendCoverageLabel.stringValue = ""
+        trendCoverageLabel.alphaValue = 0.0
+        modelsListStack.arrangedSubviews.forEach {
+            modelsListStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+        modelRowViewsByName.removeAll()
+        modelDividerViewsByName.removeAll()
+        renderedModelNames.removeAll()
+        modelsHeaderCountLabel.stringValue = ""
+        toggleModelsButton.isHidden = true
     }
 
     private func updateMenuTrendBuckets(report: [String: Any], summary: [String: Any]) {
@@ -833,10 +852,12 @@ final class MenuPanelController: NSViewController {
             let currentHour = Calendar.current.component(.hour, from: Date())
             var pts: [MenuTrendChartView.Bucket] = []
             for hr in 0..<24 {
-                let key = String(format: "%02d:00", hr)
+                let key = String(format: "%02d:00", locale: Locale(identifier: "en_US_POSIX"), hr)
                 let rawVal = hourValMap[key] ?? 0
                 let isFuture = (rawVal == 0 && hr > currentHour)
-                pts.append(.init(label: String(format: "%02d时", hr), tooltipLabel: "今日 \(key)", value: rawVal, isFuture: isFuture))
+                let hourLbl = L10n.t("menu_panel.trend.hour_label", ["hour": String(format: "%02d", locale: Locale(identifier: "en_US_POSIX"), hr)], fallback: String(format: "%02d时", locale: Locale(identifier: "en_US_POSIX"), hr))
+                let tipLbl = L10n.t("menu_panel.trend.today_key", ["time": key], fallback: "今日 \(key)")
+                pts.append(.init(label: hourLbl, tooltipLabel: tipLbl, value: rawVal, isFuture: isFuture))
             }
             trendChart.buckets = pts
             activePeriodTrendNote = ""
@@ -871,7 +892,7 @@ final class MenuPanelController: NSViewController {
             }
             trendChart.buckets = monthOrder.map { m in
                 let shortLbl = m.count >= 7 ? String(m.suffix(5)) : m
-                return .init(label: shortLbl, tooltipLabel: "\(m) 月汇总", value: monthTotals[m] ?? 0, isFuture: false)
+                return .init(label: shortLbl, tooltipLabel: L10n.t("menu_panel.trend.month_summary", ["month": m], fallback: "\(m) 月汇总"), value: monthTotals[m] ?? 0, isFuture: false)
             }
         } else if selectedPeriod == 3 && targetSlice.count > 31 {
             // 按 7 天周桶聚合
@@ -890,7 +911,7 @@ final class MenuPanelController: NSViewController {
                         : intVal(item, "request_count", fallback: intVal(item, "requestCount"))
                     return acc + v
                 }
-                buckets.append(.init(label: shortStart, tooltipLabel: "\(startD) 至 \(endD)", value: sumVal, isFuture: false))
+                buckets.append(.init(label: shortStart, tooltipLabel: L10n.t("menu_panel.trend.date_range", ["start": startD, "end": endD], fallback: "\(startD) 至 \(endD)"), value: sumVal, isFuture: false))
                 idx = endIdx
             }
             trendChart.buckets = buckets
@@ -910,7 +931,7 @@ final class MenuPanelController: NSViewController {
     }
 
     private func rebuildMenuModelList(models: [[String: Any]], totalTokens: Int) {
-        modelsHeaderCountLabel.stringValue = models.isEmpty ? "暂无记录" : "\(models.count) 个模型"
+        modelsHeaderCountLabel.stringValue = models.isEmpty ? L10n.t("menu_panel.models_none", fallback: "暂无记录") : L10n.t("menu_panel.models_count", ["count": models.count], fallback: "\(models.count) 个模型")
 
         guard !models.isEmpty else {
             modelRowViewsByName.removeAll()
@@ -920,47 +941,58 @@ final class MenuPanelController: NSViewController {
                 modelsListStack.removeArrangedSubview($0)
                 $0.removeFromSuperview()
             }
-            let emptyLbl = text("当前时间范围暂无模型调用记录", size: 11.5, color: Design.secondary)
+            let emptyLbl = text(L10n.t("menu_panel.models_empty", fallback: "当前时间范围暂无模型调用记录"), size: 11.5, color: Design.secondary)
             modelsListStack.addArrangedSubview(emptyLbl)
             toggleModelsButton.isHidden = true
             return
         }
 
-        let allNames = models.map { ($0["model"] as? String) ?? "未知模型" }
-        let validNames = Set(allNames)
-        modelRowViewsByName = modelRowViewsByName.filter { validNames.contains($0.key) }
-        modelDividerViewsByName = modelDividerViewsByName.filter { validNames.contains($0.key) }
+        var seenKeys = Set<String>()
+        var keyedItems: [(key: String, rawId: String, displayName: String, item: [String: Any])] = []
+        keyedItems.reserveCapacity(models.count)
+        for (idx, item) in models.enumerated() {
+            let rawId = (item["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let displayName = InterfaceText.localizedModelLabel(item["model"] as? String)
+            let baseKey = rawId.isEmpty ? "model_idx_\(idx)" : rawId
+            let uniqueKey = seenKeys.insert(baseKey).inserted ? baseKey : "\(baseKey)#\(idx)"
+            keyedItems.append((key: uniqueKey, rawId: rawId, displayName: displayName, item: item))
+        }
 
-        for item in models {
-            let rawName = (item["model"] as? String) ?? "未知模型"
-            let mTokens = intVal(item, "totalTokens", fallback: intVal(item, "total_tokens"))
+        let allKeys = keyedItems.map(\.key)
+        let validKeys = Set(allKeys)
+        modelRowViewsByName = modelRowViewsByName.filter { validKeys.contains($0.key) }
+        modelDividerViewsByName = modelDividerViewsByName.filter { validKeys.contains($0.key) }
+
+        for entry in keyedItems {
+            let mTokens = intVal(entry.item, "totalTokens", fallback: intVal(entry.item, "total_tokens"))
             let ratio = totalTokens > 0 ? CGFloat(mTokens) / CGFloat(totalTokens) : 0
             let tokensStr = InterfaceText.formatCompactTokens(mTokens, formatSmallWithLocale: true)
 
-            if let existing = modelRowViewsByName[rawName] {
-                existing.update(tokensText: tokensStr, shareFraction: ratio)
+            if let existing = modelRowViewsByName[entry.key] {
+                existing.update(displayName: entry.displayName, tokensText: tokensStr, shareFraction: ratio)
             } else {
                 let rowView = MenuModelUsageItemView(
-                    model: rawName,
+                    model: entry.displayName,
+                    rawModelKey: entry.rawId.isEmpty ? entry.displayName : entry.rawId,
                     tokensText: tokensStr,
                     shareFraction: ratio
                 )
-                modelRowViewsByName[rawName] = rowView
+                modelRowViewsByName[entry.key] = rowView
             }
         }
 
-        if allNames != renderedModelNames {
-            renderedModelNames = allNames
+        if allKeys != renderedModelNames {
+            renderedModelNames = allKeys
             modelsListStack.arrangedSubviews.forEach {
                 modelsListStack.removeArrangedSubview($0)
                 $0.removeFromSuperview()
             }
-            for (idx, name) in allNames.enumerated() {
-                guard let rowView = modelRowViewsByName[name] else { continue }
+            for (idx, key) in allKeys.enumerated() {
+                guard let rowView = modelRowViewsByName[key] else { continue }
                 if idx > 0 {
-                    let line = modelDividerViewsByName[name] ?? {
+                    let line = modelDividerViewsByName[key] ?? {
                         let d = divider()
-                        modelDividerViewsByName[name] = d
+                        modelDividerViewsByName[key] = d
                         return d
                     }()
                     modelsListStack.addArrangedSubview(line)
@@ -971,19 +1003,19 @@ final class MenuPanelController: NSViewController {
             }
         }
 
-        let visibleCount = showAllModels ? allNames.count : min(3, allNames.count)
-        for (idx, name) in allNames.enumerated() {
+        let visibleCount = showAllModels ? allKeys.count : min(3, allKeys.count)
+        for (idx, key) in allKeys.enumerated() {
             let shouldHide = idx >= visibleCount
-            if let rowView = modelRowViewsByName[name], rowView.isHidden != shouldHide {
+            if let rowView = modelRowViewsByName[key], rowView.isHidden != shouldHide {
                 rowView.isHidden = shouldHide
             }
-            if idx > 0, let divView = modelDividerViewsByName[name], divView.isHidden != shouldHide {
+            if idx > 0, let divView = modelDividerViewsByName[key], divView.isHidden != shouldHide {
                 divView.isHidden = shouldHide
             }
         }
 
         if models.count > 3 {
-            toggleModelsButton.title = showAllModels ? "收起其余模型" : "展开其余 \(models.count - 3) 个模型"
+            toggleModelsButton.title = showAllModels ? L10n.t("menu_panel.collapse_other_models", fallback: "收起其余模型") : L10n.t("menu_panel.expand_n_models", ["count": models.count - 3], fallback: "展开其余 \(models.count - 3) 个模型")
             toggleModelsButton.isHidden = false
         } else {
             toggleModelsButton.isHidden = true
@@ -996,15 +1028,15 @@ final class MenuPanelController: NSViewController {
         let active = app.resolvedMenuAccount()
         guard let account = active else {
             let liveUnsaved = !app.statusValue.liveAccountEmail.isEmpty
-            quotaAccountNameLabel.stringValue = !app.reachable ? "正在等待本机服务…" : (liveUnsaved ? "运行中账号尚未保存" : "尚未保存账号")
-            quotaEmailLabel.stringValue = liveUnsaved ? "检测到 \(app.statusValue.liveAccountEmail)，请前往账号页保存" : "点击下方按钮在主界面保存当前账号或登录备用账号"
+            quotaAccountNameLabel.stringValue = !app.reachable ? L10n.t("menu_panel.usage.waiting_service", fallback: "正在等待本机服务…") : (liveUnsaved ? L10n.t("menu_panel.quota.unsaved_live", fallback: "运行中账号尚未保存") : L10n.t("menu_panel.quota.no_saved", fallback: "尚未保存账号"))
+            quotaEmailLabel.stringValue = liveUnsaved ? L10n.t("menu_panel.quota.detected_unsaved", ["email": app.statusValue.liveAccountEmail], fallback: "检测到 \(app.statusValue.liveAccountEmail)，请前往账号页保存") : L10n.t("menu_panel.quota.empty_hint", fallback: "点击下方按钮在主界面保存当前账号或登录备用账号")
             quotaHeaderEmail = app.statusValue.liveAccountEmail
             quotaTierBadge.isHidden = true
             quotaStatusBadge.isHidden = true
             quotaGroupsContainer.isHidden = true
             quotaEmptyButton.isHidden = false
             quotaWarningLabel.isHidden = true
-            quotaFooterLabel.stringValue = app.reachable ? "保存账号后即可在菜单栏实时查看各模型周期配额" : "本机服务离线"
+            quotaFooterLabel.stringValue = app.reachable ? L10n.t("menu_panel.quota.empty_footer", fallback: "保存账号后即可在菜单栏实时查看各模型周期配额") : L10n.t("menu_panel.usage.service_offline", fallback: "本机服务离线")
             quotaFooterLabel.textColor = .secondaryLabelColor
             return
         }
@@ -1021,89 +1053,133 @@ final class MenuPanelController: NSViewController {
         quotaEmailLabel.stringValue = email
         quotaEmailLabel.toolTip = nil
         quotaTierBadge.title = tier
-        quotaTierBadge.tint = tier == "ULTRA" ? .systemPurple : (tier == "PRO" ? .systemBlue : Design.inactivePill)
         quotaTierBadge.isHidden = tier.isEmpty
 
         let liveEmail = app.statusValue.liveAccountEmail.trimmingCharacters(in: .whitespacesAndNewlines)
         let isLiveMatch = !liveEmail.isEmpty && liveEmail.caseInsensitiveCompare(email) == .orderedSame
-        if isLiveMatch {
-            quotaStatusBadge.title = "当前账号"
-            quotaStatusBadge.tint = Design.blue
-            quotaStatusBadge.isHidden = false
-        } else if !liveEmail.isEmpty {
-            quotaStatusBadge.title = "已选记录 · 非运行账号"
+        if !liveEmail.isEmpty && !isLiveMatch {
+            quotaStatusBadge.title = L10n.t("menu_panel.quota.not_live", fallback: "非运行账号")
             quotaStatusBadge.tint = accessibleWarningColor()
             quotaStatusBadge.isHidden = false
         } else {
-            quotaStatusBadge.title = "已选记录"
-            quotaStatusBadge.tint = Design.inactivePill
-            quotaStatusBadge.isHidden = false
+            quotaStatusBadge.title = ""
+            quotaStatusBadge.isHidden = true
         }
 
+        let unknownText = L10n.t("common.unknown", fallback: "未知")
+        let unavailableText = L10n.t("common.unavailable", fallback: "不可用")
+        let modelQuotaText = L10n.t("quota.model_quota", fallback: "模型配额")
         let contract = QuotaPresentation.contract(account)
-        quotaGemini5h.titleLabel.stringValue = contract.geminiPrimary.label
-        quotaGemini5h.apply(percentage: contract.geminiPrimary.window?.percentage, placeholder: contract.geminiPrimary.window?.placeholder ?? "未知", reset: contract.geminiPrimary.window?.resetText ?? "", stale: contract.geminiPrimary.window?.stale == true)
-        quotaGeminiWeekly.titleLabel.stringValue = "每周"
-        quotaGeminiWeekly.apply(percentage: contract.geminiWeekly?.percentage, placeholder: contract.geminiWeekly?.placeholder ?? "未知", reset: contract.geminiWeekly?.resetText ?? "", stale: contract.geminiWeekly?.stale == true)
 
-        quotaClaude5h.titleLabel.stringValue = contract.claudePrimary.label
-        quotaClaude5h.apply(percentage: contract.claudePrimary.window?.percentage, placeholder: contract.claudePrimary.window?.placeholder ?? "未知", reset: contract.claudePrimary.window?.resetText ?? "", stale: contract.claudePrimary.window?.stale == true)
-        quotaClaudeWeekly.titleLabel.stringValue = "每周"
-        quotaClaudeWeekly.apply(percentage: contract.claudeWeekly?.percentage, placeholder: contract.claudeWeekly?.placeholder ?? "未知", reset: contract.claudeWeekly?.resetText ?? "", stale: contract.claudeWeekly?.stale == true)
+        let quotaRowsFingerprint = [
+            L10n.shared.currentLocale,
+            id,
+            email,
+            contract.displayGroups.map { g in
+                let ws = g.windows.map { "\($0.localizedLabel):\($0.percentage.map(String.init) ?? "-"):\($0.placeholder(availability: g.availability)):\($0.resetText):\($0.stale)" }.joined(separator: ",")
+                return "\(g.key)|\(g.displayName)|\(g.availability)|\(ws)"
+            }.joined(separator: ";")
+        ].joined(separator: "#")
 
-        let argonState = contract.argon
-        let argonPlaceholder = argonState?.availability == "disabled" ? "不可用" : (argonState?.placeholder ?? "未知")
-        switch argonState?.periodLabel {
-        case "5小时": quotaArgon.titleLabel.stringValue = "5 小时"
-        case "每周": quotaArgon.titleLabel.stringValue = "每周"
-        case "周期未知": quotaArgon.titleLabel.stringValue = "周期未知"
-        default: quotaArgon.titleLabel.stringValue = ""
+        if quotaRowsFingerprint != renderedQuotaTabKey {
+            renderedQuotaTabKey = quotaRowsFingerprint
+            quotaUnifiedContentStack.arrangedSubviews.forEach {
+                quotaUnifiedContentStack.removeArrangedSubview($0)
+                $0.removeFromSuperview()
+            }
+            var assignedG5 = false
+            var assignedGW = false
+            var assignedC5 = false
+            var assignedCW = false
+
+            for (groupIdx, quotaGroup) in contract.displayGroups.enumerated() {
+                if groupIdx > 0 {
+                    let div = divider()
+                    quotaUnifiedContentStack.addArrangedSubview(div)
+                    fillWidth(div, in: quotaUnifiedContentStack)
+                }
+                let brands = quotaGroup.brands.isEmpty ? ModelIcons.brands(for: quotaGroup.displayName) : quotaGroup.brands
+                let header = MenuQuotaHelpers.groupHeader(quotaGroup.displayName, brands: brands, fontSize: 11.5, iconSize: 13)
+                var groupViews: [NSView] = [header]
+                var rowsForGroup: [MenuMeterRow] = []
+
+                if quotaGroup.windows.isEmpty {
+                    let row = MenuMeterRow(title: modelQuotaText)
+                    row.accessibilityGroupName = quotaGroup.displayName
+                    let ph = quotaGroup.availability == "disabled" ? unavailableText : unknownText
+                    row.apply(percentage: nil, placeholder: ph, reset: "", stale: false)
+                    groupViews.append(row)
+                    rowsForGroup.append(row)
+                } else {
+                    for win in quotaGroup.windows {
+                        let row = MenuMeterRow(title: win.localizedLabel)
+                        row.accessibilityGroupName = quotaGroup.displayName
+                        row.apply(
+                            percentage: win.percentage,
+                            placeholder: win.placeholder(availability: quotaGroup.availability),
+                            reset: win.percentage == nil ? "" : win.resetText,
+                            stale: win.stale
+                        )
+                        groupViews.append(row)
+                        rowsForGroup.append(row)
+                    }
+                }
+
+                let groupStack = vertical(groupViews, spacing: 6)
+                groupStack.alignment = .leading
+                for v in groupViews { fillWidth(v, in: groupStack) }
+                quotaUnifiedContentStack.addArrangedSubview(groupStack)
+                fillWidth(groupStack, in: quotaUnifiedContentStack)
+
+                let normalizedKey = quotaGroup.key.lowercased()
+                if normalizedKey == "gemini" {
+                    if let first = rowsForGroup.first { quotaGemini5h = first; assignedG5 = true }
+                    if rowsForGroup.count > 1 { quotaGeminiWeekly = rowsForGroup[1]; assignedGW = true }
+                } else if normalizedKey == "claude" || normalizedKey == "claude_gpt" {
+                    if let first = rowsForGroup.first { quotaClaude5h = first; assignedC5 = true }
+                    if rowsForGroup.count > 1 { quotaClaudeWeekly = rowsForGroup[1]; assignedCW = true }
+                }
+            }
+            if !assignedG5 { quotaGemini5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时")) }
+            if !assignedGW { quotaGeminiWeekly = MenuMeterRow(title: L10n.t("common.period.weekly", fallback: "每周")) }
+            if !assignedC5 { quotaClaude5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时")) }
+            if !assignedCW { quotaClaudeWeekly = MenuMeterRow(title: L10n.t("common.period.weekly", fallback: "每周")) }
         }
-        quotaArgon.apply(percentage: argonState?.percentage, placeholder: argonPlaceholder, reset: argonState?.percentage == nil ? "" : (argonState?.resetText ?? ""), stale: argonState?.stale == true)
-
-        let carbonState = contract.carbon
-        let carbonPlaceholder = carbonState?.availability == "disabled" ? "不可用" : (carbonState?.placeholder ?? "未知")
-        switch carbonState?.periodLabel {
-        case "5小时": quotaCarbon.titleLabel.stringValue = "5 小时"
-        case "每周": quotaCarbon.titleLabel.stringValue = "每周"
-        case "周期未知": quotaCarbon.titleLabel.stringValue = "周期未知"
-        default: quotaCarbon.titleLabel.stringValue = ""
-        }
-        quotaCarbon.apply(percentage: carbonState?.percentage, placeholder: carbonPlaceholder, reset: carbonState?.percentage == nil ? "" : (carbonState?.resetText ?? ""), stale: carbonState?.stale == true)
-
-        MenuQuotaHelpers.syncExtraStandaloneGroups(contract.extraStandaloneModels, into: quotaExtraStandaloneStack, withLeadingDividers: true, headerFontSize: 11.5, iconSize: 13)
 
         var warnings: [String] = []
         if let readiness = account["credentialReadiness"] as? [String: Any], readiness["state"] as? String == "needs_authorization" {
-            warnings.append("登录授权已失效，请前往主界面重新授权")
+            warnings.append(L10n.t("menu_panel.quota.reauth_needed", fallback: "登录授权已失效，请前往主界面重新授权"))
         }
         if let singleErr = app.singleAccountRefreshErrors[id], !singleErr.isEmpty {
             warnings.append(InterfaceText.quotaMessage(singleErr))
-        } else if let refreshErr = account["quota_refresh_error"] as? String, !refreshErr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !refreshErr.contains("双周期") {
+        } else if let refreshErr = account["quota_refresh_error"] as? String, !refreshErr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !InterfaceText.isInternalDualWindowError(refreshErr) {
             warnings.append(InterfaceText.quotaMessage(refreshErr))
         } else if let globalErr = app.quotaRefreshError, !globalErr.isEmpty, !InterfaceText.isMultiAccountSummary(globalErr) {
             warnings.append(InterfaceText.quotaMessage(globalErr))
         }
         if let quota = account["quota"] as? [String: Any], let staleGroups = quota["stale_groups"] as? [[String: Any]], !staleGroups.isEmpty {
             let names = staleGroups.compactMap { $0["name"] as? String }.filter { !$0.isEmpty }
-            warnings.append("部分分组沿用上次记录：" + (names.isEmpty ? "部分分组" : names.joined(separator: "、")))
+            let sep = L10n.shared.isEnglish ? ", " : "、"
+            let namesStr = names.isEmpty ? L10n.t("menu_panel.quota.partial_groups", fallback: "部分分组") : names.joined(separator: sep)
+            warnings.append(L10n.t("menu_panel.quota.stale_groups", ["names": namesStr], fallback: "部分分组沿用上次记录：\(namesStr)"))
         }
-        quotaWarningLabel.stringValue = warnings.joined(separator: "；")
+        quotaWarningLabel.stringValue = warnings.joined(separator: L10n.shared.isEnglish ? "; " : "；")
         quotaWarningLabel.isHidden = warnings.isEmpty
 
         let quota = account["quota"] as? [String: Any]
         let stamp = QuotaPresentation.number(quota?["last_updated"]) ?? QuotaPresentation.number(account["quota_last_updated"]) ?? 0
         if app.quotaRefreshing || (!id.isEmpty && app.refreshingAccountIds.contains(id)) {
-            quotaFooterLabel.stringValue = "正在刷新配额…"
+            quotaFooterLabel.stringValue = L10n.t("menu_panel.quota.refreshing", fallback: "正在刷新配额…")
             quotaFooterLabel.textColor = .secondaryLabelColor
         } else if stamp > 0 {
             let date = Date(timeIntervalSince1970: stamp)
             let fmt = Calendar.current.isDateInToday(date) ? Self.timeFormatter : Self.dateTimeFormatter
             let isStale = Date().timeIntervalSince(date) > 15 * 60
-            quotaFooterLabel.stringValue = (!app.reachable ? "本机服务离线 · " : "") + "更新于 \(fmt.string(from: date))" + (isStale ? " · 待刷新" : "")
+            let updatedStr = L10n.t("common.updated_at", ["time": fmt.string(from: date)], fallback: "更新于 \(fmt.string(from: date))")
+            quotaFooterLabel.stringValue = (!app.reachable ? L10n.t("menu_panel.quota.offline_prefix", fallback: "本机服务离线 · ") : "") + updatedStr + (isStale ? L10n.t("menu_panel.quota.stale_suffix", fallback: " · 待刷新") : "")
             quotaFooterLabel.textColor = isStale ? accessibleWarningColor() : .secondaryLabelColor
         } else {
-            quotaFooterLabel.stringValue = "尚未取得配额记录"
+            quotaFooterLabel.stringValue = L10n.t("menu_panel.quota.no_record", fallback: "尚未取得配额记录")
             quotaFooterLabel.textColor = .secondaryLabelColor
         }
     }
@@ -1128,7 +1204,7 @@ final class MenuPanelController: NSViewController {
 
     private func syncAccountsTab() {
         let accounts = app.cachedAccounts
-        accountsCountLabel.stringValue = "\(accounts.count) 个账号"
+        accountsCountLabel.stringValue = L10n.t("menu_panel.accounts.count", ["count": accounts.count], fallback: "\(accounts.count) 个账号")
 
         guard !accounts.isEmpty else {
             accountCardsById.removeAll()
@@ -1137,7 +1213,7 @@ final class MenuPanelController: NSViewController {
                 accountsCardsStack.removeArrangedSubview($0)
                 $0.removeFromSuperview()
             }
-            let emptyLbl = text(app.reachable ? "暂无账号，请前往主界面添加" : "正在等待本机服务读取账号列表…", size: 11.5, color: Design.secondary, wrap: true)
+            let emptyLbl = text(app.reachable ? L10n.t("menu_panel.accounts.empty", fallback: "暂无账号，请前往主界面添加") : L10n.t("menu_panel.accounts.waiting_list", fallback: "正在等待本机服务读取账号列表…"), size: 11.5, color: Design.secondary, wrap: true)
             let box = group([emptyLbl], inset: 12)
             accountsCardsStack.addArrangedSubview(box)
             fillWidth(box, in: accountsCardsStack)
@@ -1162,7 +1238,7 @@ final class MenuPanelController: NSViewController {
         accountCardsById = accountCardsById.filter { validSet.contains($0.key) }
 
         let liveEmail = app.statusValue.liveAccountEmail.trimmingCharacters(in: .whitespacesAndNewlines)
-        let recommendedId = app.accountsPage?.recommendedAccountId
+        let recommendedId = app.accountsPage?.recommendedAccountId ?? app.cachedRecommendedAccountId
 
         for item in ordered {
             guard let id = item["id"] as? String, !id.isEmpty else { continue }
@@ -1207,11 +1283,42 @@ final class MenuPanelController: NSViewController {
 
     // MARK: - Dynamic Content-Fitted Panel Height (Zero bottom blank gap, smooth micro-interpolation)
 
-    func updatePreferredPanelSize() {
+    func updatePreferredPanelSize(force: Bool = false) {
         guard isViewLoaded else { return }
+        let activeScreen = app.item?.button?.window?.screen ?? viewIfLoaded?.window?.screen ?? NSScreen.main
+        let screenMax = (activeScreen?.visibleFrame.height ?? 820) - 48
+        let tabFingerprint: String
+        switch selectedTab {
+        case 0:
+            let visibleCount = showAllModels ? renderedModelNames.count : min(3, renderedModelNames.count)
+            let visibleLabels = renderedModelNames.prefix(visibleCount).compactMap { modelRowViewsByName[$0]?.nameLabel.stringValue }.joined(separator: "|")
+            tabFingerprint = "u:\(usageScopeLabel.isHidden):\(usageScopeLabel.stringValue):\(modelsListStack.arrangedSubviews.count):\(renderedModelNames.count):\(showAllModels):\(visibleLabels):\(toggleModelsButton.isHidden):\(toggleModelsButton.title):\(usageFooterLabel.stringValue)"
+        case 1:
+            tabFingerprint = "q:\(quotaAccountNameLabel.stringValue):\(quotaTierBadge.isHidden):\(quotaStatusBadge.isHidden):\(quotaEmailLabel.stringValue):\(quotaGroupsContainer.isHidden):\(renderedQuotaTabKey):\(quotaEmptyButton.isHidden):\(quotaWarningLabel.isHidden):\(quotaWarningLabel.stringValue):\(quotaFooterLabel.stringValue)"
+        default:
+            let cardsSummary = renderedAccountIds.map { id -> String in
+                guard let card = accountCardsById[id] else { return id }
+                guard expandedAccountIds.contains(id) else { return "\(id):0" }
+                return "\(id):1:\(card.quotaRowsStack.arrangedSubviews.count):\(card.warningLabel.isHidden ? "" : card.warningLabel.stringValue)"
+            }.joined(separator: "|")
+            tabFingerprint = "a:\(accountsCardsStack.arrangedSubviews.count):\(app.reachable):\(cardsSummary)"
+        }
+        let measureFingerprint = "\(selectedTab):\(L10n.shared.currentLocale):\(Int(screenMax)):\(tabFingerprint)"
+        if !force && measureFingerprint == lastMeasuredContentFingerprint {
+            let sizeInSync: Bool
+            if let popover = app.menuPopover {
+                sizeInSync = abs(popover.contentSize.height - preferredContentSize.height) <= 0.5 && abs(popover.contentSize.width - preferredContentSize.width) <= 0.5
+            } else {
+                sizeInSync = abs(view.frame.height - preferredContentSize.height) <= 0.5 && abs(view.frame.width - preferredContentSize.width) <= 0.5
+            }
+            if sizeInSync {
+                return
+            }
+        }
+        lastMeasuredContentFingerprint = measureFingerprint
+
         let contentWidth = Self.panelWidth - 28
         documentContainer.frame.size.width = Self.panelWidth
-        documentContainer.layoutSubtreeIfNeeded()
         let activeRoot: NSView = selectedTab == 0 ? usageRoot : (selectedTab == 1 ? quotaRoot : accountsRoot)
         activeRoot.frame.size.width = contentWidth
         activeRoot.layoutSubtreeIfNeeded()
@@ -1219,14 +1326,14 @@ final class MenuPanelController: NSViewController {
         let contentHeight = ceil(activeRoot.fittingSize.height) + 20 // 10pt top + 10pt bottom inset
         let chromeHeight: CGFloat = 86 + 42 // header (86pt) + footer (42pt)
         let rawTotal = chromeHeight + contentHeight
-        let activeScreen = app.item?.button?.window?.screen ?? viewIfLoaded?.window?.screen ?? NSScreen.main
-        let screenMax = (activeScreen?.visibleFrame.height ?? 820) - 48
         let targetHeight = min(max(300, rawTotal), min(686, screenMax))
         let newSize = NSSize(width: Self.panelWidth, height: targetHeight)
         preferredContentSize = newSize
         let shouldAnimate = Design.shouldAnimate(in: view) && app.menuPopover?.isShown == true
+        var sizeDidChange = false
         if let popover = app.menuPopover {
             if abs(popover.contentSize.height - newSize.height) > 0.5 || abs(popover.contentSize.width - newSize.width) > 0.5 {
+                sizeDidChange = true
                 if shouldAnimate {
                     NSAnimationContext.runAnimationGroup { ctx in
                         ctx.duration = 0.18
@@ -1237,7 +1344,8 @@ final class MenuPanelController: NSViewController {
                     popover.contentSize = newSize
                 }
             }
-        } else if abs(view.frame.height - newSize.height) > 0.5 {
+        } else if abs(view.frame.height - newSize.height) > 0.5 || abs(view.frame.width - newSize.width) > 0.5 {
+            sizeDidChange = true
             if shouldAnimate {
                 NSAnimationContext.runAnimationGroup { ctx in
                     ctx.duration = 0.18
@@ -1248,7 +1356,9 @@ final class MenuPanelController: NSViewController {
                 view.frame.size = newSize
             }
         }
-        view.layoutSubtreeIfNeeded()
+        if sizeDidChange || view.needsLayout {
+            view.layoutSubtreeIfNeeded()
+        }
     }
 }
 

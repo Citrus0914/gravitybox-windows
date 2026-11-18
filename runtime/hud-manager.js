@@ -1,3 +1,4 @@
+import { normalizeHudLocale } from './hud-i18n.js';
 import { HudInstance } from './hud-instance.js';
 import { computeUpwardPopoverPosition } from './hud-popover.js';
 
@@ -16,12 +17,14 @@ export class AntigravityHudManager {
     this.nextRevisionCounter = Number(globalThis.__GRAVITYBOX_HUD_REVISION__) || 0;
     this.mutationObserver = null;
     this.domReadyAbort = null;
+    this.visibilityHandler = null;
     this.reconcileTimer = null;
     this.routeTimer = null;
     this.active = false;
     this.enabled = options.enabled !== false;
     this.routeExcluded = false;
-    this.languageMode = options.languageMode === 'en' ? 'en' : 'zh';
+    this.locale = normalizeHudLocale(options.locale || options.languageMode || 'zh-Hans');
+    this.languageMode = this.locale === 'zh-Hans' ? 'zh' : this.locale;
     this.onBridgeEvent = typeof options.onBridgeEvent === 'function' ? options.onBridgeEvent : null;
   }
 
@@ -46,28 +49,70 @@ export class AntigravityHudManager {
       this.mutationObserver = new MutationObserver((mutations) => {
         if (!this.active || !this.enabled) return;
         if (this.reconcileTimer !== null) return;
-        if (
-          Array.isArray(mutations) &&
-          mutations.length > 0 &&
-          mutations.every((m) => {
+        let hasUrgent = false;
+        if (Array.isArray(mutations) && mutations.length > 0) {
+          let hasRelevant = false;
+          for (const m of mutations) {
             const t = m?.target;
-            return Boolean(
+            if (
               t &&
-                (t.classList?.contains?.('__gravitybox_hud_host__') ||
-                  t.closest?.('.__gravitybox_hud_host__'))
-            );
-          })
-        ) {
-          return;
+              (t.classList?.contains?.('__gravitybox_hud_host__') ||
+                t.closest?.('.__gravitybox_hud_host__'))
+            ) {
+              continue;
+            }
+            if (m?.type === 'childList') {
+              hasRelevant = true;
+              hasUrgent = true;
+              continue;
+            }
+            const attr = m?.attributeName || '';
+            if (attr !== 'class' && attr !== 'aria-label' && attr !== 'style') {
+              hasRelevant = true;
+              hasUrgent = true;
+              continue;
+            }
+            if (
+              !t ||
+              t === document.body ||
+              t === document.documentElement ||
+              typeof t.matches !== 'function'
+            ) {
+              hasRelevant = true;
+              continue;
+            }
+            if (
+              t.tagName === 'BUTTON' ||
+              t.getAttribute?.('role') === 'button' ||
+              t.hasAttribute?.('data-testid') ||
+              t.hasAttribute?.('data-cascade-id') ||
+              t.hasAttribute?.('data-conversation-id') ||
+              t.hasAttribute?.('data-subagent-id') ||
+              t.hasAttribute?.('data-media-drop-scope') ||
+              t.matches(
+                '.surface-composer, .model-selector, .animate-shimmer-text, .animate-spin, .codicon-loading, .spinner'
+              ) ||
+              t.closest?.(
+                '[data-testid="idle-status-text"], [data-testid="ephemeral-tool-status"], [data-testid="agent-loading"], [data-testid="model-selector-trigger"], .surface-composer'
+              )
+            ) {
+              hasRelevant = true;
+              if (t.tagName === 'BUTTON' || attr === 'aria-label') hasUrgent = true;
+            }
+          }
+          if (!hasRelevant) return;
+        } else {
+          hasUrgent = true;
         }
 
+        const delayMs = hasUrgent ? 20 : 60;
         this.reconcileTimer = setTimeout(() => {
           this.reconcileTimer = null;
           this.checkRoute();
           if (this.enabled && !this.routeExcluded) {
             this.reconcileMounts();
           }
-        }, 20);
+        }, delayMs);
       });
       this.mutationObserver.observe(document.body, {
         childList: true,
@@ -82,17 +127,32 @@ export class AntigravityHudManager {
           'data-theme',
           'data-subagent-id',
           'data-agent-state',
+          'data-side-panel-open',
+          'data-aux-pane-open',
+          'data-split-transition',
           'aria-label',
           'class',
+          'style',
+          'hidden',
         ],
       });
       if (document.documentElement && typeof document.documentElement.nodeType === 'number') {
         try {
           this.mutationObserver.observe(document.documentElement, {
             attributes: true,
-            attributeFilter: ['class', 'data-theme', 'style'],
+            attributeFilter: ['class', 'data-theme', 'style', 'hidden'],
           });
         } catch {}
+      }
+      if (!this.visibilityHandler && typeof document.addEventListener === 'function') {
+        this.visibilityHandler = () => {
+          if (!this.active || document.hidden === true) return;
+          this.checkRoute();
+          if (this.enabled && !this.routeExcluded) {
+            this.reconcileMounts();
+          }
+        };
+        document.addEventListener('visibilitychange', this.visibilityHandler);
       }
     };
 
@@ -149,6 +209,7 @@ export class AntigravityHudManager {
     if (!this.active || !this.enabled || this.routeExcluded) return;
     this.reconcileMounts();
     for (const instance of this.instances.values()) {
+      instance.lastMetricsSequence = 0;
       instance.requestRefresh?.();
     }
   }
@@ -164,6 +225,10 @@ export class AntigravityHudManager {
     if (this.routeExcluded === next) return;
     this.routeExcluded = next;
     if (this.routeExcluded) {
+      if (this.reconcileTimer !== null) {
+        clearTimeout(this.reconcileTimer);
+        this.reconcileTimer = null;
+      }
       for (const instance of this.instances.values()) {
         instance.dispose();
       }
@@ -174,10 +239,12 @@ export class AntigravityHudManager {
   }
 
   setLanguage(mode) {
-    const next = mode === 'en' ? 'en' : 'zh';
+    const resolved = normalizeHudLocale(mode);
+    const next = resolved === 'zh-Hans' ? 'zh' : resolved;
+    this.locale = resolved;
     this.languageMode = next;
     for (const instance of this.instances.values()) {
-      instance.setLanguage(next);
+      instance.setLanguage(resolved);
     }
   }
 
@@ -221,8 +288,12 @@ export class AntigravityHudManager {
     }
 
     const panes = views.filter(Boolean).map((view, index) => {
-      const subConvNode = view.getAttribute?.('data-media-drop-scope') === 'subpane'
-        ? view.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]') : null;
+      const isMainConvView = view?.getAttribute?.('data-testid') === 'conversation-view';
+      const subConvNode = view?.getAttribute?.('data-testid') === 'subagent-tab-conversation'
+        ? view
+        : !isMainConvView
+        ? view?.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]') || null
+        : null;
       const rawCascadeId = view.getAttribute?.('data-cascade-id') || subConvNode?.getAttribute?.('data-cascade-id');
       let slotId = this.viewToSlotId.get(view);
       if (!slotId) { slotId = `slot-${this.nextSlotSeq++}`; this.viewToSlotId.set(view, slotId); }
@@ -232,11 +303,18 @@ export class AntigravityHudManager {
     for (const [slot, instance] of this.instances) {
       if (!activeSlots.has(slot)) { instance.dispose(); this.instances.delete(slot); }
     }
-    const domSubagentIds = this.collectDomSubagentIds();
+    const mainPaneCount = panes.filter(
+      (p) => !(p.subConvNode || p.view.getAttribute?.('data-media-drop-scope') === 'subpane')
+    ).length;
+    const sharedGlobalSubagentIds = mainPaneCount <= 1 ? this.collectDomSubagentIds() : null;
     for (const { view, index, subConvNode, rawCascadeId, slotId, composer } of panes) {
       const isSubpane = Boolean(subConvNode || view.getAttribute?.('data-media-drop-scope') === 'subpane');
-      const convId = this.resolveConversationId(view, rawCascadeId, views.length);
-      const modelId = this.resolveActiveModel(view, views.length);
+      const domSubagentIds = isSubpane
+        ? []
+        : sharedGlobalSubagentIds ?? this.collectDomSubagentIds(view, mainPaneCount);
+      const effectiveViewCount = isSubpane ? Math.max(2, views.length) : Math.max(1, mainPaneCount);
+      const convId = this.resolveConversationId(view, rawCascadeId, effectiveViewCount, isSubpane);
+      const modelId = this.resolveActiveModel(view, effectiveViewCount);
       const sharedButtons = typeof view.querySelectorAll === 'function' ? view.querySelectorAll('button, [role="button"]') : null;
       const subagentState = this.resolveSubagentState(view, { isSubpane, buttons: sharedButtons });
       const activityPhase = this.resolveActivityPhase(view, subagentState, { isSubpane, buttons: sharedButtons });
@@ -244,7 +322,7 @@ export class AntigravityHudManager {
       let instance = this.instances.get(slotId);
       if (!instance) {
         instance = new InstanceCtor(slotId, { paneSlotId: slotId, isPrimaryPane: index === 0 && !isSubpane,
-          isSubpane, languageMode: this.languageMode, onBridgeEvent: this.onBridgeEvent,
+          isSubpane, locale: this.locale, languageMode: this.languageMode, onBridgeEvent: this.onBridgeEvent,
           allocateRevision: () => this.allocateSessionRevision() });
         this.instances.set(slotId, instance); instance.mount(composer);
       } else instance.reconcile(composer);
@@ -256,9 +334,9 @@ export class AntigravityHudManager {
       }
       if (instance.getCurrentConvId() !== convId) {
         instance.switchConversation(convId, modelId, isStreaming, subagentState.isSubagentRunning,
-          subagentState.runningSubagentCount, isSubpane ? [] : domSubagentIds, activityPhase);
+          subagentState.runningSubagentCount, domSubagentIds, activityPhase);
       } else instance.notifyModelOrStreamingChange(modelId, isStreaming, subagentState.isSubagentRunning,
-        subagentState.runningSubagentCount, isSubpane ? [] : domSubagentIds, activityPhase);
+        subagentState.runningSubagentCount, domSubagentIds, activityPhase);
     }
   }
 
@@ -280,21 +358,30 @@ export class AntigravityHudManager {
     return true;
   }
 
-  collectDomSubagentIds() {
+  collectDomSubagentIds(scopedView = null, mainPaneCount = 1) {
     const ids = new Set();
     const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const loc =
-      typeof window !== 'undefined' && window.location
-        ? window.location
-        : globalThis.window?.location;
-    if (loc && typeof loc.search === 'string' && loc.search.includes('subagent_convo__')) {
-      const matches = loc.search.matchAll(/subagent_convo__([0-9a-f-]{36})/gi);
-      for (const m of matches) {
-        if (m[1] && uuidRe.test(m[1])) ids.add(m[1].toLowerCase());
+    const useScopedOnly = Boolean(scopedView && mainPaneCount > 1);
+    if (!useScopedOnly) {
+      const loc =
+        typeof window !== 'undefined' && window.location
+          ? window.location
+          : globalThis.window?.location;
+      if (loc && typeof loc.search === 'string' && loc.search.includes('subagent_convo__')) {
+        const matches = loc.search.matchAll(/subagent_convo__([0-9a-f-]{36})/gi);
+        for (const m of matches) {
+          if (m[1] && uuidRe.test(m[1])) ids.add(m[1].toLowerCase());
+        }
       }
     }
-    if (typeof document !== 'undefined' && typeof document.querySelectorAll === 'function') {
-      const nodes = document.querySelectorAll(
+    const queryRoot =
+      useScopedOnly && typeof scopedView.querySelectorAll === 'function'
+        ? scopedView
+        : !useScopedOnly && typeof document !== 'undefined' && typeof document.querySelectorAll === 'function'
+        ? document
+        : null;
+    if (queryRoot) {
+      const nodes = queryRoot.querySelectorAll(
         '[data-testid="subagent-tab-conversation"][data-cascade-id], [id^="subagentView-"]'
       );
       if (nodes && typeof nodes.forEach === 'function') {
@@ -330,8 +417,16 @@ export class AntigravityHudManager {
    * 3. 分栏内部 /c/<uuid> 锚点
    * 4. 单栏模式下回退至 window.location.pathname 中的 /c/<uuid>
    */
-  resolveConversationId(view, rawCascadeId, totalViews = 1) {
-    const allowUrl = totalViews === 1 && view?.getAttribute?.('data-media-drop-scope') !== 'subpane';
+  resolveConversationId(view, rawCascadeId, totalViews = 1, isSubpane = null) {
+    const subpaneDetected = isSubpane !== null
+      ? Boolean(isSubpane)
+      : Boolean(
+          view?.getAttribute?.('data-media-drop-scope') === 'subpane' ||
+          view?.getAttribute?.('data-testid') === 'subagent-tab-conversation' ||
+          (view?.getAttribute?.('data-testid') !== 'conversation-view' &&
+            view?.querySelector?.('[data-testid="subagent-tab-conversation"][data-cascade-id]'))
+        );
+    const allowUrl = totalViews === 1 && !subpaneDetected;
     if (view && typeof view.getAttribute === 'function') {
       const directId = view.getAttribute('data-conversation-id');
       if (directId && directId !== 'conversation') return directId;
@@ -410,8 +505,14 @@ export class AntigravityHudManager {
         let matchedModel = null;
         buttons.forEach((btn) => {
           if (matchedModel) return;
+          if (
+            typeof btn?.closest === 'function' &&
+            btn.closest('[data-testid*="attachment"], [data-testid*="file-chip"], [data-testid*="context-chip"]')
+          ) {
+            return;
+          }
           const t = (btn.textContent || '').replace(/\s+/g, ' ').trim();
-          if (/\b(?:Gemini|Claude|GPT|o1|o3|o4)\b/i.test(t)) {
+          if (/\b(?:Orchestrator|Gemini|Claude|GPT|o1|o3|o4)\b/i.test(t)) {
             matchedModel = t;
           }
         });
@@ -449,21 +550,38 @@ export class AntigravityHudManager {
           );
 
     let runningCount = 0;
+    let exactIdleSubagentCount = 0;
     let detected = false;
 
     const idleStatusNodes = view.querySelectorAll('[data-testid="idle-status-text"]');
     if (idleStatusNodes && typeof idleStatusNodes.forEach === 'function') {
       idleStatusNodes.forEach((node) => {
+        if (!isSubpane && typeof node?.closest === 'function') {
+          const nestedSubpane = node.closest('[data-media-drop-scope="subpane"], [data-testid="subagent-tab-conversation"]');
+          if (nestedSubpane && nestedSubpane !== view) return;
+        }
         const txt = (node.textContent || '').replace(/\s+/g, ' ').trim();
         if (!txt) return;
-        const countMatch = txt.match(/(\d+)\s*(?:个)?\s*(?:subagents?(?:\/tasks?)?|子智能体|子代理)/i);
+        // 区分混合计数 ("2 subagents/tasks running" 含终端后台任务) 与官方纯子智能体计数 ("1 subagent running" / "6 subagents running")
+        const mixedCountMatch = txt.match(/(\d+)\s*(?:个)?\s*(?:subagents?\s*\/\s*tasks?|子智能体\s*\/\s*任务|子代理\s*\/\s*任务)/i);
+        const pureCountMatch = !mixedCountMatch
+          ? txt.match(/(\d+)\s*(?:个)?\s*(?:subagents?\b|子智能体|子代理)/i)
+          : null;
         if (
-          countMatch &&
+          pureCountMatch &&
           /(?:running|working|运行中|正在运行|执行中|处理中)/i.test(txt)
         ) {
           detected = true;
-          const parsed = parseInt(countMatch[1], 10);
+          const parsed = parseInt(pureCountMatch[1], 10);
+          if (parsed > exactIdleSubagentCount) exactIdleSubagentCount = parsed;
           if (parsed > runningCount) runningCount = parsed;
+        } else if (
+          mixedCountMatch &&
+          /(?:running|working|运行中|正在运行|执行中|处理中)/i.test(txt)
+        ) {
+          // 混合文案 y = f + n (至少 1 个子智能体 + 至少 1 个后台终端任务)，不可将终端任务数计入子智能体数量
+          detected = true;
+          if (runningCount < 1) runningCount = 1;
         } else if (
           /\bsubagents?(?:\/tasks?)?\s+(?:running|working)\b|(?:子智能体|子代理).*(?:运行|工作|执行)/i.test(
             txt
@@ -491,13 +609,13 @@ export class AntigravityHudManager {
           });
         }
         const markerCount = Math.max(1, markerContainers.size);
-        if (runningCount < markerCount) {
+        if (exactIdleSubagentCount === 0 && runningCount < markerCount) {
           runningCount = markerCount;
         }
       }
     }
 
-    // 检查子智能体引用芯片是否仍处于加载态（必须具备明确正向活跃指示器，排除权限来源标签、已完成/未读状态及无指示器的静态卡片）
+    // 检查子智能体引用芯片是否仍处于加载态（排除权限来源标签、已完成/未读状态、终端后台任务图标 status-task-running 及静态卡片）
     const agentRefs = view.querySelectorAll(
       '[aria-label^="Open Subagent:"], [aria-label^="打开子智能体："], [aria-label^="打开子智能体:"], [aria-label^="打开子代理："], [aria-label^="打开子代理:"]'
     );
@@ -515,21 +633,32 @@ export class AntigravityHudManager {
           '[data-testid="agent-status-done"], [data-testid="agent-status-killed"], [data-testid="agent-status-canceled"], [data-testid="agent-status-error"], [data-testid="agent-status-failed"], [data-testid="status-unread-dot"]'
         );
         if (finishedIcon) return;
-        const hasActiveDotOrSpinner = Boolean(
-          ref.querySelector(
-            '[data-agent-state-dot], [data-testid="status-loading-spinner"], [data-testid="status-task-running"], .animate-spin, .codicon-loading, .spinner'
-          )
+        const dotEl = ref.querySelector('[data-agent-state-dot]');
+        const dotState = (dotEl?.getAttribute?.('data-agent-state-dot') || '').trim();
+        const hasActiveStateDot = Boolean(
+          dotEl &&
+            !/^(?:idle|done|completed|paused|stopped|error|failed|canceled|cancelled|killed|inactive|none|false|0)$/i.test(
+              dotState
+            )
         );
+        const hasActiveDotOrSpinner =
+          hasActiveStateDot ||
+          Boolean(
+            ref.querySelector(
+              '[data-testid="status-loading-spinner"], .animate-spin, .codicon-loading, .spinner'
+            )
+          );
         if (hasActiveDotOrSpinner) {
           const owner = ref.closest?.('[data-testid="browser-subagent-row"], [id^="subagentView-"]') || ref;
-          const id = owner.getAttribute?.('data-cascade-id') || owner.getAttribute?.('id');
+          const ariaIdentity = (ref.getAttribute?.('aria-label') || '').replace(/^(?:Open Subagent:|打开子智能体[：:]|打开子代理[：:])\s*/i, '').trim();
+          const id = owner.getAttribute?.('data-cascade-id') || owner.getAttribute?.('id') || ariaIdentity;
           activeRefOwners.add(id || owner);
         }
       });
       const activeRefCount = activeRefOwners.size;
       if (activeRefCount > 0) {
         detected = true;
-        if (activeRefCount > runningCount) runningCount = activeRefCount;
+        if (exactIdleSubagentCount === 0 && activeRefCount > runningCount) runningCount = activeRefCount;
       }
     }
 
@@ -579,7 +708,7 @@ export class AntigravityHudManager {
         const hasSpinner = Boolean(
           node.getAttribute?.('data-state') === 'running' ||
           node.querySelector?.(
-            '.animate-spin, .codicon-loading, .spinner, [data-testid="status-loading-spinner"], [data-testid="status-task-running"], [data-state="running"]'
+            '.animate-spin, .codicon-loading, .spinner, [data-testid="status-loading-spinner"], [data-state="running"]'
           )
         );
         if (hasSpinner) {
@@ -606,11 +735,52 @@ export class AntigravityHudManager {
           );
     void precomputedSubagentState;
 
-    // 仅认准当前分栏的前台轮次终止信号（排除 .codicon-loading，避免后台工具或异步任务残留 spinner 伪装前台活跃）
+    let hasIdleStatusBanner = false;
+    if (!isSubpane) {
+      const idleBannerNodes = view.querySelectorAll('[data-testid="idle-status-text"]');
+      if (idleBannerNodes && typeof idleBannerNodes.forEach === 'function') {
+        idleBannerNodes.forEach((node) => {
+          if (hasIdleStatusBanner) return;
+          if (typeof node?.closest === 'function') {
+            const nestedSubpane = node.closest('[data-media-drop-scope="subpane"], [data-testid="subagent-tab-conversation"]');
+            if (nestedSubpane && nestedSubpane !== view) return;
+          }
+          if ((node.textContent || '').trim()) hasIdleStatusBanner = true;
+        });
+      }
+    }
+
+    // 仅认准当前分栏的前台轮次终止/流式信号（排除后台等待期的 idle-status-text 伴生 agent-loading 与附件处理状态）
     const foregroundTurnNodes = view.querySelectorAll(
-      '[data-testid="input-cancel-button"], [data-testid="send-button-loading"], [data-testid="send-button-pending"], [data-testid="agent-loading"], [data-state="streaming"], [data-streaming="true"]'
+      '[data-testid="input-cancel-button"], [data-testid="agent-loading"], [data-state="streaming"], [data-streaming="true"]'
     );
-    let hasForegroundTurn = Boolean(foregroundTurnNodes && foregroundTurnNodes.length > 0);
+    let hasForegroundTurn = false;
+    let onlyAgentLoadingSeen = false;
+    if (foregroundTurnNodes && foregroundTurnNodes.length > 0) {
+      const nodeList = typeof foregroundTurnNodes.forEach === 'function'
+        ? foregroundTurnNodes
+        : Array.from(foregroundTurnNodes);
+      nodeList.forEach((node) => {
+        if (hasForegroundTurn) return;
+        const nodeTestId = node.getAttribute?.('data-testid') || '';
+        if (!isSubpane && typeof node?.closest === 'function') {
+          const nestedSubpane = node.closest('[data-media-drop-scope="subpane"], [data-testid="subagent-tab-conversation"]');
+          if (nestedSubpane && nestedSubpane !== view) return;
+          if (nodeTestId !== 'input-cancel-button') {
+            const nestedCard = node.closest(
+              '[data-testid*="subagent-card"], [data-testid="browser-subagent-row"], [data-testid="tool-call"], [data-testid="tool-invocation"], [data-testid="running-items-card"], [data-testid="idle-status-text"]'
+            );
+            if (nestedCard && nestedCard !== view) return;
+          }
+        }
+        if (!isSubpane && nodeTestId === 'agent-loading' && hasIdleStatusBanner) {
+          onlyAgentLoadingSeen = true;
+          return;
+        }
+        hasForegroundTurn = true;
+      });
+    }
+    void onlyAgentLoadingSeen;
     let hasSubpaneThinkingMarker = false;
 
     if (isSubpane) {
@@ -629,15 +799,29 @@ export class AntigravityHudManager {
     }
 
     if (!hasForegroundTurn) {
-      const buttons = (this.resolveComposerElement(view) || view).querySelectorAll('button, [role="button"]');
+      const composerRoot = this.resolveComposerElement(view);
+      const buttonScope = composerRoot || (isSubpane ? view : null);
+      const buttons = buttonScope?.querySelectorAll?.('button, [role="button"]');
       if (buttons && typeof buttons.forEach === 'function') {
         buttons.forEach((btn) => {
+          if (hasForegroundTurn) return;
+          if (typeof btn?.closest === 'function') {
+            if (btn.closest('[role="menu"], [role="listbox"], [role="dialog"], [data-select-popup]')) return;
+          }
+          const btnTestId = (btn.getAttribute?.('data-testid') || '').toLowerCase();
+          const btnClass = typeof btn.className === 'string' ? btn.className.toLowerCase() : '';
+          if (/(?:voice|dictat|microphone|audio-record|speech|record-audio)/i.test(`${btnTestId} ${btnClass}`)) {
+            return;
+          }
           const label = (
             btn.getAttribute?.('aria-label') ||
             btn.getAttribute?.('title') ||
             btn.textContent ||
             ''
           ).trim();
+          if (/(?:voice|dictat|recording|microphone|语音|录音|听写|麦克风)/i.test(label)) {
+            return;
+          }
           if (
             /^(?:Stop generating|Stop|Cancel generation|Cancel\s*[（(][^）)]+[）)]|停止生成|停止|中断|取消\s*[（(][^）)]+[）)])$/i.test(
               label
@@ -684,9 +868,8 @@ export class AntigravityHudManager {
       });
     }
 
-    const taskRunningNodes = view.querySelectorAll(
-      '[data-testid="status-task-running"], [data-testid="status-loading-spinner"]'
-    );
+    // 注意：status-task-running 为后台终端任务图标 (>_) 而非前台工具 Spinner，此处仅匹配 status-loading-spinner
+    const taskRunningNodes = view.querySelectorAll('[data-testid="status-loading-spinner"]');
     const hasTaskSpinner = Boolean(taskRunningNodes && taskRunningNodes.length > 0);
 
     let hasToolCardShimmer = false;
@@ -763,6 +946,10 @@ export class AntigravityHudManager {
 
   dispose() {
     this.active = false;
+    if (this.visibilityHandler && typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener('visibilitychange', this.visibilityHandler);
+      this.visibilityHandler = null;
+    }
     if (this.domReadyAbort) {
       this.domReadyAbort.abort();
       this.domReadyAbort = null;
@@ -793,20 +980,33 @@ export class AntigravityHudManager {
   const boot = globalThis.__GRAVITYBOX_BOOT__;
   if (boot !== undefined && !globalThis.__GRAVITYBOX_ENGINE_V1__) return;
   const initialEnabled = boot?.hudEnabled !== false;
+  const initialLang = normalizeHudLocale(boot?.locale || globalThis.__GRAVITYBOX_ENGINE_V1__?.getLanguageMode?.() || 'zh-Hans');
+  const buildSig = typeof HUD_STYLES_CSS === 'string' && typeof HUD_I18N === 'object'
+    ? `${HUD_STYLES_CSS.length}:${Object.keys(HUD_I18N['zh-Hans'] || {}).length}`
+    : 'runtime';
   if (globalThis.__GRAVITYBOX_HUD_V1__?.active) {
-    globalThis.__GRAVITYBOX_HUD_V1__.setEnabled?.(initialEnabled);
-    globalThis.__GRAVITYBOX_HUD_V1__.reconcileMounts();
-    return;
+    const existingSig = globalThis.__GRAVITYBOX_HUD_V1__.__hudBuildSig;
+    if (!existingSig || existingSig === buildSig) {
+      if (!existingSig) globalThis.__GRAVITYBOX_HUD_V1__.__hudBuildSig = buildSig;
+      globalThis.__GRAVITYBOX_HUD_V1__.setLanguage?.(initialLang);
+      globalThis.__GRAVITYBOX_HUD_V1__.setEnabled?.(initialEnabled);
+      globalThis.__GRAVITYBOX_HUD_V1__.reconcileMounts?.();
+      return;
+    }
+    try {
+      globalThis.__GRAVITYBOX_HUD_V1__.dispose?.();
+    } catch {}
   }
   if (!document.body && boot === undefined) return;
-  const initialLang = globalThis.__GRAVITYBOX_ENGINE_V1__?.getLanguageMode?.() || 'zh';
   const manager = new AntigravityHudManager({
-    languageMode: initialLang,
+    locale: initialLang,
+    languageMode: initialLang === 'zh-Hans' ? 'zh' : initialLang,
     enabled: initialEnabled,
   });
   manager.start();
 
   const hudApi = {
+    __hudBuildSig: buildSig,
     get active() {
       return manager.active;
     },

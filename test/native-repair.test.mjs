@@ -18,7 +18,7 @@ before(async () => {
   await run('/usr/bin/swiftc', [
     '-parse-as-library', '-target', 'arm64-apple-macosx14.0',
     '-framework', 'Cocoa', '-framework', 'Security',
-    'native/Backend.swift', 'native/Configuration.swift', 'test/native-repair.swift', '-o', binary,
+    'native/L10n.swift', 'native/Backend.swift', 'native/Configuration.swift', 'test/native-repair.swift', '-o', binary,
   ]);
 }, { timeout });
 after(async () => { if (buildDir) await rm(buildDir, { recursive: true, force: true }); });

@@ -7,7 +7,7 @@
 
   <p>
     <strong>Lightweight Native macOS Companion for Antigravity on Apple Silicon</strong><br />
-    Native Swift AppKit UI · In-IDE Telemetry HUD · Dual-Window Quota Monitor · Read-Only SQLite Usage &amp; Cost Engine · Non-Invasive Runtime Localization
+    Native Bilingual Swift AppKit UI (EN / 中文) · In-IDE Telemetry HUD · Dual-Window Quota Monitor · Read-Only SQLite Usage &amp; Cost Engine · Non-Invasive Runtime Localization
   </p>
 
   <p>
@@ -71,7 +71,7 @@ Mounted cleanly beneath every Antigravity conversation composer—without overla
 
 - **Session & Throughput Capsule**: Tracks turns, model vs. tool execution duration, and Time-To-First-Token (TTFT, excluding thinking idle gaps for accurate `tok/s`), with subtle streaming and subagent activity indicators.
 - **Tokens & Cost Capsule**: Breaks down total, uncached input, cached read, and output tokens alongside cache hit rate, estimated API cost, and cache cost savings.
-- **Context Window Capsule**: Renders a three-segment breakdown bar (System Prompt · Tool Definitions · Conversation Messages) calibrated against each model's true context limit.
+- **Context Window Capsule**: Tracks live context utilization against each model's true capacity limit—breaking down Cached Context, New Uncached Input, and Latest Step Output alongside peak context and compaction badges.
 
 ---
 
@@ -88,6 +88,7 @@ Mounted cleanly beneath every Antigravity conversation composer—without overla
 - **Time-Boxed Pricing Feed**: Revalues historical consumption against dated model pricing intervals with optional GitHub release checks for pricing feed updates.
 
 ### 3. Non-Invasive Bilingual Adaptation (`中文 / En`)
+- **Full Bilingual App Interface (`GravityBox v1.1.1`)**: GravityBox's native AppKit console, menu bar panel, backend status messages, and Telemetry HUD natively support **Follow System / English / 简体中文** live switching via bundled `assets/i18n/` language packs—requiring no restarts.
 - **Zero App Modification**: Injects isolated runtime localization over Chrome DevTools Protocol (`CDP`), adapting new Antigravity updates cleanly without modifying `/Applications/Antigravity.app`.
 - **Protected User Content**: Unsent drafts, chat history, code blocks, terminal output, workspace names, and brand terms are isolated behind DOM selectors.
 - **Graceful Fallback**: Automatically retains valid mappings or falls back cleanly to official English if DOM structure changes unexpectedly.
@@ -214,13 +215,13 @@ Mounted cleanly beneath every Antigravity conversation composer—without overla
 - **In-App Updates**: Background update checks remain off by default; check manually or opt in anytime from the **About** tab.
 
 <details>
-<summary>Optional: Custom Google OAuth credentials for source builds</summary>
+<summary>Optional: Custom Google OAuth credentials</summary>
 
-Local quota inspection, the Telemetry HUD, SQLite cost tracking, and runtime localization require **no OAuth setup**. For source builds using live quota API refreshes, provide your own OAuth client credentials via environment variables:
+Importing the active account ("Save Current Account"), local quota inspection, the Telemetry HUD, SQLite cost tracking, and runtime localization require **no OAuth setup**. To enable browser OAuth sign-in or background token refreshes for standby accounts, place your own OAuth client credentials in `~/Library/Application Support/GravityBox/.env` (works for packaged `.app` builds launched from Finder) or set them in your shell environment when running from source:
 
 ```bash
-export GRAVITYBOX_GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
-export GRAVITYBOX_GOOGLE_CLIENT_SECRET="your-client-secret"
+GRAVITYBOX_GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
+GRAVITYBOX_GOOGLE_CLIENT_SECRET="your-client-secret"
 ```
 
 </details>
@@ -274,12 +275,12 @@ npm run package:mac
 
 ```text
 gravitybox/
-├── native/          # Swift 6 / AppKit Main Console, Menu Bar Panel, and native App Updater
-├── src/             # TypeScript core engine (IPC, 4-phase switching, quota fusion, SQLite ledger, HUD state)
-├── runtime/         # CDP-injected runtime scripts (localization engine, DOM guards, Telemetry HUD UI)
+├── native/          # Swift 6 / AppKit Main Console, Menu Bar Panel, L10n runtime, and App Updater
+├── src/             # TypeScript core engine (IPC, bilingual i18n, 4-phase switching, quota fusion, SQLite ledger, HUD state)
+├── runtime/         # CDP-injected runtime scripts (localization engine, DOM guards, and bilingual Telemetry HUD)
 ├── dict/            # Versioned bilingual dictionaries, frozen maps, and shared glossary rules
-├── assets/          # App icons, Retina screenshots, dated pricing feed (pricing-feed.json), and model catalog
-├── test/            # Unit, integration, headless Chromium regression, and Swift native UI suites
+├── assets/          # App icons, bilingual packs (i18n/), Retina screenshots, dated pricing feed, and model catalog
+├── test/            # Unit, integration, bilingual foundation/native tests, headless Chromium, and Swift UI suites
 └── tools/           # Release integrity checks, Retina screenshot generator, and macOS DMG packager
 ```
 

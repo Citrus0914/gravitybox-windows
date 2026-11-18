@@ -6,6 +6,32 @@
 export type HudActivityPhase = 'idle' | 'generating' | 'executing';
 export type HudDataAvailability = 'loading' | 'ready' | 'partial' | 'cached' | 'unavailable';
 export type HudCapacitySource = 'explicit' | 'reference' | 'unknown';
+export type HudContextStageRole = 'planner' | 'executor' | 'model';
+
+export interface HudModelContextStage {
+  slotKey: string;
+  role: HudContextStageRole;
+  section?: 'primary' | 'history';
+  modelId: string;
+  modelDisplayName: string;
+  shortLabel: string;
+  compactLabel: string;
+  hasUsageData: boolean;
+  isActive: boolean;
+  compactionCount?: number;
+  usedTokens: number;
+  usedTokensCompact: string;
+  usedTokensFormatted: string;
+  peakContextTokens: number;
+  peakContextCompact: string;
+  peakContextFormatted: string;
+  capacityTokens: number;
+  capacityTokensCompact: string;
+  isFallbackCapacity: boolean;
+  capacitySource: HudCapacitySource;
+  usedRatio: number;
+  usedRatioFormatted: string;
+}
 
 export interface ConversationHudMetrics {
   /** 目标会话 UUID (对应 ~/.gemini/antigravity/conversations/<id>.db) */
@@ -54,6 +80,16 @@ export interface ConversationHudMetrics {
     runningSubagentCount?: number;
     /** 子智能体累计执行步数 */
     subagentSteps?: number;
+    /** 当前轮次是否涉及子智能体调度或运行 */
+    hasSubagentInTurn?: boolean;
+    /** 当前会话是否为独立子智能体轨迹 */
+    isSubagentTrajectory?: boolean;
+    /** 前台流式轮次是否处于等待下一步落库的衔接阶段（非工具审批暂停） */
+    awaitingFirstTurnStep?: boolean;
+    /** 当前轮次末步是否因用户停止或异常而终止 */
+    turnAborted?: boolean;
+    /** 当前轮次末步因停止/异常终止且底层尚未写入完成时间戳（供前端在多步轮次中保留中止时刻高水位） */
+    turnAbortedMissingEnd?: boolean;
     /** 模型累计总用时 (秒) */
     modelDurationSeconds: number;
     /** 模型用时中文格式化展示 (如 "22 分 28 秒") */
@@ -76,20 +112,24 @@ export interface ConversationHudMetrics {
     outputTps: number;
     /** 输出速度格式化展示 (如 "82 tok/s" 或 "—") */
     outputTpsFormatted: string;
+    /** 当前流式生成尚无完结样本时的测速等待标志，供渲染层按结构化布尔判断占位 */
+    outputTpsPending?: boolean;
     /** 最近一个有效完结模型步骤的真实输出速度 (tok/s) */
     latestStepOutputTps?: number;
     /** 最近一个有效完结模型步骤的输出速度格式化展示 */
     latestStepOutputTpsFormatted?: string;
     /** 最近一个有效完结模型步骤的原始 TTFT (秒) */
     latestStepTtftSeconds?: number;
-    /** 最近一步 TTFT 中文格式化展示 (如 "1.85 秒" 或 "—") */
+    /** 最近一步 TTFT 中文格式化展示 (如 "1.85 秒"、"15.5 秒" 或 "—") */
     latestStepTtftFormatted?: string;
-    /** 最近一步 TTFT 英文格式化展示 (如 "1.85s" 或 "—") */
+    /** 最近一步 TTFT 英文格式化展示 (如 "1.85s"、"15.5s" 或 "—") */
     latestStepTtftFormattedEn?: string;
     /** 本轮完整有效请求的总输出 / 总耗时，保留未舍入 tok/s；缺失状态见格式化字段 */
     currentTurnOutputTps?: number;
-    /** 本轮输出速度格式化展示 (如 "118.40 tok/s"、"计算中..." 或 "—") */
+    /** 本轮输出速度格式化展示 (如 "118.4 tok/s"、"计算中..." 或 "—") */
     currentTurnOutputTpsFormatted?: string;
+    /** 本轮流式生成尚无完结样本时的测速等待标志 */
+    currentTurnOutputTpsPending?: boolean;
     /** 本轮已完结并参与测速的模型步数量 */
     currentTurnTimedSamples?: number;
     /** 本轮总用时 (秒，含模型生成思考与工具调用) */
@@ -166,24 +206,38 @@ export interface ConversationHudMetrics {
     hasUnpricedSteps?: boolean;
   };
 
-  /** 模块 3 & Popover 3: 当前上下文实况 (100% 源自最近一步生成记录与会话真实峰值，零虚构 1M/1.9K/7.6K) */
+  /** 模块 3 & Popover 3: 当前上下文实况 (100% 源自最近一步生成记录与当前模型真实峰值，零虚构 1M/1.9K/7.6K) */
   context: {
     hasUsageData?: boolean;
     /** 当前激活模型 ID (如 "gemini-3.8-flash") */
     modelId: string;
     /** 模型展示名称 (如 "Gemini 3.8 Flash") */
     modelDisplayName: string;
+    /** 是否处于多模型或 Orchestrator 双阶段上下文模式 */
+    isMultiModel?: boolean;
+    /** 是否为 Orchestrator 规划/执行双阶段模式 */
+    isOrchestrator?: boolean;
+    /** 当前上下文归属模型的常驻短标 (如 "Carbon" / "Hydrogen") */
+    modelShortLabel?: string;
+    /** 窄分栏下的单字符模型紧凑徽标 (如 "C" / "H") */
+    modelCompactLabel?: string;
+    /** 会话级跨模型单步最高上下文 Token 数（与当前模型专属峰值分离保留） */
+    sessionPeakContextTokens?: number;
+    /** 当前激活模型在会话内经历的上下文压缩次数（多模型模式下与全对话总压缩次数解耦） */
+    activeModelCompactionCount?: number;
+    /** 按模型/阶段拆分的独立上下文水位列表 */
+    modelStages?: HudModelContextStage[];
     /** 当前上下文实际总输入 Token 数 (最近一步 rawInput + cachedRead + cacheWrite) */
     usedTokens: number;
     /** 当前上下文紧凑读数 (如 "226.4K" 或 "0") */
     usedTokensCompact: string;
     /** 当前上下文千分位精确读数 (如 "226,412 tok") */
     usedTokensFormatted?: string;
-    /** 会话历史单步最高上下文 Token 数 (真实观测峰值) */
+    /** 当前激活模型阶段单步最高上下文 Token 数 (真实观测峰值；多模型模式下与全会话峰值 sessionPeakContextTokens 分离) */
     peakContextTokens?: number;
-    /** 会话历史峰值紧凑读数 (如 "226.4K") */
+    /** 当前激活模型阶段峰值紧凑读数 (如 "226.4K") */
     peakContextCompact?: string;
-    /** 会话历史峰值千分位读数 (如 "226,412 tok") */
+    /** 当前激活模型阶段峰值千分位读数 (如 "226,412 tok") */
     peakContextFormatted?: string;
     /** 当前上下文窗口有效容量阈值 (优先取 DB context_window_metadata / planner_config 真实阈值，无则取 Antigravity 标准压缩阈值) */
     capacityTokens: number;
@@ -301,6 +355,8 @@ export interface ParsedGenMetadata {
   systemTokens?: number;
   toolTokens?: number;
   messageTokens?: number;
+  /** ChatStartMetadata.field 4 started_at (秒) */
+  startedAtSeconds?: number;
   /** ChatModelMetadata.field 11 time_to_first_token (秒) */
   timeToFirstTokenSeconds?: number;
   /** ChatModelMetadata.field 12 streaming_duration (秒) */
@@ -373,14 +429,6 @@ export type HudClientEvent =
       childConversationIds?: string[];
       timestamp: number;
     };
-
-/** 生命周期控制器接口 */
-export interface IHudLifecycleController {
-  start(): void;
-  updateMetrics(metrics: ConversationHudMetrics): void;
-  dispose(): void;
-  readonly active: boolean;
-}
 
 /** CDP 桥接器接口 */
 export interface ICdpHudBridge {

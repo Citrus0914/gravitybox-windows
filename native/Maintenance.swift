@@ -1,361 +1,545 @@
 import Cocoa
 
-// MARK: - Segmented Storage Composition Bar (Safe Junk vs Stateful Cache vs Protected Core Assets)
-final class CacheCompositionBar: NSView {
-    var safeBytes: Int64 = 0 { didSet { animateFractions() } }
-    var statefulBytes: Int64 = 0 { didSet { animateFractions() } }
-    var protectedBytes: Int64 = 0 { didSet { animateFractions() } }
-
-    private var displayedSafeFrac: CGFloat = 0
-    private var displayedStatefulFrac: CGFloat = 0
-    private let motion = DesignMotion()
-
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: 8)
+// MARK: - Segmented Storage Composition Bar (Runtime Cache vs Old Logs vs Protected Core Data)
+final class CachePage: NSObject, NSPopoverDelegate {
+    enum DetailKind: String, Equatable {
+        case runtime
+        case history
+        case protected
+        case snapshot
     }
 
-    override init(frame frameRect: NSRect = .zero) {
-        super.init(frame: frameRect)
-        translatesAutoresizingMaskIntoConstraints = false
-        heightAnchor.constraint(equalToConstant: 8).isActive = true
-        setAccessibilityElement(true)
-        setAccessibilityRole(.progressIndicator)
-        setAccessibilityLabel("存储空间构成占比条")
+    static let popoverWidth: CGFloat = 356
+
+    static var retentionChoices: [(title: String, days: Int)] {
+        [
+            (L10n.t("maintenance.simple.retention_7d"), 7),
+            (L10n.t("maintenance.simple.retention_30d"), 30),
+            (L10n.t("maintenance.simple.retention_0d"), 0)
+        ]
     }
 
-    required init?(coder: NSCoder) { fatalError() }
-
-    deinit {
-        motion.cancel()
+    static func elasticSpacer() -> NSView {
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        spacer.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        return spacer
     }
 
-    private func animateFractions() {
-        let total = max(1, safeBytes + statefulBytes + protectedBytes)
-        let targetSafe = safeBytes > 0 ? CGFloat(safeBytes) / CGFloat(total) : 0
-        let targetStateful = statefulBytes > 0 ? CGFloat(statefulBytes) / CGFloat(total) : 0
-        motion.cancel()
-        let startSafe = displayedSafeFrac
-        let startStateful = displayedStatefulFrac
-        guard Design.shouldAnimate(in: self),
-              (abs(targetSafe - startSafe) >= 0.005 || abs(targetStateful - startStateful) >= 0.005) else {
-            displayedSafeFrac = targetSafe
-            displayedStatefulFrac = targetStateful
-            needsDisplay = true
-            return
-        }
-        motion.animate(in: self, from: 0.0, to: 1.0, curve: .sweep, threshold: 0.005) { [weak self] progress in
-            guard let self else { return }
-            self.displayedSafeFrac = startSafe + (targetSafe - startSafe) * progress
-            self.displayedStatefulFrac = startStateful + (targetStateful - startStateful) * progress
-            self.needsDisplay = true
-        } completion: { [weak self] in
-            self?.displayedSafeFrac = targetSafe
-            self?.displayedStatefulFrac = targetStateful
-            self?.needsDisplay = true
-        }
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        if window == nil {
-            motion.cancel()
-        }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let radius = bounds.height / 2
-        let trackRect = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let trackPath = NSBezierPath(roundedRect: trackRect, xRadius: radius, yRadius: radius)
-        Design.track.setFill()
-        trackPath.fill()
-
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-
-        guard safeBytes > 0 || statefulBytes > 0 || protectedBytes > 0 else { return }
-
-        NSGraphicsContext.current?.saveGraphicsState()
-        trackPath.addClip()
-
-        let usableWidth = bounds.width
-        var cursorX: CGFloat = 0
-
-        if safeBytes > 0 && displayedSafeFrac > 0 {
-            let w = max(8, min(usableWidth, round(usableWidth * displayedSafeFrac)))
-            let segRect = NSRect(x: cursorX, y: 0, width: w, height: bounds.height)
-            if let grad = NSGradient(starting: Design.blue.withAlphaComponent(0.75), ending: Design.blue) {
-                grad.draw(in: segRect, angle: 0)
-            } else {
-                Design.blue.setFill()
-                segRect.fill()
-            }
-            cursorX = min(usableWidth, cursorX + w + 2)
-        }
-
-        if statefulBytes > 0 && displayedStatefulFrac > 0 && cursorX < usableWidth {
-            let w = max(6, min(usableWidth - cursorX, round(usableWidth * displayedStatefulFrac)))
-            Design.color(0xD97706, 0xFBBF24).withAlphaComponent(0.88).setFill()
-            NSRect(x: cursorX, y: 0, width: w, height: bounds.height).fill()
-            cursorX = min(usableWidth, cursorX + w + 2)
-        }
-
-        if protectedBytes > 0 && cursorX < usableWidth {
-            let protWidth = max(0, usableWidth - cursorX)
-            if protWidth > 0 {
-                let protColor = isDark
-                    ? NSColor.white.withAlphaComponent(0.26)
-                    : NSColor.black.withAlphaComponent(0.18)
-                protColor.setFill()
-                NSRect(x: cursorX, y: 0, width: protWidth, height: bounds.height).fill()
-            }
-        }
-
-        NSGraphicsContext.current?.restoreGraphicsState()
-    }
-}
-
-// MARK: - First-Class Storage & Maintenance Module ("存储与维护")
-final class CachePage: NSObject {
-    static let retentionChoices: [(title: String, days: Int)] = [
-        ("保留近 7 天", 7),
-        ("保留近 30 天", 30),
-        ("全部非活跃", 0)
+    static let catalogSpecByName: [String: (prefix: String, icon: String)] = [
+        "Cache": ("maintenance.catalog.cache", "internaldrive"),
+        "Code Cache": ("maintenance.catalog.code_cache", "cpu"),
+        "GPUCache": ("maintenance.catalog.gpu_cache", "sparkles.tv"),
+        "DawnCache": ("maintenance.catalog.dawn_cache", "cube.transparent"),
+        "DawnWebGPUCache": ("maintenance.catalog.dawn_webgpu_cache", "cube"),
+        "DawnGraphiteCache": ("maintenance.catalog.dawn_graphite_cache", "paintbrush.pointed"),
+        "GraphiteDawnCache": ("maintenance.catalog.graphite_dawn_cache", "wand.and.rays"),
+        "ShaderCache": ("maintenance.catalog.shader_cache", "circle.hexagongrid"),
+        "CachedData": ("maintenance.catalog.cached_data", "memorychip"),
+        "CachedExtensionVSIXs": ("maintenance.catalog.cached_vsix", "puzzlepiece.extension"),
+        "CachedProfilesData": ("maintenance.catalog.cached_profiles", "person.crop.square"),
+        "Crashpad": ("maintenance.catalog.crashpad", "waveform.path.ecg"),
+        "logs": ("maintenance.catalog.logs", "doc.text"),
+        "blob_storage": ("maintenance.catalog.blob_storage", "archivebox"),
+        "PartitionsCache": ("maintenance.catalog.partitions_cache", "square.split.2x2"),
+        "AgentBrowserCache": ("maintenance.catalog.agent_browser_cache", "globe"),
+        "OrphanAgentData": ("maintenance.catalog.orphan_agent_data", "trash.slash"),
+        "AgentTaskStepLogs": ("maintenance.catalog.task_step_logs", "terminal"),
+        "AgentVerboseTranscripts": ("maintenance.catalog.verbose_transcripts", "doc.on.doc"),
+        "AgentSubagentDatabases": ("maintenance.catalog.subagent_dbs", "arrow.triangle.branch"),
+        "Service Worker": ("maintenance.catalog.service_worker", "gearshape.2"),
+        "Session Storage": ("maintenance.catalog.session_storage", "rectangle.stack"),
+        "WebStorage": ("maintenance.catalog.web_storage", "externaldrive"),
+        "Local Storage": ("maintenance.catalog.local_storage", "internaldrive"),
+        "Cookies": ("maintenance.catalog.cookies", "key"),
+        "Network Persistent State": ("maintenance.catalog.network_state", "network")
     ]
 
     unowned let app: Assistant
     let view: NSView
 
+    // Header & Primary Action Controls
+    let pageTitleLabel = text(L10n.t("maintenance.title"), size: 22, weight: .semibold)
     let scanButton: InlineRefreshButton
     let clearButton: NSButton
-    let retentionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    let recommendButton: NSButton
-    let toggleAllButton: NSButton
-    let snapshotPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    let restoreLatestButton: NSButton
-    let openTrashButton: NSButton
     let sheetDoneButton: NSButton
 
-    // Hero Card Controls
-    let reclaimableTitleLabel = text("可移入废纸篓体积", size: 11.5, weight: .medium, color: Design.secondary)
-    let reclaimableValueLabel = text("正在扫描…", size: 28, weight: .bold)
-    let selectedSummaryBadge = pillBadge("正在扫描", color: Design.inactivePill)
-    let appStateLabel = text("", size: 11, color: Design.secondary)
+    // Card 1: Hero Space Overview & Composition Controls
+    let reclaimableTitleLabel = text(L10n.t("maintenance.simple.hero_title"), size: 11.5, weight: .medium, color: Design.secondary)
+    let reclaimableValueLabel = text(L10n.t("maintenance.hero.scanning"), size: 30, weight: .semibold)
+    let heroSubtitleLabel = text(L10n.t("maintenance.simple.hero_subtitle"), size: 11.5, color: Design.secondary)
     let compositionBar = CacheCompositionBar()
-    let safeLegendLabel = text("无损缓存 —", size: 11, color: Design.secondary)
-    let statefulLegendWrap = NSStackView()
-    let statefulLegendLabel = text("可瘦身历史 —", size: 11, color: Design.secondary)
-    let protectedLegendLabel = text("核心数据已保护", size: 11, color: Design.secondary)
-    let lastScannedLabel = text("", size: 11, color: Design.secondary)
+    let safeLegendLabel = text(L10n.t("maintenance.simple.legend_runtime", ["size": "—"]), size: 11, color: Design.secondary)
+    let statefulLegendLabel = text(L10n.t("maintenance.simple.legend_history", ["size": "—"]), size: 11, color: Design.secondary)
+    let protectedLegendLabel = text(L10n.t("maintenance.simple.legend_protected_empty"), size: 11, color: Design.secondary)
+    let legendRuntimeTrigger: MaintenanceInteractiveGroup
+    let legendHistoryTrigger: MaintenanceInteractiveGroup
+    let legendProtectedTrigger: MaintenanceInteractiveGroup
 
-    // Breakdown Card Controls
-    let breakdownWarningLabel = text("", size: 11, color: accessibleWarningColor())
-    let protectedNoteLabel = text("", size: 11, color: Design.secondary)
-    let itemsStack = NSStackView()
+    // Card 2: 2-Switch Foolproof Scope Card Controls
+    let scopeStack = NSStackView()
+    let runtimeTitleLabel = text(L10n.t("maintenance.simple.scope_runtime_title"), size: 13, weight: .semibold, color: .labelColor)
+    let runtimeInfoButton: MaintenanceInfoButton
+    let runtimeSubtitleLabel = text(L10n.t("maintenance.simple.scope_runtime_sub"), size: 11, color: Design.secondary)
+    let runtimeSizeLabel = text("0 B", size: 13, weight: .semibold, color: Design.secondary)
+    let runtimeCacheSwitch = DesignSwitch()
 
-    // Footer Recovery Card Controls
-    let recoveryTitleLabel = text("废纸篓安全恢复", size: 13, weight: .semibold, color: .labelColor)
-    let recoverySubtitleLabel = text("清理项移入废纸篓，支持一键原位还原", size: 11, color: Design.secondary)
-    let feedbackLabel = text("", size: 11.5, color: Design.secondary, wrap: true)
+    let historyTitleLabel = text(L10n.t("maintenance.simple.scope_history_title"), size: 13, weight: .semibold, color: .labelColor)
+    let retentionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    let historyInfoButton: MaintenanceInfoButton
+    let historySubtitleLabel = text(L10n.t("maintenance.simple.scope_history_sub", ["days": 7]), size: 11, color: Design.secondary)
+    let historySizeLabel = text("0 B", size: 13, weight: .semibold, color: Design.secondary)
+    let historyLogsSwitch = DesignSwitch()
+
+    // Card 3: Safety & Single-Click Undo Footer Card Controls
+    private let recoveryIconBox: NSBox
+    private let recoveryIconView: NSImageView
+    let recoveryTitleLabel = text(L10n.t("maintenance.simple.safety_idle_title"), size: 13, weight: .semibold, color: .labelColor)
+    let recoverySubtitleLabel = text(L10n.t("maintenance.simple.safety_idle_sub"), size: 11, color: Design.secondary)
+    let recoveryTriggerView: MaintenanceInteractiveGroup
+    let restoreLatestButton: NSButton
+    let openTrashButton: NSButton
+    let feedbackLabel = text("", size: 11.5, color: Design.secondary)
+
+    // Popover Audit State
+    var detailPopover: NSPopover?
+    var activePopoverKind: DetailKind?
+    private var languageObserver: NSObjectProtocol?
 
     // State
     var entries: [[String: Any]] = []
     var protectedEntries: [[String: Any]] = []
     var snapshots: [[String: Any]] = []
-    var selectedNames = Set<String>()
-    var hasInitializedSelection = false
+    var runtimeCacheEnabled = true
+    var historyLogsEnabled = false
+    private var userToggledRuntimeSwitch = false
+    private var userToggledHistorySwitch = false
+    var hasCompletedScan = false
     var selectedRetentionDays: Int = 7
     var scanToken = ""
-    var totalCacheBytes: Int64 = 0
+    var runtimeBucketBytes: Int64 = 0
+    var historyBucketBytes: Int64 = 0
+    var runtimeBucketFileCount: Int = 0
+    var historyBucketFileCount: Int = 0
+    var historyBucketSubagentCount: Int = 0
     var safeCacheBytes: Int64 = 0
     var statefulCacheBytes: Int64 = 0
     var totalProtectedBytes: Int64 = 0
-    var totalCacheFiles: Int = 0
-    var uncertainConversationCount = 0
-    var isTruncated = false
     var appRunning = false
     var browserBusy = false
+    var activeTrashPath = ""
+    var usingFallbackTrash = false
     var scannedAt: Int = 0
     var busy = false
-    var minorSafeExpanded = false
-    private var minorSafeNames: [String] = []
-    private var restorableSnapshots: [[String: Any]] = []
-    private var latestRestorableSnapshotId: String = ""
+    private(set) var latestRestorableSnapshotId: String = ""
+    var latestUndoSnapshot: [String: Any]?
     private var lastFetchTime: Date = .distantPast
-    private struct ItemRowControls {
-        let rowView: NSStackView
-        let checkbox: NSButton
-        let titleLabel: NSTextField
-        let subtitleLabel: NSTextField
-        let sizeLabel: NSTextField
-        var bytes: Int64
-        var clearable: Bool
+
+    static let snapshotDateFormatter: DateFormatter = InterfaceText.shortDateTimeFormatter
+
+    var selectedScopes: [String] {
+        var scopes: [String] = []
+        if runtimeCacheEnabled && runtimeBucketBytes > 0 {
+            scopes.append("runtime_cache")
+        }
+        if historyLogsEnabled && historyBucketBytes > 0 {
+            scopes.append("history_logs")
+        }
+        return scopes
     }
-    private var rowControlsByName: [String: ItemRowControls] = [:]
-    private var minorGroupCheckbox: NSButton?
-    private var minorGroupSizeLabel: NSTextField?
-    private var renderedItemNames: [String] = []
-    private var renderedLayoutSignature: String = ""
 
-    private static let timeFormatter: DateFormatter = InterfaceText.shortTimeFormatter
-
-    private static let snapshotDateFormatter: DateFormatter = InterfaceText.shortDateTimeFormatter
+    var selectedReclaimableBytes: Int64 {
+        var sum: Int64 = 0
+        if runtimeCacheEnabled && runtimeBucketBytes > 0 {
+            sum += runtimeBucketBytes
+        }
+        if historyLogsEnabled && historyBucketBytes > 0 {
+            sum += historyBucketBytes
+        }
+        return sum
+    }
 
     init(app: Assistant) {
         self.app = app
-        scanButton = InlineRefreshButton("重新扫描", width: 86, target: nil, action: #selector(scanNow))
-        clearButton = button("清理选中项…", target: nil, action: #selector(clearSelectedCaches))
+        scanButton = InlineRefreshButton(L10n.t("common.refresh"), width: 78, target: nil, action: #selector(scanNow))
+        clearButton = button(L10n.t("maintenance.simple.btn_clean_now"), target: nil, action: #selector(clearSelectedCaches))
         clearButton.bezelColor = Design.blue
+        clearButton.font = .systemFont(ofSize: 13, weight: .semibold)
         clearButton.isEnabled = false
+        clearButton.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            clearButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 106),
+            clearButton.heightAnchor.constraint(equalToConstant: 32)
+        ])
 
+        retentionPopup.controlSize = .small
+        retentionPopup.font = .systemFont(ofSize: 11, weight: .medium)
         retentionPopup.addItems(withTitles: Self.retentionChoices.map(\.title))
         retentionPopup.selectItem(at: 0)
-        retentionPopup.setAccessibilityLabel("历史瘦身保留窗口")
+        retentionPopup.setAccessibilityLabel(L10n.t("maintenance.retention_a11y"))
         retentionPopup.translatesAutoresizingMaskIntoConstraints = false
-        retentionPopup.widthAnchor.constraint(equalToConstant: 118).isActive = true
 
-        recommendButton = button("推荐项", target: nil, action: #selector(selectRecommendedOnly))
-        recommendButton.setAccessibilityLabel("推荐项 / 默认安全项")
-        recommendButton.controlSize = .small
-        recommendButton.isEnabled = false
-        toggleAllButton = button("清空勾选", target: nil, action: #selector(toggleSelectAll))
-        toggleAllButton.controlSize = .small
-        toggleAllButton.isEnabled = false
+        runtimeInfoButton = MaintenanceInfoButton(
+            accessibilityLabel: L10n.t("maintenance.popover.runtime_a11y"),
+            target: nil,
+            action: #selector(runtimeInfoPressed(_:))
+        )
+        historyInfoButton = MaintenanceInfoButton(
+            accessibilityLabel: L10n.t("maintenance.popover.history_a11y"),
+            target: nil,
+            action: #selector(historyInfoPressed(_:))
+        )
 
-        snapshotPopup.setAccessibilityLabel("选择恢复快照")
-        snapshotPopup.translatesAutoresizingMaskIntoConstraints = false
-        snapshotPopup.widthAnchor.constraint(equalToConstant: 192).isActive = true
-        snapshotPopup.isHidden = true
+        runtimeCacheSwitch.controlSize = .small
+        runtimeCacheSwitch.state = .on
+        runtimeCacheSwitch.isEnabled = false
+        runtimeCacheSwitch.setAccessibilityLabel(L10n.t("maintenance.simple.scope_runtime_a11y"))
 
-        restoreLatestButton = button("原位恢复", target: nil, action: #selector(restoreLatestSnapshot))
+        historyLogsSwitch.controlSize = .small
+        historyLogsSwitch.state = .off
+        historyLogsSwitch.isEnabled = false
+        historyLogsSwitch.setAccessibilityLabel(L10n.t("maintenance.simple.scope_history_a11y"))
+
+        let (recBox, recIcon) = Self.makeDynamicIconBadge(symbolName: "checkmark.shield", tint: .systemGreen)
+        recoveryIconBox = recBox
+        recoveryIconView = recIcon
+
+        restoreLatestButton = button(L10n.t("maintenance.simple.btn_undo"), target: nil, action: #selector(restoreLatestSnapshot))
         restoreLatestButton.controlSize = .small
+        restoreLatestButton.bezelColor = Design.blue
         restoreLatestButton.isHidden = true
-        openTrashButton = button("打开废纸篓", target: nil, action: #selector(openTrashFolder))
+
+        openTrashButton = button(L10n.t("maintenance.simple.btn_show_finder"), target: nil, action: #selector(openTrashFolder))
         openTrashButton.controlSize = .small
-        sheetDoneButton = button("完成", target: nil, action: #selector(MaintenanceSheetController.closeSheet))
+
+        sheetDoneButton = button(L10n.t("maintenance.btn.done"), target: nil, action: #selector(MaintenanceSheetController.closeSheet))
         sheetDoneButton.controlSize = .regular
         sheetDoneButton.bezelColor = Design.blue
         sheetDoneButton.keyEquivalent = "\r"
         sheetDoneButton.isHidden = true
 
-        let headerActions = horizontal([scanButton, clearButton], spacing: 8)
-        headerActions.detachesHiddenViews = true
-        let root = pageStack(title: "存储与维护", actions: headerActions)
-        root.spacing = 10
+        let headerTitle = pageTitleLabel
+        headerTitle.identifier = NSUserInterfaceItemIdentifier("page-title")
+        let headerRow = horizontal([headerTitle, Self.elasticSpacer(), scanButton], spacing: 10)
+        headerRow.alignment = .centerY
 
-        // 1. Calm Hero Overview Card (Matches Overview & Usage visual density)
-        reclaimableValueLabel.font = .monospacedDigitSystemFont(ofSize: 28, weight: .semibold)
+        // 1. Hero Space Overview & One-Click Action Card
+        reclaimableValueLabel.font = .monospacedDigitSystemFont(ofSize: 30, weight: .semibold)
         reclaimableValueLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         safeLegendLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         statefulLegendLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         protectedLegendLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        lastScannedLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
 
-        let heroLeftValueRow = horizontal([reclaimableValueLabel, selectedSummaryBadge], spacing: 10)
-        heroLeftValueRow.alignment = .centerY
-        let heroLeftCol = vertical([reclaimableTitleLabel, heroLeftValueRow], spacing: 4)
-        let heroTopRow = horizontal([heroLeftCol, flexibleSpace(), appStateLabel], spacing: 12)
-        heroTopRow.alignment = .bottom
-
-        let blueDot = Self.makeLegendDot(color: Design.blue)
-        let amberDot = Self.makeLegendDot(color: Design.color(0xD97706, 0xFBBF24))
-        let grayDot = Self.makeLegendDot(color: NSColor.secondaryLabelColor.withAlphaComponent(0.55))
-
-        let legendSafe = horizontal([blueDot, safeLegendLabel], spacing: 6)
-        legendSafe.alignment = .centerY
-
-        statefulLegendWrap.orientation = .horizontal
-        statefulLegendWrap.alignment = .centerY
-        statefulLegendWrap.spacing = 6
-        statefulLegendWrap.addArrangedSubview(amberDot)
-        statefulLegendWrap.addArrangedSubview(statefulLegendLabel)
-
-        let legendProtected = horizontal([grayDot, protectedLegendLabel], spacing: 6)
-        legendProtected.alignment = .centerY
-
-        let compressiblePriority = NSLayoutConstraint.Priority(45)
-        for lbl in [reclaimableTitleLabel, appStateLabel, safeLegendLabel, statefulLegendLabel, protectedLegendLabel, lastScannedLabel, breakdownWarningLabel, protectedNoteLabel, recoveryTitleLabel, recoverySubtitleLabel] {
+        let textCompressionPriority = NSLayoutConstraint.Priority(740)
+        for lbl in [
+            reclaimableTitleLabel, heroSubtitleLabel,
+            safeLegendLabel, statefulLegendLabel, protectedLegendLabel,
+            runtimeTitleLabel, runtimeSubtitleLabel,
+            historyTitleLabel, historySubtitleLabel,
+            recoveryTitleLabel, recoverySubtitleLabel, feedbackLabel
+        ] {
             lbl.maximumNumberOfLines = 1
             lbl.lineBreakMode = .byTruncatingTail
             lbl.cell?.wraps = false
             lbl.cell?.truncatesLastVisibleLine = true
-            lbl.setContentCompressionResistancePriority(compressiblePriority, for: .horizontal)
-            lbl.setContentHuggingPriority(NSLayoutConstraint.Priority(10), for: .horizontal)
+            lbl.toolTip = nil
+            lbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            lbl.setContentCompressionResistancePriority(textCompressionPriority, for: .horizontal)
         }
-        selectedSummaryBadge.setContentCompressionResistancePriority(.required, for: .horizontal)
-        selectedSummaryBadge.setContentHuggingPriority(.required, for: .horizontal)
 
-        let legendSpacer = flexibleSpace()
-        legendSpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(20), for: .horizontal)
-        let legendRow = horizontal([legendSafe, statefulLegendWrap, legendProtected, legendSpacer, lastScannedLabel], spacing: 14)
+        let heroLeftCol = vertical([reclaimableTitleLabel, reclaimableValueLabel, heroSubtitleLabel], spacing: 3)
+        heroLeftCol.setCustomSpacing(4, after: reclaimableValueLabel)
+        heroLeftCol.alignment = .leading
+        heroLeftCol.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        heroLeftCol.setContentCompressionResistancePriority(textCompressionPriority, for: .horizontal)
+
+        clearButton.setContentHuggingPriority(.required, for: .horizontal)
+        clearButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let heroTopRow = horizontal([heroLeftCol, Self.elasticSpacer(), clearButton], spacing: 14)
+        heroTopRow.alignment = .centerY
+
+        let blueDot = Self.makeLegendDot(color: Design.blue)
+        let amberDot = Self.makeLegendDot(color: Design.color(0xD97706, 0xFBBF24))
+        let grayDot = Self.makeLegendDot(color: Design.color(0x8E8E93, 0x98989D))
+
+        let protectedHintIcon = NSImageView(image: NSImage(systemSymbolName: "info.circle", accessibilityDescription: nil) ?? NSImage())
+        protectedHintIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10.5, weight: .medium)
+        protectedHintIcon.contentTintColor = Design.secondary.withAlphaComponent(0.62)
+        protectedHintIcon.toolTip = nil
+        protectedHintIcon.setAccessibilityElement(false)
+        protectedHintIcon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            protectedHintIcon.widthAnchor.constraint(equalToConstant: 12),
+            protectedHintIcon.heightAnchor.constraint(equalToConstant: 12)
+        ])
+
+        let legendSafe = horizontal([blueDot, safeLegendLabel], spacing: 5)
+        legendSafe.alignment = .centerY
+        let legendHistory = horizontal([amberDot, statefulLegendLabel], spacing: 5)
+        legendHistory.alignment = .centerY
+        let legendProtected = horizontal([grayDot, protectedLegendLabel, protectedHintIcon], spacing: 5)
+        legendProtected.setCustomSpacing(3.5, after: protectedLegendLabel)
+        legendProtected.alignment = .centerY
+
+        legendRuntimeTrigger = MaintenanceInteractiveGroup(
+            content: legendSafe,
+            accessibilityLabel: L10n.t("maintenance.popover.runtime_a11y")
+        )
+        legendHistoryTrigger = MaintenanceInteractiveGroup(
+            content: legendHistory,
+            accessibilityLabel: L10n.t("maintenance.popover.history_a11y")
+        )
+        legendProtectedTrigger = MaintenanceInteractiveGroup(
+            content: legendProtected,
+            accessibilityLabel: L10n.t("maintenance.popover.protected_a11y")
+        )
+        for trigger in [legendRuntimeTrigger, legendHistoryTrigger, legendProtectedTrigger] {
+            trigger.setContentHuggingPriority(.required, for: .horizontal)
+            trigger.setContentCompressionResistancePriority(textCompressionPriority, for: .horizontal)
+        }
+
+        let legendRow = horizontal([legendRuntimeTrigger, legendHistoryTrigger, legendProtectedTrigger, Self.elasticSpacer()], spacing: 14)
         legendRow.alignment = .centerY
 
-        let heroCard = group([heroTopRow, compositionBar, legendRow], inset: 13, spacing: 8)
+        let heroCard = group([heroTopRow, compositionBar, legendRow], inset: 14, spacing: 10)
         heroCard.cornerRadius = Design.Radius.card
-        root.addArrangedSubview(heroCard)
 
-        // 2. Clean Storage Governance Checklist Card (Zero row capsules, zero boxed row icons, zero mini bars)
-        let breakdownTitleLabel = text("存储治理清单", size: 13, weight: .semibold)
-        let selectionButtons = horizontal([retentionPopup, recommendButton, toggleAllButton], spacing: 6)
-        selectionButtons.alignment = .centerY
-        selectionButtons.setContentHuggingPriority(.required, for: .horizontal)
-        selectionButtons.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let breakdownHeader = horizontal([breakdownTitleLabel, flexibleSpace(), selectionButtons], spacing: 12)
-        breakdownHeader.alignment = .centerY
+        // 2. Two-Switch Foolproof Scope Card
+        runtimeSizeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        runtimeSizeLabel.alignment = .right
+        runtimeSizeLabel.setContentHuggingPriority(.required, for: .horizontal)
+        runtimeSizeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        breakdownWarningLabel.isHidden = true
-        protectedNoteLabel.isHidden = true
+        historySizeLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        historySizeLabel.alignment = .right
+        historySizeLabel.setContentHuggingPriority(.required, for: .horizontal)
+        historySizeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        itemsStack.orientation = .vertical
-        itemsStack.alignment = .leading
-        itemsStack.spacing = 6.5
+        let runtimeIcon = Self.makeIconBadge(symbolName: "sparkles", tint: Design.blue)
+        runtimeTitleLabel.setContentHuggingPriority(.required, for: .horizontal)
+        runtimeTitleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let runtimeTitleRow = horizontal([runtimeTitleLabel, runtimeInfoButton], spacing: 5)
+        runtimeTitleRow.alignment = .centerY
+        let runtimeCaptions = vertical([runtimeTitleRow, runtimeSubtitleLabel], spacing: 2)
+        runtimeCaptions.alignment = .leading
+        runtimeCaptions.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        runtimeCaptions.setContentCompressionResistancePriority(textCompressionPriority, for: .horizontal)
+        let runtimeRight = horizontal([runtimeSizeLabel, runtimeCacheSwitch], spacing: 10)
+        runtimeRight.alignment = .centerY
+        runtimeRight.setContentHuggingPriority(.required, for: .horizontal)
+        runtimeRight.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let runtimeRow = horizontal([runtimeIcon, runtimeCaptions, Self.elasticSpacer(), runtimeRight], spacing: 11)
+        runtimeRow.alignment = .centerY
 
-        let breakdownContent = vertical([breakdownHeader, breakdownWarningLabel, divider(), itemsStack, protectedNoteLabel], spacing: 8)
-        breakdownContent.detachesHiddenViews = true
-        for child in breakdownContent.arrangedSubviews { fillWidth(child, in: breakdownContent) }
-        let breakdownCard = group([breakdownContent], inset: 13)
-        breakdownCard.cornerRadius = Design.Radius.card
-        root.addArrangedSubview(breakdownCard)
+        let amberTint = Design.color(0xD97706, 0xFBBF24)
+        let historyIcon = Self.makeIconBadge(symbolName: "clock.arrow.circlepath", tint: amberTint)
+        historyTitleLabel.setContentHuggingPriority(.required, for: .horizontal)
+        historyTitleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        retentionPopup.setContentHuggingPriority(.required, for: .horizontal)
+        retentionPopup.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let historyTitleRow = horizontal([historyTitleLabel, retentionPopup, historyInfoButton], spacing: 8)
+        historyTitleRow.setCustomSpacing(5, after: retentionPopup)
+        historyTitleRow.alignment = .centerY
+        let historyCaptions = vertical([historyTitleRow, historySubtitleLabel], spacing: 2)
+        historyCaptions.alignment = .leading
+        historyCaptions.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        historyCaptions.setContentCompressionResistancePriority(textCompressionPriority, for: .horizontal)
+        let historyRight = horizontal([historySizeLabel, historyLogsSwitch], spacing: 10)
+        historyRight.alignment = .centerY
+        historyRight.setContentHuggingPriority(.required, for: .horizontal)
+        historyRight.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let historyRow = horizontal([historyIcon, historyCaptions, Self.elasticSpacer(), historyRight], spacing: 11)
+        historyRow.alignment = .centerY
 
-        // 3. Calm Single-Row Trash Recovery Card (Matches Settings row density)
-        let recoveryIconBox = Self.makeIconBadge(symbolName: "clock.arrow.circlepath", tint: Design.blue, neutral: false)
+        let scopeDivider = divider()
+        scopeStack.orientation = .vertical
+        scopeStack.alignment = .leading
+        scopeStack.spacing = 11
+        for rowView in [runtimeRow, scopeDivider, historyRow] {
+            scopeStack.addArrangedSubview(rowView)
+            fillWidth(rowView, in: scopeStack)
+        }
+        let scopeCard = group([scopeStack], inset: 14)
+        scopeCard.cornerRadius = Design.Radius.card
+
+        // 3. Safety & Single-Click Undo Footer Card (0pt horizontal trigger wrapper preserves full width budget)
         let recoveryTextCol = vertical([recoveryTitleLabel, recoverySubtitleLabel], spacing: 2)
         recoveryTextCol.alignment = .leading
-        recoveryTextCol.setContentHuggingPriority(NSLayoutConstraint.Priority(30), for: .horizontal)
-        recoveryTextCol.setContentCompressionResistancePriority(compressiblePriority, for: .horizontal)
+        recoveryTextCol.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        recoveryTextCol.setContentCompressionResistancePriority(textCompressionPriority, for: .horizontal)
 
-        let recoveryActions = horizontal([snapshotPopup, restoreLatestButton, openTrashButton], spacing: 8)
+        let recoveryLeadRow = horizontal([recoveryIconBox, recoveryTextCol], spacing: 11)
+        recoveryLeadRow.alignment = .centerY
+        recoveryTriggerView = MaintenanceInteractiveGroup(
+            content: recoveryLeadRow,
+            accessibilityLabel: L10n.t("maintenance.popover.protected_a11y")
+        )
+        recoveryTriggerView.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        recoveryTriggerView.setContentCompressionResistancePriority(textCompressionPriority, for: .horizontal)
+
+        let recoveryActions = horizontal([restoreLatestButton, openTrashButton], spacing: 8)
         recoveryActions.detachesHiddenViews = true
         recoveryActions.alignment = .centerY
         recoveryActions.setContentHuggingPriority(.required, for: .horizontal)
         recoveryActions.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let recoverySpacer = flexibleSpace()
-        recoverySpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(20), for: .horizontal)
-        let recoveryRow = horizontal([recoveryIconBox, recoveryTextCol, recoverySpacer, recoveryActions], spacing: 11)
-        recoveryRow.alignment = .centerY
 
+        let recoveryRow = horizontal([recoveryTriggerView, Self.elasticSpacer(), recoveryActions], spacing: 11)
+        recoveryRow.alignment = .centerY
         let recoveryCard = group([recoveryRow], inset: 12)
         recoveryCard.cornerRadius = Design.Radius.card
-        root.addArrangedSubview(recoveryCard)
+
+        let rootStack = vertical([headerRow, heroCard, scopeCard, recoveryCard], spacing: 10)
+        rootStack.setCustomSpacing(12, after: headerRow)
+        for child in rootStack.arrangedSubviews {
+            fillWidth(child, in: rootStack)
+        }
+
+        let container = NSView()
+        container.addSubview(rootStack)
+        rootStack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            rootStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 22),
+            rootStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -22),
+            rootStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            rootStack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -12)
+        ])
 
         feedbackLabel.isHidden = true
-        root.addArrangedSubview(feedbackLabel)
-
-        view = scrollPage(root)
+        view = container
         super.init()
 
         scanButton.target = self
         clearButton.target = self
+        runtimeInfoButton.target = self
+        historyInfoButton.target = self
+        runtimeCacheSwitch.target = self
+        runtimeCacheSwitch.action = #selector(runtimeScopeToggled)
+        historyLogsSwitch.target = self
+        historyLogsSwitch.action = #selector(historyScopeToggled)
         retentionPopup.target = self
         retentionPopup.action = #selector(retentionWindowChanged)
-        recommendButton.target = self
-        toggleAllButton.target = self
-        snapshotPopup.target = self
-        snapshotPopup.action = #selector(snapshotSelectionChanged)
         restoreLatestButton.target = self
         openTrashButton.target = self
+
+        legendRuntimeTrigger.onActivate = { [weak self] anchor in
+            self?.toggleDetailPopover(.runtime, relativeTo: anchor, preferredEdge: .maxY)
+        }
+        legendHistoryTrigger.onActivate = { [weak self] anchor in
+            self?.toggleDetailPopover(.history, relativeTo: anchor, preferredEdge: .maxY)
+        }
+        legendProtectedTrigger.onActivate = { [weak self] anchor in
+            self?.toggleDetailPopover(.protected, relativeTo: anchor, preferredEdge: .maxY)
+        }
+        recoveryTriggerView.onActivate = { [weak self] anchor in
+            guard let self else { return }
+            let targetKind: DetailKind = (self.latestUndoSnapshot != nil || !self.snapshots.isEmpty) ? .snapshot : .protected
+            self.toggleDetailPopover(targetKind, relativeTo: anchor, preferredEdge: .minY)
+        }
+
+        languageObserver = NotificationCenter.default.addObserver(
+            forName: L10n.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.dismissDetailPopover()
+            self?.applyLocalizedChrome()
+        }
+
         Design.applyControls(view)
+        Self.stripTooltipsRecursively(view)
     }
 
-    private static func makeLegendDot(color: NSColor) -> NSBox {
+    deinit {
+        if let languageObserver {
+            NotificationCenter.default.removeObserver(languageObserver)
+        }
+    }
+
+    static func stripTooltipsRecursively(_ root: NSView) {
+        root.toolTip = nil
+        for sub in root.subviews {
+            stripTooltipsRecursively(sub)
+        }
+    }
+
+    private func applyLocalizedChrome() {
+        pageTitleLabel.stringValue = L10n.t("maintenance.title")
+        let refreshTitle = L10n.t("common.refresh")
+        scanButton.title = refreshTitle
+        scanButton.setAccessibilityLabel(refreshTitle)
+        scanButton.invalidateIntrinsicContentSize()
+        runtimeTitleLabel.stringValue = L10n.t("maintenance.simple.scope_runtime_title")
+        historyTitleLabel.stringValue = L10n.t("maintenance.simple.scope_history_title")
+        runtimeCacheSwitch.setAccessibilityLabel(L10n.t("maintenance.simple.scope_runtime_a11y"))
+        historyLogsSwitch.setAccessibilityLabel(L10n.t("maintenance.simple.scope_history_a11y"))
+
+        retentionPopup.removeAllItems()
+        retentionPopup.addItems(withTitles: Self.retentionChoices.map(\.title))
+        let matchIdx = Self.retentionChoices.firstIndex(where: { $0.days == selectedRetentionDays }) ?? 0
+        retentionPopup.selectItem(at: matchIdx)
+        retentionPopup.setAccessibilityLabel(L10n.t("maintenance.retention_a11y"))
+        _ = Design.syncPopUpWidth(retentionPopup)
+
+        restoreLatestButton.title = L10n.t("maintenance.simple.btn_undo")
+        restoreLatestButton.invalidateIntrinsicContentSize()
+        openTrashButton.title = L10n.t("maintenance.simple.btn_show_finder")
+        openTrashButton.invalidateIntrinsicContentSize()
+        sheetDoneButton.title = L10n.t("maintenance.btn.done")
+        sheetDoneButton.invalidateIntrinsicContentSize()
+        syncLocalizedTriggerLabels()
+        updateSummaryAndControls()
+        updateRecoveryFooter()
+        view.window?.title = L10n.t("maintenance.sheet_title")
+        view.layoutSubtreeIfNeeded()
+    }
+
+    private func syncLocalizedTriggerLabels() {
+        runtimeInfoButton.setAccessibilityLabel(L10n.t("maintenance.popover.runtime_a11y"))
+        historyInfoButton.setAccessibilityLabel(L10n.t("maintenance.popover.history_a11y"))
+        legendRuntimeTrigger.setAccessibilityLabel(L10n.t("maintenance.popover.runtime_a11y"))
+        legendHistoryTrigger.setAccessibilityLabel(L10n.t("maintenance.popover.history_a11y"))
+        legendProtectedTrigger.setAccessibilityLabel(L10n.t("maintenance.popover.protected_a11y"))
+        let hasSnap = (latestUndoSnapshot != nil || !snapshots.isEmpty)
+        recoveryTriggerView.setAccessibilityLabel(
+            L10n.t(hasSnap ? "maintenance.popover.snapshot_a11y" : "maintenance.popover.protected_a11y")
+        )
+    }
+
+    // MARK: - Stage 2 Dynamic Running-Cleanup Scope Summary
+    func buildRunningClearConfirmationBody() -> String {
+        var activeItemCount = 0
+        var activeFileCount = 0
+
+        if runtimeCacheEnabled && runtimeBucketBytes > 0 {
+            let rtEntries = entries.filter { !isStatefulItem($0) && ($0["clearable"] as? Bool != false) && intVal($0, "bytes") > 0 }
+            activeItemCount += max(1, rtEntries.count)
+            let rtFiles = runtimeBucketFileCount > 0
+                ? runtimeBucketFileCount
+                : rtEntries.reduce(0) { $0 + intVal($1, "fileCount") }
+            activeFileCount += rtFiles
+        }
+        if historyLogsEnabled && historyBucketBytes > 0 {
+            let histEntries = entries.filter { isStatefulItem($0) && ($0["clearable"] as? Bool != false) && intVal($0, "bytes") > 0 }
+            activeItemCount += max(1, histEntries.count)
+            let histFiles = historyBucketFileCount > 0
+                ? historyBucketFileCount
+                : histEntries.reduce(0) { $0 + intVal($1, "fileCount") }
+            activeFileCount += histFiles
+        }
+
+        let targetBytes = selectedReclaimableBytes
+        guard activeItemCount > 0, activeFileCount > 0, targetBytes > 0 else {
+            return L10n.t("maintenance.simple.confirm_running_body")
+        }
+        return L10n.t("maintenance.simple.confirm_running_detail", [
+            "items": activeItemCount,
+            "files": formatCount(activeFileCount),
+            "size": formatBytes(targetBytes)
+        ])
+    }
+
+    static func makeLegendDot(color: NSColor) -> NSBox {
         let dot = NSBox()
         dot.boxType = .custom
         dot.cornerRadius = 3.5
@@ -369,8 +553,13 @@ final class CachePage: NSObject {
         return dot
     }
 
-    private static func makeIconBadge(symbolName: String, tint: NSColor, neutral: Bool = false) -> NSBox {
-        let box = tintedIconBox(size: 28, cornerRadius: 7.5, tint: tint, neutral: neutral)
+    static func makeIconBadge(symbolName: String, tint: NSColor) -> NSBox {
+        let (box, _) = makeDynamicIconBadge(symbolName: symbolName, tint: tint)
+        return box
+    }
+
+    private static func makeDynamicIconBadge(symbolName: String, tint: NSColor) -> (NSBox, NSImageView) {
+        let box = tintedIconBox(size: 28, cornerRadius: 7.5, tint: tint, neutral: false)
         let iconView = symbol(symbolName, size: 13.5, color: tint)
         iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13.5, weight: .medium)
         box.addSubview(iconView)
@@ -378,10 +567,23 @@ final class CachePage: NSObject {
             iconView.centerXAnchor.constraint(equalTo: box.centerXAnchor),
             iconView.centerYAnchor.constraint(equalTo: box.centerYAnchor)
         ])
-        return box
+        return (box, iconView)
     }
 
-    private func formatBytes(_ bytes: Int64) -> String {
+    private func applyRecoveryBadgeTheme(symbolName: String, tint: NSColor) {
+        recoveryIconBox.fillColor = NSColor(name: nil) { app in
+            let isDark = app.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return tint.withAlphaComponent(isDark ? 0.18 : 0.10)
+        }
+        recoveryIconBox.borderColor = NSColor(name: nil) { app in
+            let isDark = app.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return tint.withAlphaComponent(isDark ? 0.32 : 0.18)
+        }
+        recoveryIconView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+        recoveryIconView.contentTintColor = tint
+    }
+
+    func formatBytes(_ bytes: Int64) -> String {
         if bytes <= 0 { return "0 B" }
         return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
@@ -389,58 +591,96 @@ final class CachePage: NSObject {
     func update(force: Bool = false) {
         guard !busy else { return }
         let expired = Date().timeIntervalSince(lastFetchTime) >= 60.0
-        if !force && !expired && !entries.isEmpty { return }
+        if !force && !expired && hasCompletedScan { return }
         fetch(force: force)
     }
 
     @objc func scanNow() {
         guard !busy else { return }
+        dismissDetailPopover()
         feedbackLabel.isHidden = true
         fetch(force: true)
     }
 
+    private func setBusy(_ isBusy: Bool) {
+        busy = isBusy
+        scanButton.setBusy(isBusy, available: app.reachable)
+        retentionPopup.isEnabled = !isBusy && app.reachable
+        restoreLatestButton.isEnabled = !isBusy
+        if isBusy {
+            clearButton.isEnabled = false
+            runtimeCacheSwitch.isEnabled = false
+            historyLogsSwitch.isEnabled = false
+        } else {
+            updateSummaryAndControls()
+            if app.pendingLocalizedRebuildAfterMaintenance && app.preferencesController?.maintenanceSheet == nil {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, !self.busy,
+                          self.app.pendingLocalizedRebuildAfterMaintenance,
+                          self.app.preferencesController?.maintenanceSheet == nil else { return }
+                    self.app.pendingLocalizedRebuildAfterMaintenance = false
+                    self.app.cachePage = nil
+                    self.app.preferencesController = nil
+                    if self.app.currentPage == 3 {
+                        self.app.navigate(3, force: true)
+                    }
+                }
+            }
+        }
+    }
+
     func fetch(force: Bool = false) {
+        if !force && !hasCompletedScan,
+           let cached = app.lastMaintenanceScanPayload,
+           intVal(cached, "retentionDays", fallback: 7) == selectedRetentionDays,
+           Date().timeIntervalSince(app.lastMaintenanceScanAt) < 30.0 {
+            lastFetchTime = app.lastMaintenanceScanAt
+            applyScanPayload(cached)
+            if Date().timeIntervalSince(app.lastMaintenanceScanAt) < 15.0 {
+                return
+            }
+        }
+        if !force && Date().timeIntervalSince(lastFetchTime) < 3.0 && hasCompletedScan {
+            return
+        }
         guard app.reachable, !busy else {
             if !app.reachable {
-                if entries.isEmpty {
+                if !hasCompletedScan {
                     reclaimableValueLabel.stringValue = "—"
-                    selectedSummaryBadge.title = "等待服务"
-                    selectedSummaryBadge.tint = .secondaryLabelColor
                     clearButton.isEnabled = false
-                    recommendButton.isEnabled = false
-                    toggleAllButton.isEnabled = false
+                    runtimeCacheSwitch.isEnabled = false
+                    historyLogsSwitch.isEnabled = false
                 }
-                appStateLabel.stringValue = "等待本机服务…"
+                retentionPopup.isEnabled = false
+                heroSubtitleLabel.stringValue = L10n.t("maintenance.hero.waiting_service")
+                heroSubtitleLabel.textColor = Design.secondary
                 scanButton.setBusy(false, available: false)
             }
             return
         }
-        busy = true
-        scanButton.setBusy(true, available: app.reachable)
-        retentionPopup.isEnabled = false
-        if entries.isEmpty {
-            reclaimableValueLabel.stringValue = "正在扫描…"
-            selectedSummaryBadge.title = "正在扫描"
-            selectedSummaryBadge.tint = .secondaryLabelColor
+        setBusy(true)
+        if !hasCompletedScan {
+            reclaimableValueLabel.stringValue = L10n.t("maintenance.hero.scanning")
+            heroSubtitleLabel.stringValue = L10n.t("maintenance.simple.hero_subtitle")
+            heroSubtitleLabel.textColor = Design.secondary
             clearButton.isEnabled = false
-            recommendButton.isEnabled = false
-            toggleAllButton.isEnabled = false
         }
         app.bridge.send(["command": "maintenance_scan", "retentionDays": selectedRetentionDays]) { [weak self] response in
             guard let self else { return }
-            self.busy = false
-            self.scanButton.setBusy(false, available: self.app.reachable)
-            self.retentionPopup.isEnabled = self.app.reachable
-            self.lastFetchTime = Date()
+            self.setBusy(false)
+            let now = Date()
+            self.lastFetchTime = now
             switch response {
             case .failure(let error):
-                self.reclaimableValueLabel.stringValue = "扫描失败"
-                self.selectedSummaryBadge.title = "请重试"
-                self.selectedSummaryBadge.tint = .secondaryLabelColor
-                self.breakdownWarningLabel.isHidden = false
-                self.breakdownWarningLabel.stringValue = error.localizedDescription
+                if !self.hasCompletedScan {
+                    reclaimableValueLabel.stringValue = L10n.t("maintenance.hero.scan_failed")
+                }
+                self.heroSubtitleLabel.stringValue = error.localizedDescription
+                self.heroSubtitleLabel.textColor = accessibleWarningColor()
                 self.clearButton.isEnabled = false
             case .success(let value):
+                self.app.lastMaintenanceScanPayload = value
+                self.app.lastMaintenanceScanAt = now
                 self.applyScanPayload(value)
                 self.app.preferencesController?.applyStorageScanPayload(value)
             }
@@ -448,101 +688,53 @@ final class CachePage: NSObject {
     }
 
     @objc func retentionWindowChanged() {
+        guard !busy else {
+            if let matchIdx = Self.retentionChoices.firstIndex(where: { $0.days == selectedRetentionDays }) {
+                retentionPopup.selectItem(at: matchIdx)
+            }
+            return
+        }
         let idx = max(0, min(Self.retentionChoices.count - 1, retentionPopup.indexOfSelectedItem))
         let nextDays = Self.retentionChoices[idx].days
         guard nextDays != selectedRetentionDays else { return }
+        dismissDetailPopover()
         selectedRetentionDays = nextDays
         feedbackLabel.isHidden = true
+        updateSummaryAndControls()
         fetch(force: true)
     }
 
-    private func defaultMetadata(for name: String) -> (title: String, subtitle: String, icon: String, category: String, defaultSelected: Bool, impactWarning: String?) {
-        switch name {
-        case "Cache":
-            return ("网络与静态资源缓存", "界面静态资源与临时网络响应数据", "internaldrive", "safe", true, nil)
-        case "Code Cache":
-            return ("V8 字节码编译缓存", "JavaScript 与 WebAssembly 预编译加速缓存", "cpu", "safe", true, nil)
-        case "GPUCache":
-            return ("图形与着色器缓存", "Metal 与 WebGL 图形渲染管线编译产物", "sparkles.rectangle.stack", "safe", true, nil)
-        case "DawnCache":
-            return ("WebGPU 图形加速缓存", "Dawn 引擎图形管线与计算着色器缓存", "cube.transparent", "safe", true, nil)
-        case "DawnWebGPUCache":
-            return ("WebGPU 管线缓存", "WebGPU 渲染管线与着色器加速缓存", "cube.transparent", "safe", true, nil)
-        case "DawnGraphiteCache":
-            return ("Graphite 渲染管线缓存", "Chromium Graphite 图形管线预编译产物", "cube.transparent", "safe", true, nil)
-        case "GraphiteDawnCache":
-            return ("Graphite 着色器加速缓存", "现代图形后端预编译着色器与管线缓存", "sparkles.rectangle.stack", "safe", true, nil)
-        case "ShaderCache":
-            return ("底层着色器缓存", "图形驱动预编译着色器残留数据", "sparkles.rectangle.stack", "safe", true, nil)
-        case "CachedData":
-            return ("工作区运行编译缓存", "主进程与渲染进程预编译脚本缓存", "memorychip", "safe", true, nil)
-        case "CachedExtensionVSIXs":
-            return ("扩展安装包残留", "插件安装与更新遗留的 VSIX 压缩包", "shippingbox", "safe", true, nil)
-        case "CachedProfilesData":
-            return ("配置快照临时缓存", "工作区配置切换生成的临时加速缓存", "doc.badge.gearshape", "safe", true, nil)
-        case "Crashpad":
-            return ("崩溃转储与诊断残留", "历史崩溃报告与废弃诊断转储文件", "exclamationmark.triangle", "safe", true, nil)
-        case "logs":
-            return ("历史运行日志", "主进程、渲染进程与扩展宿主历史日志", "doc.text", "safe", true, nil)
-        case "blob_storage":
-            return ("临时二进制块缓存", "运行期产生的临时二进制块数据", "archivebox", "safe", true, nil)
-        case "PartitionsCache":
-            return ("内嵌视图子分区缓存", "内嵌浏览器与隔离分区的静态资源及编译缓存", "square.split.2x2", "safe", true, nil)
-        case "AgentBrowserCache":
-            return ("浏览器沙箱加速缓存", "Browser 沙箱的网页与编译缓存（保留站点登录与 Cookie）", "globe", "safe", true, nil)
-        case "OrphanAgentData":
-            return ("崩溃日志与临时媒体", "父对话已删除的孤儿任务碎片、崩溃日志与临时媒体缓存", "trash.slash", "safe", true, nil)
-        case "AgentTaskStepLogs":
-            return ("历史任务与步骤输出日志", "非活跃对话的后台终端日志、步骤输出与 scratch 草稿", "terminal", "stateful", false, "主对话与正式产物完好保留")
-        case "AgentVerboseTranscripts":
-            return ("全量冗余转录与分片镜像", "非活跃对话的 transcript_full 与分片镜像（保留紧凑版记录）", "doc.on.doc", "stateful", false, "对话界面与紧凑版记录不受影响")
-        case "AgentSubagentDatabases":
-            return ("历史子智能体轨迹库", "已完成任务的后台 Subagent 数据库（清理前自动归档 Token 账单）", "arrow.triangle.branch", "stateful", false, "主对话与历史账单完好保留，旧子智能体过程不再展开")
-        case "Service Worker":
-            return ("后台服务工作线程", "按需清理 · 清理后重新初始化扩展后台状态", "gearshape.2", "stateful", false, "重置扩展后台状态")
-        case "Session Storage":
-            return ("内嵌视图会话缓存", "按需清理 · 清理后重置部分内嵌视图临时会话", "rectangle.stack", "stateful", false, "重置临时会话状态")
-        case "WebStorage":
-            return ("Web 视图持久缓存", "按需清理 · 清理后重置扩展内嵌网页状态", "globe", "stateful", false, "重置内嵌网页状态")
-        case "Local Storage":
-            return ("扩展与站点本地存储", "按需清理 · 清理后可能需重新授权部分扩展", "externaldrive.badge.person.crop", "stateful", false, "可能需重新授权扩展")
-        case "Cookies":
-            return ("网络会话与授权凭据", "按需清理 · 清理后部分服务需重新登录授权", "key.horizontal", "stateful", false, "清理后需重新登录授权")
-        case "Network Persistent State":
-            return ("网络连接协商状态", "按需清理 · 清理后重新协商网络连接参数", "network", "stateful", false, "重置网络连接偏好")
-        default:
-            return (name, "应用运行缓存目录", "folder", "safe", true, nil)
-        }
+    @objc func runtimeScopeToggled() {
+        guard !busy else { return }
+        userToggledRuntimeSwitch = true
+        runtimeCacheEnabled = (runtimeCacheSwitch.state == .on) && runtimeBucketBytes > 0
+        updateSummaryAndControls()
     }
 
-    private func isStatefulItem(_ item: [String: Any]) -> Bool {
+    @objc func historyScopeToggled() {
+        guard !busy else { return }
+        userToggledHistorySwitch = true
+        historyLogsEnabled = (historyLogsSwitch.state == .on) && historyBucketBytes > 0
+        updateSummaryAndControls()
+    }
+
+    func isStatefulItem(_ item: [String: Any]) -> Bool {
         if let cat = item["category"] as? String {
             return cat == "stateful"
         }
         let name = item["name"] as? String ?? ""
-        return defaultMetadata(for: name).category == "stateful"
+        return ["AgentTaskStepLogs", "AgentVerboseTranscripts", "AgentSubagentDatabases"].contains(name)
     }
 
-    private func isDefaultSelected(_ item: [String: Any]) -> Bool {
-        if let def = item["defaultSelected"] as? Bool {
-            return def
-        }
-        return !isStatefulItem(item)
-    }
-
-    /// Only show cache items that actually occupy space or have an access warning; if all are 0 B, keep the core 3 so the card isn't blank.
-    private func visibleEntries() -> [[String: Any]] {
-        let nonZeroOrBlocked = entries.filter { intVal($0, "bytes") > 0 || ($0["clearable"] as? Bool == false) }
-        if !nonZeroOrBlocked.isEmpty {
-            return nonZeroOrBlocked
-        }
-        return Array(entries.prefix(3))
-    }
-
-    private func applyScanPayload(_ value: [String: Any]) {
+    func applyScanPayload(_ value: [String: Any]) {
         scanToken = value["token"] as? String ?? ""
         appRunning = value["running"] as? Bool == true
         browserBusy = value["browserBusy"] as? Bool == true
+        if let dir = value["trashDir"] as? String, !dir.isEmpty {
+            activeTrashPath = dir
+        }
+        usingFallbackTrash = value["usingFallbackTrash"] as? Bool == true
+
         if value["retentionDays"] != nil {
             let returnedDays = intVal(value, "retentionDays", fallback: selectedRetentionDays)
             if let matchIdx = Self.retentionChoices.firstIndex(where: { $0.days == returnedDays }) {
@@ -553,721 +745,306 @@ final class CachePage: NSObject {
             }
         }
         scannedAt = intVal(value, "scannedAt", fallback: Int(Date().timeIntervalSince1970))
-        totalCacheBytes = Int64(intVal(value, "totalBytes"))
-        totalCacheFiles = intVal(value, "totalFiles")
-        let rawEntries = value["entries"] as? [[String: Any]] ?? []
-        entries = rawEntries
-        if totalCacheFiles == 0 {
-            totalCacheFiles = entries.reduce(0) { $0 + intVal($1, "fileCount") }
-        }
-        isTruncated = value["truncated"] as? Bool == true
-        uncertainConversationCount = intVal(value["uncertainConversations"] as? [String: Any] ?? [:], "count")
+        entries = value["entries"] as? [[String: Any]] ?? []
 
-        safeCacheBytes = entries.filter { !isStatefulItem($0) }.reduce(Int64(0)) { $0 + Int64(intVal($1, "bytes")) }
-        statefulCacheBytes = entries.filter { isStatefulItem($0) }.reduce(Int64(0)) { $0 + Int64(intVal($1, "bytes")) }
-        if totalCacheBytes == 0 {
-            totalCacheBytes = safeCacheBytes + statefulCacheBytes
+        let clearableRuntimeEntries = entries.filter { !isStatefulItem($0) && ($0["clearable"] as? Bool != false) && intVal($0, "bytes") > 0 }
+        let clearableHistoryEntries = entries.filter { isStatefulItem($0) && ($0["clearable"] as? Bool != false) && intVal($0, "bytes") > 0 }
+        let fallbackRuntimeBytes = clearableRuntimeEntries.reduce(Int64(0)) { $0 + Int64(intVal($1, "bytes")) }
+        let fallbackHistoryBytes = clearableHistoryEntries.reduce(Int64(0)) { $0 + Int64(intVal($1, "bytes")) }
+        let fallbackRuntimeFiles = clearableRuntimeEntries.reduce(0) { $0 + intVal($1, "fileCount") }
+        let fallbackHistoryFiles = clearableHistoryEntries.reduce(0) { $0 + intVal($1, "fileCount") }
+
+        if let buckets = value["buckets"] as? [String: Any] {
+            let rtBucket = buckets["runtimeCache"] as? [String: Any] ?? [:]
+            let histBucket = buckets["historyLogs"] as? [String: Any] ?? [:]
+            runtimeBucketBytes = Int64(intVal(rtBucket, "clearableBytes", fallback: Int(fallbackRuntimeBytes)))
+            historyBucketBytes = Int64(intVal(histBucket, "clearableBytes", fallback: Int(fallbackHistoryBytes)))
+            runtimeBucketFileCount = intVal(rtBucket, "fileCount", fallback: fallbackRuntimeFiles)
+            historyBucketFileCount = intVal(histBucket, "fileCount", fallback: fallbackHistoryFiles)
+            historyBucketSubagentCount = intVal(histBucket, "subagentCount")
+        } else {
+            runtimeBucketBytes = entries.isEmpty ? Int64(intVal(value, "safeBytes")) : fallbackRuntimeBytes
+            historyBucketBytes = entries.isEmpty ? Int64(intVal(value, "statefulBytes")) : fallbackHistoryBytes
+            runtimeBucketFileCount = fallbackRuntimeFiles
+            historyBucketFileCount = fallbackHistoryFiles
+            historyBucketSubagentCount = 0
         }
+
+        safeCacheBytes = runtimeBucketBytes
+        statefulCacheBytes = historyBucketBytes
 
         let rawProtected = value["protectedEntries"] as? [[String: Any]] ?? []
         protectedEntries = rawProtected
         totalProtectedBytes = Int64(intVal(value, "protectedBytes", fallback: rawProtected.reduce(0) { $0 + intVal($1, "bytes") }))
 
         snapshots = value["snapshots"] as? [[String: Any]] ?? []
-
-        let activeClearableEntries = visibleEntries().filter { ($0["clearable"] as? Bool != false) && intVal($0, "bytes") > 0 }
-        let allClearableNames = Set(activeClearableEntries.compactMap { $0["name"] as? String })
-        let recommendedNames = Set(activeClearableEntries.filter { isDefaultSelected($0) }.compactMap { $0["name"] as? String })
-
-        if !hasInitializedSelection {
-            selectedNames = recommendedNames
-            hasInitializedSelection = true
+        if let latest = value["latestRestorableSnapshot"] as? [String: Any],
+           let id = latest["id"] as? String, !id.isEmpty {
+            latestUndoSnapshot = latest
+            latestRestorableSnapshotId = id
+        } else if let firstRestorable = snapshots.first(where: { ($0["restorable"] as? Bool) == true && !(($0["id"] as? String) ?? "").isEmpty }) {
+            latestUndoSnapshot = firstRestorable
+            latestRestorableSnapshotId = (firstRestorable["id"] as? String) ?? ""
         } else {
-            selectedNames = selectedNames.intersection(allClearableNames)
+            latestUndoSnapshot = nil
+            latestRestorableSnapshotId = ""
         }
 
+        if !userToggledRuntimeSwitch {
+            runtimeCacheEnabled = runtimeBucketBytes > 0
+        } else if runtimeBucketBytes <= 0 {
+            runtimeCacheEnabled = false
+        }
+        if !userToggledHistorySwitch {
+            historyLogsEnabled = false
+        } else if historyBucketBytes <= 0 {
+            historyLogsEnabled = false
+        }
+
+        hasCompletedScan = true
         renderAll()
     }
 
-    private func selectionSummary() -> (bytes: Int64, files: Int, count: Int, statefulCount: Int) {
-        var bytes: Int64 = 0
-        var files = 0
-        var count = 0
-        var statefulCount = 0
-        for item in visibleEntries() {
-            let itemBytes = Int64(intVal(item, "bytes"))
-            guard let name = item["name"] as? String,
-                  item["clearable"] as? Bool != false,
-                  itemBytes > 0,
-                  selectedNames.contains(name) else { continue }
-            bytes += itemBytes
-            files += intVal(item, "fileCount")
-            count += 1
-            if isStatefulItem(item) {
-                statefulCount += 1
-            }
+    private func resolvedHistorySubtitle(hasClearableBytes: Bool) -> String {
+        if hasClearableBytes {
+            return selectedRetentionDays > 0
+                ? L10n.t("maintenance.simple.scope_history_sub", ["days": selectedRetentionDays])
+                : L10n.t("maintenance.simple.scope_history_sub_inactive")
         }
-        return (bytes, files, count, statefulCount)
+        return selectedRetentionDays > 0
+            ? L10n.t("maintenance.simple.scope_history_empty", ["days": selectedRetentionDays])
+            : L10n.t("maintenance.simple.scope_history_empty_inactive")
     }
 
     private func updateSummaryAndControls() {
-        let sel = selectionSummary()
-        let shown = visibleEntries()
-        let blocked = shown.filter { $0["clearable"] as? Bool == false }
-        let clearableEntries = shown.filter { ($0["clearable"] as? Bool != false) && intVal($0, "bytes") > 0 }
-        let recommendedNames = Set(clearableEntries.filter { isDefaultSelected($0) }.compactMap { $0["name"] as? String })
-
-        let heroDisplayBytes = sel.count > 0 ? sel.bytes : safeCacheBytes
-        reclaimableTitleLabel.stringValue = "可移入废纸篓体积"
-        reclaimableValueLabel.stringValue = formatBytes(heroDisplayBytes)
-        if sel.count > 0 {
-            selectedSummaryBadge.title = "已选 \(sel.count) 项"
-            selectedSummaryBadge.tint = Design.blue
-        } else if !entries.isEmpty {
-            selectedSummaryBadge.title = "未选择"
-            selectedSummaryBadge.tint = Design.inactivePill
-        }
-        if appRunning {
-            appStateLabel.stringValue = "Antigravity 运行中 · 清理前将提示关闭"
-            appStateLabel.textColor = Design.secondary
-        } else if !entries.isEmpty {
-            appStateLabel.stringValue = "仅移入废纸篓 · 核心数据受保护"
-            appStateLabel.textColor = Design.secondary
-        } else {
-            appStateLabel.stringValue = ""
+        let selectedBytes = selectedReclaimableBytes
+        reclaimableTitleLabel.stringValue = L10n.t("maintenance.simple.hero_title")
+        if hasCompletedScan {
+            reclaimableValueLabel.stringValue = formatBytes(selectedBytes)
+            heroSubtitleLabel.stringValue = L10n.t("maintenance.simple.hero_subtitle")
+            heroSubtitleLabel.textColor = Design.secondary
         }
 
-        let blockedNotes = blocked.map { "\($0["name"] ?? "缓存")：\($0["reason"] ?? "无法读取")" }
-        breakdownWarningLabel.stringValue = blockedNotes.joined(separator: "；")
-        breakdownWarningLabel.setAccessibilityLabel(breakdownWarningLabel.stringValue)
-        breakdownWarningLabel.isHidden = blockedNotes.isEmpty
-
-        if uncertainConversationCount > 0 {
-            protectedNoteLabel.stringValue = "已自动保护 \(uncertainConversationCount) 个归属待确认会话、全部主对话及登录凭据"
-            protectedNoteLabel.isHidden = false
-        } else {
-            protectedNoteLabel.stringValue = ""
-            protectedNoteLabel.isHidden = true
-        }
-
-        compositionBar.safeBytes = safeCacheBytes
-        compositionBar.statefulBytes = statefulCacheBytes
+        compositionBar.safeBytes = runtimeBucketBytes
+        compositionBar.statefulBytes = historyBucketBytes
         compositionBar.protectedBytes = totalProtectedBytes
 
-        safeLegendLabel.stringValue = "无损缓存 \(formatBytes(safeCacheBytes))"
-        if statefulCacheBytes > 0 {
-            statefulLegendWrap.isHidden = false
-            statefulLegendLabel.stringValue = "可瘦身历史 \(formatBytes(statefulCacheBytes))"
-        } else {
-            statefulLegendWrap.isHidden = true
-        }
-        if isTruncated {
-            protectedLegendLabel.stringValue = totalProtectedBytes > 0
-                ? "核心数据 \(formatBytes(totalProtectedBytes))（部分统计）"
-                : "核心数据（部分统计）"
-        } else {
-            protectedLegendLabel.stringValue = totalProtectedBytes > 0
-                ? "核心数据 \(formatBytes(totalProtectedBytes))（已保护）"
-                : "核心数据（已保护）"
-        }
+        safeLegendLabel.stringValue = L10n.t("maintenance.simple.legend_runtime", ["size": formatBytes(runtimeBucketBytes)])
+        statefulLegendLabel.stringValue = L10n.t("maintenance.simple.legend_history", ["size": formatBytes(historyBucketBytes)])
+        protectedLegendLabel.stringValue = totalProtectedBytes > 0
+            ? L10n.t("maintenance.simple.legend_protected", ["size": formatBytes(totalProtectedBytes)])
+            : L10n.t("maintenance.simple.legend_protected_empty")
 
-        if scannedAt > 0 {
-            lastScannedLabel.stringValue = "更新于 \(Self.timeFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(scannedAt))))"
-        } else {
-            lastScannedLabel.stringValue = ""
-        }
+        // Row 1: App Runtime Caches
+        let canToggleRuntime = runtimeBucketBytes > 0
+        let runtimeActive = canToggleRuntime && runtimeCacheEnabled
+        runtimeCacheSwitch.state = runtimeActive ? .on : .off
+        runtimeCacheSwitch.isEnabled = !busy && canToggleRuntime
+        runtimeSizeLabel.stringValue = formatBytes(runtimeBucketBytes)
+        runtimeSizeLabel.textColor = runtimeActive ? .labelColor : Design.secondary
+        runtimeSubtitleLabel.stringValue = L10n.t("maintenance.simple.scope_runtime_sub")
 
-        let safeClearableEntries = clearableEntries.filter { !isStatefulItem($0) }
-        let safeClearableCount = safeClearableEntries.count
-        let safeSelectedCount = selectedNames.intersection(Set(safeClearableEntries.compactMap { $0["name"] as? String })).count
-        recommendButton.isEnabled = !busy && !recommendedNames.isEmpty && selectedNames != recommendedNames
-        let shouldOfferClearSelection = (safeSelectedCount == safeClearableCount && safeClearableCount > 0) || (!selectedNames.isEmpty && safeClearableCount == 0)
-        let nextToggleTitle = shouldOfferClearSelection ? "清空勾选" : "全选安全项"
-        if toggleAllButton.title != nextToggleTitle {
-            toggleAllButton.title = nextToggleTitle
-            toggleAllButton.invalidateIntrinsicContentSize()
-        }
-        toggleAllButton.isEnabled = !busy && (safeClearableCount > 0 || !selectedNames.isEmpty)
+        // Row 2: Background Task Logs
+        let canToggleHistory = historyBucketBytes > 0
+        let historyActive = canToggleHistory && historyLogsEnabled
+        historyLogsSwitch.state = historyActive ? .on : .off
+        historyLogsSwitch.isEnabled = !busy && canToggleHistory
+        historySizeLabel.stringValue = formatBytes(historyBucketBytes)
+        historySizeLabel.textColor = historyActive ? .labelColor : Design.secondary
+        historySubtitleLabel.stringValue = resolvedHistorySubtitle(hasClearableBytes: canToggleHistory)
 
-        clearButton.isEnabled = !busy && blocked.isEmpty && sel.bytes > 0 && sel.count > 0
-        let nextClearTitle = sel.count > 0 ? "清理选中项 (\(sel.count))…" : "清理选中项…"
+        // Primary CTA Button
+        let canClean = !busy && hasCompletedScan && selectedBytes > 0 && !selectedScopes.isEmpty
+        clearButton.isEnabled = canClean
+        let nextClearTitle = (!hasCompletedScan || selectedBytes > 0)
+            ? L10n.t("maintenance.simple.btn_clean_now")
+            : L10n.t("maintenance.simple.btn_nothing_to_clean")
         if clearButton.title != nextClearTitle {
             clearButton.title = nextClearTitle
             clearButton.invalidateIntrinsicContentSize()
         }
     }
 
-    private func syncMinorGroupState() {
-        guard let box = minorGroupCheckbox else { return }
-        let selectableMinor = minorSafeNames.filter { name in
-            guard let ctrl = rowControlsByName[name] else { return false }
-            return ctrl.clearable && ctrl.bytes > 0
-        }
-        let selectedMinorCount = selectableMinor.filter { selectedNames.contains($0) }.count
-        box.allowsMixedState = true
-        if selectableMinor.isEmpty || selectedMinorCount == 0 {
-            box.state = .off
-        } else if selectedMinorCount == selectableMinor.count {
-            box.state = .on
+    private func updateRecoveryFooter() {
+        if let snap = latestUndoSnapshot, !latestRestorableSnapshotId.isEmpty {
+            let bytes = Int64(intVal(snap, "totalBytes"))
+            let ts = intVal(snap, "timestamp")
+            let timeStr = ts > 0
+                ? Self.snapshotDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
+                : L10n.t("maintenance.recovery.recent")
+            let sizeStr = bytes > 0 ? formatBytes(bytes) : L10n.t("maintenance.recovery.items_count", ["count": 1])
+            applyRecoveryBadgeTheme(symbolName: "arrow.uturn.backward.circle", tint: Design.blue)
+            recoveryTitleLabel.stringValue = L10n.t("maintenance.simple.undo_ready_title", ["size": sizeStr, "time": timeStr])
+            recoverySubtitleLabel.stringValue = L10n.t("maintenance.simple.undo_ready_sub")
+            restoreLatestButton.isHidden = false
+            restoreLatestButton.isEnabled = !busy
+        } else if let latestSnap = snapshots.first, latestSnap["restoredAt"] != nil {
+            let ts = intVal(latestSnap, "timestamp")
+            let timeStr = ts > 0
+                ? Self.snapshotDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
+                : L10n.t("maintenance.recovery.recent")
+            applyRecoveryBadgeTheme(symbolName: "checkmark.shield", tint: .systemGreen)
+            recoveryTitleLabel.stringValue = L10n.t("maintenance.simple.undo_done_title", ["time": timeStr])
+            recoverySubtitleLabel.stringValue = L10n.t("maintenance.simple.safety_idle_sub")
+            restoreLatestButton.isHidden = true
         } else {
-            box.state = .mixed
+            applyRecoveryBadgeTheme(symbolName: "checkmark.shield", tint: .systemGreen)
+            recoveryTitleLabel.stringValue = L10n.t("maintenance.simple.safety_idle_title")
+            recoverySubtitleLabel.stringValue = L10n.t("maintenance.simple.safety_idle_sub")
+            restoreLatestButton.isHidden = true
         }
-        box.isEnabled = !selectableMinor.isEmpty && !busy
-        minorGroupSizeLabel?.textColor = selectedMinorCount > 0 ? .labelColor : Design.secondary
-    }
-
-    private func updateSelectionInPlace() {
-        updateSummaryAndControls()
-        for (name, ctrl) in rowControlsByName {
-            let isSelected = ctrl.clearable && ctrl.bytes > 0 && selectedNames.contains(name)
-            ctrl.checkbox.state = isSelected ? .on : .off
-            ctrl.checkbox.isEnabled = ctrl.clearable && ctrl.bytes > 0 && !busy
-            ctrl.sizeLabel.textColor = isSelected ? .labelColor : Design.secondary
-        }
-        syncMinorGroupState()
+        recoveryTitleLabel.toolTip = nil
+        recoverySubtitleLabel.toolTip = nil
+        syncLocalizedTriggerLabels()
     }
 
     private func renderAll() {
         let state = PerformanceSignpost.begin("CacheRenderAll")
         defer { PerformanceSignpost.end("CacheRenderAll", state) }
         updateSummaryAndControls()
-        rebuildItemsStack()
         updateRecoveryFooter()
     }
 
-    private func makeItemRowControls(name: String, title: String) -> ItemRowControls {
-        let checkbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(itemSelectionChanged(_:)))
-        checkbox.identifier = NSUserInterfaceItemIdentifier(name)
-        checkbox.setAccessibilityLabel("勾选 \(title)")
-
-        let compressiblePriority = NSLayoutConstraint.Priority(45)
-        let titleLbl = text(title, size: 13, weight: .semibold, color: .labelColor)
-        titleLbl.lineBreakMode = .byTruncatingTail
-        titleLbl.setContentHuggingPriority(NSLayoutConstraint.Priority(10), for: .horizontal)
-        titleLbl.setContentCompressionResistancePriority(compressiblePriority, for: .horizontal)
-
-        let subLbl = text("", size: 11, color: Design.secondary)
-        subLbl.maximumNumberOfLines = 1
-        subLbl.lineBreakMode = .byTruncatingTail
-        subLbl.cell?.wraps = false
-        subLbl.cell?.truncatesLastVisibleLine = true
-        subLbl.setContentHuggingPriority(NSLayoutConstraint.Priority(10), for: .horizontal)
-        subLbl.setContentCompressionResistancePriority(compressiblePriority, for: .horizontal)
-
-        let captions = vertical([titleLbl, subLbl], spacing: 2)
-        captions.alignment = .leading
-        captions.setContentHuggingPriority(NSLayoutConstraint.Priority(30), for: .horizontal)
-        captions.setContentCompressionResistancePriority(compressiblePriority, for: .horizontal)
-
-        let sizeLbl = text("0 B", size: 13, weight: .semibold, color: Design.secondary)
-        sizeLbl.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        sizeLbl.alignment = .right
-        sizeLbl.setContentHuggingPriority(.required, for: .horizontal)
-        sizeLbl.setContentCompressionResistancePriority(.required, for: .horizontal)
-
-        let rowSpacer = flexibleSpace()
-        rowSpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(20), for: .horizontal)
-        let row = horizontal([checkbox, captions, rowSpacer, sizeLbl], spacing: 10)
-        row.alignment = .centerY
-
-        return ItemRowControls(
-            rowView: row,
-            checkbox: checkbox,
-            titleLabel: titleLbl,
-            subtitleLabel: subLbl,
-            sizeLabel: sizeLbl,
-            bytes: 0,
-            clearable: true
-        )
-    }
-
-    private func rebuildItemsStack() {
-        let shown = visibleEntries()
-        // Sort safe items first (by size descending), stateful items second (by size descending)
-        let sortedEntries = shown.enumerated().sorted { lhs, rhs in
-            let lStateful = isStatefulItem(lhs.element)
-            let rStateful = isStatefulItem(rhs.element)
-            if lStateful != rStateful { return !lStateful }
-            let lBytes = intVal(lhs.element, "bytes")
-            let rBytes = intVal(rhs.element, "bytes")
-            if lBytes != rBytes { return lBytes > rBytes }
-            return lhs.offset < rhs.offset
-        }.map(\.element)
-
-        var nextNames: [String] = []
-        for item in sortedEntries {
-            let name = item["name"] as? String ?? "Cache"
-            nextNames.append(name)
-            let defaults = defaultMetadata(for: name)
-            let serverTitle = (item["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let serverSubtitle = (item["subtitle"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let title = serverTitle.isEmpty ? defaults.title : serverTitle
-            let subtitle = serverSubtitle.isEmpty ? defaults.subtitle : serverSubtitle
-            let bytes = Int64(intVal(item, "bytes"))
-            let clearable = item["clearable"] as? Bool != false
-            let canSelect = clearable && bytes > 0
-            let isSelected = canSelect && selectedNames.contains(name)
-
-            var ctrl = rowControlsByName[name] ?? makeItemRowControls(name: name, title: title)
-            ctrl.bytes = bytes
-            ctrl.clearable = clearable
-            ctrl.checkbox.state = isSelected ? .on : .off
-            ctrl.checkbox.isEnabled = canSelect && !busy
-            ctrl.checkbox.setAccessibilityLabel("勾选 \(title)")
-            if ctrl.titleLabel.stringValue != title { ctrl.titleLabel.stringValue = title }
-
-            let detailCopy: String
-            if !clearable, let reason = item["reason"] as? String, !reason.isEmpty {
-                detailCopy = reason
-            } else if name == "AgentBrowserCache" && browserBusy {
-                detailCopy = "浏览器运行中，清理时自动跳过"
-            } else {
-                detailCopy = subtitle
-            }
-            if ctrl.subtitleLabel.stringValue != detailCopy { ctrl.subtitleLabel.stringValue = detailCopy }
-            ctrl.subtitleLabel.textColor = clearable ? Design.secondary : accessibleWarningColor()
-
-            let sizeText = bytes > 0 ? formatBytes(bytes) : "0 B"
-            if ctrl.sizeLabel.stringValue != sizeText { ctrl.sizeLabel.stringValue = sizeText }
-            ctrl.sizeLabel.textColor = isSelected ? .labelColor : Design.secondary
-            rowControlsByName[name] = ctrl
-        }
-
-        let validNames = Set(nextNames)
-        rowControlsByName = rowControlsByName.filter { validNames.contains($0.key) }
-
-        let safeNames = nextNames.filter { name in
-            guard let item = sortedEntries.first(where: { ($0["name"] as? String) == name }) else { return true }
-            return !isStatefulItem(item)
-        }
-        let statefulNames = nextNames.filter { name in
-            guard let item = sortedEntries.first(where: { ($0["name"] as? String) == name }) else { return false }
-            return isStatefulItem(item)
-        }
-        let minorThresholdBytes: Int64 = 15 * 1024 * 1024
-        let candidateMinorSafe = safeNames.filter { name in
-            guard name != "OrphanAgentData", let ctrl = rowControlsByName[name] else { return false }
-            return ctrl.clearable && ctrl.bytes > 0 && ctrl.bytes < minorThresholdBytes
-        }
-        let foldMinorSafe = candidateMinorSafe.count >= 2
-        let majorSafeNames = foldMinorSafe
-            ? safeNames.filter { !candidateMinorSafe.contains($0) }
-            : safeNames
-        minorSafeNames = foldMinorSafe ? candidateMinorSafe : []
-
-        let currentWindowTitle = Self.retentionChoices.first(where: { $0.days == selectedRetentionDays })?.title ?? "保留近 7 天"
-        let nextSignature = "\(majorSafeNames.joined(separator: "|"))##\(minorSafeNames.joined(separator: "|"))##\(minorSafeExpanded ? "exp" : "col")##\(statefulNames.joined(separator: "|"))##\(statefulNames.isEmpty ? currentWindowTitle : "has-stateful")"
-
-        if nextSignature != renderedLayoutSignature {
-            renderedLayoutSignature = nextSignature
-            renderedItemNames = nextNames
-            minorGroupCheckbox = nil
-            minorGroupSizeLabel = nil
-            itemsStack.arrangedSubviews.forEach {
-                itemsStack.removeArrangedSubview($0)
-                $0.removeFromSuperview()
-            }
-
-            if !safeNames.isEmpty {
-                let safeDot = Self.makeLegendDot(color: Design.blue)
-                let safeTitle = text("无损加速缓存（推荐清理）", size: 11.5, weight: .semibold, color: Design.secondary)
-                let safeHeader = horizontal([safeDot, safeTitle], spacing: 6)
-                safeHeader.alignment = .centerY
-                itemsStack.addArrangedSubview(safeHeader)
-                fillWidth(safeHeader, in: itemsStack)
-                var rowCountInSafe = 0
-                for name in majorSafeNames {
-                    guard let ctrl = rowControlsByName[name] else { continue }
-                    if rowCountInSafe > 0 {
-                        let line = divider()
-                        itemsStack.addArrangedSubview(line)
-                        fillWidth(line, in: itemsStack)
-                    }
-                    itemsStack.addArrangedSubview(ctrl.rowView)
-                    fillWidth(ctrl.rowView, in: itemsStack)
-                    rowCountInSafe += 1
-                }
-                if foldMinorSafe {
-                    if rowCountInSafe > 0 {
-                        let line = divider()
-                        itemsStack.addArrangedSubview(line)
-                        fillWidth(line, in: itemsStack)
-                    }
-                    let minorBytes = minorSafeNames.reduce(Int64(0)) { acc, name in
-                        acc + (rowControlsByName[name]?.bytes ?? 0)
-                    }
-                    let groupCheck = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleMinorSafeGroup(_:)))
-                    groupCheck.allowsMixedState = true
-                    groupCheck.setAccessibilityLabel("勾选其余底层加速缓存")
-                    minorGroupCheckbox = groupCheck
-
-                    let gTitle = text("其余 \(minorSafeNames.count) 项底层编译与图形缓存", size: 13, weight: .semibold, color: .labelColor)
-                    let gSub = text("V8、Metal、WebGPU 等无损加速缓存", size: 11, color: Design.secondary)
-                    gSub.maximumNumberOfLines = 1
-                    gSub.lineBreakMode = .byTruncatingTail
-                    let gCaptions = vertical([gTitle, gSub], spacing: 2)
-                    gCaptions.alignment = .leading
-                    gCaptions.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(45), for: .horizontal)
-
-                    let expandBtn = button(minorSafeExpanded ? "收起" : "展开明细", target: self, action: #selector(toggleMinorSafeExpanded))
-                    expandBtn.controlSize = .small
-                    expandBtn.image = NSImage(
-                        systemSymbolName: minorSafeExpanded ? "chevron.up" : "chevron.down",
-                        accessibilityDescription: nil
-                    )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
-                    expandBtn.image?.isTemplate = true
-                    expandBtn.imagePosition = .imageTrailing
-                    expandBtn.setContentHuggingPriority(.required, for: .horizontal)
-                    expandBtn.setContentCompressionResistancePriority(.required, for: .horizontal)
-
-                    let gSize = text(formatBytes(minorBytes), size: 13, weight: .semibold, color: .labelColor)
-                    gSize.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-                    gSize.alignment = .right
-                    gSize.setContentHuggingPriority(.required, for: .horizontal)
-                    gSize.setContentCompressionResistancePriority(.required, for: .horizontal)
-                    minorGroupSizeLabel = gSize
-
-                    let gSpacer = flexibleSpace()
-                    gSpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(20), for: .horizontal)
-                    let groupRow = horizontal([groupCheck, gCaptions, gSpacer, expandBtn, gSize], spacing: 10)
-                    groupRow.alignment = .centerY
-                    itemsStack.addArrangedSubview(groupRow)
-                    fillWidth(groupRow, in: itemsStack)
-                    Design.applyControls(groupRow)
-
-                    if minorSafeExpanded {
-                        for name in minorSafeNames {
-                            guard let ctrl = rowControlsByName[name] else { continue }
-                            let subLine = divider()
-                            itemsStack.addArrangedSubview(subLine)
-                            fillWidth(subLine, in: itemsStack)
-                            itemsStack.addArrangedSubview(ctrl.rowView)
-                            fillWidth(ctrl.rowView, in: itemsStack)
-                        }
-                    }
-                }
-            }
-
-            if !safeNames.isEmpty {
-                let sectionDivider = divider()
-                itemsStack.addArrangedSubview(sectionDivider)
-                fillWidth(sectionDivider, in: itemsStack)
-                itemsStack.setCustomSpacing(10, after: sectionDivider)
-            }
-
-            let historyDot = Self.makeLegendDot(color: Design.color(0xD97706, 0xFBBF24))
-            let historyTitle = text("历史记录瘦身（按需勾选 · 保留主对话与账单）", size: 11.5, weight: .semibold, color: Design.secondary)
-            let historyHeader = horizontal([historyDot, historyTitle], spacing: 6)
-            historyHeader.alignment = .centerY
-            itemsStack.addArrangedSubview(historyHeader)
-            fillWidth(historyHeader, in: itemsStack)
-
-            if !statefulNames.isEmpty {
-                for (idx, name) in statefulNames.enumerated() {
-                    guard let ctrl = rowControlsByName[name] else { continue }
-                    if idx > 0 {
-                        let line = divider()
-                        itemsStack.addArrangedSubview(line)
-                        fillWidth(line, in: itemsStack)
-                    }
-                    itemsStack.addArrangedSubview(ctrl.rowView)
-                    fillWidth(ctrl.rowView, in: itemsStack)
-                }
-            } else {
-                let emptyHint = text("当前范围（\(currentWindowTitle)）外暂无可瘦身的历史运行日志或子智能体库", size: 11, color: Design.secondary)
-                emptyHint.maximumNumberOfLines = 1
-                emptyHint.lineBreakMode = .byTruncatingTail
-                itemsStack.addArrangedSubview(emptyHint)
-                fillWidth(emptyHint, in: itemsStack)
+    func rotateSupersededSnapshotsToSystemTrashAsync(_ paths: [String]) {
+        guard !paths.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            for rawPath in paths where !rawPath.isEmpty {
+                let url = URL(fileURLWithPath: rawPath)
+                guard fm.fileExists(atPath: url.path) else { continue }
+                try? fm.trashItem(at: url, resultingItemURL: nil)
             }
         }
-        syncMinorGroupState()
-    }
-
-    private func renderSelectedSnapshotSummary(_ snap: [String: Any]) {
-        let bytes = Int64(intVal(snap, "totalBytes"))
-        let ts = intVal(snap, "timestamp")
-        let items = (snap["items"] as? [String]) ?? []
-        let rawTitles = (snap["itemTitles"] as? [String]) ?? items.map { defaultMetadata(for: $0).title }
-        let timeStr = ts > 0
-            ? Self.snapshotDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
-            : "近期"
-        let sizeStr = bytes > 0 ? formatBytes(bytes) : "\(max(1, items.count)) 项"
-        if restorableSnapshots.count >= 2 {
-            recoveryTitleLabel.stringValue = "可恢复快照（共 \(restorableSnapshots.count) 个）· \(sizeStr)"
-        } else {
-            recoveryTitleLabel.stringValue = "最近清理 · \(timeStr)（\(sizeStr)）"
-        }
-        if !rawTitles.isEmpty {
-            let preview = rawTitles.prefix(2).joined(separator: "、")
-            let suffix = rawTitles.count > 2 ? " 等 \(rawTitles.count) 项" : ""
-            recoverySubtitleLabel.stringValue = "含 \(preview)\(suffix) · 支持一键原位还原"
-        } else {
-            recoverySubtitleLabel.stringValue = "已移入系统废纸篓，支持一键原位还原"
-        }
-        recoverySubtitleLabel.toolTip = nil
-    }
-
-    private func updateRecoveryFooter() {
-        restorableSnapshots = snapshots.filter { snap in
-            guard (snap["restorable"] as? Bool) == true,
-                  let id = snap["id"] as? String, !id.isEmpty else { return false }
-            return true
-        }
-
-        if !restorableSnapshots.isEmpty {
-            let preferredId: String
-            if restorableSnapshots.contains(where: { ($0["id"] as? String) == latestRestorableSnapshotId }) {
-                preferredId = latestRestorableSnapshotId
-            } else {
-                preferredId = (restorableSnapshots[0]["id"] as? String) ?? ""
-            }
-            latestRestorableSnapshotId = preferredId
-
-            if restorableSnapshots.count >= 2 {
-                snapshotPopup.removeAllItems()
-                var selectedIdx = 0
-                for (idx, snap) in restorableSnapshots.enumerated() {
-                    let id = (snap["id"] as? String) ?? ""
-                    let ts = intVal(snap, "timestamp")
-                    let bytes = Int64(intVal(snap, "totalBytes"))
-                    let items = (snap["items"] as? [String]) ?? []
-                    let timeStr = ts > 0
-                        ? Self.snapshotDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
-                        : "快照 \(idx + 1)"
-                    let sizeStr = bytes > 0 ? formatBytes(bytes) : "\(max(1, items.count)) 项"
-                    snapshotPopup.addItem(withTitle: "\(timeStr) · \(sizeStr)")
-                    snapshotPopup.lastItem?.representedObject = id
-                    if id == preferredId { selectedIdx = idx }
-                }
-                snapshotPopup.selectItem(at: selectedIdx)
-                snapshotPopup.isHidden = false
-                snapshotPopup.isEnabled = !busy
-            } else {
-                snapshotPopup.removeAllItems()
-                snapshotPopup.isHidden = true
-            }
-
-            if let activeSnap = restorableSnapshots.first(where: { ($0["id"] as? String) == preferredId }) ?? restorableSnapshots.first {
-                renderSelectedSnapshotSummary(activeSnap)
-            }
-            restoreLatestButton.isHidden = false
-            restoreLatestButton.isEnabled = !busy
-        } else if let latestSnap = snapshots.first {
-            latestRestorableSnapshotId = ""
-            snapshotPopup.removeAllItems()
-            snapshotPopup.isHidden = true
-            let ts = intVal(latestSnap, "timestamp")
-            let timeStr = ts > 0
-                ? Self.snapshotDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
-                : "近期"
-            let restored = latestSnap["restoredAt"] != nil
-            recoveryTitleLabel.stringValue = restored ? "最近清理（\(timeStr) · 已恢复）" : "废纸篓安全恢复"
-            recoverySubtitleLabel.stringValue = "清理项移入废纸篓，支持一键原位还原"
-            recoverySubtitleLabel.toolTip = nil
-            restoreLatestButton.isHidden = true
-        } else {
-            latestRestorableSnapshotId = ""
-            snapshotPopup.removeAllItems()
-            snapshotPopup.isHidden = true
-            recoveryTitleLabel.stringValue = "废纸篓安全恢复"
-            recoverySubtitleLabel.stringValue = "清理项移入废纸篓，支持一键原位还原"
-            recoverySubtitleLabel.toolTip = nil
-            restoreLatestButton.isHidden = true
-        }
-    }
-
-    @objc func snapshotSelectionChanged() {
-        guard let id = snapshotPopup.selectedItem?.representedObject as? String, !id.isEmpty else { return }
-        latestRestorableSnapshotId = id
-        if let activeSnap = restorableSnapshots.first(where: { ($0["id"] as? String) == id }) {
-            renderSelectedSnapshotSummary(activeSnap)
-        }
-    }
-
-    @objc func itemSelectionChanged(_ sender: NSButton) {
-        guard let name = sender.identifier?.rawValue, !name.isEmpty else { return }
-        if sender.state == .on {
-            selectedNames.insert(name)
-        } else {
-            selectedNames.remove(name)
-        }
-        updateSelectionInPlace()
-    }
-
-    @objc func toggleMinorSafeGroup(_ sender: NSButton) {
-        let selectableMinor = minorSafeNames.filter { name in
-            guard let ctrl = rowControlsByName[name] else { return false }
-            return ctrl.clearable && ctrl.bytes > 0
-        }
-        let allSelected = !selectableMinor.isEmpty && selectableMinor.allSatisfy { selectedNames.contains($0) }
-        if allSelected {
-            selectedNames.subtract(selectableMinor)
-        } else {
-            selectedNames.formUnion(selectableMinor)
-        }
-        updateSelectionInPlace()
-    }
-
-    @objc func toggleMinorSafeExpanded() {
-        minorSafeExpanded.toggle()
-        rebuildItemsStack()
-    }
-
-    @objc func selectRecommendedOnly() {
-        let recommendedNames = Set(visibleEntries().compactMap { item -> String? in
-            guard item["clearable"] as? Bool != false, intVal(item, "bytes") > 0, isDefaultSelected(item) else { return nil }
-            return item["name"] as? String
-        })
-        selectedNames = recommendedNames
-        updateSelectionInPlace()
-    }
-
-    @objc func toggleSelectAll() {
-        let safeClearableNames = Set(visibleEntries().compactMap { item -> String? in
-            guard item["clearable"] as? Bool != false, intVal(item, "bytes") > 0, !isStatefulItem(item) else { return nil }
-            return item["name"] as? String
-        })
-        let selectedSafe = selectedNames.intersection(safeClearableNames)
-        let shouldClearAll = (selectedSafe.count == safeClearableNames.count && !safeClearableNames.isEmpty) || (!selectedNames.isEmpty && safeClearableNames.isEmpty)
-        if shouldClearAll {
-            selectedNames.removeAll()
-        } else {
-            selectedNames.formUnion(safeClearableNames)
-        }
-        updateSelectionInPlace()
     }
 
     @objc func openTrashFolder() {
-        let trashURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
+        dismissDetailPopover()
+        let fm = FileManager.default
+        let activeSnap = latestUndoSnapshot ?? snapshots.first
+        if let snapPath = activeSnap?["snapshotPath"] as? String,
+           !snapPath.isEmpty,
+           fm.fileExists(atPath: snapPath) {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: snapPath)])
+            return
+        }
+        if usingFallbackTrash, !activeTrashPath.isEmpty {
+            try? fm.createDirectory(atPath: activeTrashPath, withIntermediateDirectories: true)
+            if fm.fileExists(atPath: activeTrashPath) {
+                NSWorkspace.shared.open(URL(fileURLWithPath: activeTrashPath))
+                return
+            }
+        }
+        let trashURL = fm.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
         NSWorkspace.shared.open(trashURL)
     }
 
-    @objc func restoreLatestSnapshot() {
-        guard !latestRestorableSnapshotId.isEmpty else { return }
-        let dummy = NSButton()
-        dummy.identifier = NSUserInterfaceItemIdentifier(latestRestorableSnapshotId)
-        restoreSnapshot(dummy)
-    }
-
-    @objc func clearSelectedCaches() {
-        guard !busy, !scanToken.isEmpty else { return }
-        let sel = selectionSummary()
-        guard sel.count > 0, sel.bytes > 0 else { return }
-        let orderedSelected = entries.compactMap { item -> String? in
-            guard let name = item["name"] as? String,
-                  item["clearable"] as? Bool != false,
-                  intVal(item, "bytes") > 0,
-                  selectedNames.contains(name) else { return nil }
-            return name
-        }
-        guard !orderedSelected.isEmpty else { return }
-        let tokenToClear = scanToken
-
-        #if NATIVE_UI_TEST
-        performClear(token: tokenToClear, selected: orderedSelected, restartAfter: false)
-        return
-        #else
-        let presentConfirmModal: () -> Void = { [weak self] in
-            guard let self else { return }
-            let confirm = NSAlert()
-            confirm.alertStyle = .informational
-            let hasStateful = sel.statefulCount > 0
-            if self.appRunning {
-                confirm.messageText = hasStateful
-                    ? "退出 Antigravity 并清理 \(self.formatBytes(sel.bytes)) 所选存储项？"
-                    : "退出 Antigravity 并清理 \(self.formatBytes(sel.bytes)) 无损缓存与残留？"
-                confirm.informativeText = hasStateful
-                    ? "确认后将自动重启 Antigravity，并将所选 \(orderedSelected.count) 项（含 \(sel.statefulCount) 项历史深度瘦身）移入系统废纸篓。核心账号、主对话/归档对话与本地 Token 账单完好保留。"
-                    : "确认后将自动重启 Antigravity，并将所选 \(orderedSelected.count) 项移入系统废纸篓。账号登录态与历史对话完好保留。"
-                confirm.addButton(withTitle: "退出并清理")
-                confirm.addButton(withTitle: "取消")
-            } else {
-                confirm.messageText = hasStateful
-                    ? "确认清理所选 \(self.formatBytes(sel.bytes)) 存储项？"
-                    : "确认清理所选 \(self.formatBytes(sel.bytes)) 无损缓存与残留？"
-                confirm.informativeText = hasStateful
-                    ? "所选 \(orderedSelected.count) 项（含 \(sel.statefulCount) 项历史深度瘦身）将移入系统废纸篓并生成恢复快照。核心账号、主对话/归档对话与本地 Token 账单完好保留。"
-                    : "所选 \(orderedSelected.count) 项将移入系统废纸篓并生成恢复快照。账号登录态与历史对话完好保留。"
-                confirm.addButton(withTitle: "移到废纸篓")
-                confirm.addButton(withTitle: "取消")
-            }
-
-            let handleChoice: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-                guard let self else { return }
-                guard response == .alertFirstButtonReturn else { return }
-                if self.appRunning {
-                    self.quitAntigravityAndClear(token: tokenToClear, selected: orderedSelected)
-                } else {
-                    self.performClear(token: tokenToClear, selected: orderedSelected, restartAfter: false)
-                }
-            }
-
-            var parentWindow = self.app.window
-            while let sheet = parentWindow?.activeSheetWindow { parentWindow = sheet }
-            if let parentWindow, parentWindow.isVisible {
-                confirm.beginSheetModal(for: parentWindow) { handleChoice($0) }
-            } else {
-                NSApp.activate(ignoringOtherApps: true)
-                handleChoice(confirm.runModal())
-            }
-        }
-
-        if appRunning {
-            busy = true
-            scanButton.setBusy(true, available: app.reachable)
-            retentionPopup.isEnabled = false
-            clearButton.isEnabled = false
-            app.bridge.send(["command": "maintenance_preflight"]) { [weak self] preflightRes in
-                guard let self else { return }
-                self.busy = false
-                self.scanButton.setBusy(false, available: self.app.reachable)
-                self.retentionPopup.isEnabled = self.app.reachable
-                self.updateSummaryAndControls()
-                switch preflightRes {
-                case .failure(let error):
-                    let msg = error.localizedDescription
-                    self.feedbackLabel.isHidden = false
-                    self.feedbackLabel.textColor = accessibleWarningColor()
-                    self.feedbackLabel.stringValue = msg
-                    let warn = NSAlert()
-                    warn.alertStyle = .warning
-                    warn.messageText = "当前无法执行存储清理"
-                    warn.informativeText = msg
-                    warn.addButton(withTitle: "知道了")
-                    var parentWindow = self.app.window
-                    while let sheet = parentWindow?.activeSheetWindow { parentWindow = sheet }
-                    if let parentWindow, parentWindow.isVisible {
-                        warn.beginSheetModal(for: parentWindow, completionHandler: nil)
-                    } else {
-                        warn.runModal()
-                    }
-                case .success:
-                    presentConfirmModal()
-                }
-            }
-        } else {
-            presentConfirmModal()
+    private func syncLiveRunningState() {
+        #if !NATIVE_UI_TEST
+        let liveRunning = Assistant.isAntigravityRunning()
+        if appRunning != liveRunning {
+            appRunning = liveRunning
+            updateSummaryAndControls()
         }
         #endif
     }
 
-    private func quitAntigravityAndClear(token: String, selected: [String]) {
-        busy = true
-        scanButton.setBusy(true, available: app.reachable)
-        retentionPopup.isEnabled = false
-        clearButton.isEnabled = false
+    private func relaunchAntigravityAndSyncState(delay: TimeInterval) {
+        app.suppressLifecycleAutoQuit(seconds: 45.0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.app.openAntigravity()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
+                guard let self, !self.busy else { return }
+                self.syncLiveRunningState()
+            }
+        }
+    }
+
+    private func showPreflightBlockedAlert(_ msg: String) {
+        feedbackLabel.isHidden = false
+        feedbackLabel.textColor = accessibleWarningColor()
+        feedbackLabel.stringValue = msg
+        let warn = NSAlert()
+        warn.alertStyle = .warning
+        warn.messageText = L10n.t("maintenance.preflight_blocked_title")
+        warn.informativeText = msg
+        warn.addButton(withTitle: L10n.t("maintenance.btn.known"))
+        var parentWindow = app.window
+        while let sheet = parentWindow?.activeSheetWindow { parentWindow = sheet }
+        if let parentWindow, parentWindow.isVisible {
+            warn.beginSheetModal(for: parentWindow, completionHandler: nil)
+        } else {
+            warn.runModal()
+        }
+    }
+
+    @objc func clearSelectedCaches() {
+        guard !busy, hasCompletedScan else { return }
+        dismissDetailPopover()
+        syncLiveRunningState()
+        let scopesToClear = selectedScopes
+        let targetBytes = selectedReclaimableBytes
+        guard !scopesToClear.isEmpty, targetBytes > 0 else { return }
+
+        #if NATIVE_UI_TEST
+        performSmartClear(scopes: scopesToClear, restartAfter: false)
+        return
+        #else
+        if appRunning {
+            setBusy(true)
+            app.bridge.send(["command": "maintenance_preflight"]) { [weak self] preflightRes in
+                guard let self else { return }
+                self.setBusy(false)
+                switch preflightRes {
+                case .failure(let error):
+                    self.showPreflightBlockedAlert(error.localizedDescription)
+                case .success:
+                    let confirm = NSAlert()
+                    confirm.alertStyle = .informational
+                    confirm.messageText = L10n.t("maintenance.simple.confirm_running_title", ["size": self.formatBytes(targetBytes)])
+                    confirm.informativeText = self.buildRunningClearConfirmationBody()
+                    confirm.addButton(withTitle: L10n.t("maintenance.simple.confirm_restart_and_clean"))
+                    confirm.addButton(withTitle: L10n.t("common.cancel"))
+
+                    let handleChoice: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+                        guard let self, response == .alertFirstButtonReturn else { return }
+                        self.syncLiveRunningState()
+                        if self.appRunning {
+                            self.quitAntigravityAndSmartClear(scopes: scopesToClear)
+                        } else {
+                            self.performSmartClear(scopes: scopesToClear, restartAfter: false)
+                        }
+                    }
+
+                    var parentWindow = self.app.window
+                    while let sheet = parentWindow?.activeSheetWindow { parentWindow = sheet }
+                    if let parentWindow, parentWindow.isVisible {
+                        confirm.beginSheetModal(for: parentWindow) { handleChoice($0) }
+                    } else {
+                        NSApp.activate(ignoringOtherApps: true)
+                        handleChoice(confirm.runModal())
+                    }
+                }
+            }
+        } else {
+            performSmartClear(scopes: scopesToClear, restartAfter: false)
+        }
+        #endif
+    }
+
+    private func quitAntigravityAndSmartClear(scopes: [String]) {
+        setBusy(true)
+        app.suppressLifecycleAutoQuit(seconds: 90.0)
         feedbackLabel.isHidden = false
         feedbackLabel.textColor = Design.secondary
-        feedbackLabel.stringValue = "正在退出 Antigravity 并清理所选存储项…"
+        feedbackLabel.stringValue = L10n.t("maintenance.simple.status_restarting_clean")
 
         app.quitAntigravityAndWait { [weak self] exited in
             guard let self else { return }
+            self.app.suppressLifecycleAutoQuit(seconds: 90.0)
             guard exited else {
-                self.busy = false
-                self.scanButton.setBusy(false, available: self.app.reachable)
-                self.retentionPopup.isEnabled = self.app.reachable
-                let msg = "请先保存工作并退出 Antigravity，再执行存储清理。"
+                self.setBusy(false)
+                let msg = L10n.t("maintenance.error.quit_first_clear")
                 self.feedbackLabel.isHidden = false
                 self.feedbackLabel.textColor = accessibleWarningColor()
                 self.feedbackLabel.stringValue = msg
@@ -1275,52 +1052,27 @@ final class CachePage: NSObject {
                 self.fetch(force: true)
                 return
             }
-            // Antigravity 及 language_server 完全静止后重新扫描最新指纹（保持当前保留窗口）再执行安全清理
-            self.app.bridge.send(["command": "maintenance_scan", "retentionDays": self.selectedRetentionDays]) { [weak self] scanRes in
-                guard let self else { return }
-                switch scanRes {
-                case .success(let scanPayload):
-                    if scanPayload["running"] as? Bool == true {
-                        self.busy = false
-                        self.scanButton.setBusy(false, available: self.app.reachable)
-                        self.retentionPopup.isEnabled = self.app.reachable
-                        let msg = "请先保存工作并退出 Antigravity，再执行存储清理。"
-                        self.feedbackLabel.isHidden = false
-                        self.feedbackLabel.textColor = accessibleWarningColor()
-                        self.feedbackLabel.stringValue = msg
-                        self.app.showMessage(msg, error: true)
-                        self.fetch(force: true)
-                        return
-                    }
-                    let freshToken = (scanPayload["token"] as? String) ?? token
-                    self.busy = false
-                    self.performClear(token: freshToken, selected: selected, restartAfter: true)
-                case .failure(let error):
-                    self.busy = false
-                    self.scanButton.setBusy(false, available: self.app.reachable)
-                    self.retentionPopup.isEnabled = self.app.reachable
-                    let msg = "退出 Antigravity 后重扫存储清单失败（\(error.localizedDescription)），已取消清理以保护数据。"
-                    self.feedbackLabel.isHidden = false
-                    self.feedbackLabel.textColor = accessibleWarningColor()
-                    self.feedbackLabel.stringValue = msg
-                    self.app.showMessage(msg, error: true)
-                    self.fetch(force: true)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.app.openAntigravity() }
-                }
-            }
+            self.performSmartClear(scopes: scopes, restartAfter: true)
         }
     }
 
-    private func performClear(token: String, selected: [String], restartAfter: Bool) {
-        busy = true
-        scanButton.setBusy(true, available: app.reachable)
-        retentionPopup.isEnabled = false
-        clearButton.isEnabled = false
-        app.bridge.send(["command": "maintenance_clear", "token": token, "selectedNames": selected, "force": false]) { [weak self] response in
+    private func performSmartClear(scopes: [String], restartAfter: Bool) {
+        setBusy(true)
+        if restartAfter {
+            app.suppressLifecycleAutoQuit(seconds: 90.0)
+        } else {
+            feedbackLabel.isHidden = false
+            feedbackLabel.textColor = Design.secondary
+            feedbackLabel.stringValue = L10n.t("maintenance.simple.status_cleaning")
+        }
+        app.bridge.send([
+            "command": "maintenance_smart_clear",
+            "scopes": scopes,
+            "retentionDays": selectedRetentionDays,
+            "keepLocalSnapshots": 1
+        ]) { [weak self] response in
             guard let self else { return }
-            self.busy = false
-            self.scanButton.setBusy(false, available: self.app.reachable)
-            self.retentionPopup.isEnabled = self.app.reachable
+            self.setBusy(false)
             switch response {
             case .failure(let error):
                 self.feedbackLabel.isHidden = false
@@ -1329,10 +1081,27 @@ final class CachePage: NSObject {
                 self.app.showMessage(error.localizedDescription, error: true)
                 self.fetch(force: true)
                 if restartAfter {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.app.openAntigravity() }
+                    self.relaunchAntigravityAndSyncState(delay: 0.5)
                 }
             case .success(let value):
-                let msg = (value["message"] as? String) ?? "已将所选存储项移入废纸篓"
+                if let dir = value["trashDir"] as? String, !dir.isEmpty {
+                    self.activeTrashPath = dir
+                }
+                if let fallbackFlag = value["usingFallbackTrash"] as? Bool {
+                    self.usingFallbackTrash = fallbackFlag
+                }
+                if let superseded = value["supersededSnapshotPaths"] as? [String], !superseded.isEmpty {
+                    self.rotateSupersededSnapshotsToSystemTrashAsync(superseded)
+                }
+                let clearedBytes = Int64(intVal(value, "clearedBytes"))
+                let msg: String
+                if let serverMsg = value["message"] as? String, !serverMsg.isEmpty {
+                    msg = serverMsg
+                } else if clearedBytes > 0 {
+                    msg = L10n.t("maintenance.simple.success_cleaned", ["size": self.formatBytes(clearedBytes)])
+                } else {
+                    msg = L10n.t("maintenance.simple.success_nothing")
+                }
                 self.feedbackLabel.isHidden = false
                 self.feedbackLabel.textColor = Design.secondary
                 self.feedbackLabel.stringValue = msg
@@ -1341,139 +1110,122 @@ final class CachePage: NSObject {
                 self.app.overview?.fetch()
                 self.app.usagePage?.fetch(force: true)
                 if restartAfter {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.app.openAntigravity() }
+                    self.relaunchAntigravityAndSyncState(delay: 0.6)
                 }
             }
         }
     }
 
-    @objc func restoreSnapshot(_ sender: NSButton) {
-        guard !busy, let snapshotId = sender.identifier?.rawValue, !snapshotId.isEmpty else { return }
-
-        let executeRestore: () -> Void = { [weak self] in
-            guard let self else { return }
-            self.busy = true
-            self.scanButton.setBusy(true, available: self.app.reachable)
-            self.retentionPopup.isEnabled = false
-            self.snapshotPopup.isEnabled = false
-            self.clearButton.isEnabled = false
-            self.app.bridge.send(["command": "maintenance_restore", "snapshotId": snapshotId]) { [weak self] response in
-                guard let self else { return }
-                self.busy = false
-                self.scanButton.setBusy(false, available: self.app.reachable)
-                self.retentionPopup.isEnabled = self.app.reachable
-                switch response {
-                case .failure(let error):
-                    self.feedbackLabel.isHidden = false
-                    self.feedbackLabel.textColor = accessibleWarningColor()
-                    self.feedbackLabel.stringValue = error.localizedDescription
-                    self.app.showMessage(error.localizedDescription, error: true)
-                    self.fetch(force: true)
-                case .success(let value):
-                    let msg = (value["message"] as? String) ?? "已原位恢复存储快照"
-                    self.feedbackLabel.isHidden = false
-                    self.feedbackLabel.textColor = Design.secondary
-                    self.feedbackLabel.stringValue = msg
-                    self.app.showMessage(msg)
-                    self.fetch(force: true)
-                    self.app.overview?.fetch()
-                    self.app.usagePage?.fetch(force: true)
-                }
-            }
-        }
+    @objc func restoreLatestSnapshot() {
+        guard !busy, !latestRestorableSnapshotId.isEmpty else { return }
+        dismissDetailPopover()
+        let snapshotId = latestRestorableSnapshotId
+        syncLiveRunningState()
 
         #if NATIVE_UI_TEST
-        executeRestore()
+        executeRestoreRequest(snapshotId: snapshotId, restartAfter: false)
         #else
         if appRunning {
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "请先退出 Antigravity 后再恢复缓存快照"
-            alert.informativeText = "为避免缓存目录在恢复过程中发生读写冲突，请先关闭 Antigravity，再点击「原位恢复」。"
-            alert.addButton(withTitle: "知道了")
-            var parentWindow = app.window
-            while let sheet = parentWindow?.activeSheetWindow { parentWindow = sheet }
-            if let parentWindow, parentWindow.isVisible {
-                alert.beginSheetModal(for: parentWindow, completionHandler: nil)
-            } else {
-                alert.runModal()
+            setBusy(true)
+            app.bridge.send(["command": "maintenance_preflight"]) { [weak self] preflightRes in
+                guard let self else { return }
+                self.setBusy(false)
+                switch preflightRes {
+                case .failure(let error):
+                    self.showPreflightBlockedAlert(error.localizedDescription)
+                case .success:
+                    let alert = NSAlert()
+                    alert.alertStyle = .informational
+                    alert.messageText = L10n.t("maintenance.simple.undo_running_title")
+                    alert.informativeText = L10n.t("maintenance.simple.undo_running_body")
+                    alert.addButton(withTitle: L10n.t("maintenance.simple.confirm_restart_and_undo"))
+                    alert.addButton(withTitle: L10n.t("common.cancel"))
+                    let handleRestoreChoice: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
+                        guard let self, resp == .alertFirstButtonReturn else { return }
+                        self.syncLiveRunningState()
+                        if self.appRunning {
+                            self.quitAntigravityAndRestore(snapshotId: snapshotId)
+                        } else {
+                            self.executeRestoreRequest(snapshotId: snapshotId, restartAfter: false)
+                        }
+                    }
+                    var parentWindow = self.app.window
+                    while let sheet = parentWindow?.activeSheetWindow { parentWindow = sheet }
+                    if let parentWindow, parentWindow.isVisible {
+                        alert.beginSheetModal(for: parentWindow) { handleRestoreChoice($0) }
+                    } else {
+                        NSApp.activate(ignoringOtherApps: true)
+                        handleRestoreChoice(alert.runModal())
+                    }
+                }
             }
             return
         }
-        executeRestore()
+        executeRestoreRequest(snapshotId: snapshotId, restartAfter: false)
         #endif
     }
-}
 
-// MARK: - Maintenance Sheet Window Controller
-final class MaintenanceSheetController: NSObject, NSWindowDelegate {
-    unowned let app: Assistant
-    let sheet = SheetWindow(contentRect: NSRect(x: 0, y: 0, width: 740, height: 724), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-    var cachePage: CachePage
-    var onDismiss: (() -> Void)?
+    private func quitAntigravityAndRestore(snapshotId: String) {
+        setBusy(true)
+        app.suppressLifecycleAutoQuit(seconds: 90.0)
+        feedbackLabel.isHidden = false
+        feedbackLabel.textColor = Design.secondary
+        feedbackLabel.stringValue = L10n.t("maintenance.simple.status_restarting_undo")
 
-    init(app: Assistant) {
-        self.app = app
-        let page = app.cachePage ?? CachePage(app: app)
-        app.cachePage = page
-        self.cachePage = page
-        super.init()
-        sheet.delegate = self
-        sheet.title = "存储与维护 · Antigravity"
-        sheet.isReleasedWhenClosed = false
-        sheet.onCancelOperation = { [weak self] in self?.closeSheet() }
-
-        page.sheetDoneButton.target = self
-        page.sheetDoneButton.action = #selector(closeSheet)
-        page.sheetDoneButton.isHidden = false
-
-        let surface = SheetVisualEffectView()
-        let footerDivider = divider()
-        let footerRow = horizontal([flexibleSpace(), page.sheetDoneButton], spacing: 8)
-        footerRow.alignment = .centerY
-
-        page.view.translatesAutoresizingMaskIntoConstraints = false
-        footerDivider.translatesAutoresizingMaskIntoConstraints = false
-        footerRow.translatesAutoresizingMaskIntoConstraints = false
-
-        surface.addSubview(page.view)
-        surface.addSubview(footerDivider)
-        surface.addSubview(footerRow)
-        NSLayoutConstraint.activate([
-            page.view.leadingAnchor.constraint(equalTo: surface.leadingAnchor),
-            page.view.trailingAnchor.constraint(equalTo: surface.trailingAnchor),
-            page.view.topAnchor.constraint(equalTo: surface.topAnchor),
-            page.view.bottomAnchor.constraint(equalTo: footerDivider.topAnchor),
-            footerDivider.leadingAnchor.constraint(equalTo: surface.leadingAnchor, constant: 22),
-            footerDivider.trailingAnchor.constraint(equalTo: surface.trailingAnchor, constant: -22),
-            footerDivider.bottomAnchor.constraint(equalTo: footerRow.topAnchor, constant: -10),
-            footerRow.leadingAnchor.constraint(equalTo: surface.leadingAnchor, constant: 22),
-            footerRow.trailingAnchor.constraint(equalTo: surface.trailingAnchor, constant: -22),
-            footerRow.bottomAnchor.constraint(equalTo: surface.bottomAnchor, constant: -12),
-        ])
-        sheet.isOpaque = false
-        sheet.backgroundColor = .clear
-        sheet.contentView = surface
-        Design.applyControls(surface)
-    }
-
-    func show(in parent: NSWindow, onDismiss: (() -> Void)? = nil) {
-        guard sheet.sheetParent == nil else { return }
-        let clampedHeight = min(724, max(500, parent.frame.height - 36))
-        sheet.setContentSize(NSSize(width: 740, height: clampedHeight))
-        self.onDismiss = onDismiss
-        cachePage.update(force: true)
-        parent.beginSheet(sheet) { [weak self] _ in
-            self?.onDismiss?()
+        app.quitAntigravityAndWait { [weak self] exited in
+            guard let self else { return }
+            self.app.suppressLifecycleAutoQuit(seconds: 90.0)
+            guard exited else {
+                self.setBusy(false)
+                let msg = L10n.t("maintenance.restore.quit_body")
+                self.feedbackLabel.isHidden = false
+                self.feedbackLabel.textColor = accessibleWarningColor()
+                self.feedbackLabel.stringValue = msg
+                self.app.showMessage(msg, error: true)
+                self.fetch(force: true)
+                return
+            }
+            self.executeRestoreRequest(snapshotId: snapshotId, restartAfter: true)
         }
     }
 
-    @objc func closeSheet() {
-        sheet.sheetParent?.endSheet(sheet)
-    }
-
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        closeSheet()
-        return false
+    private func executeRestoreRequest(snapshotId: String, restartAfter: Bool) {
+        setBusy(true)
+        if restartAfter {
+            app.suppressLifecycleAutoQuit(seconds: 90.0)
+        } else {
+            feedbackLabel.isHidden = false
+            feedbackLabel.textColor = Design.secondary
+            feedbackLabel.stringValue = L10n.t("maintenance.simple.status_undoing")
+        }
+        app.bridge.send(["command": "maintenance_restore", "snapshotId": snapshotId]) { [weak self] response in
+            guard let self else { return }
+            self.setBusy(false)
+            switch response {
+            case .failure(let error):
+                self.feedbackLabel.isHidden = false
+                self.feedbackLabel.textColor = accessibleWarningColor()
+                self.feedbackLabel.stringValue = error.localizedDescription
+                self.app.showMessage(error.localizedDescription, error: true)
+                self.fetch(force: true)
+                if restartAfter {
+                    self.relaunchAntigravityAndSyncState(delay: 0.5)
+                }
+            case .success(let value):
+                let msg = (value["message"] as? String) ?? L10n.t("maintenance.simple.success_undone")
+                self.feedbackLabel.isHidden = false
+                self.feedbackLabel.textColor = Design.secondary
+                self.feedbackLabel.stringValue = msg
+                self.app.showMessage(msg)
+                self.fetch(force: true)
+                self.app.overview?.fetch()
+                self.app.usagePage?.fetch(force: true)
+                if restartAfter {
+                    self.relaunchAntigravityAndSyncState(delay: 0.6)
+                }
+            }
+        }
     }
 }
+
+// MARK: - Compact Non-Scrolling Maintenance Sheet Window Controller (620 × 464)

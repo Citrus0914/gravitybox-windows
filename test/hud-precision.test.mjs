@@ -70,7 +70,7 @@ test('TPS uses total output / total full request duration, not a mean of step ra
   closeTo(result.session.outputTps, 1000 / 12, 'weighted TPS');
   assert.notEqual(result.session.outputTps, (100 / 10 + 900 / 2) / 2);
   assert.equal(result.session.modelDurationSeconds, 12);
-  assert.equal(result.session.outputTpsFormatted, '83.33 tok/s');
+  assert.equal(result.session.outputTpsFormatted, '83.3 tok/s');
 });
 
 test('authoritative generation durations beat timestamps and never infer thinking phases', () => {
@@ -118,8 +118,8 @@ test('raw TTFT zero survives protobuf parsing and participates in the average', 
   assert.equal(raw.timeToFirstTokenSeconds, 0, 'an empty Duration is an explicit zero');
   const zero = metrics([step({ generation: raw })]);
   assert.equal(zero.session.averageTtftSeconds, 0);
-  assert.equal(zero.session.averageTtftFormatted, '0.00 秒');
-  assert.equal(zero.session.averageTtftFormattedEn, '0.00s');
+  assert.equal(zero.session.averageTtftFormatted, '0 秒');
+  assert.equal(zero.session.averageTtftFormattedEn, '0s');
   const average = metrics([
     step({ generation: raw }),
     step({ idx: 51, firstTokenSeconds: 104 }),
@@ -141,7 +141,7 @@ test('TPS has no 500 tok/s cap or artificial minimum duration', () => {
   assert.equal(result.status, 'calculated');
   assert.equal(result.rawTps, 100000);
   assert.equal(result.outputTps, 100000);
-  assert.equal(result.formatted, '100000.00 tok/s');
+  assert.equal(result.formatted, '100K tok/s');
   assert.equal(metrics([step({
     outputTokens: 1000, generation: { timeToFirstTokenSeconds: 0, streamingDurationSeconds: 0.25 },
   })]).session.outputTps, 4000);
@@ -172,7 +172,7 @@ test('actual context is independent of generator estimates and output tokens', (
     assert.equal(result.context.breakdown.uncachedContextTokens, 130);
     assert.equal(result.context.breakdown.latestOutputTokens, 99999);
     assert.equal(result.context.usedRatio, 0.33);
-    assert.equal(result.context.usedRatioFormatted, '33.00%');
+    assert.equal(result.context.usedRatioFormatted, '33%');
   }
 });
 
@@ -194,7 +194,7 @@ test('an observed 226412-token context never guesses 256K or clamps the reported
   assert.equal(result.context.isFallbackCapacity, true);
   assert.equal(result.context.hasExplicitDbCapacity, false);
   closeTo(result.context.usedRatio, 1.13206);
-  assert.equal(result.context.usedRatioFormatted, '113.21%');
+  assert.equal(result.context.usedRatioFormatted, '113%');
   for (const overrides of [
     { modelCapacity: 262144 }, { genMetadata: { maxContextTokens: 262144 } },
   ]) {
@@ -806,7 +806,7 @@ test('latestStepOutputTps 真实记录最近一个完结前台模型步速度，
     Math.abs((res.session.latestStepOutputTps || 0) - 4324 / 24.12) < 0.01,
     `latestStepOutputTps 应精确等于 4324 / 24.12，实际 ${res.session.latestStepOutputTps}`
   );
-  assert.equal(res.session.latestStepOutputTpsFormatted, '179.27 tok/s');
+  assert.equal(res.session.latestStepOutputTpsFormatted, '179 tok/s');
 
   // 无有效计时步骤时，不应编造 latestStepOutputTps
   const untimed = buildConversationHudMetrics({
@@ -880,8 +880,8 @@ test('currentTurnOutputTps 仅统计本轮已完结前台模型步并隔离历�
     Math.abs((res.session.currentTurnOutputTps || 0) - 2000 / 15) < 0.01,
     `currentTurnOutputTps 应为 2000 / 15，实际 ${res.session.currentTurnOutputTps}`
   );
-  assert.equal(res.session.currentTurnOutputTpsFormatted, '133.33 tok/s');
-  assert.equal(res.session.latestStepOutputTpsFormatted, '150.00 tok/s');
+  assert.equal(res.session.currentTurnOutputTpsFormatted, '133 tok/s');
+  assert.equal(res.session.latestStepOutputTpsFormatted, '150 tok/s');
   assert.ok((res.session.outputTps || 0) < 100, `全会话均速受上一轮与子智能体拉低，实际 ${res.session.outputTps}`);
 });
 
@@ -1061,10 +1061,13 @@ test('latestStepTtft 仅取最近已完结前台模型步并隔离历史步与�
 });
 
 test('formatHudUsd 与 tokens 估算费用/缓存节省严守零编造规则', () => {
-  assert.equal(formatHudUsd(0), '~$0.00');
+  assert.equal(formatHudUsd(0), '$0');
   assert.equal(formatHudUsd(0.00426), '~$0.0043');
-  assert.equal(formatHudUsd(0.00999), '~$0.0100');
+  assert.equal(formatHudUsd(0.005), '~$0.005');
+  assert.equal(formatHudUsd(0.00999), '~$0.01');
   assert.equal(formatHudUsd(0.184), '~$0.18');
+  assert.equal(formatHudUsd(2.0), '~$2');
+  assert.equal(formatHudUsd(15.5), '~$15.5');
   assert.equal(formatHudUsd(12.345), '~$12.35');
 
   const pricedSingle = buildConversationHudMetrics({
@@ -1191,3 +1194,720 @@ test('formatHudUsd 与 tokens 估算费用/缓存节省严守零编造规则', (
   assert.equal(unpriced.tokens.cacheSavedUsd, undefined);
   assert.equal(unpriced.tokens.cacheSavedFormatted, undefined);
 });
+
+test('本轮用时按挂钟时间计算：上下文压缩与步骤间空档计入，结束后不回退', () => {
+  const done = metrics([
+    step({ idx: 1, stepType: 14, startTimeSeconds: 100, endTimeSeconds: 100 }),
+    step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: 100, endTimeSeconds: 110, rawInputTokens: 50, outputTokens: 20 }),
+    step({ idx: 3, stepType: 23, status: 3, startTimeSeconds: 112, endTimeSeconds: 112 }),
+    step({ idx: 4, stepType: 15, status: 3, startTimeSeconds: 150, endTimeSeconds: 160, rawInputTokens: 50, outputTokens: 20 }),
+  ]);
+  assert.equal(Number(done.session.currentTurnDurationSeconds.toFixed(1)), 60);
+
+  const nowSec = Date.now() / 1000;
+  const running = metrics(
+    [
+      step({ idx: 1, stepType: 14, startTimeSeconds: nowSec - 300, endTimeSeconds: nowSec - 300 }),
+      step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: nowSec - 300, endTimeSeconds: nowSec - 290, rawInputTokens: 50, outputTokens: 20 }),
+    ],
+    { isStreaming: true }
+  );
+  assert.ok(running.session.currentTurnDurationSeconds >= 299, `实际 ${running.session.currentTurnDurationSeconds}`);
+
+  // 多轮会话隔离回归：第 1 轮数小时前产生子代理，第 2 轮刚起步 (USER_INPUT 无时间戳) 且新子代理活跃时，不得将第 1 轮子代理 startTimeSeconds 混入本轮墙钟起点
+  const turn1Start = nowSec - 7200;
+  const turn2ChildStart = nowSec - 8;
+  const multiTurnMain = [
+    step({ idx: 0, stepType: 14, startTimeSeconds: turn1Start, endTimeSeconds: turn1Start }),
+    step({ idx: 1, stepType: 127, status: 3, isSubagentStep: true, startTimeSeconds: turn1Start + 1, endTimeSeconds: turn1Start + 30 }),
+    step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: turn1Start + 30, endTimeSeconds: turn1Start + 45 }),
+    step({ idx: 3, stepType: 14, startTimeSeconds: null, endTimeSeconds: null, createdAtSeconds: null, hasUsage: false }),
+  ];
+  const turn1OldChild = step({
+    idx: 0,
+    stepType: 15,
+    status: 3,
+    startTimeSeconds: turn1Start + 2,
+    endTimeSeconds: turn1Start + 28,
+    outputTokens: 300,
+  });
+  const turn2NewChild = step({
+    idx: 0,
+    stepType: 15,
+    status: 2,
+    startTimeSeconds: turn2ChildStart,
+    endTimeSeconds: null,
+    outputTokens: 0,
+    hasUsage: false,
+  });
+  const isolatedTurn2 = buildConversationHudMetrics({
+    conversationId: 'multi-turn-subagent-boundary',
+    isStreaming: true,
+    isSubagentRunning: true,
+    runningSubagentCount: 1,
+    contextSteps: multiTurnMain,
+    steps: [...multiTurnMain, turn1OldChild, turn2NewChild],
+  });
+  assert.ok(
+    isolatedTurn2.session.currentTurnDurationSeconds >= 7.5 && isolatedTurn2.session.currentTurnDurationSeconds < 20,
+    `第 2 轮本轮用时应仅围绕新子代理 ~8s 累计，不得被第 1 轮子代理拉至 7200s，实际 ${isolatedTurn2.session.currentTurnDurationSeconds}`
+  );
+});
+
+test('P1-1 & P1-2: 主/子代理并发重叠模型耗时按并集去重且 TPS 不受影响，hasSubagentInTurn 精准隔离历史轮次子代理', () => {
+  const mainTurn1And2 = [
+    step({ idx: 0, stepType: 14, startTimeSeconds: 100, endTimeSeconds: 100 }),
+    step({ idx: 1, stepType: 127, status: 3, isSubagentStep: true, startTimeSeconds: 100, endTimeSeconds: 120, hasUsage: false }),
+    step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: 100, endTimeSeconds: 115, outputTokens: 300 }),
+    step({ idx: 3, stepType: 14, startTimeSeconds: 200, endTimeSeconds: 200 }),
+    step({ idx: 4, stepType: 15, status: 3, startTimeSeconds: 200, endTimeSeconds: 210, outputTokens: 200 }),
+  ];
+  const turn1ChildModel = step({
+    idx: 0,
+    stepType: 15,
+    status: 3,
+    startTimeSeconds: 105,
+    endTimeSeconds: 120,
+    outputTokens: 150,
+  });
+  const res = buildConversationHudMetrics({
+    conversationId: 'p1-overlap-and-turn-subagent',
+    isStreaming: false,
+    isSubagentRunning: false,
+    subagentCount: 1,
+    subagentSteps: 1,
+    contextSteps: mainTurn1And2,
+    steps: [...mainTurn1And2, turn1ChildModel],
+  });
+  assert.equal(res.session.modelDurationSeconds, 30);
+  closeTo(res.session.outputTps, 650 / 40, 'TPS keeps sum of generation durations');
+  assert.equal(res.session.subagentCount, 1);
+  assert.equal(res.session.hasSubagentInTurn, false);
+});
+
+test('P0-2 & P1-5: 子智能体本轮模型/工具耗时纳入当轮分解且支持 >30s 逆向嗅探窗口与无关会话负向缓存', async (t) => {
+  const nowSec = Date.now() / 1000;
+  const turnStart = nowSec - 30;
+  const mainTurnSteps = [
+    step({ idx: 0, stepType: 14, startTimeSeconds: turnStart, endTimeSeconds: turnStart }),
+    step({ idx: 1, stepType: 15, status: 3, startTimeSeconds: turnStart, endTimeSeconds: turnStart + 5, outputTokens: 100 }),
+    step({ idx: 2, stepType: 127, status: 3, isSubagentStep: true, startTimeSeconds: turnStart + 5, endTimeSeconds: turnStart + 5.02, hasUsage: false }),
+  ];
+  const childCompletedModel = step({
+    idx: 1,
+    stepType: 15,
+    status: 3,
+    startTimeSeconds: turnStart + 6,
+    endTimeSeconds: turnStart + 16,
+    outputTokens: 200,
+  });
+  const childActiveTool = step({
+    idx: 2,
+    stepType: 21,
+    status: 2,
+    startTimeSeconds: nowSec - 4,
+    endTimeSeconds: null,
+    hasUsage: false,
+  });
+  const liveTurn = buildConversationHudMetrics({
+    conversationId: 'subagent-turn-breakdown',
+    isStreaming: false,
+    isSubagentRunning: true,
+    runningSubagentCount: 1,
+    contextSteps: mainTurnSteps,
+    steps: [...mainTurnSteps, childCompletedModel, childActiveTool],
+  });
+  // 本轮模型用时 = 主对话 5s + 子智能体 10s = 15s
+  assert.equal(Number(liveTurn.session.currentTurnModelDurationSeconds.toFixed(1)), 15);
+  // 本轮工具用时包含子智能体进行中的 ~4s 工具执行，且 inFlightToolDurationSeconds 同步可见
+  assert.ok(liveTurn.session.currentTurnToolDurationSeconds >= 3.8 && liveTurn.session.currentTurnToolDurationSeconds < 6);
+  assert.ok(liveTurn.session.inFlightToolDurationSeconds >= 3.8 && liveTurn.session.inFlightToolDurationSeconds < 6);
+
+  // 逆向嗅探 5 分钟窗口：子会话无显式 UUID 引用且其 mtime 为 90 秒前（>30s 旧阈值，<=300s 新阈值）仍可被发现并汇总
+  const { create, engine } = databaseFixture(t);
+  const mainDb = create(ids.main);
+  const sniffChildDb = create(ids.child, { parentBlob: parentMetadata(ids.main) });
+  const otherDb = create(ids.unrelated, { parentBlob: parentMetadata(ids.impostor, ids.impostor) });
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status) VALUES (1, 14, 3)').run();
+  insertStep(mainDb, { idx: 2, value: usage({ outputTokens: 100 }) });
+  insertStep(sniffChildDb, { idx: 1, status: 2, value: usage({ outputTokens: 300 }) });
+  insertStep(otherDb, { idx: 1, status: 3, value: usage({ outputTokens: 999 }) });
+  sniffChildDb.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+  otherDb.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+
+  const childDbPath = engine.resolveDbPath(ids.child);
+  const otherDbPath = engine.resolveDbPath(ids.unrelated);
+  const ninetySecAgo = new Date(Date.now() - 90_000);
+  fs.utimesSync(childDbPath, ninetySecAgo, ninetySecAgo);
+  fs.utimesSync(otherDbPath, ninetySecAgo, ninetySecAgo);
+
+  const sniffedRes1 = await engine.getConversationMetrics({
+    conversationId: ids.main,
+    isSubagentRunning: true,
+    runningSubagentCount: 1,
+  });
+  assert.equal(sniffedRes1.session.subagentCount, 1);
+  assert.equal(sniffedRes1.tokens.outputTokens, 400);
+
+  // 第二次轮询命中负向 mtime 缓存，保持无关会话零混入且结果幂等
+  const sniffedRes2 = await engine.getConversationMetrics({
+    conversationId: ids.main,
+    isSubagentRunning: true,
+    runningSubagentCount: 1,
+  });
+  assert.equal(sniffedRes2.session.subagentCount, 1);
+  assert.equal(sniffedRes2.tokens.outputTokens, 400);
+});
+
+test('P0-03 & P1-05 & P1-08: 中止/报错步保留真实挂钟不倒退、过渡空档 awaitingFirstTurnStep 精准置位、子分栏活跃圆点同步', () => {
+  // P0-03: 无子智能体的普通对话轮次，步骤 1 耗时 25s (100->125)，步骤 2 运行至 155s 被用户停止 (status=6)
+  const abortedTurn = metrics(
+    [
+      step({ idx: 1, stepType: 14, startTimeSeconds: 100, endTimeSeconds: 100 }),
+      step({
+        idx: 2,
+        stepType: 15,
+        status: 3,
+        startTimeSeconds: 100,
+        endTimeSeconds: 125,
+        outputTokens: 500,
+        generation: { timeToFirstTokenSeconds: 1, streamingDurationSeconds: 24 },
+      }),
+      step({
+        idx: 3,
+        stepType: 15,
+        status: 6,
+        startTimeSeconds: 125,
+        endTimeSeconds: 155,
+        hasUsage: false,
+        outputTokens: 0,
+      }),
+    ],
+    { isStreaming: false }
+  );
+  assert.equal(abortedTurn.session.turnAborted, true);
+  assert.equal(abortedTurn.session.currentTurnDurationSeconds, 55, '被停止步骤的结束时间戳必须纳入本轮挂钟用时，不得退回 25s');
+  assert.equal(abortedTurn.session.outputTps, 20, '被停止步骤不混入 TPS 样本');
+
+  // P1-05: 工具执行完毕进入下一轮思考空档时 awaitingFirstTurnStep=true；模型步刚完结等待工具审批时保持 false
+  const afterToolGap = metrics(
+    [
+      step({ idx: 1, stepType: 14, startTimeSeconds: 100, endTimeSeconds: 100 }),
+      step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: 100, endTimeSeconds: 108, outputTokens: 160 }),
+      step({ idx: 3, stepType: 21, status: 3, startTimeSeconds: 108, endTimeSeconds: 112, hasUsage: false }),
+    ],
+    { isStreaming: true, activityPhase: 'generating' }
+  );
+  assert.equal(afterToolGap.session.awaitingFirstTurnStep, true);
+
+  const afterModelApprovalWait = metrics(
+    [
+      step({ idx: 1, stepType: 14, startTimeSeconds: 100, endTimeSeconds: 100 }),
+      step({ idx: 2, stepType: 15, status: 3, startTimeSeconds: 100, endTimeSeconds: 108, outputTokens: 160 }),
+    ],
+    { isStreaming: true, activityPhase: 'generating' }
+  );
+  assert.equal(Boolean(afterModelApprovalWait.session.awaitingFirstTurnStep), false);
+
+  // P1-08: 独立子智能体分栏即使 DOM 未检测到停止按钮 (isStreaming=false)，只要数据库存在活跃前台步即同步 generating/executing
+  const nowSec = Date.now() / 1000;
+  const subpaneGen = buildConversationHudMetrics({
+    conversationId: 'subpane-active-model',
+    isStreaming: false,
+    isSubagentTrajectory: true,
+    allowDbActiveStepInference: true,
+    steps: [
+      step({ idx: 1, stepType: 14, startTimeSeconds: nowSec - 6, endTimeSeconds: nowSec - 6 }),
+      step({ idx: 2, stepType: 15, status: 8, startTimeSeconds: nowSec - 4, endTimeSeconds: null, hasUsage: false }),
+    ],
+  });
+  assert.equal(subpaneGen.activityPhase, 'generating');
+
+  const subpaneExec = buildConversationHudMetrics({
+    conversationId: 'subpane-active-tool',
+    isStreaming: false,
+    isSubagentTrajectory: true,
+    allowDbActiveStepInference: true,
+    steps: [
+      step({ idx: 1, stepType: 14, startTimeSeconds: nowSec - 6, endTimeSeconds: nowSec - 6 }),
+      step({ idx: 2, stepType: 21, status: 2, startTimeSeconds: nowSec - 3, endTimeSeconds: null, hasUsage: false }),
+    ],
+  });
+  assert.equal(subpaneExec.activityPhase, 'executing');
+});
+
+test('P1-06 & P1-07: 多子代理步骤间空档防抖不掉数 + 历史多代理会话冷启动反向嗅探补齐', async (t) => {
+  const { create, engine } = databaseFixture(t);
+  const mainDb = create(ids.main);
+  const child1Db = create(ids.child, { parentBlob: parentMetadata(ids.main) });
+  const child2Db = create(ids.grandchild, { parentBlob: parentMetadata(ids.main) });
+
+  // P1-06: 两个子代理已由主会话派发，child1 刚跑完第 1 步正处于等待第 2 步落盘的间隙 (<15s 且未写入 step_type=2 结束步)，child2 正在运行步骤
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status) VALUES (1, 14, 3)').run();
+  invoke(mainDb, 2, [ids.child, ids.grandchild]);
+  child1Db.prepare('INSERT INTO steps (idx, step_type, status) VALUES (1, 14, 3)').run();
+  insertStep(child1Db, { idx: 2, status: 3, value: usage({ outputTokens: 120 }) });
+  child2Db.prepare('INSERT INTO steps (idx, step_type, status) VALUES (1, 14, 3)').run();
+  insertStep(child2Db, { idx: 2, status: 2, value: usage({ outputTokens: 80 }) });
+
+  const liveMulti = await engine.getConversationMetrics({
+    conversationId: ids.main,
+    isStreaming: false,
+    isSubagentRunning: true,
+    runningSubagentCount: 1, // 模拟页面仅渲染汇总按钮 "Stop All Subagents" (DOM count=1)
+  });
+  assert.equal(liveMulti.runningSubagentCount, 2, '步骤间 15s 窗口内未完结的子代理不得闪烁跌落');
+
+  // child1 写入轮次完结步 (step_type=2, status=3) 后，立即准确收敛为 1 个运行中子代理
+  child1Db.prepare('INSERT INTO steps (idx, step_type, status) VALUES (3, 2, 3)').run();
+  const afterChild1Done = await engine.getConversationMetrics({
+    conversationId: ids.main,
+    isStreaming: false,
+    isSubagentRunning: true,
+    runningSubagentCount: 1,
+  });
+  assert.equal(afterChild1Done.runningSubagentCount, 1);
+
+  // P1-07: 全新引擎实例冷启动打开 2 小时前已完成的历史多代理会话（主库含 invoke_subagent 工具步但无内联子 UUID）
+  const histDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-cold-sniff-'));
+  t.after(() => fs.rmSync(histDir, { recursive: true, force: true }));
+  const histMainId = '77777777-7777-4777-8777-777777777777';
+  const histChildId = '88888888-8888-4888-8888-888888888888';
+  const twoHoursAgoSec = Math.floor(Date.now() / 1000) - 7200;
+
+  const mkHistDb = (id, parentBlob = null) => {
+    const db = new DatabaseSync(path.join(histDir, `${id}.db`));
+    db.exec(`
+      CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB, render_info BLOB, step_payload BLOB);
+      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER);
+      CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+    `);
+    db.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 0)').run(id, id);
+    if (parentBlob) db.prepare('INSERT INTO trajectory_metadata_blob VALUES (?, ?)').run('main', parentBlob);
+    return db;
+  };
+
+  const hMain = mkHistDb(histMainId);
+  const hChild = mkHistDb(histChildId, parentMetadata(histMainId, histMainId));
+  hMain.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (1, 14, 3, ?)').run(
+    Buffer.from([...seconds(1, twoHoursAgoSec), ...seconds(7, twoHoursAgoSec)])
+  );
+  // 主库步骤 2 为 invoke_subagent (step_type=127)，但 metadata/render_info 未内联子 UUID
+  hMain.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (2, 127, 3, ?)').run(
+    Buffer.from([...seconds(1, twoHoursAgoSec + 2), ...seconds(7, twoHoursAgoSec + 2.1), ...message(4, string(2, 'invoke_subagent'))])
+  );
+  hMain.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (3, 15, 3, ?)').run(
+    Buffer.from([...seconds(1, twoHoursAgoSec + 20), ...seconds(6, twoHoursAgoSec + 21), ...seconds(7, twoHoursAgoSec + 25), ...message(9, usageBytes(usage({ outputTokens: 150 })))])
+  );
+  hChild.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (1, 15, 3, ?)').run(
+    Buffer.from([...seconds(1, twoHoursAgoSec + 3), ...seconds(6, twoHoursAgoSec + 4), ...seconds(7, twoHoursAgoSec + 18), ...message(9, usageBytes(usage({ outputTokens: 450 })))])
+  );
+  hMain.close();
+  hChild.close();
+
+  const twoHoursAgoDate = new Date(twoHoursAgoSec * 1000 + 30_000);
+  fs.utimesSync(path.join(histDir, `${histMainId}.db`), twoHoursAgoDate, twoHoursAgoDate);
+  fs.utimesSync(path.join(histDir, `${histChildId}.db`), twoHoursAgoDate, twoHoursAgoDate);
+
+  const coldEngine = new ConversationMetricsEngine({ conversationsDir: histDir });
+  const coldMetrics = await coldEngine.getConversationMetrics({
+    conversationId: histMainId,
+    isStreaming: false,
+    isSubagentRunning: false,
+  });
+  assert.equal(coldMetrics.session.subagentCount, 1, '冷启动历史多代理会话应通过反向嗅探找回关联子库');
+  assert.equal(coldMetrics.tokens.outputTokens, 600, '主库 150 + 子库 450 = 600 outputTokens');
+});
+
+test('已完结或已中止轮次闲置后收到瞬时 isStreaming 脉冲时，严禁把跨轮挂机时间外推入本轮用时', () => {
+  const nowSec = Date.now() / 1000;
+  const oldStart = nowSec - 2688; // 44m48s 前开始
+  const oldEnd = oldStart + 404; // 6m44s 后完成，距今已闲置 38 分钟
+
+  // 场景 1: 末步为已完成的模型步 (stepType=15, status=3)，闲置 38 分钟后瞬时收到 isStreaming=true
+  const staleModelTurn = metrics(
+    [
+      step({ idx: 0, stepType: 14, startTimeSeconds: null, endTimeSeconds: null }),
+      step({
+        idx: 1,
+        stepType: 15,
+        status: 3,
+        startTimeSeconds: oldStart,
+        endTimeSeconds: oldEnd,
+        outputTokens: 200,
+        generation: { timeToFirstTokenSeconds: 2, streamingDurationSeconds: 402 },
+      }),
+    ],
+    { isStreaming: true, allowDbActiveStepInference: true }
+  );
+  assert.equal(
+    Math.round(staleModelTurn.session.currentTurnDurationSeconds),
+    404,
+    `已完结 38 分钟的轮次收到瞬时 isStreaming 不得计入空闲挂机时间，实际 ${staleModelTurn.session.currentTurnDurationSeconds}`
+  );
+
+  // 场景 2: 末步为明确收尾步 (stepType=2, status=3)，即使刚结束 2s 内收到 isStreaming=true 也不得外推旧轮挂钟
+  const closedTurn = metrics(
+    [
+      step({ idx: 0, stepType: 14, startTimeSeconds: nowSec - 120, endTimeSeconds: nowSec - 120 }),
+      step({ idx: 1, stepType: 15, status: 3, startTimeSeconds: nowSec - 120, endTimeSeconds: nowSec - 2 }),
+      step({ idx: 2, stepType: 2, status: 3, startTimeSeconds: nowSec - 2, endTimeSeconds: nowSec - 2, hasUsage: false }),
+    ],
+    { isStreaming: true, allowDbActiveStepInference: true }
+  );
+  assert.equal(Math.round(closedTurn.session.currentTurnDurationSeconds), 118);
+
+  // 场景 3: 含历史已完成子智能体的中止轮次 (status=6)，无运行中子智能体时收到 isStreaming=true 不得继续计时
+  const abortedWithDoneSub = buildConversationHudMetrics({
+    conversationId: 'aborted-with-historical-subagent',
+    isStreaming: true,
+    isSubagentRunning: false,
+    allowDbActiveStepInference: true,
+    contextSteps: [
+      step({ idx: 0, stepType: 14, startTimeSeconds: oldStart, endTimeSeconds: oldStart }),
+      step({ idx: 1, stepType: 127, status: 3, isSubagentStep: true, toolCallName: 'invoke_subagent', startTimeSeconds: oldStart + 1, endTimeSeconds: oldStart + 10 }),
+      step({ idx: 2, stepType: 15, status: 6, startTimeSeconds: oldStart + 10, endTimeSeconds: oldStart + 50, hasUsage: false }),
+    ],
+    steps: [
+      step({ idx: 0, stepType: 14, startTimeSeconds: oldStart, endTimeSeconds: oldStart }),
+      step({ idx: 1, stepType: 127, status: 3, isSubagentStep: true, toolCallName: 'invoke_subagent', startTimeSeconds: oldStart + 1, endTimeSeconds: oldStart + 10 }),
+      step({ idx: 2, stepType: 15, status: 6, startTimeSeconds: oldStart + 10, endTimeSeconds: oldStart + 50, hasUsage: false }),
+      step({ idx: 3, stepType: 15, status: 3, startTimeSeconds: oldStart + 1, endTimeSeconds: oldStart + 9 }),
+    ],
+  });
+  assert.equal(Math.round(abortedWithDoneSub.session.currentTurnDurationSeconds), 50);
+});
+
+test('多模型与曾用模型 (history) 压缩归因、当前模型峰值解耦及角色去重守恒', () => {
+  // 场景 1：历史 Opus 压缩 2 次后切换到 Orchestrator (Carbon 规划 0 次 + Hydrogen 执行 1 次)
+  const opusStep1 = step({
+    idx: 1,
+    rawInputTokens: 20000,
+    cachedReadTokens: 165000,
+    cacheWriteTokens: 0,
+    outputTokens: 1200,
+    generation: {
+      responseModel: 'claude-opus-4-6-thinking',
+      modelDisplayName: 'Claude Opus 4.6 (Thinking)',
+      maxContextTokens: 200000,
+    },
+  });
+  const opusStep2 = step({
+    idx: 3,
+    rawInputTokens: 15000,
+    cachedReadTokens: 175000,
+    cacheWriteTokens: 0,
+    outputTokens: 900,
+    generation: {
+      responseModel: 'claude-opus-4-6-thinking',
+      modelDisplayName: 'Claude Opus 4.6 (Thinking)',
+      maxContextTokens: 200000,
+    },
+  });
+  const carbonStep = step({
+    idx: 6,
+    rawInputTokens: 12000,
+    cachedReadTokens: 244000,
+    cacheWriteTokens: 0,
+    outputTokens: 800,
+    generation: {
+      modelEnum: 1667,
+      responseModel: 'gemini-pro-orchestrator',
+      modelDisplayName: 'Orchestrator (Carbon)',
+      maxContextTokens: 512000,
+    },
+  });
+  const hydrogenStep = step({
+    idx: 7,
+    rawInputTokens: 40000,
+    cachedReadTokens: 360000,
+    cacheWriteTokens: 0,
+    outputTokens: 1500,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  });
+
+  // 刚切到 Carbon 时：Opus 压缩 2 次（含一次由后台轻量摘要模型执行的 CHECKPOINT，不得生成幽灵模型阶段），Carbon 自身压缩 0 次
+  const atCarbon = buildConversationHudMetrics({
+    conversationId: 'conv-compaction-history-orch',
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      opusStep1,
+      { idx: 2, stepType: 23, status: 3 }, // 无 metadata 的常规 CHECKPOINT -> 归因至紧邻前置 Opus
+      opusStep2,
+      {
+        idx: 4,
+        stepType: 23,
+        status: 5,
+        generation: { responseModel: 'gemini-2.5-flash-lite', modelDisplayName: 'Internal Summarizer' },
+      }, // 后台摘要模型不在对话阶段列表中 -> 回退归因至 Opus 且不产生幽灵阶段
+      { idx: 5, stepType: 14, status: 3 },
+      carbonStep,
+    ],
+  });
+
+  assert.equal(atCarbon.session.compactionCount, 2);
+  assert.equal(atCarbon.context.activeModelCompactionCount, 0);
+  assert.equal(atCarbon.context.modelStages?.length, 3);
+  const carbonStage1 = atCarbon.context.modelStages?.find((s) => s.slotKey === 'orchestrator:carbon');
+  const opusHistoryStage = atCarbon.context.modelStages?.find((s) => s.shortLabel === 'Opus');
+  assert.equal(carbonStage1?.isActive, true);
+  assert.equal(carbonStage1?.compactionCount, undefined);
+  assert.equal(opusHistoryStage?.section, 'history');
+  assert.equal(opusHistoryStage?.compactionCount, 2);
+
+  // Hydrogen 执行器介入并触发 1 次压缩后：总压缩 3 次，当前活跃 Hydrogen 压缩 1 次，曾用模型 Opus 保持 2 次
+  const atHydrogen = buildConversationHudMetrics({
+    conversationId: 'conv-compaction-history-orch',
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      opusStep1,
+      { idx: 2, stepType: 23, status: 3 },
+      opusStep2,
+      { idx: 4, stepType: 23, status: 5 },
+      { idx: 5, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenStep,
+      { idx: 8, stepType: 23, status: 3 },
+    ],
+  });
+  assert.equal(atHydrogen.session.compactionCount, 3);
+  assert.equal(atHydrogen.context.activeModelCompactionCount, 1);
+  const carbonStage2 = atHydrogen.context.modelStages?.find((s) => s.slotKey === 'orchestrator:carbon');
+  const hydrogenStage2 = atHydrogen.context.modelStages?.find((s) => s.slotKey === 'orchestrator:hydrogen');
+  const opusHistory2 = atHydrogen.context.modelStages?.find((s) => s.shortLabel === 'Opus');
+  assert.equal(carbonStage2?.compactionCount, undefined);
+  assert.equal(hydrogenStage2?.isActive, true);
+  assert.equal(hydrogenStage2?.compactionCount, 1);
+  assert.equal(opusHistory2?.section, 'history');
+  assert.equal(opusHistory2?.compactionCount, 2);
+
+  // 场景 2：Orchestrator Hydrogen 压缩 1 次后切回独立 Gemini 4 Hydrogen (High)，去重合并时压缩次数守恒不丢失
+  const standaloneHydrogenStep = step({
+    idx: 10,
+    rawInputTokens: 30000,
+    cachedReadTokens: 50000,
+    cacheWriteTokens: 0,
+    outputTokens: 600,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 200000,
+    },
+  });
+  const deduped = buildConversationHudMetrics({
+    conversationId: 'conv-compaction-dedup',
+    modelId: 'Gemini 4 Hydrogen (High)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenStep,
+      { idx: 8, stepType: 23, status: 3 },
+      { idx: 9, stepType: 14, status: 3 },
+      standaloneHydrogenStep,
+    ],
+  });
+  assert.equal(deduped.session.compactionCount, 1);
+  assert.equal(deduped.context.activeModelCompactionCount, 1);
+  assert.equal(deduped.context.modelStages?.length, 2);
+  assert.equal(deduped.context.modelStages?.[1]?.slotKey, 'model:gemini-4-hydrogen');
+  assert.equal(deduped.context.modelStages?.[1]?.compactionCount, 1);
+});
+
+test('SQLite 压缩步 (step_type=23) 关联 gen_metadata 时兼具模型阶段归因与独立计费 Token 守恒', async (t) => {
+  const { create, engine } = databaseFixture(t);
+  const db = create(ids.main);
+
+  // step 1: Claude Opus 4.6 模型步 (100 + 200 + 30 + 120 = 450 tok)
+  insertStep(db, { idx: 1, execution: 'exec-opus-1', value: usage() });
+  const opusGen = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(usage())),
+      ...string(19, 'claude-opus-4-6-thinking'),
+    ]),
+    ...message(2, varint(1)),
+    ...string(4, 'exec-opus-1'),
+  ]);
+  db.prepare('INSERT INTO gen_metadata VALUES (?, ?, ?)').run(1, opusGen, opusGen.length);
+
+  // step 2: CHECKPOINT (step_type=23)，计费仅存于 gen_metadata idx=2 (500 + 1500 + 0 + 100 = 2100 tok)
+  db.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, 23, 3, ?)').run(2, null);
+  const cpUsage = usage({
+    rawInputTokens: 500,
+    cachedReadTokens: 1500,
+    cacheWriteTokens: 0,
+    outputTokens: 100,
+    reasoningTokens: 0,
+    candidateTokens: 100,
+  });
+  const cpGen = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(cpUsage)),
+      ...string(19, 'claude-opus-4-6-thinking'),
+    ]),
+    ...message(2, varint(2)),
+    ...string(4, 'exec-cp-1'),
+  ]);
+  db.prepare('INSERT INTO gen_metadata VALUES (?, ?, ?)').run(2, cpGen, cpGen.length);
+
+  // step 3: 切换到 Gemini 3.8 Flash 模型步 (100 + 200 + 30 + 120 = 450 tok)，无压缩
+  insertStep(db, { idx: 3, execution: 'exec-flash-1', value: usage() });
+  insertGeneration(db, { indices: [3], execution: 'exec-flash-1' }, 3);
+
+  const result = await engine.getConversationMetrics({ conversationId: ids.main });
+  assert.equal(result.session.compactionCount, 1);
+  assert.equal(result.context.isMultiModel, true);
+  assert.equal(result.context.activeModelCompactionCount, 0);
+  // Token 守恒：450 (Opus) + 2100 (CHECKPOINT unmatchedUsageGenerations) + 450 (Flash) = 3000 tok
+  assert.equal(result.tokens.totalTokens, 3000);
+  const opusStage = result.context.modelStages?.find((s) => s.shortLabel === 'Opus');
+  const flashStage = result.context.modelStages?.find((s) => s.modelId === 'gemini-3.8-flash');
+  assert.equal(opusStage?.compactionCount, 1);
+  assert.equal(flashStage?.isActive, true);
+  assert.equal(flashStage?.compactionCount, undefined);
+});
+
+test('SQLite 跨模型压缩归因：Model A 命中精确匹配且与 Model B 共用 step_type=23 索引时不得被 Model B 抢占', async (t) => {
+  const { create, engine } = databaseFixture(t);
+  const db = create(ids.main);
+
+  db.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(
+    Buffer.from(seconds(1, 1000))
+  );
+  // step 1: Model A (Opus) 精确匹配自身 usage，同时关联压缩步 idx=2 (exec-A)
+  insertStep(db, { idx: 1, execution: 'exec-A', value: usage({ rawInputTokens: 40_000, cachedReadTokens: 120_000, outputTokens: 800 }) });
+  const genA = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(usage({ rawInputTokens: 40_000, cachedReadTokens: 120_000, outputTokens: 800 }))),
+      ...string(19, 'claude-opus-4-6-thinking'),
+      ...string(21, 'Claude Opus 4.6 (Thinking)'),
+    ]),
+    ...message(2, [1, 2].flatMap(varint)),
+    ...string(4, 'exec-A'),
+  ]);
+  db.prepare('INSERT INTO gen_metadata VALUES (?, ?, ?)').run(0, genA, genA.length);
+
+  // step 2: 压缩步 (step_type=23) 自身带 executionId = exec-A（依赖 sqlite-worker 放开 step_type=23 读取）
+  db.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (2, 23, 3, ?)').run(
+    Buffer.from([...seconds(1, 1008), ...string(12, 'exec-A')])
+  );
+
+  // step 3: 接手的 Model B (Sonnet) 未命中 exactMatch（cacheWrite 不同）且 stepIndices 也覆盖了 [2, 3]
+  insertStep(db, { idx: 3, execution: 'exec-B', value: usage({ rawInputTokens: 20_000, cachedReadTokens: 30_000, cacheWriteTokens: 0, outputTokens: 500 }) });
+  const genB = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(usage({ rawInputTokens: 20_000, cachedReadTokens: 30_000, cacheWriteTokens: 500, outputTokens: 500 }))),
+      ...string(19, 'claude-sonnet-4-6'),
+      ...string(21, 'Claude Sonnet 4.6'),
+    ]),
+    ...message(2, [2, 3].flatMap(varint)),
+    ...string(4, 'exec-B'),
+  ]);
+  db.prepare('INSERT INTO gen_metadata VALUES (?, ?, ?)').run(1, genB, genB.length);
+
+  const res = await engine.getConversationMetrics({ conversationId: ids.main });
+  assert.equal(res.session.compactionCount, 1);
+  assert.equal(res.context.activeModelCompactionCount, 0);
+  const opusStage = res.context.modelStages?.find((s) => s.shortLabel === 'Opus');
+  const sonnetStage = res.context.modelStages?.find((s) => s.shortLabel === 'Sonnet');
+  assert.equal(opusStage?.compactionCount, 1, '压缩步 exec-A 必须精准归因至触发压缩的 Opus');
+  assert.equal(sonnetStage?.isActive, true);
+  assert.equal(sonnetStage?.compactionCount, undefined, '接手模型 Sonnet 不得抢占 Opus 的压缩归因');
+});
+
+test('Orchestrator 吸收同名独立模型阶段及单物理模型跨角色合并时均保留历史峰值与激活阶段', () => {
+  const standaloneHydrogenHighPeak = step({
+    idx: 1,
+    rawInputTokens: 180_000,
+    cachedReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 400,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 512000,
+    },
+  });
+  const carbonStep = step({
+    idx: 4,
+    rawInputTokens: 20_000,
+    cachedReadTokens: 200_000,
+    cacheWriteTokens: 0,
+    outputTokens: 600,
+    generation: {
+      modelEnum: 1667,
+      responseModel: 'gemini-pro-orchestrator',
+      modelDisplayName: 'Orchestrator (Carbon)',
+      maxContextTokens: 512000,
+    },
+  });
+  const hydrogenExecLowPeak = step({
+    idx: 5,
+    rawInputTokens: 50_000,
+    cachedReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 300,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  });
+
+  // 1. Orchestrator 吸收同名独立 Hydrogen 时保留历史峰值 180K 与压缩次数
+  const orchMerged = buildConversationHudMetrics({
+    conversationId: 'conv-orch-absorb-peak',
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      standaloneHydrogenHighPeak,
+      { idx: 2, stepType: 23, status: 3 },
+      { idx: 3, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenExecLowPeak,
+    ],
+  });
+  assert.equal(orchMerged.context.peakContextTokens, 180_000);
+  assert.equal(orchMerged.context.activeModelCompactionCount, 1);
+  assert.equal(orchMerged.context.modelStages?.some((s) => s.isActive), true);
+
+  // 2. Turn 2 独立 Hydrogen 为最后一步，选择器切回 Orchestrator (Carbon) 未发言时，执行器吸收后仍保持 isActive
+  const selectorBack = buildConversationHudMetrics({
+    conversationId: 'conv-orch-absorb-active',
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenExecLowPeak,
+      { idx: 6, stepType: 14, status: 3 },
+      { ...standaloneHydrogenHighPeak, idx: 7 },
+    ],
+  });
+  assert.equal(selectorBack.context.modelStages?.some((s) => s.isActive), true);
+
+  // 3. 仅有单个物理模型跨角色合并（orderedEntries.length === 1）时保留历史峰值 190K 与压缩 1 次
+  const singlePhysMerged = buildConversationHudMetrics({
+    conversationId: 'conv-single-phys-merge',
+    modelId: 'Gemini 4 Hydrogen (High)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      { ...hydrogenExecLowPeak, idx: 1, rawInputTokens: 190_000 },
+      { idx: 2, stepType: 23, status: 3 },
+      { idx: 3, stepType: 14, status: 3 },
+      { ...standaloneHydrogenHighPeak, idx: 4, rawInputTokens: 80_000 },
+    ],
+  });
+  assert.equal(Boolean(singlePhysMerged.context.isMultiModel), false);
+  assert.equal(singlePhysMerged.context.peakContextTokens, 190_000);
+  assert.equal(singlePhysMerged.context.activeModelCompactionCount, 1);
+});
+
+

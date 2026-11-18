@@ -14,8 +14,8 @@ final class UsageCacheTrack: NSView {
         heightAnchor.constraint(equalToConstant: trackHeight + scaleHeight + 3).isActive = true
         setAccessibilityElement(true)
         setAccessibilityRole(.progressIndicator)
-        setAccessibilityLabel("缓存命中率")
-        setAccessibilityHelp("0%–100% 基准：轨道长度代表缓存命中率。")
+        setAccessibilityLabel(L10n.t("usage.section.cache_hit_rate"))
+        setAccessibilityHelp(L10n.t("usage.cache.track_help"))
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -26,9 +26,9 @@ final class UsageCacheTrack: NSView {
     func update(percent: Double) {
         let target = percent.isFinite ? max(0, min(100, percent)) : nil
         self.percent = target
-        let current = target.map { String(format: "%.1f%%", $0) } ?? "待刷新"
+        let current = target.map { String(format: "%.1f%%", locale: Locale(identifier: "en_US_POSIX"), $0) } ?? L10n.t("common.pending_refresh")
         setAccessibilityValue(target.map { NSNumber(value: $0) })
-        setAccessibilityHelp("0%–100% 基准：轨道长度代表缓存命中率，当前 \(current)。")
+        setAccessibilityHelp(L10n.t("usage.cache.track_help_value", ["value": current]))
         let targetVal = target ?? 0
         motion.cancel()
         let startVal = displayedPercent

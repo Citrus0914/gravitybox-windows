@@ -38,14 +38,19 @@ test('foreground idle plus running child keeps activityPhase idle while preservi
   bridge.dispose();
 });
 
-test('bridge fingerprint rounds inFlight model/tool durations to throttle sub-second polls', async () => {
+test('bridge fingerprint suppresses wall-clock ticking while streaming and pushes on state change', async () => {
   const sent = [];
   let inFlightModel = 10.1;
+  let turnDuration = 10.1;
+  let activeModelCount = 1;
+  let streaming = true;
   const engine = {
     getConversationMetrics: async options => {
       const m = buildConversationHudMetrics({ ...options, observedAt: 1_700_000_000_000, steps: [] });
+      m.isStreaming = streaming;
+      m.session.currentTurnDurationSeconds = turnDuration;
       m.session.inFlightModelDurationSeconds = inFlightModel;
-      m.session.activeModelStepCount = 1;
+      m.session.activeModelStepCount = activeModelCount;
       return m;
     },
     clearCache() {},
@@ -59,13 +64,20 @@ test('bridge fingerprint rounds inFlight model/tool durations to throttle sub-se
   await new Promise(r => setImmediate(r));
   assert.equal(sent.length, 1);
 
-  // 同秒微增量 (10.1 -> 10.4) 应被指纹节流抑制
+  // 流式运行期间仅挂钟秒数递增（前端本地 250ms 定时器自走表），不触发冗余跨进程 CDP Runtime.evaluate
   inFlightModel = 10.4;
+  turnDuration = 10.4;
   await bridge.pollActiveSessions(true);
   assert.equal(sent.length, 1);
 
-  // 跨过整秒阈值 (10.4 -> 11.2) 应推送更新
-  inFlightModel = 11.2;
+  inFlightModel = 24.8;
+  turnDuration = 24.8;
+  await bridge.pollActiveSessions(true);
+  assert.equal(sent.length, 1);
+
+  // 一旦步骤活跃计数或流式状态发生真实变更，立即推送权威指标包
+  activeModelCount = 0;
+  streaming = false;
   await bridge.pollActiveSessions(true);
   assert.equal(sent.length, 2);
   bridge.dispose();

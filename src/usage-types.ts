@@ -1,6 +1,8 @@
 import type { ApiPricing } from './pricing.js';
 import { stripModelProviderPrefix } from './model-identity.js';
+import { getEffectiveModelPriceAlias } from './model-catalog.js';
 import type { LedgerEvent } from './usage-ledger.js';
+import { bt } from './i18n.js';
 
 export interface TokenUsageTotals {
   input_tokens: number;
@@ -79,6 +81,7 @@ export interface TokenUsageSummary {
   snapshot_id?: string;
   last_attempt_at?: number;
   pricing_warnings?: string[];
+  pricing_warning_codes?: string[];
   unattributed_requests?: number;
   unattributed_tokens?: number;
   ledger_review_records?: number;
@@ -122,31 +125,49 @@ export interface GenerationEvent {
  * 针对 Vertex AI / GCP 路径前缀（如 publishers/google/models/gemini-4-carbon）自动解耦并清洗为规范模型名称。
  * 同时对 Orchestrator 双阶段模式（Plan Mode: Argon / Carbon；Execution Mode: gemini-flash-worker-agy / 1669）执行方案 B 归一化合并。
  */
+export const CANONICAL_UNKNOWN_MODEL = '未知模型';
+
+export function isUnknownModelName(name: string | null | undefined): boolean {
+  const clean = typeof name === 'string' ? name.trim() : '';
+  return clean === CANONICAL_UNKNOWN_MODEL || clean.toLowerCase() === 'unknown model';
+}
+
 export function resolveDatabaseModelFullName(
   modelId: string | null | undefined,
   label: string | null | undefined,
-  modelEnum?: number | null
+  modelEnum?: number | null,
+  options?: { canonicalUnknown?: boolean }
 ): string {
-  const cleanId = typeof modelId === 'string' ? modelId.trim() : '';
+  const rawId = typeof modelId === 'string' ? modelId.trim() : '';
+  const cleanId = isUnknownModelName(rawId) ? '' : rawId;
   const strippedId = cleanId ? (stripModelProviderPrefix(cleanId) || cleanId) : '';
-  const cleanLabel = typeof label === 'string' ? label.trim() : '';
+  const rawLabel = typeof label === 'string' ? label.trim() : '';
+  const cleanLabel = isUnknownModelName(rawLabel) ? '' : rawLabel;
 
-  // Antigravity Orchestrator 双阶段模型归一化（方案 B）：
-  // 1. 规划阶段 (Plan Mode)：response_model 恒为 "gemini-pro-orchestrator-g1-pro"，由 label ("Orchestrator (Argon)" / "Orchestrator (Carbon)") 或 model_enum (1668 / 1667) 区分底层规划模型；
-  // 2. 执行阶段 (Execution Mode)：model_enum 为 1669 (MODEL_PLACEHOLDER_M669)，response_model 为 "gemini-flash-worker-agy"，label 为 "Gemini Flash"，对应底层 Gemini 3.8 Flash。
-  const isOrchestratorId = /\borchestrator\b/i.test(strippedId) || /^MODEL_PLACEHOLDER_M66[78]$/i.test(strippedId);
-  const isOrchestratorLabel = /\borchestrator\b/i.test(cleanLabel);
-  if (isOrchestratorId || isOrchestratorLabel || modelEnum === 1667 || modelEnum === 1668) {
+  // Antigravity Orchestrator 双阶段模型归一化：
+  // 1. 规划阶段 (Plan Mode)：旧版 response_model 恒为 "gemini-pro-orchestrator-g1-pro"，需结合 label / model_enum 区分 Carbon / Hydrogen / Argon；
+  // 2. 其他已知历史 ID 与远端热更新别名优先走 getEffectiveModelPriceAlias，未知新变体原样保留以便归入未计价统计（禁止前缀猜名伪造费用）。
+  const isLegacyAmbiguousOrchestratorId =
+    /^gemini-pro-orchestrator(?:-g1-pro)?$/i.test(strippedId) ||
+    /^MODEL_PLACEHOLDER_M66[78]$/i.test(strippedId) ||
+    /^Orchestrator\s*\(\s*(?:Carbon|Hydrogen|Argon)\s*\)$/i.test(strippedId);
+
+  if (!strippedId || isLegacyAmbiguousOrchestratorId) {
     if (/\bcarbon\b/i.test(cleanLabel) || /\bcarbon\b/i.test(strippedId) || modelEnum === 1667 || /M667$/i.test(strippedId)) {
-      return 'gemini-4-carbon';
+      return getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M667') ?? 'gemini-4-carbon';
     }
     if (/\bhydrogen\b/i.test(cleanLabel) || /\bhydrogen\b/i.test(strippedId)) {
-      return 'gemini-4-hydrogen';
+      return getEffectiveModelPriceAlias(cleanLabel) ?? 'gemini-4-hydrogen';
     }
-    if (/\bargon\b/i.test(cleanLabel) || /\bargon\b/i.test(strippedId) || modelEnum === 1668 || /M668$/i.test(strippedId) || /^gemini-pro-orchestrator/i.test(strippedId)) {
-      return 'gemini-4-argon';
+    if (/\bargon\b/i.test(cleanLabel) || /\bargon\b/i.test(strippedId) || modelEnum === 1668 || /M668$/i.test(strippedId)) {
+      return getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M668') ?? 'gemini-4-argon';
+    }
+    if (cleanLabel) {
+      const labelAlias = getEffectiveModelPriceAlias(cleanLabel);
+      if (labelAlias) return labelAlias;
     }
   }
+
   if (
     /^gemini-flash-worker(?:-agy)?$/i.test(strippedId) ||
     /^MODEL_PLACEHOLDER_M669$/i.test(strippedId) ||
@@ -156,20 +177,36 @@ export function resolveDatabaseModelFullName(
     if (/\bhydrogen\b/i.test(cleanLabel) || /\bhydrogen\b/i.test(strippedId)) {
       return 'gemini-4-hydrogen';
     }
-    return 'gemini-3.8-flash';
+    const workerAlias = strippedId
+      ? (getEffectiveModelPriceAlias(strippedId) ?? getEffectiveModelPriceAlias(cleanId))
+      : undefined;
+    return workerAlias ?? getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M669') ?? 'gemini-3.8-flash';
   }
 
+  const normalizeDisplayLabel = (lbl: string): string =>
+    lbl
+      .replace(/\s*[（(]\s*(?:extra[\s-]*high|extra[\s-]*low|xhigh|high|medium|low|thinking|max)\s*[）)]\s*$/i, '')
+      .replace(/\s+(?:extra[\s-]*high|extra[\s-]*low|xhigh|high|medium|low|thinking|max)\s*$/i, '')
+      .trim() || lbl;
+
   if (cleanId) {
+    const dynamicIdAlias = getEffectiveModelPriceAlias(strippedId) ?? getEffectiveModelPriceAlias(cleanId);
+    if (dynamicIdAlias) return dynamicIdAlias;
+    if (/^(?:gemini-pro-orchestrator|gemini-pro-orchestrator-g1-pro|gemini-pro-orchestrator-argon)$/i.test(strippedId)) {
+      return 'gemini-4-argon';
+    }
+    if (/^MODEL_PLACEHOLDER_M\d+$/i.test(strippedId) && cleanLabel) {
+      const normalizedLabel = normalizeDisplayLabel(cleanLabel);
+      return getEffectiveModelPriceAlias(normalizedLabel) ?? normalizedLabel;
+    }
     if (strippedId) return strippedId;
     return cleanId;
   }
   if (cleanLabel) {
-    return cleanLabel
-      .replace(/\s*[（(]\s*(?:extra[\s-]*low|high|medium|low|thinking|max)\s*[）)]\s*$/i, '')
-      .replace(/\s+(?:extra[\s-]*low|high|medium|low|thinking|max)\s*$/i, '')
-      .trim() || cleanLabel;
+    const normalizedLabel = normalizeDisplayLabel(cleanLabel);
+    return getEffectiveModelPriceAlias(normalizedLabel) ?? normalizedLabel;
   }
-  return '未知模型';
+  return options?.canonicalUnknown ? CANONICAL_UNKNOWN_MODEL : bt('usage.unknown_model');
 }
 
 export interface FileCacheEntry {

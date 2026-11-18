@@ -1,5 +1,6 @@
 import { closeSync, openSync, readSync } from 'node:fs';
 import { open, type FileHandle } from 'node:fs/promises';
+import { bt } from './i18n.js';
 
 export interface AsarFileEntry {
   size?: number | string;
@@ -21,11 +22,11 @@ export interface ParsedAsarHeaderPrefix {
 
 /** Parse and validate the 16-byte ASAR preamble before reading its JSON header. */
 export function parseAsarHeaderPrefix(prefix: Buffer, maxHeaderBytes = 16_000_000): ParsedAsarHeaderPrefix {
-  if (prefix.length < 16) throw new Error('应用资源头不完整');
+  if (prefix.length < 16) throw new Error(bt('asar.header_incomplete'));
   const headerSize = prefix.readUInt32LE(4);
   const jsonSize = prefix.readUInt32LE(12);
   if (jsonSize <= 0 || jsonSize > maxHeaderBytes) {
-    throw new Error('应用资源索引无效');
+    throw new Error(bt('asar.index_invalid'));
   }
   return { headerSize, jsonSize, dataOffset: 8 + headerSize };
 }
@@ -48,12 +49,12 @@ export function resolveAsarEntryRange(
     relOffset < 0 ||
     size > maxSize
   ) {
-    throw new Error('应用资源位置无效');
+    throw new Error(bt('asar.offset_invalid'));
   }
   const offset = dataOffset + relOffset;
-  if (offset < dataOffset) throw new Error('应用资源位置无效');
+  if (offset < dataOffset) throw new Error(bt('asar.offset_invalid'));
   if (options.fileSize !== undefined && offset + size > options.fileSize) {
-    throw new Error('应用资源位置无效');
+    throw new Error(bt('asar.offset_invalid'));
   }
   return { size, offset };
 }
@@ -69,12 +70,12 @@ export function openAsarSync(asarPath: string, maxHeaderBytes = 16_000_000): {
   try {
     const prefix = Buffer.alloc(16);
     if (readSync(fd, prefix, 0, 16, 0) !== 16) {
-      throw new Error('应用资源头不完整');
+      throw new Error(bt('asar.header_incomplete'));
     }
     const { jsonSize, dataOffset } = parseAsarHeaderPrefix(prefix, maxHeaderBytes);
     const headerBytes = Buffer.alloc(jsonSize);
     if (readSync(fd, headerBytes, 0, jsonSize, 16) !== jsonSize) {
-      throw new Error('应用资源索引无效');
+      throw new Error(bt('asar.index_invalid'));
     }
     const header = JSON.parse(headerBytes.toString('utf8')) as AsarHeader;
     return {
@@ -113,16 +114,16 @@ export async function openAsarArchive(asarPath: string, maxHeaderBytes = 16_000_
     const prefix = Buffer.alloc(16);
     const prefixRead = await handle.read(prefix, 0, 16, 0);
     if (prefixRead.bytesRead !== 16) {
-      throw new Error('应用资源头不完整');
+      throw new Error(bt('asar.header_incomplete'));
     }
     const { jsonSize, dataOffset } = parseAsarHeaderPrefix(prefix, maxHeaderBytes);
     if (16 + jsonSize > stat.size || dataOffset > stat.size) {
-      throw new Error('应用资源索引无效');
+      throw new Error(bt('asar.index_invalid'));
     }
     const headerBytes = Buffer.alloc(jsonSize);
     const headerRead = await handle.read(headerBytes, 0, jsonSize, 16);
     if (headerRead.bytesRead !== jsonSize) {
-      throw new Error('应用资源索引无效');
+      throw new Error(bt('asar.index_invalid'));
     }
     const header = JSON.parse(headerBytes.toString('utf8')) as AsarHeader;
     return {
@@ -136,7 +137,7 @@ export async function openAsarArchive(asarPath: string, maxHeaderBytes = 16_000_
         const bytes = Buffer.alloc(range.size);
         const { bytesRead } = await handle.read(bytes, 0, range.size, range.offset);
         if (bytesRead !== range.size) {
-          throw new Error('应用资源读取不完整');
+          throw new Error(bt('asar.read_incomplete'));
         }
         return bytes;
       },

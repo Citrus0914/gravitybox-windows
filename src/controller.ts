@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { CDP, assertLoopback } from './cdp.js';
 import { allowedTarget, discover, verifyPageService, type Endpoint } from './discovery.js';
 import { compareLayers, type Dictionary } from './dictionary.js';
+import { normalizeLocale, translate } from './i18n.js';
 import {
   isEnglishSource, SUPPORTED_BUNDLES,
   fetchBundleFromOrigin,
@@ -35,6 +36,8 @@ export type AssistantStatus = {
   menuHooked?: boolean;
   dictionaryBaseVersion?: string;
   languageMode?: string;
+  locale?: string;
+  configuredLanguage?: string;
   bundleCacheHit?: boolean;
   taskRevision?: number;
   bundleReads?:number;bundleBytes?:number;
@@ -53,7 +56,20 @@ export class Controller {
   private targetTimer?: NodeJS.Timeout;
   private stopped = false;
   private paused = false;
+  private locale = 'zh-Hans';
+  private configuredLanguage = 'zh-Hans';
+  private hasTargetDictionary = true;
   private get dormant() { return this.paused && !this.hudEnabled; }
+  private effectiveStatusLocale(): string {
+    return this.locale;
+  }
+  private effectiveHudLocale(): string {
+    if (this.options.fixture && this.paused) return 'en';
+    return this.locale;
+  }
+  private t(key: string, params?: Record<string, string | number | boolean | null | undefined>): string {
+    return translate(this.effectiveStatusLocale(), key, params, { namespace: 'backend' });
+  }
   private hudEnabled = true;
   private reconnectionDelay = 1000;
   private syncing = false;
@@ -61,7 +77,12 @@ export class Controller {
   private engine = '';
   private runtimeId='';
   private bootCache = new Map<string, string>();
-  private dictionaryChain: Promise<void> = Promise.resolve();
+  private controlChain: Promise<void> = Promise.resolve();
+  private enqueueControl<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.controlChain.catch(() => {}).then(task);
+    this.controlChain = run.then(() => {}, () => {});
+    return run;
+  }
   private profileWatchers: FSWatcher[] = [];
   private connecting?: Promise<void>;
   private syncWaiters: (() => void)[] = [];
@@ -87,26 +108,37 @@ export class Controller {
     shortcutEnabled?: boolean;
     hudEnabled?: boolean;
     initiallyPaused?: boolean;
+    locale?: string;
+    configuredLanguage?: string;
+    hasTargetDictionary?: boolean;
     reloadDictionary?: () => Promise<void>;
     selectDictionary?: (version: string) => Promise<Dictionary>;
     onStatus: (status: AssistantStatus) => void;
   }) {
-    this.paused = options.initiallyPaused === true;
+    const initialLocale = normalizeLocale(options.locale ?? '') ?? (options.initiallyPaused ? 'en' : 'zh-Hans');
+    this.locale = initialLocale;
+    this.configuredLanguage = options.configuredLanguage ?? initialLocale;
+    this.hasTargetDictionary = options.hasTargetDictionary ?? (initialLocale !== 'en');
+    this.paused = options.initiallyPaused === true || initialLocale === 'en' || !this.hasTargetDictionary;
     this.hudEnabled = options.hudEnabled !== false;
     this.hudBridge = new CdpHudBridge({
       geminiDir: options.geminiDir || process.env.GRAVITYBOX_GEMINI_DIR || process.env.GEMINI_DIR,
       stateDir: options.stateDir,
     });
-    this.status = { schema: 1, mode: 'starting', message: '正在初始化', windows: 0, dictionaryVersion: options.dictionary.version, entries: Object.keys(options.dictionary.entries).length, errors: [], rssMB: 0, updatedAt: '', pid: process.pid, menuHooked: false, translationEnabled: !this.paused, hudEnabled: this.hudEnabled };
+    const effectiveLocale = this.effectiveStatusLocale();
+    this.status = { schema: 1, mode: 'starting', message: this.t('status.starting'), windows: 0, dictionaryVersion: options.dictionary.version, entries: Object.keys(options.dictionary.entries).length, errors: [], rssMB: 0, updatedAt: '', pid: process.pid, menuHooked: false, translationEnabled: !this.paused, hudEnabled: this.hudEnabled, locale: effectiveLocale, configuredLanguage: this.configuredLanguage };
   }
   private publish(mode?: string, message?: string) {
     if (mode) this.status.mode = mode;
     if (message) this.status.message = message;
+    const effectiveLocale = this.effectiveStatusLocale();
     this.status.translationEnabled = !this.paused;
     this.status.hudEnabled = this.hudEnabled;
+    this.status.locale = effectiveLocale;
+    this.status.configuredLanguage = this.configuredLanguage;
     this.status.windows = this.pages.size;
     this.status.bundleReads=this.bundleCache.downloads;this.status.bundleBytes=this.bundleCache.downloadedBytes;
-    const modes=new Set([...this.pages.values()].map(p=>p.languageMode??'zh'));this.status.languageMode=modes.size>1?'mixed':([...modes][0]??'zh');
+    const modes=new Set([...this.pages.values()].map(p=>p.languageMode??(this.paused?'en':'zh')));this.status.languageMode=modes.size>1?'mixed':([...modes][0]??(this.paused?'en':'zh'));
     this.status.rssMB = Math.round(process.memoryUsage().rss / 1024 / 1024 * 10) / 10;
     this.status.updatedAt = new Date().toISOString();
     this.options.onStatus({ ...this.status });
@@ -142,7 +174,7 @@ export class Controller {
     this.watchProfiles();
     if(this.dormant) {
       if(!this.options.fixture) { this.endpoint=await discover(this.options.appPath,this.options.profile);this.status.appVersion=this.endpoint?.appVersion; }
-      this.publish('paused','已按上次选择保持暂停；开启后连接目标窗口');return;
+      this.publish('paused', this.t('status.paused_keep'));return;
     }
     await this.tryConnect();
   }
@@ -161,20 +193,20 @@ export class Controller {
         const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(2000) });
         const version = await response.json() as { webSocketDebuggerUrl: string };
         const url = assertLoopback(version.webSocketDebuggerUrl);
-        if (Number(url.port) !== port) throw new Error('测试调试端口不匹配');
+        if (Number(url.port) !== port) throw new Error(this.t('controller.err.fixture_port_mismatch'));
         this.endpoint = { port, browserURL: url.href, pid: 0, appVersion: 'fixture', legacyPatch: false };
       } else this.endpoint = await discover(this.options.appPath, this.options.profile);
       if (this.stopped) return;
-      if (!this.endpoint) { this.publish('waiting', '等待 Antigravity 打开'); this.retry(); return; }
+      if (!this.endpoint) { this.publish('waiting', this.t('status.waiting_app')); this.retry(); return; }
       this.status.appVersion = this.endpoint.appVersion;
       if(this.options.selectDictionary){const dictionary=await this.options.selectDictionary(this.endpoint.appVersion);this.options.dictionary=dictionary;this.status.dictionaryVersion=dictionary.version;this.status.entries=Object.keys(dictionary.entries).length;this.bootCache.clear();}
-      if (this.endpoint.legacyPatch) { this.publish('legacy-blocked', '检测到旧汉化，已阻止重复注入；需先完成迁移'); this.retry(30000); return; }
+      if (this.endpoint.legacyPatch) { this.publish('legacy-blocked', this.t('status.legacy_blocked')); this.retry(30000); return; }
       this.status.dictionaryBaseVersion = [...SUPPORTED_BUNDLES.keys()].filter(v=>compareLayers(v+'.json',this.endpoint!.appVersion+'.json')<=0).sort((a,b)=>compareLayers(a+'.json',b+'.json')).at(-1)??'base';
       if (!this.options.fixture) {
         const activeApp = this.activeAppPath();
         const targets = await (await fetch(`http://127.0.0.1:${this.endpoint.port}/json/list`, { signal: AbortSignal.timeout(2000), redirect: 'error' })).json() as {type: string; url: string}[];
         const target = targets.find(t => allowedTarget(t));
-        if (!target || !await verifyPageService(target.url, activeApp)) { this.publish('waiting-window', '等待已确认身份的应用窗口'); this.retry(); return; }
+        if (!target || !await verifyPageService(target.url, activeApp)) { this.publish('waiting-window', this.t('status.waiting_window')); this.retry(); return; }
         const bundle=await this.bundleCache.read(activeApp,this.endpoint.pid,this.endpoint.appVersion,new URL(target.url).origin);
         if(this.status.bundleSha256!==bundle.hash){this.trustedCandidates=[];}this.status.bundleSha256=bundle.hash;this.status.bundleCacheHit=bundle.cacheHit;this.initialBundle=bundle.source;
       }
@@ -185,7 +217,7 @@ export class Controller {
       browser.on('Target.targetCreated', () => this.scheduleSync());
       browser.on('Target.targetInfoChanged', () => this.scheduleSync());
       browser.on('Target.targetDestroyed', () => this.scheduleSync());
-      browser.on('disconnected', () => { void this.disconnectPages(); this.browser = undefined; if (!this.stopped) { this.reconnectionDelay = 1000; this.unverifiedWindowRetries = 0; this.publish('waiting', '连接中断，等待应用恢复'); this.retry(); } });
+      browser.on('disconnected', () => { void this.disconnectPages(); this.browser = undefined; if (!this.stopped) { this.reconnectionDelay = 1000; this.unverifiedWindowRetries = 0; this.publish('waiting', this.t('status.reconnecting')); this.retry(); } });
       await browser.send('Target.setDiscoverTargets', { discover: true });
       this.reconnectionDelay = 1000;
       this.unverifiedWindowRetries = 0;
@@ -210,14 +242,16 @@ export class Controller {
   private scheduleSync(delayMs = 100) {
     if (this.stopped) return;
     clearTimeout(this.targetTimer);
-    this.targetTimer = setTimeout(() => void this.sync().catch(() => this.publish('error', '窗口探测失败')), delayMs);
+    this.targetTimer = setTimeout(() => void this.sync().catch(() => this.publish('error', this.t('status.probe_failed'))), delayMs);
   }
   private boot(url: string) {
     const page = new URL(url);
-    const key = `${page.origin}${page.pathname}:${this.options.dictionary.version}:${this.verifiedBundle()}:${this.hudEnabled}:${this.paused}`;
+    const effectiveHudLocale = this.effectiveHudLocale();
+    const languageMode = this.paused ? 'en' : (this.locale === 'zh-Hans' ? 'zh' : this.locale);
+    const key = `${page.origin}${page.pathname}:${this.options.dictionary.version}:${this.verifiedBundle()}:${this.hudEnabled}:${this.paused}:${effectiveHudLocale}`;
     const cached = this.bootCache.get(key);
     if (cached) return cached;
-    const source = `delete globalThis.__GRAVITYBOX_ATTACH_DEEP_SCAN__;delete globalThis.__GRAVITYBOX_ATTACH_HUD__;globalThis.__GRAVITYBOX_BOOT__=${JSON.stringify({ origin: page.origin, path: page.pathname, dictionary: this.options.dictionary, conservative:!this.verifiedBundle(),runtimeId:this.runtimeId,shortcutEnabled:this.options.shortcutEnabled!==false,hudEnabled:this.hudEnabled,translationEnabled:!this.paused,languageMode:this.paused?'en':'zh',shellValidated:true })};\n${this.engine}`;
+    const source = `delete globalThis.__GRAVITYBOX_ATTACH_DEEP_SCAN__;delete globalThis.__GRAVITYBOX_ATTACH_HUD__;globalThis.__GRAVITYBOX_BOOT__=${JSON.stringify({ origin: page.origin, path: page.pathname, dictionary: this.options.dictionary, conservative:!this.verifiedBundle(),runtimeId:this.runtimeId,shortcutEnabled:this.options.shortcutEnabled!==false,hudEnabled:this.hudEnabled,translationEnabled:!this.paused,languageMode,locale:effectiveHudLocale,shellValidated:true })};\n${this.engine}`;
     if (this.bootCache.size < 4) this.bootCache.set(key, source);
     return source;
   }
@@ -250,12 +284,12 @@ export class Controller {
         if (this.dormant || this.stopped) break;
         try {
           if (!this.options.fixture && !await verifyPageService(target.url, this.activeAppPath())) {
-            this.status.errors.push('一个窗口的本地服务身份未确认，已跳过');
+            this.status.errors.push(this.t('controller.err.window_unverified'));
             continue;
           }
           if (this.dormant || this.stopped) break;
           const socketURL = assertLoopback(target.webSocketDebuggerUrl);
-          if (Number(socketURL.port) !== this.endpoint.port) throw new Error('窗口调试端口不匹配');
+          if (Number(socketURL.port) !== this.endpoint.port) throw new Error(this.t('controller.err.window_port_mismatch'));
           const cdp = new CDP(socketURL.href);
           const session: PageSession = { cdp, targetId: target.id, url: target.url, updateChain: Promise.resolve() };
           await cdp.connect();
@@ -278,12 +312,12 @@ export class Controller {
           await cdp.send('Page.enable'); await cdp.send('Runtime.enable');
           await cdp.send('Runtime.addBinding',{name:'__gravityboxLanguageChanged',executionContextName:WORLD});
           await this.hudBridge.attachToTarget(target.id, cdp, () => session.contextId, WORLD);
-          cdp.on('Runtime.bindingCalled',(event)=>{if(event.name==='__gravityboxLanguageChanged'&&event.executionContextId===session.contextId&&['zh','en'].includes(event.payload)){session.languageMode=event.payload;this.publish();}else if(event.name===HUD_BRIDGE_BINDING_NAME&&this.hudEnabled&&event.executionContextId===session.contextId){this.hudBridge.handleRawBindingPayload(target.id,event.payload);}});
+          cdp.on('Runtime.bindingCalled',(event)=>{if(event.name==='__gravityboxLanguageChanged'&&event.executionContextId===session.contextId&&['zh','en'].includes(event.payload)){session.languageMode=event.payload;this.publish();if(this.hudEnabled){void this.hudBridge.refreshAllForLocaleChange();}}else if(event.name===HUD_BRIDGE_BINDING_NAME&&this.hudEnabled&&event.executionContextId===session.contextId){this.hudBridge.handleRawBindingPayload(target.id,event.payload);}});
           await this.refreshRegistration(session);
           await this.queueBootstrap(session, false);
         } catch(error) {
           const failed = this.pages.get(target.id); if (failed) { await this.detach(failed); this.pages.delete(target.id); }
-          this.status.errors.push((error as Error).message==='新版页面结构尚未识别，已跳过该窗口'?(error as Error).message:'一个窗口注入失败');
+          this.status.errors.push((error as Error).message === this.t('controller.err.unrecognized_structure') ? (error as Error).message : this.t('controller.err.window_inject_failed'));
         }
       }
       const hasUnreadyPage = [...this.pages.values()].some(session => !session.detaching && session.contextId === undefined);
@@ -302,14 +336,14 @@ export class Controller {
           ? (isVerified ? 'connected' : 'adaptive')
           : 'waiting-window';
       const defaultMsg = this.paused
-        ? '已暂停，界面恢复英文'
+        ? this.t('status.paused')
         : this.pages.size
           ? (isVerified
-              ? '已连接；词典修改后自动更新'
+              ? this.t('status.connected_watch')
               : (this.status.newStringsCount
-                  ? `已连接（兼容模式：版本 ${this.endpoint?.appVersion} 发现 ${this.status.newStringsCount} 条新词）`
-                  : `已连接（兼容模式：版本 ${this.endpoint?.appVersion} 适配中，使用现有词典）`))
-          : '等待受支持窗口；未向未知页面注入';
+                  ? this.t('status.connected_adaptive_new', { version: this.endpoint?.appVersion ?? '', count: this.status.newStringsCount })
+                  : this.t('status.connected_adaptive', { version: this.endpoint?.appVersion ?? '' })))
+          : this.t('status.waiting_supported_window');
       this.publish(defaultMode, defaultMsg);
 
       if (!this.options.fixture && this.endpoint && permitted.length > 0 && !this.inspectingBundle && (this.lastInspectedAppVersion !== this.endpoint.appVersion || this.lastInspectedSha!==this.status.bundleSha256)) {
@@ -337,7 +371,7 @@ export class Controller {
       if (!allowedTarget({ type: 'page', url: frame.url }, this.options.fixture?.origin)) return;
       if(!this.options.fixture&&this.endpoint){
         const activeApp = this.activeAppPath();
-        if(!await verifyPageService(frame.url,activeApp))throw new Error('页面服务身份尚未确认');
+        if(!await verifyPageService(frame.url,activeApp))throw new Error(this.t('controller.err.page_unverified'));
         const bundle=await this.bundleCache.read(activeApp,this.endpoint.pid,this.endpoint.appVersion,new URL(frame.url).origin);
         this.status.bundleSha256=bundle.hash;this.status.bundleCacheHit=bundle.cacheHit;this.status.unverifiedVersion=!this.verifiedBundle();
         if(bundle.source)this.initialBundle=bundle.source;
@@ -357,35 +391,41 @@ export class Controller {
         session.contextId = context.executionContextId;
       }
       if(!this.verifiedBundle()){
-        if(/^\/(?:onboarding|oauth|auth|login|sign-in)(?:\/|$)/i.test(new URL(frame.url).pathname))throw new Error('未验证的登录或引导页面已跳过');
+        if(/^\/(?:onboarding|oauth|auth|login|sign-in)(?:\/|$)/i.test(new URL(frame.url).pathname))throw new Error(this.t('controller.err.onboarding_skipped'));
         const contract=await session.cdp.evaluate(`(async()=>{for(let i=0;i<30;i++){if(!!document.body&&((!!document.querySelector('[aria-label*="Sidebar" i],[aria-label*="侧边栏"],[data-testid*="sidebar" i],[data-testid="agent-input-box"]')&&!!document.querySelector('[data-testid="model-selector-trigger"],a[href="/history"],a[href="/customizations"],[data-testid="agent-input-box"],textarea,input'))||(/^\\/(?:settings(?:\\/[^?#]*)?|settings-standalone)$/.test(location.pathname)&&!!document.querySelector('[role="dialog"][aria-label="Settings"],[role="dialog"][aria-label="设置"],[data-testid*="settings"]')&&!!document.querySelector('[role="tablist"],nav,[role="navigation"]'))||(location.pathname==='/terminal-standalone'&&!!document.querySelector('.xterm,.monaco-editor,[data-testid*="terminal"]'))))return true;await new Promise(r=>setTimeout(r,100));}return false;})()`,session.contextId);
-        if(!contract)throw new Error('新版页面结构尚未识别，已跳过该窗口');
+        if(!contract)throw new Error(this.t('controller.err.unrecognized_structure'));
       }
       if(this.dormant||this.stopped||session.detaching)return;
       if (!previous?.active) previous = await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.state()', session.contextId);
       if(this.dormant||this.stopped||session.detaching)return;
+      const preservedManualEn = !this.paused && session.languageMode === 'en';
       if (previous?.active&&previous.runtimeId===this.runtimeId) {
         if (previous.version === this.options.dictionary.version) await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.refresh()', session.contextId);
         else await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__.update(${JSON.stringify(this.options.dictionary)})`, session.contextId);
+        const desiredLanguageMode = this.paused ? 'en' : preservedManualEn ? 'en' : (this.locale === 'zh-Hans' ? 'zh' : 'en');
+        if (!this.paused && !this.options.fixture && previous.languageMode && previous.languageMode !== desiredLanguageMode) {
+          await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage?.(${JSON.stringify(desiredLanguageMode)})`, session.contextId);
+        }
       }
-      else{if(previous?.active)await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.dispose()',session.contextId);await session.cdp.evaluate(this.boot(session.url),session.contextId);if(this.options.fixture&&previous?.active&&previous.languageMode==='en')await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.toggleLanguage("en")',session.contextId);}
+      else{if(previous?.active)await session.cdp.evaluate(this.hudEnabled?'globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.({keepHud:true})':'(globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.(),globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.())',session.contextId);await session.cdp.evaluate(this.boot(session.url),session.contextId);if((this.options.fixture||preservedManualEn)&&!this.paused&&(previous?.languageMode==='en'||preservedManualEn))await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage?.("en")',session.contextId);}
       let state: any;
       for (let i = 0; i < 10; i++) {
         state = await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.state()', session.contextId);
         if (state?.version === this.options.dictionary.version) break;
         await new Promise(r => setTimeout(r, 100));
       }
-      if (state?.version !== this.options.dictionary.version) throw new Error('窗口词典版本未确认');
+      if (state?.version !== this.options.dictionary.version) throw new Error(this.t('controller.err.dict_version_unconfirmed'));
       session.languageMode=state.languageMode??'zh';
+      const effectiveHudLocale = !this.paused && session.languageMode === 'en' ? 'en' : this.effectiveHudLocale();
       if (this.hudEnabled) {
-        await session.cdp.evaluate('(globalThis.__GRAVITYBOX_ATTACH_HUD__?.(), globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true), globalThis.__GRAVITYBOX_HUD_V1__?.syncAllSessions?.())', session.contextId).catch(() => {});
+        await session.cdp.evaluate(`(globalThis.__GRAVITYBOX_ATTACH_HUD__?.(), globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(${JSON.stringify(effectiveHudLocale)}), globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true), globalThis.__GRAVITYBOX_HUD_V1__?.syncAllSessions?.())`, session.contextId).catch(() => {});
       } else {
         await session.cdp.evaluate('globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(false)', session.contextId).catch(() => {});
       }
     });
     if (reportUnhandledError) {
       session.updateChain.catch(() => {
-        if (!this.status.errors.includes('一个窗口连接或恢复失败')) this.status.errors.push('一个窗口连接或恢复失败');
+        if (!this.status.errors.includes(this.t('controller.err.window_connect_failed'))) this.status.errors.push(this.t('controller.err.window_connect_failed'));
         this.publish();
       });
     }
@@ -449,11 +489,11 @@ export class Controller {
       const candidateCount = this.trustedCandidates.length;
       if (!isVerified) {
         const msg = candidateCount > 0
-          ? `已连接（兼容模式：版本 ${appVersion} 发现 ${candidateCount} 条待译新词，已生成清单）`
-          : `已连接（兼容模式：版本 ${appVersion} 词典匹配良好）`;
+          ? this.t('status.adaptive_candidates', { version: appVersion, count: candidateCount })
+          : this.t('status.adaptive_matched', { version: appVersion });
         this.publish('adaptive', msg);
       } else if (candidateCount > 0) {
-        this.publish('connected', `已连接；发现 ${candidateCount} 条新词，已生成待译清单`);
+        this.publish('connected', this.t('status.connected_candidates', { count: candidateCount }));
       }
     } catch {
       // 后台探测异常不影响前台窗口注入与翻译
@@ -462,8 +502,7 @@ export class Controller {
     }
   }
   update(dictionary: Dictionary): Promise<void> {
-    this.dictionaryChain = this.dictionaryChain.catch(() => {}).then(() => this.applyDictionary(dictionary));
-    return this.dictionaryChain;
+    return this.enqueueControl(() => this.applyDictionary(dictionary));
   }
   private async applyDictionary(dictionary: Dictionary) {
     this.options.dictionary = dictionary;
@@ -474,7 +513,7 @@ export class Controller {
       await this.refreshRegistration(session);
       await this.queueBootstrap(session);
     }));
-    if (results.some(result => result.status === 'rejected')) this.status.errors.push('部分窗口未确认词典更新');
+    if (results.some(result => result.status === 'rejected')) this.status.errors.push(this.t('controller.err.partial_dict_update'));
     this.publish();
   }
   dictionaryError(message?: string) { this.status.dictionaryError = message; this.publish(); }
@@ -494,32 +533,111 @@ export class Controller {
       await session.cdp.evaluate('(globalThis.__GRAVITYBOX_PENDING_BOOT__?.cancel(),globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose(),globalThis.__GRAVITYBOX_HUD_V1__?.dispose())', ctxId);
     } catch { restorationFailed = true; }
     session.cdp.close();
-    if (restorationFailed) this.status.errors.push('窗口已失联，无法确认恢复英文');
+    if (restorationFailed) this.status.errors.push(this.t('controller.err.window_lost_restore'));
   }
   private async disconnectPages() { for (const session of this.pages.values()) await this.detach(session); this.pages.clear(); }
-  private async quiesce() {
+  private async quiescePages() {
     await this.connecting?.catch(() => {});
     if (this.syncing) await new Promise<void>(resolve => this.syncWaiters.push(resolve));
-    await this.dictionaryChain.catch(() => {});
     await this.disconnectPages();
   }
-  async pause() {
-    this.paused = true;
-    this.bootCache.clear();
-    await this.quiesce();
-    if (this.hudEnabled) await this.resumeHudOnly();
-    this.publish('paused', this.status.errors.length ? '已暂停，部分窗口恢复情况待确认' : '已暂停，界面恢复英文');
+  private async quiesce() {
+    await this.controlChain.catch(() => {});
+    await this.quiescePages();
+  }
+  private async transitionActiveSessionsToHudOnly(): Promise<void> {
+    await this.connecting?.catch(() => {});
+    if (this.syncing) await new Promise<void>(resolve => this.syncWaiters.push(resolve));
+    if (!this.hudEnabled) {
+      await this.disconnectPages();
+      return;
+    }
+    const hudLocale = this.effectiveHudLocale();
+    for (const [id, session] of [...this.pages.entries()]) {
+      if (session.detaching) continue;
+      try {
+        await session.updateChain.catch(() => {});
+        const tree = await session.cdp.send('Page.getFrameTree');
+        const frame = tree.frameTree.frame;
+        if (!allowedTarget({ type: 'page', url: frame.url }, this.options.fixture?.origin)) {
+          await this.detach(session);
+          this.pages.delete(id);
+          continue;
+        }
+        session.url = frame.url;
+        await this.refreshRegistration(session);
+        if (session.contextId === undefined) {
+          const world = await session.cdp.send('Page.createIsolatedWorld', { frameId: frame.id, worldName: WORLD });
+          session.contextId = world.executionContextId;
+        }
+        await session.cdp.evaluate(
+          '(globalThis.__GRAVITYBOX_PENDING_BOOT__?.cancel?.(),globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.({keepHud:true}))',
+          session.contextId
+        );
+        await session.cdp.evaluate(this.boot(session.url), session.contextId);
+        await session.cdp.evaluate(
+          `(globalThis.__GRAVITYBOX_ATTACH_HUD__?.(), globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(${JSON.stringify(hudLocale)}), globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true))`,
+          session.contextId
+        );
+        session.languageMode = 'en';
+      } catch {
+        await this.detach(session);
+        this.pages.delete(id);
+      }
+    }
+  }
+  pause(): Promise<void> {
+    return this.enqueueControl(async () => {
+      const prevHudLocale = this.effectiveHudLocale();
+      this.paused = true;
+      this.status.errors = [];
+      this.bootCache.clear();
+      await this.transitionActiveSessionsToHudOnly();
+      if (this.hudEnabled) {
+        await this.resumeHudOnly();
+        if (this.effectiveHudLocale() !== prevHudLocale) {
+          await this.hudBridge.refreshAllForLocaleChange();
+        }
+      }
+      this.publish('paused', this.status.errors.length ? this.t('status.pausedWithErrors') : this.t('status.paused'));
+    });
   }
   private async resumeHudOnly() {
     if (this.browser) await this.sync(); else await this.tryConnect();
   }
-  async resume() {
+  private async resumeInternal() {
+    const prevHudLocale = this.effectiveHudLocale();
     // Recreate the isolated runtime so translation starts from the chosen mode.
-    if (this.paused && this.pages.size) await this.disconnectPages();
+    if (this.locale === 'en') {
+      this.locale = 'zh-Hans';
+      this.configuredLanguage = 'zh-Hans';
+      this.hasTargetDictionary = true;
+    }
+    const wasPaused = this.paused;
+    if (wasPaused && this.pages.size && !this.hudEnabled) await this.disconnectPages();
     this.paused = false;
     this.reconnectionDelay = 1000;
     this.unverifiedWindowRetries = 0;
     this.bootCache.clear();
+    if (wasPaused && this.hudEnabled && this.pages.size) {
+      for (const [id, session] of [...this.pages.entries()]) {
+        if (session.detaching) continue;
+        session.languageMode = undefined;
+        try {
+          if (session.contextId !== undefined) {
+            await session.cdp.evaluate(
+              '(globalThis.__GRAVITYBOX_PENDING_BOOT__?.cancel?.(),globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.({keepHud:true}))',
+              session.contextId
+            );
+          }
+          await this.refreshRegistration(session);
+          await this.queueBootstrap(session, false);
+        } catch {
+          await this.detach(session);
+          this.pages.delete(id);
+        }
+      }
+    }
     try {
       if (this.browser) await this.sync();
       else { clearTimeout(this.reconnection); await this.tryConnect(); }
@@ -529,53 +647,143 @@ export class Controller {
       clearTimeout(this.reconnection);
       await this.tryConnect();
     }
-  }
-  async configureShortcut(enabled: boolean) {
-    this.options.shortcutEnabled=enabled; this.bootCache.clear();
-    for(const session of this.pages.values()) {
-      await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__?.setShortcutEnabled(${enabled})`,session.contextId);
-      if(session.registration) await session.cdp.send('Page.removeScriptToEvaluateOnNewDocument',{identifier:session.registration});
-      const result=await session.cdp.send('Page.addScriptToEvaluateOnNewDocument',{source:this.boot(session.url),worldName:WORLD});session.registration=result.identifier;
+    if (this.hudEnabled && this.effectiveHudLocale() !== prevHudLocale) {
+      await this.hudBridge.refreshAllForLocaleChange();
     }
   }
-  async configureHud(enabled: boolean) {
-    this.hudEnabled = enabled;
-    this.options.hudEnabled = enabled;
-    this.bootCache.clear();
-    if (this.paused) {
-      await this.disconnectPages();
-      if (enabled) {
-        await this.resumeHudOnly();
-      } else {
-        this.hudBridge.clearActivePanes();
-        this.browser?.close();
-        this.browser = undefined;
+  resume(): Promise<void> {
+    return this.enqueueControl(() => this.resumeInternal());
+  }
+  setLocale(
+    nextLocale: string,
+    configuredLanguage?: string,
+    options?: { dictionary?: Dictionary; hasTargetDictionary?: boolean }
+  ): Promise<void> {
+    return this.enqueueControl(async () => {
+      const resolved = normalizeLocale(nextLocale) ?? 'en';
+      const previousLocale = this.locale;
+      const previousPaused = this.paused;
+      this.locale = resolved;
+      this.configuredLanguage = configuredLanguage ?? resolved;
+      this.hasTargetDictionary = options?.hasTargetDictionary ?? (resolved !== 'en');
+      this.status.errors = [];
+      if (options?.dictionary) {
+        this.options.dictionary = options.dictionary;
+        this.status.dictionaryVersion = options.dictionary.version;
+        this.status.entries = Object.keys(options.dictionary.entries).length;
       }
-      this.publish(); return;
-    }
-    if (!enabled) {
-      this.hudBridge.clearActivePanes();
-    }
-    await Promise.allSettled([...this.pages.values()].map(async session => {
-      await this.refreshRegistration(session);
-      if (session.contextId !== undefined && !session.detaching) {
-        if (enabled) {
-          await session.cdp.evaluate('((globalThis.__GRAVITYBOX_BOOT__&&(globalThis.__GRAVITYBOX_BOOT__.hudEnabled=true)),globalThis.__GRAVITYBOX_ATTACH_HUD__?.(),globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true),globalThis.__GRAVITYBOX_HUD_V1__?.syncAllSessions?.())', session.contextId);
-        } else {
-          await session.cdp.evaluate('((globalThis.__GRAVITYBOX_BOOT__&&(globalThis.__GRAVITYBOX_BOOT__.hudEnabled=false)),globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(false))', session.contextId);
+      if (previousLocale !== resolved) {
+        for (const s of this.pages.values()) s.languageMode = undefined;
+      }
+      this.bootCache.clear();
+      const shouldTranslateDom = resolved !== 'en' && this.hasTargetDictionary;
+      if (!shouldTranslateDom) {
+        this.paused = true;
+        if (!previousPaused || previousLocale !== resolved) {
+          await this.transitionActiveSessionsToHudOnly();
+          if (this.hudEnabled) {
+            await this.resumeHudOnly();
+            await this.hudBridge.refreshAllForLocaleChange();
+          } else {
+            this.hudBridge.clearActivePanes();
+            this.browser?.close();
+            this.browser = undefined;
+          }
         }
+        const message = this.status.errors.length
+          ? this.t('status.pausedWithErrors')
+          : this.t('status.paused');
+        this.publish('paused', message);
+        return;
       }
-    }));
-    this.publish();
+      if (previousPaused) {
+        await this.resumeInternal();
+        if (this.hudEnabled) {
+          await this.hudBridge.refreshAllForLocaleChange();
+        }
+        return;
+      }
+      if (options?.dictionary) {
+        await this.applyDictionary(options.dictionary);
+      }
+      const effectiveHudLocale = this.effectiveHudLocale();
+      await Promise.allSettled([...this.pages.values()].map(async session => {
+        await this.refreshRegistration(session);
+        if (session.contextId !== undefined && !session.detaching) {
+          await session.cdp.evaluate(
+            `globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(${JSON.stringify(effectiveHudLocale)})`,
+            session.contextId
+          );
+        }
+      }));
+      if (this.hudEnabled) {
+        await this.hudBridge.refreshAllForLocaleChange();
+      }
+      this.publish();
+    });
   }
-  async toggleLanguage(mode?: 'zh' | 'en'): Promise<void> {
-    if (this.paused) return;
-    if (!this.pages.size) return;
-    await Promise.allSettled([...this.pages.values()].map(async session => {
-      if (session.contextId !== undefined) {
-        await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage(${mode ? JSON.stringify(mode) : ''})`, session.contextId);
+  /** @internal Fixture-only shortcut toggle; no-op in production. */
+  configureShortcut(enabled: boolean): Promise<void> {
+    return this.enqueueControl(async () => {
+      if (!this.options.fixture) return;
+      this.options.shortcutEnabled = enabled;
+      this.bootCache.clear();
+      await Promise.allSettled([...this.pages.values()].map(async session => {
+        await this.refreshRegistration(session);
+        if (session.contextId !== undefined && !session.detaching) {
+          await session.cdp.evaluate(
+            `globalThis.__GRAVITYBOX_ENGINE_V1__?.setShortcutEnabled(${enabled})`,
+            session.contextId
+          );
+        }
+      }));
+    });
+  }
+  configureHud(enabled: boolean): Promise<void> {
+    return this.enqueueControl(async () => {
+      this.hudEnabled = enabled;
+      this.options.hudEnabled = enabled;
+      this.bootCache.clear();
+      if (this.paused) {
+        await this.disconnectPages();
+        if (enabled) {
+          await this.resumeHudOnly();
+        } else {
+          this.hudBridge.clearActivePanes();
+          this.browser?.close();
+          this.browser = undefined;
+        }
+        this.publish(); return;
       }
-    }));
+      if (!enabled) {
+        this.hudBridge.clearActivePanes();
+      }
+      const effectiveHudLocale = this.effectiveHudLocale();
+      await Promise.allSettled([...this.pages.values()].map(async session => {
+        await this.refreshRegistration(session);
+        if (session.contextId !== undefined && !session.detaching) {
+          if (enabled) {
+            await session.cdp.evaluate(
+              `((globalThis.__GRAVITYBOX_BOOT__&&(globalThis.__GRAVITYBOX_BOOT__.hudEnabled=true)),globalThis.__GRAVITYBOX_ATTACH_HUD__?.(),globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(${JSON.stringify(effectiveHudLocale)}),globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true),globalThis.__GRAVITYBOX_HUD_V1__?.syncAllSessions?.())`,
+              session.contextId
+            );
+          } else {
+            await session.cdp.evaluate('((globalThis.__GRAVITYBOX_BOOT__&&(globalThis.__GRAVITYBOX_BOOT__.hudEnabled=false)),globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(false))', session.contextId);
+          }
+        }
+      }));
+      this.publish();
+    });
+  }
+  toggleLanguage(mode?: 'zh' | 'en'): Promise<void> {
+    return this.enqueueControl(async () => {
+      if (this.paused || !this.pages.size) return;
+      await Promise.allSettled([...this.pages.values()].map(async session => {
+        if (session.contextId !== undefined && !session.detaching) {
+          await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage(${mode ? JSON.stringify(mode) : ''})`, session.contextId);
+        }
+      }));
+    });
   }
   snapshot(): AssistantStatus {
     this.status.rssMB = Math.round(process.memoryUsage().rss / 1024 / 1024 * 10) / 10;
@@ -619,11 +827,11 @@ export class Controller {
   }
   coverageEditable(entry:CoverageReport['entries'][number]){return entry.confidence==='ui'&&!['native','review','dynamic'].includes(entry.status)&&coverageScopes(entry).length<=1;}
   async prepareCoverageEdit(key:unknown){
-    if(typeof key!=='string')throw new Error('请选择界面词条');
+    if(typeof key!=='string')throw new Error(this.t('controller.coverage.select_entry'));
     const report=await this.coverageReport(), entry=report?.entries.find(e=>e.key===key);
-    if(!entry||!this.coverageEditable(entry))throw new Error('此行不是可直接编辑的确定界面词条；菜单、动态模板或多个场景请单独核对');
+    if(!entry||!this.coverageEditable(entry))throw new Error(this.t('controller.coverage.not_editable'));
     const scope=coverageScopes(entry)[0], normalized=key.replace(/\s+/g,' ').trim(), target=scope?scopedKey(normalized,scope.kind,scope.route):normalized;
-    return{key:target,displayKey:key,context:scope?describeContext(scope):'通用界面',value:this.options.dictionary.entries[target]??entry.translation??'',version:this.options.dictionary.version};
+    return{key:target,displayKey:key,context:scope?describeContext(scope):this.t('controller.coverage.general_context'),value:this.options.dictionary.entries[target]??entry.translation??'',version:this.options.dictionary.version};
   }
   async hasRunningAgentTask(): Promise<{ busy: boolean; reason?: string }> {
     for (const page of this.pages.values()) {
@@ -633,7 +841,7 @@ export class Controller {
           page.cdp.evaluate(
             `(() => {
               const engineState = globalThis.__GRAVITYBOX_ENGINE_V1__?.draftState?.();
-              if (engineState?.generating) return { busy: true, reason: '检测到活跃的模型流式推理任务' };
+              if (engineState?.generating) return { busy: true, reason: ${JSON.stringify(this.t('controller.task.streaming_busy'))} };
               const rendered = e => !!e?.getClientRects?.().length && getComputedStyle(e).visibility !== 'hidden';
               const stopBtn = [...document.querySelectorAll('button,[role="button"],[data-testid*="stop"],[data-testid*="cancel"]')].some(e => {
                 if (!rendered(e)) return false;
@@ -643,9 +851,9 @@ export class Controller {
                 if (e.querySelector?.('.codicon-debug-stop, .codicon-stop-circle')) return true;
                 return false;
               });
-              if (stopBtn) return { busy: true, reason: '检测到正在执行的 Agent 会话或模型推理任务' };
+              if (stopBtn) return { busy: true, reason: ${JSON.stringify(this.t('controller.task.agent_busy'))} };
               const streaming = [...document.querySelectorAll('[data-state="streaming"],[data-streaming="true"],.codicon-loading')].some(rendered);
-              if (streaming) return { busy: true, reason: '检测到正在执行的 Agent 会话或模型推理任务' };
+              if (streaming) return { busy: true, reason: ${JSON.stringify(this.t('controller.task.agent_busy'))} };
               return { busy: false };
             })()`,
             page.contextId
@@ -661,18 +869,18 @@ export class Controller {
     if(!this.endpoint||!this.pages.size)return{ok:true,pid:0};
     const endpoint=await discover(this.options.appPath,this.options.profile);if(!endpoint||endpoint.pid!==this.endpoint.pid)return{ok:true,pid:endpoint?.pid??0};
     const agentTask=await this.hasRunningAgentTask();
-    if(agentTask.busy)throw new Error(agentTask.reason?`${agentTask.reason}，请等待任务结束后再执行清理`:'检测到正在执行的 Agent 任务，请等待任务结束后再执行清理');
+    if(agentTask.busy)throw new Error(agentTask.reason?this.t('controller.preflight.reason_wait', { reason: agentTask.reason }):this.t('controller.preflight.task_wait'));
     for(const page of this.pages.values()){
       if(page.contextId===undefined)continue;
       const state=await page.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.maintenanceState?.()',page.contextId);
-      if(state?.busy)throw new Error('请先保存所有窗口的未发送草稿、关闭弹窗并等待任务结束');
+      if(state?.busy)throw new Error(this.t('controller.preflight.save_drafts'));
     }
     return{ok:true,pid:endpoint.pid};
   }
   async prepareDeepScan() {
-    if(this.options.fixture)throw new Error('测试模式不读取系统菜单');
+    if(this.options.fixture)throw new Error(this.t('controller.scan.fixture_unsupported'));
     const endpoint=await discover(this.options.appPath,this.options.profile);
-    if(!endpoint||endpoint.pid!==this.endpoint?.pid||endpoint.appVersion!==this.status.appVersion)throw new Error('请先连接已适配的官方应用');
+    if(!endpoint||endpoint.pid!==this.endpoint?.pid||endpoint.appVersion!==this.status.appVersion)throw new Error(this.t('controller.scan.connect_app_first'));
     const sources=await nativeSources(endpoint.appPath ?? this.activeAppPath());
     const report=createCoverage(sources,this.options.dictionary,endpoint.appVersion,this.status.bundleSha256??'');
     const defaults=['Antigravity','File','Edit','View','Window','Help','Services','Hide Antigravity','Hide Others','Show All','Quit Antigravity','About Antigravity','Undo','Redo','Cut','Copy','Paste','Paste and Match Style','Delete','Select All','Minimize','Zoom','Bring All to Front','Open Recent','Clear Menu'];
@@ -682,15 +890,16 @@ export class Controller {
   async metadataScan(signal:AbortSignal,nativeInput?:unknown,onCommit?:()=>void){
     const prepared=await this.prepareDeepScan();signal.throwIfAborted();
     const report=await this.coverageReport()??createCoverage([],this.options.dictionary,this.status.appVersion??'unknown',this.status.bundleSha256??'',[]);
-    const deep:DeepReport={schema:1,scope:'metadata',startedAt:new Date().toISOString(),finishedAt:new Date().toISOString(),state:'partial',steps:[],plugins:await readPluginCatalog(join(homedir(),'.gemini/config/plugins'),signal),nativeMenus:sanitizeNativeMenus(nativeInput,new Set(prepared.nativeKeys)),notes:['本轮仅采集插件展示说明与原生菜单，未自动切换页面。','插件说明仅本机记录；当前版本不提供在线补译，原生菜单不发送到模型。']};
-    deep.state=deep.nativeMenus.state==='read'&&!deep.plugins.limited?'complete':'partial';report.deep=deep;signal.throwIfAborted();onCommit?.();const directory=join(this.options.stateDir!,'reports');await atomicJson(join(directory,'coverage.json'),report,signal);await atomicJson(join(directory,'deep-scan.json'),deep,signal);await atomicText(join(directory,'界面深度扫描报告.md'),deepMarkdown(deep),signal);this.coverage=report;this.publish();return{ok:deep.state==='complete',partial:true,message:`已读取 ${deep.plugins.entries.length} 条插件说明；${deep.nativeMenus.message}。未切换应用页面。`};
+    const deep:DeepReport={schema:1,scope:'metadata',startedAt:new Date().toISOString(),finishedAt:new Date().toISOString(),state:'partial',steps:[],plugins:await readPluginCatalog(join(homedir(),'.gemini/config/plugins'),signal),nativeMenus:sanitizeNativeMenus(nativeInput,new Set(prepared.nativeKeys)),notes:[this.t('controller.scan.note_metadata_only'),this.t('controller.scan.note_local_only')]};
+    const reportFilename = this.t('deep_scan.report_filename');
+    deep.state=deep.nativeMenus.state==='read'&&!deep.plugins.limited?'complete':'partial';report.deep=deep;signal.throwIfAborted();onCommit?.();const directory=join(this.options.stateDir!,'reports');await atomicJson(join(directory,'coverage.json'),report,signal);await atomicJson(join(directory,'deep-scan.json'),deep,signal);await atomicText(join(directory,reportFilename),deepMarkdown(deep),signal);this.coverage=report;this.publish();return{ok:deep.state==='complete',partial:true,message:this.t('controller.scan.summary', { count: deep.plugins.entries.length, menuMessage: deep.nativeMenus.message })};
   }
   async stop() {
     this.stopped = true; this.closeProfileWatchers(); clearTimeout(this.reconnection); clearTimeout(this.targetTimer);
     this.hudBridge.dispose();
     await this.quiesce();
     this.browser?.close();
-    this.publish('stopped', this.status.errors.length ? '助手已停止，部分窗口恢复情况待确认' : '助手已停止');
+    this.publish('stopped', this.status.errors.length ? this.t('status.stopped_with_errors') : this.t('status.stopped'));
   }
 }
 

@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { computeCascadeContextBreakdown, computeTps, parseProtobufTimestamp, parseStepMetadataBlob, parseLatestGenMetadataBlob, ConversationMetricsEngine, buildConversationHudMetrics, resolveModelCapacity } from "../dist/hud.js";
+import * as hudExports from "../dist/hud.js";
+const { computeTps, parseProtobufTimestamp, parseStepMetadataBlob, parseLatestGenMetadataBlob, ConversationMetricsEngine, buildConversationHudMetrics, resolveModelCapacity } = hudExports;
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("HUD 指标 · hud-empirical-v2", { concurrency: false }, async () => {
@@ -46,7 +47,8 @@ function encodeUsageField9({ rawInput = 0, outputTokens = 0, cacheWriteTokens = 
   return [(9 << 3) | 2, ...encodeVarint(inner.length), ...inner];
 }
 
-test('复验 1: 级联独立裁剪纯数学模型在各种极端边界下非负性与严格守恒性', () => {
+test('复验 1: 真实单步上下文明细在极端边界下满足非负性与严格守恒性（废弃 computeCascadeContextBreakdown 已移除）', () => {
+  assert.equal('computeCascadeContextBreakdown' in hudExports, false);
   const testCapacities = [200000, 262144, 128000, 1048576];
   const testInputs = [
     0, 1, 500, 1900, 1901, 5000, 9500, 9501, 150000, 200000, 226000
@@ -54,17 +56,33 @@ test('复验 1: 级联独立裁剪纯数学模型在各种极端边界下非负�
 
   for (const cap of testCapacities) {
     for (const u of testInputs) {
-      const res = computeCascadeContextBreakdown(u, cap);
-      assert.ok(res.T_sys >= 0);
-      assert.ok(res.T_tool >= 0);
-      assert.ok(res.T_msg >= 0);
-      assert.ok(res.W_sys >= 0);
-      assert.ok(res.W_tool >= 0);
-      assert.ok(res.W_msg >= 0);
-      assert.equal(res.sumT, u, `Token 分配总和必须严格等于输入 U (u=${u}, cap=${cap})`);
-
+      const cached = Math.floor(u * 0.7);
+      const rawInput = u - cached;
+      const m = buildConversationHudMetrics({
+        conversationId: 'ctx-conservation',
+        modelId: 'gemini-3.8-flash',
+        modelCapacity: cap,
+        steps: [
+          {
+            idx: 1,
+            stepType: 15,
+            status: 3,
+            hasUsage: true,
+            rawInputTokens: rawInput,
+            cachedReadTokens: cached,
+            cacheWriteTokens: 0,
+            outputTokens: 64,
+          },
+        ],
+      });
+      const bd = m.context.breakdown;
+      assert.ok(bd.cachedContextTokens >= 0);
+      assert.ok(bd.uncachedContextTokens >= 0);
+      assert.ok(bd.cachedContextRatio >= 0);
+      assert.ok(bd.uncachedContextRatio >= 0);
+      assert.equal(bd.cachedContextTokens + bd.uncachedContextTokens, u, `Token 分解总和必须严格等于输入 U (u=${u}, cap=${cap})`);
       if (u <= cap) {
-        assert.ok(Math.abs(res.sumW - res.Ratio_total) < 1e-9);
+        assert.ok(Math.abs((bd.cachedContextRatio + bd.uncachedContextRatio) - m.context.usedRatio * 100) < 1e-9);
       }
     }
   }
@@ -104,10 +122,10 @@ test('复验 3: 有效输出速度保留原始精度、拒绝无效耗时且不�
   assert.equal(computeTps(NaN, 100).formatted, '—');
   assert.equal(computeTps(2, Infinity).formatted, '—');
   assert.equal(computeTps(0.05, 50).outputTps, 1000);
-  assert.equal(computeTps(0.1, 100).formatted, '1000.00 tok/s');
+  assert.equal(computeTps(0.1, 100).formatted, '1K tok/s');
   const normal = computeTps(3, 100);
   assert.equal(normal.outputTps, 100 / 3);
-  assert.equal(normal.formatted, '33.33 tok/s');
+  assert.equal(normal.formatted, '33.3 tok/s');
 });
 
 test('复验 4: 64 位 BigInt 无符号 Varint 解码、未知 WireType 跳过与 Protobuf 完整解析', () => {
@@ -203,11 +221,11 @@ test('复验 5: ConversationMetricsEngine 两级 lstat 门控、子智能体会�
     assert.equal(m1.session.turns, 1);
     assert.equal(m1.session.steps, 2);
     assert.equal(m1.tokens.totalTokens, 100500);
-    assert.equal(m1.tokens.cacheHitRateFormatted, '90.00%');
-    assert.equal(m1.session.outputTpsFormatted, '41.67 tok/s');
+    assert.equal(m1.tokens.cacheHitRateFormatted, '90%');
+    assert.equal(m1.session.outputTpsFormatted, '41.7 tok/s');
     assert.equal(m1.context.usedTokens, 100000);
     assert.equal(m1.context.capacityTokens, 200000);
-    assert.equal(m1.context.usedRatioFormatted, '50.00%');
+    assert.equal(m1.context.usedRatioFormatted, '50%');
     assert.equal(m1.context.breakdown.cachedContextTokens, 90000);
     assert.equal(m1.context.breakdown.uncachedContextTokens, 10000);
 
@@ -278,7 +296,7 @@ test('复验 5: ConversationMetricsEngine 两级 lstat 门控、子智能体会�
     assert.equal(m2.tokens.totalTokens, 100500 + 201000 + 50250, '累计 Token 应自动汇总子智能体消耗');
     // 主会话当前单步上下文仍保持主会话最后一步的 200,000 tok (100%)，不被子智能体的 50,000 tok 覆盖
     assert.equal(m2.context.usedTokens, 200000);
-    assert.equal(m2.context.usedRatioFormatted, '100.00%');
+    assert.equal(m2.context.usedRatioFormatted, '100%');
 
     // 验证 Antigravity 2.30.0 真实表结构 (无 data 列，使用 render_info + trajectory_metadata_blob) 与防无关 UUID 串号污染
     const realMainId = '11111111-2222-4333-8444-555555555555';
@@ -348,6 +366,166 @@ test('复验 5: ConversationMetricsEngine 两级 lstat 门控、子智能体会�
     assert.equal(mReal.session.steps, 4, '主会话 3 步 + 真实子智能体 1 步 = 4 步');
     assert.equal(mReal.tokens.totalTokens, 20200, '绝不混入 unrelatedDb 的 1,000,000 token');
 
+    // 验证 claude-opus-5-5 并行审计团队 (step_type = 132 GENERIC StepRenderInfo.AgentRef x 6 + 超 64KB render_info 投影)
+    // 与 gen_metadata 压缩步/缺失 field 9/同轮重试/cacheWriteTokens 全量守恒对账（菜单栏 15.9M vs HUD 一致）
+    const opusMainId = 'f073e34e-fa07-4df6-9b98-e5acb9fbc3fa';
+    const opusChildIds = [
+      '10000000-fa07-4df6-9b98-000000000001',
+      '10000000-fa07-4df6-9b98-000000000002',
+      '10000000-fa07-4df6-9b98-000000000003',
+      '10000000-fa07-4df6-9b98-000000000004',
+      '10000000-fa07-4df6-9b98-000000000005',
+      '10000000-fa07-4df6-9b98-000000000006',
+    ];
+    const encodeSubmessage = (fieldNum, innerBytes) => [
+      ...encodeVarint((fieldNum << 3) | 2),
+      ...encodeVarint(innerBytes.length),
+      ...innerBytes,
+    ];
+    const encodeGenMetadataRow = ({ stepIndices = [], execHex = '', modelId = 'claude-opus-5-5-medium', displayName = 'Claude Opus 5.5', startedSec = 1794284000, rawInput = 0, cachedTokens = 0, cacheWriteTokens = 0, outputTokens = 0 }) => {
+      const usageInner = [
+        (2 << 3) | 0, ...encodeVarint(rawInput),
+        (3 << 3) | 0, ...encodeVarint(outputTokens),
+        (4 << 3) | 0, ...encodeVarint(cacheWriteTokens),
+        (5 << 3) | 0, ...encodeVarint(cachedTokens),
+      ];
+      const chatStart = [...encodeTimestampField(4, startedSec, 0)];
+      const chatModel = [
+        ...encodeSubmessage(4, usageInner),
+        ...encodeSubmessage(9, chatStart),
+        ...encodeStringField(19, modelId),
+        ...encodeStringField(21, displayName),
+      ];
+      const packedIndices = stepIndices.flatMap((idxVal) => encodeVarint(idxVal));
+      const execBytes = execHex ? [...Buffer.from(execHex, 'hex')] : [];
+      return Buffer.from([
+        ...encodeSubmessage(1, chatModel),
+        ...(packedIndices.length ? encodeSubmessage(2, packedIndices) : []),
+        ...(execBytes.length ? encodeSubmessage(4, execBytes) : []),
+      ]);
+    };
+
+    const opusMainDb = new DatabaseSync(path.join(convDir, `${opusMainId}.db`));
+    opusMainDb.exec(`
+      CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER);
+      CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB, render_info BLOB, step_payload BLOB);
+      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+    `);
+    opusMainDb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, ?)').run(opusMainId, opusMainId, 1);
+    opusMainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, ?, ?, ?)').run(0, 14, 3, null);
+    // 主会话 step 1: 内联 field 9 未写 cacheWriteTokens (=0)，而 gen_metadata idx=0 含 cacheWriteTokens=90,000
+    const mainExec1 = 'aa11bb22cc33dd44';
+    const mainStep1Meta = Buffer.from([
+      ...encodeTimestampField(1, 1794284001, 0),
+      ...encodeTimestampField(8, 1794284010, 0),
+      ...encodeUsageField9({ rawInput: 105000, cachedTokens: 492000, cacheWriteTokens: 0, outputTokens: 12000 }),
+      ...encodeSubmessage(12, Buffer.from(mainExec1, 'hex')),
+    ]);
+    opusMainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, ?, ?, ?)').run(1, 15, 3, mainStep1Meta);
+    opusMainDb.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(0, encodeGenMetadataRow({
+      stepIndices: [1],
+      execHex: mainExec1,
+      rawInput: 105000,
+      cachedTokens: 492000,
+      cacheWriteTokens: 90000,
+      outputTokens: 12000,
+    }));
+
+    // 主会话 step 2: 并行审计调度 GENERIC (step_type=132)，无 invoke_subagent toolCall，
+    // render_info 前部填充 70KB Markdown（触发 >64KB 投影），尾部通过 TitlePart.field5 与 ContentBlock.field4 挂载 6 个 AgentRef
+    const bigMarkdownBlock = encodeSubmessage(10, encodeStringField(1, 'x'.repeat(70_000)));
+    const agentRefParts = opusChildIds.flatMap((cid, i) => {
+      const agentRef = encodeStringField(1, cid);
+      return i < 3
+        ? encodeSubmessage(9, encodeSubmessage(5, agentRef))
+        : encodeSubmessage(10, encodeSubmessage(4, agentRef));
+    });
+    const parallelAuditRenderInfo = Buffer.from([...bigMarkdownBlock, ...agentRefParts]);
+    opusMainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata, render_info) VALUES (?, ?, ?, ?, ?)').run(
+      2,
+      132,
+      3,
+      Buffer.from([...encodeTimestampField(1, 1794284012, 0), ...encodeTimestampField(8, 1794284120, 0)]),
+      parallelAuditRenderInfo
+    );
+    // 主会话 step 3: 上下文压缩 CHECKPOINT (step_type=23)，计费仅存于 gen_metadata idx=1 (201,000 tok)
+    opusMainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, ?, ?, ?)').run(3, 23, 3, null);
+    opusMainDb.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(1, encodeGenMetadataRow({
+      stepIndices: [3],
+      execHex: 'ee55ff6677889900',
+      rawInput: 20000,
+      cachedTokens: 150000,
+      cacheWriteTokens: 30000,
+      outputTokens: 1000,
+    }));
+
+    // 6 个已停止的并行子智能体库（模拟 Individual quota reached 终止后，无活跃步，但各自消耗 2,500,000 tok）
+    const opusChildDbs = [];
+    for (let i = 0; i < opusChildIds.length; i++) {
+      const cid = opusChildIds[i];
+      const cdb = new DatabaseSync(path.join(convDir, `${cid}.db`));
+      cdb.exec(`
+        CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB);
+        CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+        CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+      `);
+      cdb.prepare('INSERT INTO trajectory_metadata_blob VALUES (?, ?)').run('main', Buffer.from(encodeStringField(5, opusMainId)));
+      if (i === 0) {
+        // 子库 0：step 1 缺失内联 field 9，且存在一次配额重试未关联的 gen_metadata 行 (1,000,000 + 1,500,000 = 2,500,000)
+        cdb.prepare('INSERT INTO steps VALUES (?, ?, ?, ?)').run(1, 15, 3, Buffer.from([
+          ...encodeTimestampField(1, 1794284020, 0),
+          ...encodeTimestampField(8, 1794284050, 0),
+        ]));
+        cdb.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(0, encodeGenMetadataRow({
+          stepIndices: [1],
+          rawInput: 100000,
+          cachedTokens: 800000,
+          cacheWriteTokens: 80000,
+          outputTokens: 20000,
+        }));
+        cdb.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(1, encodeGenMetadataRow({
+          stepIndices: [],
+          rawInput: 150000,
+          cachedTokens: 1200000,
+          cacheWriteTokens: 120000,
+          outputTokens: 30000,
+        }));
+      } else {
+        // 子库 1~5：标准模型步 + 对齐的 gen_metadata，不得发生双倍重复计费 (各 2,500,000 tok)
+        const execHex = `001122334455660${i}`;
+        cdb.prepare('INSERT INTO steps VALUES (?, ?, ?, ?)').run(1, 15, 3, Buffer.from([
+          ...encodeTimestampField(1, 1794284020 + i, 0),
+          ...encodeTimestampField(8, 1794284060 + i, 0),
+          ...encodeUsageField9({ rawInput: 250000, cachedTokens: 2000000, cacheWriteTokens: 200000, outputTokens: 50000 }),
+          ...encodeSubmessage(12, Buffer.from(execHex, 'hex')),
+        ]));
+        cdb.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(0, encodeGenMetadataRow({
+          stepIndices: [1],
+          execHex,
+          rawInput: 250000,
+          cachedTokens: 2000000,
+          cacheWriteTokens: 200000,
+          outputTokens: 50000,
+        }));
+      }
+      opusChildDbs.push(cdb);
+    }
+
+    const mOpus = await engine.getConversationMetrics({
+      conversationId: opusMainId,
+      sessionRevision: 1,
+      modelId: 'claude-opus-5-5-medium',
+      isStreaming: false,
+      isSubagentRunning: false,
+    });
+    // 主库 (699,000 + 201,000 = 900,000) + 6 个并行审计子智能体 (6 * 2,500,000 = 15,000,000) = 15,900,000 (15.9M)
+    assert.equal(mOpus.session.subagentCount, 6, 'StepRenderInfo.AgentRef 应完整识别全部 6 个已结束并行审计子智能体');
+    assert.equal(mOpus.tokens.totalTokens, 15_900_000, 'HUD 总 Token 必须与菜单栏 gen_metadata 全口径严格一致 (15.9M)');
+    assert.equal(mOpus.tokens.totalTokensCompact, '15.9M tok');
+    assert.equal(mOpus.tokens.cacheWriteTokens, 90000 + 30000 + 6 * 200000);
+
+    for (const cdb of opusChildDbs) cdb.close();
+    opusMainDb.close();
     realChildDb.close();
     unrelatedDb.close();
     realMainDb.close();
@@ -379,7 +557,7 @@ test('Case A: 新会话空状态 (0 Token, 0 轮次, 0 步数) - 真实引擎模
   assert.equal(m.session.outputTpsFormatted, '—');
   assert.equal(Number.isFinite(m.session.outputTps), true);
   assert.equal(m.context.usedRatio, 0);
-  assert.equal(m.context.usedRatioFormatted, '0.00%');
+  assert.equal(m.context.usedRatioFormatted, '0%');
   assert.equal(m.context.capacityTokens, 200000, 'Antigravity 标准上下文容量应为 200K 而非虚假 1M');
   assert.equal(m.context.capacityTokensCompact, '~200K');
 });
@@ -481,7 +659,7 @@ test('Case D: 超出默认阈值与未知模型 ~200K 回退及显式 DB 容量�
   assert.equal(mUnknown.context.capacityTokens, 200000);
   assert.equal(mUnknown.context.capacityTokensCompact, '~200K', '未知模型容量应回退为 ~200K 而非虚假 1M');
   assert.equal(mUnknown.context.usedRatio, 0.75);
-  assert.equal(mUnknown.context.usedRatioFormatted, '75.00%');
+  assert.equal(mUnknown.context.usedRatioFormatted, '75%');
 
   // 当底层 gen_metadata 显式提供 maxContextTokens 时严格以底层数据为准
   const mExplicit = buildConversationHudMetrics({
@@ -572,9 +750,9 @@ test('Case E: 客户端时间戳逆序、多类型工具步耗时聚合与实机
   assert.equal(mRef.tokens.totalTokens, 23196078);
   assert.equal(mRef.tokens.totalTokensCompact, '23.2M tok');
   assert.equal(mRef.tokens.totalTokensFormatted, '23,196,078 tok');
-  assert.equal(mRef.tokens.cacheHitRateFormatted, '96.93%');
-  assert.equal(mRef.session.averageTtftFormatted, '5.60 秒');
-  assert.equal(mRef.session.outputTpsFormatted, '312.14 tok/s');
+  assert.equal(mRef.tokens.cacheHitRateFormatted, '96.9%');
+  assert.equal(mRef.session.averageTtftFormatted, '5.6 秒');
+  assert.equal(mRef.session.outputTpsFormatted, '312 tok/s');
   assert.equal(mRef.context.modelId, 'gemini-3.8-flash');
   assert.equal(mRef.context.modelDisplayName, 'Gemini 3.8 Flash');
 
@@ -615,11 +793,377 @@ test('Case F: 推理输出使用完整请求耗时，不推算思维链时间或
   });
 
   assert.equal(m.tokens.totalTokens, 15504736);
-  assert.equal(m.tokens.cacheHitRateFormatted, '97.14%');
+  assert.equal(m.tokens.cacheHitRateFormatted, '97.1%');
   assert.equal(m.session.modelDurationFormatted, '22分43秒');
   // 校准后 TPS 必须反映真实物理流式速率 (~82 tok/s)，绝不再出现将 65,352 除以 184s 得出的 355 tok/s
   assert.equal(m.session.outputTps, 65352 / 1363);
-  assert.equal(m.session.outputTpsFormatted, '47.95 tok/s');
-  assert.equal(m.session.averageTtftFormatted, '1178.91 秒');
+  assert.equal(m.session.outputTpsFormatted, '47.9 tok/s');
+  assert.equal(m.session.averageTtftFormatted, '1.18K 秒');
+});
+
+test('Case G: Orchestrator (Carbon / Hydrogen) 双阶段分模型独立水位与峰值隔离 + 手动切换未发言模型不串算容量', () => {
+  const carbonStep = {
+    idx: 1,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 100,
+    endTimeSeconds: 110,
+    rawInputTokens: 2485,
+    cachedReadTokens: 459413,
+    cacheWriteTokens: 0,
+    outputTokens: 16074,
+    generation: {
+      modelEnum: 1667,
+      responseModel: 'gemini-pro-orchestrator',
+      modelDisplayName: 'Orchestrator (Carbon)',
+      maxContextTokens: 512000,
+    },
+  };
+
+  // 1. 仅跑完 Carbon 规划阶段（461,898 / 512,000）
+  const phase1 = buildConversationHudMetrics({
+    conversationId: 'conv-orch-dual',
+    sessionRevision: 1,
+    modelId: 'Orchestrator (Carbon)',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, carbonStep],
+  });
+  assert.equal(phase1.context.isOrchestrator, true);
+  assert.equal(phase1.context.isMultiModel, true);
+  assert.equal(phase1.context.modelShortLabel, 'Carbon');
+  assert.equal(phase1.context.modelCompactLabel, 'C');
+  assert.equal(phase1.context.usedTokens, 461898);
+  assert.equal(phase1.context.peakContextTokens, 461898);
+  assert.equal(phase1.context.capacityTokens, 512000);
+  assert.equal(phase1.context.modelStages?.length, 2);
+  assert.equal(phase1.context.modelStages?.[0]?.role, 'planner');
+  assert.equal(phase1.context.modelStages?.[0]?.shortLabel, 'Carbon');
+  assert.equal(phase1.context.modelStages?.[0]?.isActive, true);
+  assert.equal(phase1.context.modelStages?.[0]?.hasUsageData, true);
+  assert.equal(phase1.context.modelStages?.[0]?.usedTokens, 461898);
+  assert.equal(phase1.context.modelStages?.[1]?.slotKey, 'orchestrator:executor_pending');
+  assert.equal(phase1.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(phase1.context.modelStages?.[1]?.modelId, 'pending');
+  assert.equal(phase1.context.modelStages?.[1]?.shortLabel, '');
+  assert.equal(phase1.context.modelStages?.[1]?.section, 'primary');
+  assert.equal(phase1.context.modelStages?.[1]?.isActive, false);
+  assert.equal(phase1.context.modelStages?.[1]?.hasUsageData, false);
+  assert.equal(phase1.context.modelStages?.[1]?.capacityTokens, 512000);
+
+  // 2. 切入 Hydrogen 执行首步（401,280 / 512,000）：Hydrogen 自身峰值严禁混入 Carbon 的 461,898
+  const hydrogenStep1 = {
+    idx: 2,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 112,
+    endTimeSeconds: 118,
+    rawInputTokens: 401280,
+    cachedReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 516,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  };
+  const phase2 = buildConversationHudMetrics({
+    conversationId: 'conv-orch-dual',
+    sessionRevision: 2,
+    modelId: 'Orchestrator (Carbon)',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, carbonStep, hydrogenStep1],
+  });
+  assert.equal(phase2.context.modelShortLabel, 'Hydrogen');
+  assert.equal(phase2.context.modelCompactLabel, 'H');
+  assert.equal(phase2.context.usedTokens, 401280);
+  assert.equal(phase2.context.peakContextTokens, 401280, 'Hydrogen 当前模型峰值不得混入 Carbon 的 461,898');
+  assert.equal(phase2.context.sessionPeakContextTokens, 461898);
+  assert.equal(phase2.context.modelStages?.length, 2);
+  assert.equal(phase2.context.modelStages?.[0]?.shortLabel, 'Carbon');
+  assert.equal(phase2.context.modelStages?.[0]?.usedTokens, 461898);
+  assert.equal(phase2.context.modelStages?.[0]?.peakContextTokens, 461898);
+  assert.equal(phase2.context.modelStages?.[0]?.isActive, false);
+  assert.equal(phase2.context.modelStages?.[1]?.shortLabel, 'Hydrogen');
+  assert.equal(phase2.context.modelStages?.[1]?.usedTokens, 401280);
+  assert.equal(phase2.context.modelStages?.[1]?.peakContextTokens, 401280);
+  assert.equal(phase2.context.modelStages?.[1]?.isActive, true);
+
+  // 3. Hydrogen 涨到 467,900：两模型水位与各自峰值独立更新
+  const hydrogenStep2 = {
+    idx: 3,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 120,
+    endTimeSeconds: 126,
+    rawInputTokens: 2425,
+    cachedReadTokens: 465475,
+    cacheWriteTokens: 0,
+    outputTokens: 3732,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  };
+  const phase3 = buildConversationHudMetrics({
+    conversationId: 'conv-orch-dual',
+    sessionRevision: 3,
+    modelId: 'Orchestrator (Carbon)',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, carbonStep, hydrogenStep1, hydrogenStep2],
+  });
+  assert.equal(phase3.context.usedTokens, 467900);
+  assert.equal(phase3.context.peakContextTokens, 467900);
+  assert.equal(phase3.context.usedRatioFormatted, '91.4%');
+  assert.equal(phase3.context.modelStages?.[0]?.usedTokens, 461898);
+  assert.equal(phase3.context.modelStages?.[0]?.usedRatioFormatted, '90.2%');
+  assert.equal(phase3.context.modelStages?.[1]?.usedTokens, 467900);
+  assert.equal(phase3.context.modelStages?.[1]?.peakContextTokens, 467900);
+
+  // 4. 手动切换至尚未发言的 Claude Sonnet 4.6（200K）：不得拿 Hydrogen 的 467,900 除以 200,000
+  const switchedPending = buildConversationHudMetrics({
+    conversationId: 'conv-orch-dual',
+    sessionRevision: 4,
+    modelId: 'Claude Sonnet 4.6',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, carbonStep, hydrogenStep1, hydrogenStep2],
+  });
+  assert.equal(switchedPending.context.modelShortLabel, 'Hydrogen');
+  assert.equal(switchedPending.context.usedTokens, 467900);
+  assert.equal(switchedPending.context.capacityTokens, 512000, '未产生新步前不得拿新模型 200K 覆盖旧用量分母');
+  assert.equal(switchedPending.context.usedRatioFormatted, '91.4%');
+  assert.equal(switchedPending.context.modelStages?.length, 3);
+  assert.equal(switchedPending.context.modelStages?.[2]?.modelId, 'claude-sonnet-4-6');
+  assert.equal(switchedPending.context.modelStages?.[2]?.hasUsageData, false);
+  assert.equal(switchedPending.context.modelStages?.[2]?.capacityTokens, 200000);
+  assert.equal(switchedPending.context.modelStages?.[2]?.section, 'primary');
+});
+
+test('Case H: 独立 Hydrogen 切入 Orchestrator 仅显示通用待介入执行阶段与历史模型分组，执行器介入后去重', () => {
+  const standaloneHydrogenStep = {
+    idx: 1,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 50,
+    endTimeSeconds: 60,
+    rawInputTokens: 20000,
+    cachedReadTokens: 80000,
+    cacheWriteTokens: 0,
+    outputTokens: 500,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 200000,
+    },
+  };
+  const carbonStep = {
+    idx: 3,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 100,
+    endTimeSeconds: 110,
+    rawInputTokens: 5000,
+    cachedReadTokens: 455000,
+    cacheWriteTokens: 0,
+    outputTokens: 2000,
+    generation: {
+      modelEnum: 1667,
+      responseModel: 'gemini-pro-orchestrator',
+      modelDisplayName: 'Orchestrator (Carbon)',
+      maxContextTokens: 512000,
+    },
+  };
+  const hydrogenExecStep = {
+    idx: 4,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 112,
+    endTimeSeconds: 120,
+    rawInputTokens: 300000,
+    cachedReadTokens: 100000,
+    cacheWriteTokens: 0,
+    outputTokens: 1500,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  };
+
+  // 1. 仅选中 Orchestrator (Carbon)，尚未跑 Carbon 与执行器：Carbon(primary) + pending(primary) + 历史 Hydrogen(history)
+  const pendingCarbon = buildConversationHudMetrics({
+    conversationId: 'conv-standalone-to-orch',
+    sessionRevision: 1,
+    modelId: 'Orchestrator (Carbon)',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, standaloneHydrogenStep],
+  });
+  assert.equal(pendingCarbon.context.isOrchestrator, true);
+  assert.equal(pendingCarbon.context.modelStages?.length, 3);
+  assert.equal(pendingCarbon.context.modelStages?.[0]?.slotKey, 'orchestrator:carbon');
+  assert.equal(pendingCarbon.context.modelStages?.[0]?.section, 'primary');
+  assert.equal(pendingCarbon.context.modelStages?.[1]?.slotKey, 'orchestrator:executor_pending');
+  assert.equal(pendingCarbon.context.modelStages?.[1]?.shortLabel, '');
+  assert.equal(pendingCarbon.context.modelStages?.[1]?.section, 'primary');
+  assert.equal(pendingCarbon.context.modelStages?.[2]?.slotKey, 'model:gemini-4-hydrogen');
+  assert.equal(pendingCarbon.context.modelStages?.[2]?.section, 'history');
+  assert.equal(pendingCarbon.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
+
+  // 2. Carbon 规划阶段完成、执行器仍未运行：保留历史 Hydrogen 在 history 分组，总计仅 1 个 Hydrogen
+  const beforeExecutor = buildConversationHudMetrics({
+    conversationId: 'conv-standalone-to-orch',
+    sessionRevision: 2,
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      standaloneHydrogenStep,
+      { idx: 2, stepType: 14, status: 3 },
+      carbonStep,
+    ],
+  });
+  assert.equal(beforeExecutor.context.isOrchestrator, true);
+  assert.equal(beforeExecutor.context.modelStages?.length, 3);
+  assert.equal(beforeExecutor.context.modelStages?.[0]?.slotKey, 'orchestrator:carbon');
+  assert.equal(beforeExecutor.context.modelStages?.[0]?.section, 'primary');
+  assert.equal(beforeExecutor.context.modelStages?.[0]?.isActive, true);
+  assert.equal(beforeExecutor.context.modelStages?.[1]?.slotKey, 'orchestrator:executor_pending');
+  assert.equal(beforeExecutor.context.modelStages?.[1]?.shortLabel, '');
+  assert.equal(beforeExecutor.context.modelStages?.[1]?.section, 'primary');
+  assert.equal(beforeExecutor.context.modelStages?.[1]?.capacityTokens, 512000);
+  assert.equal(beforeExecutor.context.modelStages?.[2]?.slotKey, 'model:gemini-4-hydrogen');
+  assert.equal(beforeExecutor.context.modelStages?.[2]?.section, 'history');
+  assert.equal(beforeExecutor.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
+
+  // 3. Hydrogen 执行器运行后：历史独立 Hydrogen 被去重剔除，仅保留 Carbon + Orchestrator Hydrogen 2 个主阶段
+  const afterExecutor = buildConversationHudMetrics({
+    conversationId: 'conv-standalone-to-orch',
+    sessionRevision: 3,
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      standaloneHydrogenStep,
+      { idx: 2, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenExecStep,
+    ],
+  });
+  assert.equal(afterExecutor.context.isOrchestrator, true);
+  assert.equal(afterExecutor.context.modelStages?.length, 2);
+  assert.equal(afterExecutor.context.modelStages?.[0]?.slotKey, 'orchestrator:carbon');
+  assert.equal(afterExecutor.context.modelStages?.[0]?.section, 'primary');
+  assert.equal(afterExecutor.context.modelStages?.[1]?.slotKey, 'orchestrator:hydrogen');
+  assert.equal(afterExecutor.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(afterExecutor.context.modelStages?.[1]?.section, 'primary');
+  assert.equal(afterExecutor.context.modelStages?.[1]?.isActive, true);
+  assert.equal(afterExecutor.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
+});
+
+test('Case I: Orchestrator 后新轮切回独立 Gemini 4 Hydrogen (High) 按轮次隔离角色并去重', () => {
+  const carbonStep = {
+    idx: 1,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 100,
+    endTimeSeconds: 110,
+    rawInputTokens: 2000,
+    cachedReadTokens: 458000,
+    cacheWriteTokens: 0,
+    outputTokens: 1000,
+    generation: {
+      modelEnum: 1667,
+      responseModel: 'gemini-pro-orchestrator',
+      modelDisplayName: 'Orchestrator (Carbon)',
+      maxContextTokens: 512000,
+    },
+  };
+  const hydrogenExecStep = {
+    idx: 2,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 112,
+    endTimeSeconds: 120,
+    rawInputTokens: 350000,
+    cachedReadTokens: 50000,
+    cacheWriteTokens: 0,
+    outputTokens: 800,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512000,
+    },
+  };
+  const standaloneTurn2Step = {
+    idx: 4,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 200,
+    endTimeSeconds: 210,
+    rawInputTokens: 60000,
+    cachedReadTokens: 20000,
+    cacheWriteTokens: 0,
+    outputTokens: 300,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 200000,
+    },
+  };
+
+  const res = buildConversationHudMetrics({
+    conversationId: 'conv-orch-to-standalone-hydrogen',
+    sessionRevision: 1,
+    modelId: 'Gemini 4 Hydrogen (High)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenExecStep,
+      { idx: 3, stepType: 14, status: 3 },
+      standaloneTurn2Step,
+    ],
+  });
+
+  assert.equal(Boolean(res.context.isOrchestrator), false);
+  assert.equal(res.context.isMultiModel, true);
+  assert.equal(res.context.modelId, 'gemini-4-hydrogen');
+  assert.equal(res.context.usedTokens, 80000);
+  assert.equal(res.context.capacityTokens, 200000);
+  assert.equal(res.context.modelStages?.length, 2);
+  assert.equal(res.context.modelStages?.[0]?.slotKey, 'orchestrator:carbon');
+  assert.equal(res.context.modelStages?.[0]?.section, 'primary');
+  assert.equal(res.context.modelStages?.[0]?.isActive, false);
+  assert.equal(res.context.modelStages?.[1]?.slotKey, 'model:gemini-4-hydrogen');
+  assert.equal(res.context.modelStages?.[1]?.role, 'model');
+  assert.equal(res.context.modelStages?.[1]?.section, 'primary');
+  assert.equal(res.context.modelStages?.[1]?.isActive, true);
+  assert.equal(res.context.modelStages?.[1]?.usedTokens, 80000);
+  assert.equal(res.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
+
+  // 同理，若第 2 轮步骤仅通过 step.modelName / modelId 传入（无 generation），仍必须归类为独立 model 而非 executor
+  const resFallbackModel = buildConversationHudMetrics({
+    conversationId: 'conv-orch-to-standalone-hydrogen-fallback',
+    sessionRevision: 2,
+    modelId: 'Gemini 4 Hydrogen (High)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      carbonStep,
+      hydrogenExecStep,
+      { idx: 3, stepType: 14, status: 3 },
+      { ...standaloneTurn2Step, generation: undefined, modelName: 'Gemini 4 Hydrogen (High)' },
+    ],
+  });
+  assert.equal(Boolean(resFallbackModel.context.isOrchestrator), false);
+  assert.equal(resFallbackModel.context.modelStages?.length, 2);
+  assert.equal(resFallbackModel.context.modelStages?.[1]?.slotKey, 'model:gemini-4-hydrogen');
+  assert.equal(resFallbackModel.context.modelStages?.[1]?.role, 'model');
+  assert.equal(resFallbackModel.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
 });
 });

@@ -1,10 +1,12 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile, stat as fsStat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, stat as fsStat, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { openAsarArchive } from './asar.js';
 import { assertLoopback } from './cdp.js';
 import { targetForApp } from './application-target.js';
+import { bt } from './i18n.js';
 const execFileRaw = promisify(execFile);
 const execute = (file: string, args: string[], timeout = 3000) => execFileRaw(file, args, { timeout });
 export type Endpoint = { port: number; pid: number; browserURL: string; appVersion: string; legacyPatch: boolean; appPath?: string; profile?: string };
@@ -17,55 +19,159 @@ export function parseListeners(stdout: string, port: number): { pid: number; nam
     if (line.startsWith('n') && current) current.names.push(line.slice(1));
   }
   for (const owner of results) for (const name of owner.names) {
-    if (![`127.0.0.1:${port}`, `[::1]:${port}`].includes(name)) throw new Error('调试接口存在非回环监听，已停止连接');
+    if (![`127.0.0.1:${port}`, `[::1]:${port}`].includes(name)) throw new Error(bt('discovery.non_loopback'));
   }
   return results.filter(owner => owner.names.length > 0);
 }
 
-const bundleCache = new Map<string, { value: { version: string; legacyPatch: boolean }; expiresAt: number; hardExpiresAt: number; plistMtimeMs: number; asarMtimeMs: number; asarSize: number }>();
+type PersistedBundleEntry = {
+  value: { version: string; legacyPatch: boolean };
+  verifiedAt: number;
+  plistMtimeMs: number;
+  plistSize: number;
+  asarMtimeMs: number;
+  asarSize: number;
+  execMtimeMs: number;
+  execSize: number;
+  codeResMtimeMs: number;
+  codeResSize: number;
+};
+
+const bundleCache = new Map<string, PersistedBundleEntry & { expiresAt: number; hardExpiresAt: number }>();
+const inFlightBundleInspect = new Map<string, Promise<{ version: string; legacyPatch: boolean }>>();
+const BUNDLE_DISK_CACHE_PATH = join(homedir(), 'Library', 'Caches', 'GravityBox', 'bundle-verify-cache-v1.json');
+let diskBundleCacheLoaded = false;
+
+async function ensureDiskBundleCacheLoaded(): Promise<void> {
+  if (diskBundleCacheLoaded) return;
+  diskBundleCacheLoaded = true;
+  try {
+    const parsed = JSON.parse(await readFile(BUNDLE_DISK_CACHE_PATH, 'utf8'));
+    if (!parsed || parsed.schema !== 1 || typeof parsed.entries !== 'object' || !parsed.entries) return;
+    const now = Date.now();
+    for (const [k, raw] of Object.entries<any>(parsed.entries)) {
+      if (
+        raw?.value &&
+        typeof raw.value.version === 'string' &&
+        typeof raw.value.legacyPatch === 'boolean' &&
+        typeof raw.verifiedAt === 'number' &&
+        now - raw.verifiedAt < 24 * 3600_000
+      ) {
+        bundleCache.set(k, {
+          ...raw,
+          expiresAt: 0,
+          hardExpiresAt: raw.verifiedAt + 24 * 3600_000,
+        });
+      }
+    }
+  } catch {}
+}
+
+async function saveDiskBundleCache(): Promise<void> {
+  try {
+    const entries: Record<string, PersistedBundleEntry> = {};
+    for (const [k, entry] of bundleCache.entries()) {
+      const { expiresAt: _e, hardExpiresAt: _h, ...persisted } = entry;
+      entries[k] = persisted;
+    }
+    await mkdir(dirname(BUNDLE_DISK_CACHE_PATH), { recursive: true, mode: 0o700 });
+    await writeFile(BUNDLE_DISK_CACHE_PATH, JSON.stringify({ schema: 1, entries }) + '\n', { mode: 0o600 });
+  } catch {}
+}
 
 export async function inspectBundle(appPath: string): Promise<{ version: string; legacyPatch: boolean }> {
   const now = Date.now();
-  const cached = bundleCache.get(appPath);
-  if (cached && cached.expiresAt > now) return cached.value;
+  const memCached = bundleCache.get(appPath);
+  if (memCached && memCached.expiresAt > now) return memCached.value;
 
-  const plist = join(appPath, 'Contents', 'Info.plist');
-  const asarPath = join(appPath, 'Contents', 'Resources', 'app.asar');
-  if (cached && cached.hardExpiresAt > now) {
-    try {
-      const [pStat, aStat] = await Promise.all([fsStat(plist), fsStat(asarPath)]);
-      if (pStat.mtimeMs === cached.plistMtimeMs && aStat.mtimeMs === cached.asarMtimeMs && aStat.size === cached.asarSize) {
-        cached.expiresAt = now + 60_000;
-        return cached.value;
-      }
-    } catch {}
-  }
+  const inflight = inFlightBundleInspect.get(appPath);
+  if (inflight) return inflight;
 
-  const id = (await execute('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleIdentifier', plist])).stdout.trim();
-  if (id !== targetForApp(appPath).bundleId) throw new Error('应用身份不匹配');
-  const version = (await execute('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', plist])).stdout.trim();
-  const signature = await execute('/usr/bin/codesign', ['-dv', appPath]);
-  if (!signature.stderr.includes('TeamIdentifier=EQHXZ8M8AV')) throw new Error('Antigravity 签名身份未通过 Google TeamID 检查');
-  await execute('/usr/bin/codesign', ['--verify', '--deep', '--strict', appPath]);
-  const plistStat = await fsStat(plist);
-  const archive = await openAsarArchive(asarPath, 16_000_000);
-  try {
-    let legacyPatch = false;
-    for (const name of ['preload.js', 'main.js', 'utils.js']) {
-      const entry = archive.header.files?.dist?.files?.[name];
-      if (!entry || entry.unpacked) continue;
-      const bytes = await archive.readEntryBuffer(entry, 3_000_000, 1);
-      if (!bytes) continue;
-      const text = bytes.toString();
-      legacyPatch ||= /ANTIGRAVITY CHINESE LOCALIZATION START|injectAntigravityI18n|__ANTIGRAVITY_I18N_DATA__|createI18nEngine|__ag_hanhua_engine__/.test(text);
+  const work = (async () => {
+    await ensureDiskBundleCacheLoaded();
+    const target = targetForApp(appPath);
+    const plist = join(appPath, 'Contents', 'Info.plist');
+    const asarPath = join(appPath, 'Contents', 'Resources', 'app.asar');
+    const execPath = join(appPath, 'Contents', 'MacOS', target.executable);
+    const codeResPath = join(appPath, 'Contents', '_CodeSignature', 'CodeResources');
+    const cached = bundleCache.get(appPath);
+    if (cached && cached.hardExpiresAt > Date.now()) {
+      try {
+        const [pStat, aStat, eStat, cStat] = await Promise.all([
+          fsStat(plist),
+          fsStat(asarPath),
+          fsStat(execPath),
+          fsStat(codeResPath),
+        ]);
+        if (
+          pStat.mtimeMs === cached.plistMtimeMs &&
+          pStat.size === cached.plistSize &&
+          aStat.mtimeMs === cached.asarMtimeMs &&
+          aStat.size === cached.asarSize &&
+          eStat.mtimeMs === cached.execMtimeMs &&
+          eStat.size === cached.execSize &&
+          cStat.mtimeMs === cached.codeResMtimeMs &&
+          cStat.size === cached.codeResSize
+        ) {
+          const sig = await execute('/usr/bin/codesign', ['-dv', appPath]);
+          if (sig.stderr.includes('TeamIdentifier=EQHXZ8M8AV')) {
+            cached.expiresAt = Date.now() + 120_000;
+            return cached.value;
+          }
+        }
+      } catch {}
     }
-    const asarStat = await fsStat(asarPath);
-    const val = { version, legacyPatch };
-    bundleCache.set(appPath, { value: val, expiresAt: now + 60_000, hardExpiresAt: now + 600_000, plistMtimeMs: plistStat.mtimeMs, asarMtimeMs: asarStat.mtimeMs, asarSize: archive.fileSize });
-    return val;
-  } finally {
-    await archive.close();
-  }
+
+    const id = (await execute('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleIdentifier', plist])).stdout.trim();
+    if (id !== target.bundleId) throw new Error(bt('discovery.app_mismatch'));
+    const version = (await execute('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', plist])).stdout.trim();
+    const signature = await execute('/usr/bin/codesign', ['-dv', appPath]);
+    if (!signature.stderr.includes('TeamIdentifier=EQHXZ8M8AV')) throw new Error(bt('discovery.signature_failed'));
+    await execute('/usr/bin/codesign', ['--verify', '--deep', '--strict', appPath], 8000);
+    const [plistStat, execStat, codeResStat] = await Promise.all([
+      fsStat(plist),
+      fsStat(execPath),
+      fsStat(codeResPath),
+    ]);
+    const archive = await openAsarArchive(asarPath, 16_000_000);
+    try {
+      let legacyPatch = false;
+      for (const name of ['preload.js', 'main.js', 'utils.js']) {
+        const entry = archive.header.files?.dist?.files?.[name];
+        if (!entry || entry.unpacked) continue;
+        const bytes = await archive.readEntryBuffer(entry, 3_000_000, 1);
+        if (!bytes) continue;
+        const text = bytes.toString();
+        legacyPatch ||= /ANTIGRAVITY CHINESE LOCALIZATION START|injectAntigravityI18n|__ANTIGRAVITY_I18N_DATA__|createI18nEngine|__ag_hanhua_engine__/.test(text);
+      }
+      const asarStat = await fsStat(asarPath);
+      const val = { version, legacyPatch };
+      const completedAt = Date.now();
+      bundleCache.set(appPath, {
+        value: val,
+        verifiedAt: completedAt,
+        expiresAt: completedAt + 120_000,
+        hardExpiresAt: completedAt + 24 * 3600_000,
+        plistMtimeMs: plistStat.mtimeMs,
+        plistSize: plistStat.size,
+        asarMtimeMs: asarStat.mtimeMs,
+        asarSize: archive.fileSize,
+        execMtimeMs: execStat.mtimeMs,
+        execSize: execStat.size,
+        codeResMtimeMs: codeResStat.mtimeMs,
+        codeResSize: codeResStat.size,
+      });
+      void saveDiskBundleCache();
+      return val;
+    } finally {
+      await archive.close();
+    }
+  })().finally(() => {
+    inFlightBundleInspect.delete(appPath);
+  });
+
+  inFlightBundleInspect.set(appPath, work);
+  return work;
 }
 
 async function discoverSingle(appPath: string, profile: string): Promise<Endpoint | undefined> {
@@ -91,7 +197,7 @@ async function discoverSingle(appPath: string, profile: string): Promise<Endpoin
   const version = await response.json() as Record<string, string>;
   if (!version.webSocketDebuggerUrl) return undefined;
   const ws = assertLoopback(version.webSocketDebuggerUrl);
-  if (Number(ws.port) !== port) throw new Error('调试接口端口不匹配');
+  if (Number(ws.port) !== port) throw new Error(bt('discovery.port_mismatch'));
   return { port, pid: owner.pid, browserURL: ws.href, appVersion: bundle.version, legacyPatch: bundle.legacyPatch, appPath, profile };
 }
 
@@ -107,7 +213,7 @@ export function allowedTarget(target: { type: string; url: string }, fixtureOrig
     const blockedPaths = /^\/(?:api|oauth|login|browser|preview)(?:\/|$)/i;
     const pathAllowed = !blockedPaths.test(url.pathname) && (
       url.pathname === '/' ||
-      /^\/(?:history|sidecars|customizations|automations|settings|settings-standalone|terminal-standalone|new-project|onboarding|multi|artifact|s|chatski-connect)(?:\/.*)?$/i.test(url.pathname) ||
+      /^\/(?:history|sidecars|customizations|automations|settings|settings-standalone|terminal-standalone|new-project|multi|artifact|s|chatski-connect)(?:\/.*)?$/i.test(url.pathname) ||
       /^\/c(?:\/|\/(?:[0-9a-f-]{36}|_new)(?:\/.*)?)?$/i.test(url.pathname) ||
       /^\/(?:forked|view|battle)\/.*$/i.test(url.pathname)
     );
@@ -149,18 +255,39 @@ export async function verifyPageService(url: string, appPath: string): Promise<b
   }
 }
 
+const verifiedLsPidPortsCache = new Map<string, { ports: number[]; expiresAt: number }>();
+
 /** Verify the real executable and official bundle before trusting a language-server listener, returning verified loopback IPv4 ports. */
 export async function resolveVerifiedLanguageServerPorts(pid: number, appPath = '/Applications/Antigravity.app'): Promise<number[] | null> {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  const cacheKey = `${pid}:${appPath}`;
+  const now = Date.now();
+  const cachedPorts = verifiedLsPidPortsCache.get(cacheKey);
+  if (cachedPorts && cachedPorts.expiresAt > now) {
+    try {
+      process.kill(pid, 0);
+      return cachedPorts.ports;
+    } catch {
+      verifiedLsPidPortsCache.delete(cacheKey);
+      return null;
+    }
+  }
   try {
     await inspectBundle(appPath);
-    const executable = (await execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-d', 'txt', '-Fn'])).stdout;
-    if (!executable.split('\n').includes('n' + join(appPath, 'Contents/Resources/bin/language_server'))) return null;
-    const listenerOut = (await execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-iTCP', '-sTCP:LISTEN', '-Fn'])).stdout;
+    const [execRes, listenerRes] = await Promise.all([
+      execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-d', 'txt', '-Fn']),
+      execute('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-iTCP', '-sTCP:LISTEN', '-Fn']),
+    ]);
+    if (!execRes.stdout.split('\n').includes('n' + join(appPath, 'Contents/Resources/bin/language_server'))) return null;
+    const listenerOut = listenerRes.stdout;
     const listeners = listenerOut.split('\n').filter(line => line.startsWith('n'));
     if (listeners.length === 0 || !listeners.every(line => /^n(?:127\.0\.0\.1|\[::1\]):\d+$/.test(line))) return null;
     const portMatches = Array.from(listenerOut.matchAll(/n127\.0\.0\.1:(\d+)/g)).map(m => parseInt(m[1]!, 10));
-    return Array.from(new Set(portMatches));
+    const ports = Array.from(new Set(portMatches));
+    if (ports.length > 0) {
+      verifiedLsPidPortsCache.set(cacheKey, { ports, expiresAt: Date.now() + 15_000 });
+    }
+    return ports;
   } catch {
     return null;
   }

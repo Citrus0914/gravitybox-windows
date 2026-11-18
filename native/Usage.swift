@@ -12,25 +12,25 @@ final class UsagePage: NSObject {
     unowned let app: Assistant
     let view: NSView
 
-    let periodSegment = DesignSegmentedControl(labels: ["今日", "近 7 天", "近 30 天", "全部"], trackingMode: .selectOne, target: nil, action: nil)
+    let periodSegment = DesignSegmentedControl(labels: [L10n.t("usage.period.today"), L10n.t("usage.period.7d"), L10n.t("usage.period.30d"), L10n.t("usage.period.all")], trackingMode: .selectOne, target: nil, action: nil)
     let refreshButton: InlineRefreshButton
-    let exportButton = button("导出…", target: nil, action: #selector(exportUsage))
+    let exportButton = button(L10n.t("usage.export_btn"), target: nil, action: #selector(exportUsage))
 
     // 顶部 4 张 KPI 指标卡
     let totalTokensMetric = metricValue()
-    let tokensDetail = text("输入 — · 缓存读取 — · 输出 —", size: 11, color: .secondaryLabelColor, wrap: true)
-    let costTitle = text("API 费用估算", size: 12, weight: .semibold)
+    let tokensDetail = text(L10n.t("usage.tokens.placeholder"), size: 11, color: .secondaryLabelColor, wrap: true)
+    let costTitle = text(L10n.t("usage.section.cost"), size: 12, weight: .semibold)
     let usdMetric = metricValue()
     let usdDetail = text("", size: 11, color: .secondaryLabelColor, wrap: true)
     let cacheRateMetric = metricValue()
     let cacheTrack = UsageCacheTrack()
-    let requestDetailsButton = button("请求明细…", target: nil, action: #selector(showLog))
+    let requestDetailsButton = button(L10n.t("usage.request_details_btn"), target: nil, action: #selector(showLog))
     let cacheRateDetail = text("", size: 11, color: .secondaryLabelColor, wrap: true)
     let requestsMetric = metricValue()
     let requestsDetail = text("", size: 11, color: .secondaryLabelColor, wrap: true)
 
     // 中部可视化图表
-    let trendTitleLabel = text("今日用量", size: 13.5, weight: .semibold)
+    let trendTitleLabel = text(L10n.t("usage.trend_title.today"), size: 13.5, weight: .semibold)
     let trendChart = UsageTrendChartView()
     let donutChart = ModelDonutChartView()
     let donutLegendStack = NSStackView()
@@ -51,7 +51,6 @@ final class UsagePage: NSObject {
     private var restoreScroll = true
     var lastFetchTime: Date = .distantPast
     var modelRows: [[String: Any]] = []
-    private static let scanDateFormatter: DateFormatter = InterfaceText.shortDateTimeFormatter
     let periods = ["today", "7d", "30d", "all"]
     let palette: [NSColor] = [
         Design.color(0x2563EB, 0x3B82F6),
@@ -64,25 +63,25 @@ final class UsagePage: NSObject {
 
     init(app: Assistant) {
         self.app = app
-        refreshButton = InlineRefreshButton("刷新", width: 66, target: nil, action: #selector(refreshUsage))
+        refreshButton = InlineRefreshButton(L10n.t("common.refresh"), width: 76, target: nil, action: #selector(refreshUsage))
         periodSegment.selectedSegment = app.usageSelectedPeriod
         periodSegment.controlSize = .regular
-        periodSegment.setAccessibilityLabel("用量统计时间范围")
+        periodSegment.setAccessibilityLabel(L10n.t("usage.period_a11y"))
         periodSegment.translatesAutoresizingMaskIntoConstraints = false
         periodSegment.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
         let headerActions = horizontal([periodSegment, refreshButton, exportButton], spacing: 8)
         headerActions.alignment = .centerY
-        let root = pageStack(title: "用量", actions: headerActions)
+        let root = pageStack(title: L10n.t("usage.title"), actions: headerActions)
         root.spacing = Design.Spacing.roomy
         totalTokensMetric.font = .monospacedDigitSystemFont(ofSize: 30, weight: .semibold)
-        let trendHeader = horizontal([vertical([text("Token 用量", size: 11, color: Design.secondary), totalTokensMetric, tokensDetail], spacing: 6), flexibleSpace(), trendTitleLabel])
+        let trendHeader = horizontal([vertical([text(L10n.t("usage.section.token_usage"), size: 11, color: Design.secondary), totalTokensMetric, tokensDetail], spacing: 6), flexibleSpace(), trendTitleLabel])
         let trend = vertical([trendHeader, trendChart], spacing: 12)
         fillWidth(trendHeader, in: trend); fillWidth(trendChart, in: trend)
         root.addArrangedSubview(group([trend]))
         costTitle.font = .systemFont(ofSize: 13, weight: .semibold)
         usdMetric.font = .monospacedDigitSystemFont(ofSize: 24, weight: .semibold)
-        donutLegendStack.orientation = .vertical; donutLegendStack.alignment = .leading; donutLegendStack.spacing = 8
+        donutLegendStack.orientation = .vertical; donutLegendStack.alignment = .leading; donutLegendStack.spacing = 5
         donutLegendStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let costHeading = horizontal([costTitle, flexibleSpace(), usdMetric], spacing: 8)
         costHeading.alignment = .centerY
@@ -91,26 +90,71 @@ final class UsagePage: NSObject {
         donutBody.alignment = .centerY
         donutLegendStack.translatesAutoresizingMaskIntoConstraints = false
         donutLegendStack.widthAnchor.constraint(equalTo: donutBody.widthAnchor, constant: -114).isActive = true
+        let donutBodyHost = NSView()
+        donutBodyHost.translatesAutoresizingMaskIntoConstraints = false
+        donutBodyHost.setContentHuggingPriority(NSLayoutConstraint.Priority(200), for: .vertical)
+        donutBodyHost.addSubview(donutBody)
+        let donutBodyTight = donutBodyHost.heightAnchor.constraint(equalTo: donutBody.heightAnchor)
+        donutBodyTight.priority = NSLayoutConstraint.Priority(210)
+        NSLayoutConstraint.activate([
+            donutBody.leadingAnchor.constraint(equalTo: donutBodyHost.leadingAnchor),
+            donutBody.trailingAnchor.constraint(equalTo: donutBodyHost.trailingAnchor),
+            donutBody.centerYAnchor.constraint(equalTo: donutBodyHost.centerYAnchor),
+            donutBody.topAnchor.constraint(greaterThanOrEqualTo: donutBodyHost.topAnchor),
+            donutBody.bottomAnchor.constraint(lessThanOrEqualTo: donutBodyHost.bottomAnchor),
+            donutBodyTight
+        ])
         usdDetail.isHidden = true
-        let donutContent = vertical([costHeading, divider(), donutBody, usdDetail], spacing: 12)
+        let donutContent = vertical([costHeading, divider(), donutBodyHost, usdDetail], spacing: 12)
+        donutContent.detachesHiddenViews = true
         for row in donutContent.arrangedSubviews { fillWidth(row, in: donutContent) }
 
         requestsMetric.font = .monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
         cacheRateMetric.font = .monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
         requestDetailsButton.controlSize = .small
-        let requestHeading = horizontal([text("请求与缓存", size: 13, weight: .semibold), flexibleSpace(), requestDetailsButton], spacing: 8)
+        let requestHeading = horizontal([text(L10n.t("usage.section.requests_cache"), size: 13, weight: .semibold), flexibleSpace(), requestDetailsButton], spacing: 8)
         requestHeading.alignment = .centerY
         requestHeading.heightAnchor.constraint(equalToConstant: 28).isActive = true
-        let requestLeft = vertical([text("请求总数", size: 11.5, weight: .medium, color: .labelColor), requestsDetail], spacing: 3)
+        let requestLeft = vertical([text(L10n.t("usage.section.total_requests"), size: 11.5, weight: .medium, color: .labelColor), requestsDetail], spacing: 3)
         let requestStats = horizontal([requestLeft, flexibleSpace(), requestsMetric], spacing: 10)
         requestStats.alignment = .centerY
-        let cacheLeft = vertical([text("缓存命中率", size: 11.5, weight: .medium, color: .labelColor), cacheRateDetail], spacing: 2)
+        let cacheLeft = vertical([text(L10n.t("usage.section.cache_hit_rate"), size: 11.5, weight: .medium, color: .labelColor), cacheRateDetail], spacing: 2)
         let cacheHeading = horizontal([cacheLeft, flexibleSpace(), cacheRateMetric], spacing: 10)
         cacheHeading.alignment = .centerY
         let cacheStats = vertical([cacheHeading, cacheTrack], spacing: 8)
         fillWidth(cacheHeading, in: cacheStats); fillWidth(cacheTrack, in: cacheStats)
-        let requestContent = vertical([requestHeading, divider(), requestStats, divider(), cacheStats], spacing: 14)
+
+        // 当左侧费用卡因 5 行图例变高时，将额外纵向空间对称平分给「请求总数」与「缓存命中率」两个区块的上下留白，消除底部大块空白
+        func makeBalancedSlot(for content: NSView) -> (host: NSView, padGuide: NSLayoutGuide) {
+            let host = NSView()
+            host.translatesAutoresizingMaskIntoConstraints = false
+            host.setContentHuggingPriority(NSLayoutConstraint.Priority(200), for: .vertical)
+            let topPad = NSLayoutGuide()
+            let bottomPad = NSLayoutGuide()
+            host.addLayoutGuide(topPad)
+            host.addLayoutGuide(bottomPad)
+            host.addSubview(content)
+            content.translatesAutoresizingMaskIntoConstraints = false
+            let zeroPad = topPad.heightAnchor.constraint(equalToConstant: 0)
+            zeroPad.priority = NSLayoutConstraint.Priority(210)
+            NSLayoutConstraint.activate([
+                topPad.topAnchor.constraint(equalTo: host.topAnchor),
+                content.topAnchor.constraint(equalTo: topPad.bottomAnchor),
+                bottomPad.topAnchor.constraint(equalTo: content.bottomAnchor),
+                bottomPad.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+                topPad.heightAnchor.constraint(equalTo: bottomPad.heightAnchor),
+                content.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+                zeroPad
+            ])
+            return (host, topPad)
+        }
+        let requestSlot = makeBalancedSlot(for: requestStats)
+        let cacheSlot = makeBalancedSlot(for: cacheStats)
+
+        let requestContent = vertical([requestHeading, divider(), requestSlot.host, divider(), cacheSlot.host], spacing: 12)
         for row in requestContent.arrangedSubviews { fillWidth(row, in: requestContent) }
+        requestSlot.padGuide.heightAnchor.constraint(equalTo: cacheSlot.padGuide.heightAnchor).isActive = true
         let costCard = group([donutContent], inset: 15); let requestCard = group([requestContent], inset: 15); requestCard.identifier = NSUserInterfaceItemIdentifier("requests-cache-card")
         let middle = horizontal([costCard, requestCard], spacing: 12); middle.distribution = .fill; middle.alignment = .top
         costCard.heightAnchor.constraint(equalTo: requestCard.heightAnchor).isActive = true
@@ -118,7 +162,7 @@ final class UsagePage: NSObject {
         root.addArrangedSubview(middle)
         modelsBreakdownStack.orientation = .vertical; modelsBreakdownStack.alignment = .leading; modelsBreakdownStack.spacing = 14
         modelsBreakdownStack.identifier = NSUserInterfaceItemIdentifier("model-usage-list")
-        let breakdown = vertical([horizontal([text("模型用量", size: 13, weight: .semibold), flexibleSpace(), modelsCountLabel]), modelsBreakdownStack], spacing: 16)
+        let breakdown = vertical([horizontal([text(L10n.t("usage.section.model_breakdown"), size: 13, weight: .semibold), flexibleSpace(), modelsCountLabel]), modelsBreakdownStack], spacing: 16)
         for row in breakdown.arrangedSubviews { fillWidth(row, in: breakdown) }
         let footerRow = horizontal([statusSummary], spacing: 8)
         footerRow.alignment = .centerY
@@ -194,15 +238,18 @@ final class UsagePage: NSObject {
 
     func fetch(force: Bool = false) {
         guard !loading else { return }
-        loading = true
-        refreshButton.setBusy(true, available: app.reachable)
-        exportButton.isEnabled = false
         let requestKey = metricsKeyForCurrentPeriod()
         let segIdx = max(0, min(periods.count - 1, periodSegment.selectedSegment))
         let period = periods[segIdx]
-        trendTitleLabel.stringValue = segIdx == 0 ? "今日用量" : (segIdx == 1 ? "近 7 天用量" : (segIdx == 2 ? "近 30 天用量" : "全部用量"))
+        trendTitleLabel.stringValue = segIdx == 0 ? L10n.t("usage.trend_title.today") : (segIdx == 1 ? L10n.t("usage.trend_title.7d") : (segIdx == 2 ? L10n.t("usage.trend_title.30d") : L10n.t("usage.trend_title.all")))
+        if !force, let preloaded = app.cachedUsageReportsByPeriod[period], !UsageQueryIdentity(period: period).matches(latestReport) {
+            applyUsagePayload(preloaded, period: period, segIdx: segIdx, requestKey: requestKey)
+        }
+        loading = true
+        refreshButton.setBusy(true, available: app.reachable)
+        exportButton.isEnabled = false
 
-        app.fetchUsageSummary(period: period, force: force, allowCached: false) { [weak self] response in
+        app.fetchUsageSummary(period: period, force: force, allowCached: !force) { [weak self] response in
             guard let self else { return }
             self.loading = false
             self.refreshButton.setBusy(false, available: self.app.reachable)
@@ -217,90 +264,110 @@ final class UsagePage: NSObject {
                 self.metricsKey = requestKey
                 self.syncExportButtonState(for: period)
                 let oldPeriod = self.latestReport["period"] as? String ?? ""
-                self.statusSummary.stringValue = "读取失败，保留上次结果（\(oldPeriod)）：\(error.localizedDescription)"
+                self.statusSummary.stringValue = L10n.t("usage.error.read_keep_cached", ["period": oldPeriod, "error": error.localizedDescription])
                 self.statusSummary.textColor = accessibleWarningColor()
                 self.footerBox.isHidden = false
             case .success(let value):
-                guard UsageQueryIdentity(period: period).matches(value) else {
-                    self.statusSummary.stringValue = "返回的统计范围不匹配，已停止展示和导出，请重新读取"
-                    self.statusSummary.textColor = accessibleWarningColor()
-                    self.footerBox.isHidden = false
-                    self.exportButton.isEnabled = false
-                    return
-                }
-                self.metricsKey = requestKey
-                self.latestReport = value
-                let summary = value["summary"] as? [String: Any] ?? [:]
-                // Request state is independent of chart identity: a successful retry must
-                // clear the old error even when the data snapshot itself did not change.
-                self.updateReadStatus(summary)
-                let snapshotKey = "\(value["snapshotId"] ?? ""):\(period):\(summary["availability"] ?? ""):\(summary["failedDatabasesCount"] ?? 0):\(summary["skippedLargeRecords"] ?? 0):\(summary["unknownTimeRecords"] ?? 0)"
-                if !snapshotKey.hasPrefix(":") && snapshotKey == self.renderedSnapshotKey { self.syncExportButtonState(for: period); return }
-                self.renderedSnapshotKey = snapshotKey
-                self.syncExportButtonState(for: period)
-                if (summary["availability"] as? String) == "unavailable" {
-                    for label in [self.totalTokensMetric, self.usdMetric, self.cacheRateMetric, self.requestsMetric] { label.stringValue = "—" }
-                    self.tokensDetail.stringValue = "当前无法读取统计"; self.usdDetail.stringValue = "暂无可用估算"; self.requestsDetail.stringValue = "无法判断调用次数"; self.cacheRateDetail.stringValue = "暂无可用数据"
-                    self.modelRows = []; self.trendChart.points = []; self.donutChart.slices = []
-                    self.modelsBreakdownStack.arrangedSubviews.forEach { self.modelsBreakdownStack.removeArrangedSubview($0); $0.removeFromSuperview() }
-                    self.statusSummary.stringValue = "统计暂不可用：所选数据库均读取失败，请检查本地数据库权限或磁盘状态。"; self.statusSummary.textColor = accessibleWarningColor(); self.footerBox.isHidden = false
-                    return
-                }
-                let total = intVal(summary, "totalTokens")
-                let prompt = intVal(summary, "promptTokens")
-                let output = intVal(summary, "candidatesTokens")
-                let cached = intVal(summary, "cachedTokens")
-                let requests = intVal(summary, "requestCount")
-                let usd = doubleVal(summary, "estimatedUsd")
-                let cacheHit = doubleVal(summary, "cacheHitRate", fallback: (prompt + cached) > 0 ? (Double(cached) / Double(prompt + cached)) * 100.0 : 0.0)
+                self.applyUsagePayload(value, period: period, segIdx: segIdx, requestKey: requestKey)
+            }
+        }
+    }
 
-                self.totalTokensMetric.stringValue = self.formatCompactTokens(total)
-                let cacheWrite = intVal(summary, "cacheWriteTokens")
-                self.tokensDetail.stringValue = "输入 \(self.formatCompactTokens(prompt)) · 缓存读取 \(self.formatCompactTokens(cached))" + (cacheWrite > 0 ? " · 缓存写入 \(self.formatCompactTokens(cacheWrite))" : "") + " · 输出 \(self.formatCompactTokens(output))"
-                let pricedCount = (summary["pricedModels"] as? Int) ?? (summary["priced_models"] as? Int) ?? (value["pricedModels"] as? Int) ?? 0
-                let unpricedCount = (summary["unpricedModels"] as? Int) ?? (summary["unpriced_models"] as? Int) ?? (value["unpricedModels"] as? Int) ?? 0
-                self.costTitle.stringValue = "API 费用估算"
-                self.usdMetric.stringValue = unpricedCount > 0 && pricedCount == 0 && usd == 0 ? "未计价" : self.formatUsd(usd)
-                self.usdDetail.stringValue = ""
-                self.usdDetail.isHidden = true
+    func applyUsagePayload(_ value: [String: Any], period: String, segIdx: Int, requestKey: String) {
+        guard UsageQueryIdentity(period: period).matches(value) else {
+            self.statusSummary.stringValue = L10n.t("usage.error.period_mismatch")
+            self.statusSummary.textColor = accessibleWarningColor()
+            self.footerBox.isHidden = false
+            self.exportButton.isEnabled = false
+            return
+        }
+        self.metricsKey = requestKey
+        self.latestReport = value
+        let summary = value["summary"] as? [String: Any] ?? [:]
+        // Request state is independent of chart identity: a successful retry must
+        // clear the old error even when the data snapshot itself did not change.
+        self.updateReadStatus(summary)
+        let snapshotKey = "\(value["snapshotId"] ?? ""):\(period):\(summary["availability"] ?? ""):\(summary["failedDatabasesCount"] ?? 0):\(summary["skippedLargeRecords"] ?? 0):\(summary["unknownTimeRecords"] ?? 0)"
+        if !snapshotKey.hasPrefix(":") && snapshotKey == self.renderedSnapshotKey { self.syncExportButtonState(for: period); return }
+        self.renderedSnapshotKey = snapshotKey
+        self.syncExportButtonState(for: period)
+        if (summary["availability"] as? String) == "unavailable" {
+            for label in [self.totalTokensMetric, self.usdMetric, self.cacheRateMetric, self.requestsMetric] { label.stringValue = "—" }
+            self.tokensDetail.stringValue = L10n.t("usage.unavailable.tokens")
+            self.usdDetail.stringValue = L10n.t("usage.unavailable.cost")
+            self.usdDetail.textColor = .secondaryLabelColor
+            self.usdDetail.isHidden = false
+            self.requestsDetail.stringValue = L10n.t("usage.unavailable.requests")
+            self.cacheRateDetail.stringValue = L10n.t("usage.unavailable.cache")
+            self.cacheTrack.update(percent: 0)
+            self.modelRows = []; self.trendChart.points = []; self.donutChart.slices = []
+            self.donutChart.isHidden = true
+            self.modelsCountLabel.stringValue = ""
+            self.modelsBreakdownStack.arrangedSubviews.forEach { self.modelsBreakdownStack.removeArrangedSubview($0); $0.removeFromSuperview() }
+            self.statusSummary.stringValue = L10n.t("usage.unavailable.banner"); self.statusSummary.textColor = accessibleWarningColor(); self.footerBox.isHidden = false
+            return
+        }
+        let total = intVal(summary, "totalTokens")
+        let prompt = intVal(summary, "promptTokens")
+        let output = intVal(summary, "candidatesTokens")
+        let cached = intVal(summary, "cachedTokens")
+        let cacheWrite = intVal(summary, "cacheWriteTokens", fallback: intVal(summary, "cache_write_tokens"))
+        let requests = intVal(summary, "requestCount")
+        let usd = doubleVal(summary, "estimatedUsd")
+        let cacheDenom = prompt + cached + cacheWrite
+        let cacheHit = doubleVal(summary, "cacheHitRate", fallback: cacheDenom > 0 ? (Double(cached) / Double(cacheDenom)) * 100.0 : 0.0)
 
-                self.cacheRateMetric.stringValue = String(format: "%.1f%%", cacheHit)
-                self.cacheTrack.update(percent: cacheHit)
-                self.cacheRateDetail.stringValue = "读取 \(self.formatCompactTokens(cached)) Token"
+        self.totalTokensMetric.stringValue = self.formatCompactTokens(total)
+        let cacheWritePart = cacheWrite > 0 ? L10n.t("usage.tokens.cache_write_part", ["count": self.formatCompactTokens(cacheWrite)]) : ""
+        self.tokensDetail.stringValue = L10n.t("usage.tokens.summary", [
+            "input": self.formatCompactTokens(prompt),
+            "cached": self.formatCompactTokens(cached),
+            "cacheWrite": cacheWritePart,
+            "output": self.formatCompactTokens(output)
+        ])
+        let pricedCount = (summary["pricedModels"] as? Int) ?? (summary["priced_models"] as? Int) ?? (value["pricedModels"] as? Int) ?? 0
+        let unpricedCount = (summary["unpricedModels"] as? Int) ?? (summary["unpriced_models"] as? Int) ?? (value["unpricedModels"] as? Int) ?? 0
+        self.costTitle.stringValue = L10n.t("usage.section.cost")
+        let partialPrefix = (unpricedCount > 0 && (pricedCount > 0 || usd > 0)) ? L10n.t("usage.models.partial_prefix") : ""
+        self.usdMetric.stringValue = unpricedCount > 0 && pricedCount == 0 && usd == 0 ? L10n.t("menu_panel.usage.unpriced") : partialPrefix + self.formatUsd(usd)
+        self.usdDetail.stringValue = ""
+        self.usdDetail.isHidden = true
 
-                self.requestsMetric.stringValue = "\(requests.formatted()) 次"
-                let avgIn = requests > 0 ? total / requests : 0
-                self.requestsDetail.stringValue = requests > 0 ? "平均每次约 \(self.formatCompactTokens(avgIn)) Token" : "当前时段暂无调用"
+        self.cacheRateMetric.stringValue = String(format: "%.1f%%", locale: Locale(identifier: "en_US_POSIX"), cacheHit)
+        self.cacheTrack.update(percent: cacheHit)
+        self.cacheRateDetail.stringValue = L10n.t("usage.cache.read_detail", ["count": self.formatCompactTokens(cached)])
 
-                self.updateReadStatus(summary)
+        self.requestsMetric.stringValue = L10n.t("usage.requests.value", ["count": InterfaceText.formatInteger(requests)])
+        let avgIn = requests > 0 ? total / requests : 0
+        self.requestsDetail.stringValue = requests > 0 ? L10n.t("usage.requests.avg_per_call", ["count": self.formatCompactTokens(avgIn)]) : L10n.t("usage.requests.none")
 
-                let priceRows = value["byModel"] as? [[String: Any]] ?? []
-                let outdated = priceRows.filter { ($0["pricingStatus"] as? String ?? "") == "expired" }.count
-                if outdated > 0 {
-                    self.usdDetail.stringValue = "\(outdated) 个模型价格待核对"
-                    self.usdDetail.textColor = accessibleWarningColor()
-                    self.usdDetail.isHidden = false
-                } else {
-                    self.usdDetail.textColor = .secondaryLabelColor
-                    self.usdDetail.isHidden = true
-                }
-                let rows = (value["byModel"] as? [[String: Any]]) ?? (value["models"] as? [[String: Any]]) ?? []
-                self.modelRows = rows
-                let scroll = self.view as? NSScrollView
-                let preservedOrigin = self.restoreScroll ? self.app.usageScrollOrigin : (scroll?.contentView.bounds.origin ?? .zero)
-                self.restoreScroll = false
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0
-                    ctx.allowsImplicitAnimation = false
-                    self.updateChartsAndBreakdown(summary: summary, value: value, segIdx: segIdx, totalTokens: total, totalUsd: usd)
-                    scroll?.layoutSubtreeIfNeeded()
-                    if let scroll {
-                        let maxY = max(0, (scroll.documentView?.bounds.height ?? 0) - scroll.contentView.bounds.height)
-                        let clampedY = max(0, min(preservedOrigin.y, maxY))
-                        scroll.contentView.scroll(to: NSPoint(x: 0, y: clampedY))
-                        scroll.reflectScrolledClipView(scroll.contentView)
-                    }
-                }
+        self.updateReadStatus(summary)
+
+        let priceRows = value["byModel"] as? [[String: Any]] ?? []
+        let outdated = priceRows.filter { ($0["pricingStatus"] as? String ?? "") == "expired" }.count
+        if outdated > 0 {
+            self.usdDetail.stringValue = L10n.t("usage.cost.outdated_models", ["count": outdated])
+            self.usdDetail.textColor = accessibleWarningColor()
+            self.usdDetail.isHidden = false
+        } else {
+            self.usdDetail.textColor = .secondaryLabelColor
+            self.usdDetail.isHidden = true
+        }
+        let rows = (value["byModel"] as? [[String: Any]]) ?? (value["models"] as? [[String: Any]]) ?? []
+        self.modelRows = rows
+        let scroll = self.view as? NSScrollView
+        let preservedOrigin = self.restoreScroll ? self.app.usageScrollOrigin : (scroll?.contentView.bounds.origin ?? .zero)
+        self.restoreScroll = false
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0
+            ctx.allowsImplicitAnimation = false
+            self.updateChartsAndBreakdown(summary: summary, value: value, segIdx: segIdx, totalTokens: total, totalUsd: usd)
+            scroll?.layoutSubtreeIfNeeded()
+            if let scroll {
+                let maxY = max(0, (scroll.documentView?.bounds.height ?? 0) - scroll.contentView.bounds.height)
+                let clampedY = max(0, min(preservedOrigin.y, maxY))
+                scroll.contentView.scroll(to: NSPoint(x: 0, y: clampedY))
+                scroll.reflectScrolledClipView(scroll.contentView)
             }
         }
     }
@@ -314,20 +381,37 @@ final class UsagePage: NSObject {
         let unpriced = intVal(summary, "unpricedModels", fallback: intVal(summary, "unpriced_models"))
         let scope = InterfaceText.usageScope(scanned: scanned, discovered: discovered, failed: failed, skipped: skipped, unknown: unknown)
         let cached = summary["availability"] as? String == "cached"
-        let warnings = (summary["pricing_warnings"] as? [String] ?? []).filter {
-            !$0.hasPrefix("旧JSON") && !$0.hasPrefix("旧账本") && !$0.hasPrefix("历史金额凭据")
+        let rawWarnings = summary["pricing_warnings"] as? [String] ?? []
+        let warningCodes = summary["pricing_warning_codes"] as? [String]
+        let suppressedCodes: Set<String> = ["legacy_json_migrated", "legacy_ledger_migrated", "historical_receipts_locked"]
+        let isLegacyWarningText: (String) -> Bool = { text in
+            text.hasPrefix("旧JSON")
+                || text.hasPrefix("旧账本")
+                || text.hasPrefix("历史金额凭据")
+                || text.hasPrefix("Legacy JSON")
+                || text.hasPrefix("Legacy ledger")
+                || text.hasPrefix("Historical cost")
+        }
+        let warnings: [String]
+        if let warningCodes, warningCodes.count == rawWarnings.count {
+            warnings = zip(warningCodes, rawWarnings).compactMap { code, text in
+                guard !suppressedCodes.contains(code), !isLegacyWarningText(text) else { return nil }
+                return text
+            }
+        } else {
+            warnings = rawWarnings.filter { !isLegacyWarningText($0) }
         }
         var parts: [String] = []
-        if cached { parts.append("上次记录") }
+        if cached { parts.append(L10n.t("usage.status.cached_record")) }
         let hasScopeIssue = failed > 0 || skipped > 0 || unknown > 0 || (discovered > 0 && scanned < discovered)
         if hasScopeIssue || cached {
             parts.append(scope)
         }
         if unpriced > 0 {
-            parts.append("\(unpriced) 款模型暂无适用价格")
+            parts.append(L10n.t("usage.status.unpriced_models", ["count": unpriced]))
         }
         if !warnings.isEmpty {
-            parts.append(warnings.joined(separator: "；"))
+            parts.append(warnings.joined(separator: L10n.shared.isEnglish ? "; " : "；"))
         }
         statusSummary.stringValue = parts.joined(separator: " · ")
         let hasWarning = hasScopeIssue || cached || unpriced > 0 || !warnings.isEmpty
@@ -360,7 +444,7 @@ final class UsagePage: NSObject {
             trendChart.points = pts
         }
         let maxPoint = trendChart.points.max(by: { $0.tokens < $1.tokens })
-        let peakText = (maxPoint != nil && maxPoint!.tokens > 0) ? "，峰值于 \(maxPoint!.label) · \(formatCompactTokens(maxPoint!.tokens)) Token" : ""
+        let peakText = (maxPoint != nil && maxPoint!.tokens > 0) ? L10n.t("usage.chart.peak_suffix", ["label": maxPoint!.label, "tokens": formatCompactTokens(maxPoint!.tokens)]) : ""
         trendChart.setAccessibilityElement(true)
         trendChart.setAccessibilityLabel("\(trendTitleLabel.stringValue)\(peakText)")
 
@@ -392,7 +476,7 @@ final class UsagePage: NSObject {
         var otherCount = 0
 
         for (idx, item) in pricedModels.enumerated() {
-            let name = (item["model"] as? String) ?? "未知模型"
+            let name = InterfaceText.localizedModelLabel(item["model"] as? String)
             let mUsd = doubleVal(item, "estimatedUsd", fallback: doubleVal(item, "estimated_usd"))
             let mTokens = intVal(item, "totalTokens", fallback: intVal(item, "total_tokens"))
             if idx < topCount || pricedModels.count <= 5 {
@@ -406,7 +490,7 @@ final class UsagePage: NSObject {
         }
 
         if otherCount > 0 && otherUsd > 0 {
-            topSlices.append((name: "其他模型 · \(otherCount) 个", usd: otherUsd, tokens: otherTokens, color: .systemGray))
+            topSlices.append((name: L10n.t("usage.donut.other_models", ["count": otherCount]), usd: otherUsd, tokens: otherTokens, color: .systemGray))
         }
 
         for (_, slice) in topSlices.enumerated() {
@@ -427,11 +511,11 @@ final class UsagePage: NSObject {
             nameLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
             let usdDisplay = self.formatUsd(slice.usd)
-            let valLbl = text("\(usdDisplay) · 占比 \(pctText)", size: 10.5, weight: .regular, color: .secondaryLabelColor)
+            let valLbl = text(L10n.t("usage.donut.value_share", ["usd": usdDisplay, "pct": pctText]), size: 10.5, weight: .regular, color: .secondaryLabelColor)
             valLbl.lineBreakMode = .byTruncatingTail
             valLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             valLbl.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
-            let details = vertical([nameLbl, valLbl], spacing: 2)
+            let details = vertical([nameLbl, valLbl], spacing: 1.5)
             fillWidth(nameLbl, in: details); fillWidth(valLbl, in: details)
             let dotWrap = NSView()
             dotWrap.translatesAutoresizingMaskIntoConstraints = false
@@ -451,33 +535,34 @@ final class UsagePage: NSObject {
         }
 
         if slices.isEmpty {
-            let zeroHint = modelRows.isEmpty ? "当前时段暂无模型用量记录" : modelRows.contains(where: { $0["priced"] as? Bool == true }) ? "已计价费用为零" : "暂无价格数据"
+            let zeroHint = modelRows.isEmpty ? L10n.t("usage.donut.empty_calls") : modelRows.contains(where: { $0["priced"] as? Bool == true }) ? L10n.t("usage.donut.zero_cost") : L10n.t("usage.donut.no_pricing")
             donutLegendStack.addArrangedSubview(text(zeroHint, size: 12, color: .secondaryLabelColor))
         }
         donutChart.isHidden = slices.isEmpty
         donutChart.slices = slices
         donutChart.totalUsd = effectiveTotalUsd
-        let topModelName = topSlices.first?.name ?? "暂无"
+        let topModelName = topSlices.first?.name ?? L10n.t("usage.donut.none_model")
         let topPct = topSlices.first.map { slice in effectiveTotalUsd > 0 ? Int(round((slice.usd / effectiveTotalUsd) * 100)) : 0 } ?? 0
         donutChart.setAccessibilityElement(true)
-        donutChart.setAccessibilityLabel(pricedModels.isEmpty && !modelRows.isEmpty ? "暂无可计价模型" : "各模型费用占比环图，合计等效费用 \(self.formatUsd(effectiveTotalUsd))，最高费用占比 \(topModelName) · \(topPct)%")
+        donutChart.setAccessibilityLabel(pricedModels.isEmpty && !modelRows.isEmpty ? L10n.t("usage.donut.a11y_unpriced") : L10n.t("usage.donut.a11y_summary", ["total": self.formatUsd(effectiveTotalUsd), "model": topModelName, "pct": topPct]))
 
         // Visible summaries use real model metrics.
         modelsBreakdownStack.arrangedSubviews.forEach {
             modelsBreakdownStack.removeArrangedSubview($0)
             $0.removeFromSuperview()
         }
-        modelsCountLabel.stringValue = modelRows.isEmpty ? "" : "\(modelRows.count) 个模型"
+        modelsCountLabel.stringValue = modelRows.isEmpty ? "" : L10n.t("usage.models.count", ["count": modelRows.count])
 
         guard !modelRows.isEmpty else {
-            let empty = vertical([symbol("chart.bar", size: 22, color: Design.secondary), text("暂无模型用量", size: 13, color: Design.secondary)], spacing: 10)
+            let empty = vertical([symbol("chart.bar", size: 22, color: Design.secondary), text(L10n.t("usage.models.empty"), size: 13, color: Design.secondary)], spacing: 10)
             empty.alignment = .centerX; empty.heightAnchor.constraint(greaterThanOrEqualToConstant: 90).isActive = true
             modelsBreakdownStack.addArrangedSubview(empty); fillWidth(empty, in: modelsBreakdownStack)
             return
         }
 
         for item in modelRows {
-            let name = (item["model"] as? String) ?? "未知模型"
+            let name = InterfaceText.localizedModelLabel(item["model"] as? String)
+            let rawModelId = (item["modelId"] as? String) ?? (item["model_id"] as? String)
             let mTokens = intVal(item, "totalTokens", fallback: intVal(item, "total_tokens"))
             let mIn = intVal(item, "promptTokens", fallback: intVal(item, "input_tokens"))
             let mOut = intVal(item, "candidatesTokens", fallback: intVal(item, "output_tokens"))
@@ -488,21 +573,14 @@ final class UsagePage: NSObject {
             let shareText = (mTokens > 0 && sharePct == 0) ? "<1%" : "\(sharePct)%"
             let isItemPriced = (item["priced"] as? Bool) ?? (mUsd > 0)
             var usdStr: String
+            let isItemUnpriced = !(isItemPriced || (item["partiallyPriced"] as? Bool == true)) && mTokens > 0
             if isItemPriced || (item["partiallyPriced"] as? Bool == true) {
-                if mUsd > 0 && mUsd < 0.001 {
-                    usdStr = "<$0.001"
-                } else if mUsd < 0.01 && mUsd > 0 {
-                    usdStr = String(format: "$%.3f", mUsd)
-                } else if mUsd == 0 {
-                    usdStr = "$0.00"
-                } else {
-                    usdStr = String(format: "$%.2f", mUsd)
-                }
+                usdStr = self.formatUsd(mUsd)
             } else {
-                usdStr = mTokens > 0 ? "未计价" : "$0.00"
+                usdStr = mTokens > 0 ? L10n.t("menu_panel.usage.unpriced") : "$0.00"
             }
-            if item["partiallyPriced"] as? Bool == true { usdStr = "部分 " + usdStr }
-            let row = ModelUsageRow(name: name, tokens: formatCompactTokens(mTokens), input: formatCompactTokens(mIn), output: formatCompactTokens(mOut), requests: mReq, cost: usdStr, share: sharePct, shareText: shareText)
+            if item["partiallyPriced"] as? Bool == true { usdStr = L10n.t("usage.models.partial_prefix") + usdStr }
+            let row = ModelUsageRow(name: name, rawModelId: rawModelId, tokens: formatCompactTokens(mTokens), input: formatCompactTokens(mIn), output: formatCompactTokens(mOut), requests: mReq, cost: usdStr, share: sharePct, shareText: shareText, isUnpriced: isItemUnpriced)
             if !modelsBreakdownStack.arrangedSubviews.isEmpty {
                 let line = divider(); modelsBreakdownStack.addArrangedSubview(line); fillWidth(line, in: modelsBreakdownStack)
             }
@@ -519,7 +597,7 @@ final class UsagePage: NSObject {
         let selected = periods[max(0, min(periods.count - 1, periodSegment.selectedSegment))]
         guard !loading, exportButton.isEnabled, UsageQueryIdentity(period: selected).matches(latestReport), latestReport["snapshotId"] != nil, let window = app.window else { return }
         let snapshot = latestReport
-        saveUsageJSON(snapshot, name: "GravityBox-用量-\(selected).json", window: window, app: app)
+        saveUsageJSON(snapshot, name: L10n.t("usage.models.export_filename", ["period": selected]), window: window, app: app)
     }
 
 }

@@ -401,8 +401,8 @@ test('Google 授权保存核实邮箱且不切换账号，未验证邮箱与取�
  await f.manager.addAccountFromOAuth(token,new AbortController().signal,async()=>Response.json({email:'other@test.example',verified_email:true,name:'Other'}));assert.equal((await f.manager.loadIndex()).accounts.length,before+1);assert.equal((await f.manager.loadIndex()).current_account_id,f.a.id);
 });
 
-test('仅有 Gemini 每周配额时保留真实每周值，五小时保持未知且不伪造窗口，Starter订阅不露出',async t=>{
+test('仅有 Gemini 每周配额时保留真实每周值，五小时保持未知且不伪造窗口，Starter订阅映射为FREE',async t=>{
  const f=await fixture(t);
  const cloud=async url=>url.includes('loadCodeAssist')?Response.json({currentTier:{name:'Antigravity Starter Quota'}}):url.includes('fetchAvailableModels')?Response.json({models:{'gemini-test':{quotaInfo:{remainingFraction:1}}}}):Response.json({groups:[{displayName:'Gemini Models',buckets:[{bucketId:'gemini-weekly',window:'weekly',remainingFraction:.73}]}]});
- const fresh=await f.manager.refreshQuota(f.b.id,cloud);const q=f.manager.getAccountQuotaOverview(fresh);assert.equal(q.geminiWeeklyRemaining,73);assert.equal(q.geminiFiveHourRemaining,null);assert.equal(fresh.quota_refresh_error,null);assert.equal(q.subscriptionTier,'');
+ const fresh=await f.manager.refreshQuota(f.b.id,cloud);const q=f.manager.getAccountQuotaOverview(fresh);assert.equal(q.geminiWeeklyRemaining,73);assert.equal(q.geminiFiveHourRemaining,null);assert.equal(fresh.quota_refresh_error,null);assert.equal(q.subscriptionTier,'FREE');
 });

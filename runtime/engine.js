@@ -4,16 +4,28 @@
   const options = globalThis.__GRAVITYBOX_BOOT__;
   if (!options || location.origin !== options.origin) return;
   if (options.path === '/fixture' && location.pathname !== '/fixture') return;
-  const allowedPath=location.pathname==='/'||/^\/(?:history|sidecars|customizations|automations|settings|settings-standalone|terminal-standalone|new-project|onboarding|multi|artifact|s|chatski-connect)(?:\/.*)?$/i.test(location.pathname)||/^\/c(?:\/|\/(?:[0-9a-f-]{36}|_new)(?:\/.*)?)?$/i.test(location.pathname)||/^\/(?:forked|view|battle)\/.*$/i.test(location.pathname)||(options.path==='/fixture'&&location.pathname==='/fixture');
+  const allowedPath=location.pathname==='/'||/^\/(?:history|sidecars|customizations|automations|settings|settings-standalone|terminal-standalone|new-project|multi|artifact|s|chatski-connect)(?:\/.*)?$/i.test(location.pathname)||/^\/c(?:\/|\/(?:[0-9a-f-]{36}|_new)(?:\/.*)?)?$/i.test(location.pathname)||/^\/(?:forked|view|battle)\/.*$/i.test(location.pathname)||(options.path==='/fixture'&&location.pathname==='/fixture');
   if(!allowedPath)return;
-  if(options.conservative&&/^\/(?:onboarding|oauth|auth|login|sign-in)(?:\/|$)/i.test(location.pathname))return;
+  if(options.conservative&&/^\/(?:oauth|auth|login|sign-in)(?:\/|$)/i.test(location.pathname))return;
   // Recognize the actual system-settings shell, then admit only its content pane.
   // Project navigation, editable values, chat and code keep their existing protection.
+  const SETTINGS_SCREEN_RE=/^(General|App|AppSettings|Application|Appearance|Account|Accounts|Plan|Notifications|NotificationSettings|Notification Settings|Models|ModelsAndUsage|Models & Usage|KeyboardShortcuts|Shortcuts|Customizations|Editor|Tab|Browser|Developer|Project 4K|Jetski Chat|Provide Feedback|Project General|Project Folders|Project Agent|Permissions)$/i;
+  const BASE_SETTINGS_NAV_KEYS=['General','通用','App','应用','Application','App Settings','应用设置','Appearance','外观','Notifications','通知','Notification Settings','通知设置','Models','Models & Usage','模型','模型与使用量','模型与用量','驱动模型','Keyboard Shortcuts','Keyboard shortcuts','Shortcuts','快捷键','键盘快捷键','键盘快捷方式','Account','Accounts','账户','账号','Plan','计划','规划','Permissions','权限','Customizations','自定义','Editor','Editor Settings','编辑器','编辑器设置','Tab','Tab 键补全','标签页','Browser','浏览器','Developer','开发者','Provide Feedback','提供反馈'];
+  const SETTINGS_NAV_SET=new Set(BASE_SETTINGS_NAV_KEYS.map(s=>s.toLowerCase()));
+  const normalize = s => s.replace(/\s+/g, ' ').trim();
+  const nodeSlots = new WeakMap();
   let settingsPaneCache = null;
+  function settingsDialogRoot(el) {
+    const root=el?.closest?.('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]');
+    if(!root)return null;
+    const labels=['Settings','设置',options.dictionary?.entries?.Settings].filter(Boolean);
+    const hasHeader=[...root.querySelectorAll('h1')].some(e=>labels.includes(normalize(originalText(e)))||labels.includes(normalize(e.textContent||'')));
+    return hasHeader?root:null;
+  }
   function systemSettingsPane() {
     const query=new URL(location.href).searchParams;
     const screen=query.get('settingsScreen');
-    if(screen&&!/^(General|App|AppSettings|Application|Appearance|Account|Notifications|Models|KeyboardShortcuts|Shortcuts|Customizations|Editor|Tab|Browser|Developer|Project 4K|Jetski Chat|Provide Feedback|Project General|Project Folders|Project Agent|Permissions)$/i.test(screen)){settingsPaneCache=null;return null;}
+    if(screen&&!SETTINGS_SCREEN_RE.test(screen)){settingsPaneCache=null;return null;}
     const cached = settingsPaneCache;
     // React can mount before updating the URL, and retain the dialog during its exit animation.
     // A validated, connected pane remains the same scope until it is replaced or detached.
@@ -22,16 +34,17 @@
       &&cached.root.contains(cached.header)&&cached.pane.contains(cached.heading)&&!cached.pane.contains(cached.header))return cached.pane;
     settingsPaneCache=null;
     const clean=e=>(e?.textContent||'').replace(/\s+/g,' ').trim();
+    const rawLabel=e=>normalize(originalText(e))||clean(e);
+    const isNavMatch=e=>{const raw=rawLabel(e).toLowerCase(),cur=clean(e).toLowerCase();return SETTINGS_NAV_SET.has(raw)||SETTINGS_NAV_SET.has(cur);};
     const labels=['Settings','设置',options.dictionary?.entries?.Settings].filter(Boolean);
-    const navigation=['General','通用','Application','App Settings','应用设置','Appearance','外观','Notifications','通知','Models','模型','Keyboard Shortcuts','Shortcuts','快捷键','键盘快捷方式','Account','账户','账号','Customizations','自定义','Editor','Editor Settings','编辑器','编辑器设置','Tab','Browser','浏览器','Developer','开发者','Provide Feedback','提供反馈'];
     const selectors=labels.map(label=>'[role="dialog"][aria-label="'+CSS.escape(label)+'"]').concat('[data-testid="settings-root"]','[data-testid="settings-dialog"]');
     for(const root of document.querySelectorAll(selectors.join(','))) {
-      const header=[...root.querySelectorAll('h1')].find(e=>labels.includes(clean(e)));
+      const header=[...root.querySelectorAll('h1')].find(e=>labels.includes(rawLabel(e))||labels.includes(clean(e)));
       if(!header)continue;
-      const navigationButtons=[...root.querySelectorAll('button')].filter(e=>navigation.includes(clean(e))||(e.getAttribute('data-testid')||'').startsWith('settings-nav-item-'));
-      const names=new Set(navigationButtons.map(clean));
+      const navigationButtons=[...root.querySelectorAll('button')].filter(e=>isNavMatch(e)||(e.getAttribute('data-testid')||'').startsWith('settings-nav-item-'));
+      const names=new Set(navigationButtons.map(e=>rawLabel(e).toLowerCase()));
       if(names.size<3)continue;
-      const headings=[...root.querySelectorAll('h2')].filter(e=>navigation.includes(clean(e)));
+      const headings=[...root.querySelectorAll('h2')].filter(isNavMatch);
       const heading=headings.find(e=>e.closest('[style*="display: block"]'))||headings[0];
       if(!heading)continue;
       let pane=heading;
@@ -64,7 +77,12 @@
     globalThis[KEY] = {
       state, getLanguageMode: () => 'en', refresh() {},
       update(next) { dictionary = next; }, setShortcutEnabled() {},
-      dispose() { delete globalThis[KEY]; delete globalThis.__GRAVITYBOX_BOOT__; },
+      dispose(opts) {
+        if (!opts?.keepHud) { try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {} }
+        delete globalThis[KEY];
+        if (globalThis.__GRAVITYBOX_BOOT__ === options) delete globalThis.__GRAVITYBOX_BOOT__;
+        return { restored: 0, skipped: 0, active: false };
+      },
     };
     globalThis.__GRAVITYBOX_ATTACH_HUD__?.();
     return;
@@ -120,7 +138,7 @@
   /* J03: third-party/product names are not interface copy. Entity links/cards are protected
      structurally (J01); this allowlist covers brand-only labels rendered as plain text/buttons so a
      dictionary hit can never turn "Gemini"/"GitHub" into Chinese. */
-  const BRAND_NAMES = new Set(['antigravity', 'gemini', 'claude', 'gpt', 'chatgpt', 'google', 'google chat', 'github', 'github copilot', 'copilot', 'chrome', 'chromium', 'firefox', 'safari', 'webkit', 'node.js', 'nodejs', 'npm', 'pnpm', 'yarn', 'deno', 'bun', 'electron', 'typescript', 'javascript', 'python', 'rust', 'golang', 'java', 'kotlin', 'swift', 'xcode', 'vscode', 'vs code', 'visual studio code', 'intellij idea', 'pycharm', 'webstorm', 'jetbrains', 'docker', 'kubernetes', 'postgresql', 'postgres', 'mysql', 'sqlite', 'redis', 'mongodb', 'react', 'vue', 'svelte', 'angular', 'next.js', 'vite', 'webpack', 'esbuild', 'tailwind', 'tailwind css', 'openai', 'anthropic', 'deepseek', 'mistral', 'llama', 'perplexity', 'notion', 'slack', 'linear', 'jira', 'figma', 'gitlab', 'bitbucket', 'vercel', 'cloudflare', 'firebase', 'supabase', 'prisma', 'playwright', 'xterm', 'monaco', 'markdown', 'inter', 'google sans', 'google sans code', 'google sans text', 'jetbrains mono', 'fira code', 'fira mono', 'cascadia code', 'cascadia mono', 'sf mono', 'roboto mono', 'source code pro', 'consolas', 'menlo', 'courier new', 'ubuntu mono', 'inconsolata', 'hack', 'catppuccin', 'catppuccin frappe', 'catppuccin latte', 'catppuccin macchiato', 'catppuccin mocha', 'gruvbox', 'gruvbox material', 'gruvbox dark', 'gruvbox light', 'solarized', 'solarized light', 'solarized dark', 'one light', 'one dark', 'one dark pro', 'dracula', 'nord', 'monokai', 'monokai pro', 'monokai dimmed', 'tokyo night', 'ayu', 'ayu dark', 'ayu light', 'ayu mirage', 'quiet light', 'aoede', 'arlo', 'charon', 'cleo', 'fenrir', 'finn', 'fola', 'gero', 'kore', 'leda', 'lora', 'neno', 'olin', 'orus', 'puck', 'tari', 'zephyr', 'project 4k', 'workspace_1', 'workspace_2', 'workspace_3']);
+  const BRAND_NAMES = new Set(['antigravity', 'gravitybox', 'gemini', 'claude', 'gpt', 'chatgpt', 'google', 'google chat', 'github', 'github copilot', 'copilot', 'chrome', 'chromium', 'firefox', 'safari', 'webkit', 'node.js', 'nodejs', 'npm', 'pnpm', 'yarn', 'deno', 'bun', 'electron', 'typescript', 'javascript', 'python', 'rust', 'golang', 'java', 'kotlin', 'swift', 'xcode', 'vscode', 'vs code', 'visual studio code', 'intellij idea', 'pycharm', 'webstorm', 'jetbrains', 'docker', 'kubernetes', 'postgresql', 'postgres', 'mysql', 'sqlite', 'redis', 'mongodb', 'react', 'vue', 'svelte', 'angular', 'next.js', 'vite', 'webpack', 'esbuild', 'tailwind', 'tailwind css', 'openai', 'anthropic', 'deepseek', 'mistral', 'llama', 'perplexity', 'notion', 'slack', 'linear', 'jira', 'figma', 'gitlab', 'bitbucket', 'vercel', 'cloudflare', 'firebase', 'supabase', 'prisma', 'playwright', 'puppeteer', 'xterm', 'monaco', 'markdown', 'latex', 'mermaid', 'git', 'mcp', 'oauth', 'jetski', 'sidecar', 'flutter', 'dart', 'agy', 'inter', 'google sans', 'google sans code', 'google sans text', 'jetbrains mono', 'fira code', 'fira mono', 'cascadia code', 'cascadia mono', 'sf mono', 'roboto mono', 'source code pro', 'consolas', 'menlo', 'courier new', 'ubuntu mono', 'inconsolata', 'hack', 'catppuccin', 'catppuccin frappe', 'catppuccin latte', 'catppuccin macchiato', 'catppuccin mocha', 'gruvbox', 'gruvbox material', 'gruvbox dark', 'gruvbox light', 'solarized', 'solarized light', 'solarized dark', 'one light', 'one dark', 'one dark pro', 'dracula', 'nord', 'monokai', 'monokai pro', 'monokai dimmed', 'tokyo night', 'ayu', 'ayu dark', 'ayu light', 'ayu mirage', 'quiet light', 'aoede', 'arlo', 'charon', 'cleo', 'fenrir', 'finn', 'fola', 'gero', 'kore', 'leda', 'lora', 'neno', 'olin', 'orus', 'puck', 'tari', 'zephyr', 'project 4k', 'workspace_1', 'workspace_2', 'workspace_3']);
   function isBrandName(value) { return BRAND_NAMES.has(lower(normalize(value))); }
   /* J04 disclosure: templates only understand {0}/{1}… placeholders. printf-style (%s/%d/…) and
      ICU plural/select messages are not recognised (the runtime substitutes the number before the
@@ -144,7 +162,6 @@
   }
   const TRANSLATABLE_ATTRS = ['title', 'aria-label', 'data-tooltip', 'placeholder'];
   const QUEUE_LIMIT = 50000;
-  const nodeSlots = new WeakMap();
   const activeNodes = new Set();
   const observed = new Set();
   const inlineGroups = new WeakMap();
@@ -154,8 +171,8 @@
   const unsupportedInlineGroupReasons = new WeakMap();
   const unsupportedInlineGroupSet = new Set();
   const INLINE_LAYOUT_WARNING = '内联占位符无法安全映射（语序重排/缺少对应文本槽/占位符集合不一致）：已保留完整英文，请在词典中按原占位顺序提供译文';
-  const normalize = s => s.replace(/\s+/g, ' ').trim();
   const lower = s => s.toLowerCase();
+  const foldKey = s => lower(s).replace(/[\u2018\u2019]/g, "'");
   let auditKeys = null, auditExpires = 0;
   const auditTrail = new Map();
   function visibleUi(el) {
@@ -223,7 +240,7 @@
 
   let lastMatchedKeys=[];
   const conservative=!!options.conservative;
-  const restrictedAdaptiveRoute=()=>conservative&&/^\/(?:onboarding|oauth|auth|login|sign-in)(?:\/|$)/i.test(location.pathname);
+  const restrictedAdaptiveRoute=()=>false;
   const scopeRoute=(el)=>{if(inSystemSettings(el,scanCount))return '/settings';const panel=el?.closest('[role="dialog"],[data-testid*="settings"],[data-testid*="preferences"]');if(panel&&((panel.getAttribute('data-testid')||'').match(/settings|preferences/)||/^(Settings|设置)$/i.test(panel.getAttribute('aria-label')||'')||/^(Settings|设置)$/.test(panel.querySelector('h1,[role="heading"]')?.textContent?.trim()??'')))return '/settings';return location.pathname==='/fixture'?'/fixture':/^\/customizations(?:\/installed)?$/.test(location.pathname)?location.pathname:location.pathname.startsWith('/settings')?'/settings':location.pathname.startsWith('/automations')?'/automations':location.pathname.startsWith('/sidecars')?'/sidecars':['/','/history'].includes(location.pathname)?location.pathname:'/other';};
   const scopeKey=(key,kind,route=scopeRoute())=>`@ui:${route}|${kind}|${key}`;
   /* J02 SPA route guard. The bootstrap allow-list above is evaluated once per document, but the app
@@ -259,6 +276,7 @@
     routeExcluded = excluded;
     try { globalThis.__GRAVITYBOX_HUD_V1__?.setRouteExcluded?.(routeExcluded); } catch {}
     if (excluded) {
+      pluginCards = []; pluginCardsAt = -1;
       if (timer !== null) { clearTimeout(timer); timer = null; }
       pending.clear(); waiting.clear(); settingsWaiting.clear(); requeueDocument = false; reconcileRequested = false; reconcileQueue = null;
       /* updateValue() is the single place that knows how to put a slot back to English and drop it;
@@ -274,7 +292,7 @@
   routeExcluded = !routeAllowedNow();
   let pluginCardsAt=-1,pluginCards=[];
   function pluginCardRoots(){
-    if(!/^\/customizations(?:\/installed)?$/.test(location.pathname))return [];
+    if(!/^\/customizations(?:\/installed)?$/.test(location.pathname)){pluginCards=[];pluginCardsAt=-1;return [];}
     if(pluginCardsAt===scanCount)return pluginCards;pluginCardsAt=scanCount;pluginCards=[];
     const pluginLink=a=>{try{const u=new URL(a.href,location.href);return u.origin===location.origin&&/^\/customizations\/(?:plugins\/[\w.-]+|marketplaces\/[\w.-]+\/plugins\/[\w.-]+)$/.test(u.pathname);}catch{return false;}};
     for(const anchor of [...document.querySelectorAll('a[href]')].filter(pluginLink)){
@@ -312,13 +330,86 @@
       if(entries.length>=250)break;
     }return entries;
   }
+  let customTemplateRules = [];
+  function isRepeatableBraceQuantifier(tail) {
+    const m = tail.match(/^\{(\d+)(?:,(\d*))?\}/);
+    if (!m) return false;
+    if (m[2] === undefined) return Number(m[1]) >= 2;
+    if (m[2] === '') return true;
+    return Number(m[2]) >= 2;
+  }
+  function hasNestedQuantifiedGroup(pattern) {
+    const groupHasQuantifier = [];
+    let inCharClass = false;
+    for (let i = 0; i < pattern.length; i++) {
+      const ch = pattern[i];
+      if (ch === '\\') { i++; continue; }
+      if (ch === '[') { inCharClass = true; continue; }
+      if (ch === ']' && inCharClass) { inCharClass = false; continue; }
+      if (inCharClass) continue;
+      if (ch === '(') {
+        groupHasQuantifier.push(false);
+      } else if (ch === ')') {
+        const innerQuantified = groupHasQuantifier.pop() ?? false;
+        const next = pattern[i + 1] ?? '';
+        const outerRepeats =
+          next === '+' ||
+          next === '*' ||
+          (next === '{' && isRepeatableBraceQuantifier(pattern.slice(i + 1)));
+        const outerOptional = next === '?';
+        if (innerQuantified && (outerRepeats || outerOptional)) return true;
+        if ((innerQuantified || outerRepeats) && groupHasQuantifier.length > 0) {
+          groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+        }
+      } else if (
+        (ch === '+' || ch === '*' || (ch === '{' && isRepeatableBraceQuantifier(pattern.slice(i))))
+        && groupHasQuantifier.length > 0
+      ) {
+        groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+      }
+    }
+    return false;
+  }
+  function compileDeclarativeTemplateRules(rawRules) {
+    if (!Array.isArray(rawRules) || rawRules.length === 0) return [];
+    const compiled = [];
+    for (const item of rawRules) {
+      if (!item || typeof item !== 'object') continue;
+      const key = typeof item.key === 'string' ? item.key.trim() : '';
+      const patternSrc = typeof item.pattern === 'string' ? item.pattern : '';
+      const flags = typeof item.flags === 'string' ? item.flags : 'i';
+      const replacement = typeof item.replacement === 'string' ? item.replacement : '';
+      if (!key || key.length > 240 || !patternSrc || patternSrc.length > 320 || !patternSrc.startsWith('^') || !replacement || replacement.length > 400) continue;
+      if (!/^[iu]*$/.test(flags)) continue;
+      if (hasNestedQuantifiedGroup(patternSrc) || /(\([^)]*[+*][^)]*\))[+*?]/.test(patternSrc)) continue;
+      try {
+        const pattern = new RegExp(patternSrc, flags);
+        compiled.push({
+          key,
+          pattern,
+          inlineOnly: item.inlineOnly === true || key.includes('{0}'),
+          replace: (...args) => {
+            const groups = args.slice(1, -2);
+            return replacement.replace(/\$([1-9]\d?|\$)/g, (_, token) => {
+              if (token === '$') return '$';
+              const idx = Number(token) - 1;
+              return groups[idx] !== undefined ? String(groups[idx]) : '';
+            });
+          },
+        });
+        if (compiled.length >= 256) break;
+      } catch {}
+    }
+    return compiled;
+  }
   function rebuildIndex(dict) {
     dictionary = dict;
     foldedMap = new Map();
+    customTemplateRules = compileDeclarativeTemplateRules(dict?.templateRules);
     if (!dict?.entries) return;
     for (const [k, v] of Object.entries(dict.entries)) {
       if(k.startsWith('@ui:'))continue;
-      const f = lower(k);
+      const f = foldKey(k);
       if (!foldedMap.has(f)) foldedMap.set(f, v);
     }
   }
@@ -453,13 +544,14 @@
     const button=element?.closest?.('button');
     if(!button||inSystemSettings(button,scan))return false;
     const pane=settingsScope;
-    const root=pane?.closest('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]');
+    const root=pane?.closest('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]')||settingsDialogRoot(button);
     if(!root?.contains(button))return false;
+    if(pane?pane.contains(button):Boolean(button.closest('main,[role="tabpanel"]')))return false;
     // The small standalone expansion control is built-in navigation, unlike project rows.
     const original=nodeSlots.get(button.firstChild)?.get('')?.original??button.textContent??'';
     if(button.matches('.mx-4.hover\\:underline:is(.text-xs,.text-sm)')&&['Show All','Show all','Show Less','Show less','显示全部','Collapse','收起'].includes(normalize(original)))return false;
-    const headings=[...root.querySelectorAll('h2')].filter(e=>!pane.contains(e));
-    const label=e=>(e.textContent||'').replace(/\s+/g,' ').trim();
+    const headings=[...root.querySelectorAll('h2')].filter(e=>pane?!pane.contains(e):!e.closest('main,[role="tabpanel"]'));
+    const label=e=>normalize(originalText(e))||(e.textContent||'').replace(/\s+/g,' ').trim();
     const start=headings.find(e=>['Projects','Project list','项目列表','项目'].includes(label(e)));
     if(!start||!(start.compareDocumentPosition(button)&Node.DOCUMENT_POSITION_FOLLOWING))return false;
     const next=headings.find(e=>e!==start&&(start.compareDocumentPosition(e)&Node.DOCUMENT_POSITION_FOLLOWING));
@@ -490,7 +582,8 @@
     if (!p) return false;
     const dialog = p.closest('[role="dialog"],[role="alertdialog"]');
     if (!dialog) return false;
-    if (dialog.getAttribute('aria-label') === 'Settings' || dialog.querySelector('aside,[data-testid*="settings"]')) return false;
+    const dialogLabel = dialog.getAttribute('aria-label');
+    if (dialogLabel === 'Settings' || dialogLabel === '设置' || dialog.querySelector('aside,[data-testid*="settings"]')) return false;
     return Boolean(dialog.querySelector('[data-testid*="confirm"],button'));
   }
   function eligible(element, scan = 0) {
@@ -509,7 +602,10 @@
   function entryFor(key) {
     const entries = dictionary.entries;
     if (Object.hasOwn(entries, key)) return entries[key];
-    return foldedMap.get(lower(key));
+    return foldedMap.get(foldKey(key));
+  }
+  function nestedLabel(name) {
+    return isBrandName(name) ? name : (entryFor(name) || name);
   }
 
   const RE_DUR_H = /(\d+)\s*h\b/gi;
@@ -756,11 +852,12 @@
 
     // 8. 模型配额与刷新限额动态提示 (如 You have used some of your weekly limit, it will fully refresh in 20 hours, 52 minutes.)
     {
-      key: "You have used some of your {period} limit, it will fully refresh in {duration}.", pattern: /^You have (used some of|hit) your (weekly|5-hour|\w+) limit, it will fully refresh in (.+?)\.?$/i,
+      key: "You have used some of your {period} limit, it will fully refresh in {duration}.", pattern: /^You have (used some of|hit) your (weekly|daily|5-hour|five[- ]hour|\d+[- ]?(?:hour|day|minute)|\w+) limit, it will fully refresh in (.+?)\.?$/i,
       replace: (_, action, period, time) => {
         const actZh = /hit/i.test(action) ? '已达到' : '已使用了部分';
-        const pMap = { weekly: '每周', '5-hour': '5小时' };
-        const pZh = pMap[period.toLowerCase()] || period;
+        const normP = period.toLowerCase().replace(/\s+/g, ' ');
+        const pMap = { weekly: '每周', daily: '每日', '5-hour': '5小时', 'five-hour': '5小时', 'five hour': '5小时' };
+        const pZh = pMap[normP] || period;
         const timeZh = time
           .replace(/(\d+)\s*days?/gi, '$1天')
           .replace(/(\d+)\s*hours?/gi, '$1小时')
@@ -794,7 +891,7 @@
       key: "{category} (", pattern: /^(Child Subagents|Generation Steps|Tools|Subagents|Workspaces|Plugins|Skills|Rules|Hooks|Mcp|Sessions)\s*\($/i,
       replace: (_, name) => {
         const nMap = {
-          'child subagents': '子级智能体',
+          'child subagents': '子智能体',
           'generation steps': '生成步骤',
           'tools': '工具',
           'subagents': '子智能体',
@@ -880,7 +977,7 @@
       replace: () => '您确定要删除该'
     },
     {
-      key: "Are you sure you want to delete {name}?", pattern: /^Are you sure you want to delete\s+(?:the\s+)?(.+?)\??$/i,
+      key: "Are you sure you want to delete {name}?", pattern: /^Are you sure you want to delete\s+(?:the\s+)?(.+?)\?$/i,
       replace: (_, target) => `您确定要删除 ${target} 吗？`
     },
     {
@@ -995,7 +1092,7 @@
     },
     {
       key: "{count} Side Questions", pattern: /^(\d+)\s+Side\s+Questions?$/i,
-      replace: (_, n) => `${n} 个旁路追问`
+      replace: (_, n) => `${n} 个侧边提问`
     },
     {
       key: "{count} seconds", pattern: /^(\d+)\s+seconds?$/i,
@@ -1079,43 +1176,43 @@
     },
     {
       key: "{name} (Default)", pattern: /^(.+?)\s+\(Default\)$/i,
-      replace: (_, name) => `${entryFor(name) || name}（默认）`
+      replace: (_, name) => `${nestedLabel(name)}（默认）`
     },
     {
       key: "{name} (Archived)", pattern: /^(.+?)\s+\(Archived\)$/i,
-      replace: (_, name) => `${entryFor(name) || name}（已归档）`
+      replace: (_, name) => `${nestedLabel(name)}（已归档）`
     },
     {
       key: "{name} (Experimental)", pattern: /^(.+?)\s+\(Experimental\)$/i,
-      replace: (_, name) => `${entryFor(name) || name}（实验性）`
+      replace: (_, name) => `${nestedLabel(name)}（实验性）`
     },
     {
       key: "{name} (disabled by admin)", pattern: /^(.+?)\s+\(disabled\s+by\s+admin\)$/i,
-      replace: (_, name) => `${entryFor(name) || name}（已被管理员禁用）`
+      replace: (_, name) => `${nestedLabel(name)}（已被管理员禁用）`
     },
     {
       key: "{name} [Remote]", pattern: /^(.+?)\s+\[Remote\]$/i,
-      replace: (_, name) => `${name} [远程]`
+      replace: (_, name) => `${nestedLabel(name)} [远程]`
     },
     {
       key: "{name}, setup required", pattern: /^(.+?),\s*setup\s+required$/i,
-      replace: (_, name) => `${name}（需要配置）`
+      replace: (_, name) => `${nestedLabel(name)}（需要配置）`
     },
     {
       key: "{name} · Context window", pattern: /^(.+?)\s*·\s*Context\s+window$/i,
-      replace: (_, name) => `${name} · 上下文窗口`
+      replace: (_, name) => `${nestedLabel(name)} · 上下文窗口`
     },
     {
       key: "{name}: Expired", pattern: /^(.+?):\s+Expired$/i,
-      replace: (_, name) => `${name}：已过期`
+      replace: (_, name) => `${nestedLabel(name)}：已过期`
     },
     {
       key: "{name}: Invalid", pattern: /^(.+?):\s+Invalid$/i,
-      replace: (_, name) => `${name}：无效`
+      replace: (_, name) => `${nestedLabel(name)}：无效`
     },
     {
       key: "{name}: Unknown", pattern: /^(.+?):\s+Unknown$/i,
-      replace: (_, name) => `${name}：未知`
+      replace: (_, name) => `${nestedLabel(name)}：未知`
     },
     {
       key: "Viewed {file}:{start}-{end}", pattern: /^Viewed\s+(.+?):(\d+)-(\d+)$/i,
@@ -1407,7 +1504,7 @@
     },
     {
       key: "View {count} side questions", pattern: /^View\s+(\d+)\s+side\s+questions?$/i,
-      replace: (_, n) => `查看 ${n} 个旁路追问`
+      replace: (_, n) => `查看 ${n} 个侧边提问`
     },
     {
       key: "Open {name} skill", pattern: /^Open\s+(.+?)\s+skill$/i,
@@ -1430,7 +1527,7 @@
     {
       key: "{name} (Remote)",
       pattern: /^(.+?)\s+\(Remote\)$/i,
-      replace: (_, name) => `${name}（远程）`
+      replace: (_, name) => `${nestedLabel(name)}（远程）`
     },
     {
       key: "Account this MCP server uses: {name}",
@@ -1491,6 +1588,231 @@
       key: "Stop {count} selected",
       pattern: /^Stop\s+(\d+)\s+selected$/i,
       replace: (_, n) => `停止已选中的 ${n} 项`
+    },
+    {
+      key: "⚠️ Failed to render LaTeX: {reason}",
+      pattern: /^⚠️\s*Failed\s+to\s+render\s+LaTeX:\s*(.+)$/i,
+      replace: (_, r) => `⚠️ LaTeX 渲染失败：${r}`
+    },
+    {
+      key: "⚠️ Failed to render Mermaid diagram: {reason}",
+      pattern: /^⚠️\s*Failed\s+to\s+render\s+Mermaid\s+diagram:\s*(.+)$/i,
+      replace: (_, r) => `⚠️ Mermaid 图表渲染失败：${r}`
+    },
+    {
+      key: "Agent: {name}",
+      pattern: /^Agent:\s*(.+)$/i,
+      replace: (_, n) => `智能体：${n}`
+    },
+    {
+      key: "Agent ID: {id}",
+      pattern: /^Agent\s+ID:\s*(.+)$/i,
+      replace: (_, id) => `智能体 ID：${id}`
+    },
+    {
+      key: "Error: {message}",
+      pattern: /^Error:\s*(.+)$/i,
+      replace: (_, m) => `错误：${m}`
+    },
+    {
+      key: "Error ID: {id}",
+      pattern: /^Error\s+ID:\s*(.+)$/i,
+      replace: (_, id) => `错误 ID：${id}`
+    },
+    {
+      key: "Working directory: {path}",
+      pattern: /^Working\s+directory:\s*(.+)$/i,
+      replace: (_, p) => `工作目录：${p}`
+    },
+    {
+      key: "Side Question: {title}",
+      pattern: /^Side\s+Question:\s*(.+)$/i,
+      replace: (_, t) => `侧边提问：${t}`
+    },
+    {
+      key: "Delete side question: {title}",
+      pattern: /^Delete\s+side\s+question:\s*(.+)$/i,
+      replace: (_, t) => `删除侧边提问：${t}`
+    },
+    {
+      key: "Edit side question title: {title}",
+      pattern: /^Edit\s+side\s+question\s+title:\s*(.+)$/i,
+      replace: (_, t) => `编辑侧边提问标题：${t}`
+    },
+    {
+      key: "Couldn't connect to {target}",
+      pattern: /^Couldn['’]t\s+connect\s+to\s+(.+)$/i,
+      replace: (_, t) => `无法连接到 ${t}`
+    },
+    {
+      key: "Couldn't switch accounts: {reason}",
+      pattern: /^Couldn['’]t\s+switch\s+accounts:\s*(.+)$/i,
+      replace: (_, r) => `无法切换账号：${r}`
+    },
+    {
+      key: "Unable to load PDF: {reason}",
+      pattern: /^Unable\s+to\s+load\s+PDF:\s*(.+)$/i,
+      replace: (_, r) => `无法加载 PDF：${r}`
+    },
+    {
+      key: "List resources: {server}",
+      pattern: /^List\s+resources:\s*(.+)$/i,
+      replace: (_, s) => `列出资源：${s}`
+    },
+    {
+      key: "Read resource: {uri}",
+      pattern: /^Read\s+resource:\s*(.+)$/i,
+      replace: (_, u) => `读取资源：${u}`
+    },
+    {
+      key: "Commented on: {target}",
+      pattern: /^Commented\s+on:\s*(.+)$/i,
+      replace: (_, t) => `已评论：${t}`
+    },
+    {
+      key: "SSH config: {path}",
+      pattern: /^SSH\s+config:\s*(.+)$/i,
+      replace: (_, p) => `SSH 配置：${p}`
+    },
+    {
+      key: "Domains: {domains}",
+      pattern: /^Domains:\s*(.+)$/i,
+      replace: (_, d) => `域名：${d}`
+    },
+    {
+      key: "Location: {location}",
+      pattern: /^Location:\s*(.+)$/i,
+      replace: (_, l) => `位置：${l}`
+    },
+    {
+      key: "Payload: {payload}",
+      pattern: /^Payload:\s*(.+)$/i,
+      replace: (_, p) => `载荷：${p}`
+    },
+    {
+      key: "Project ID: {id}",
+      pattern: /^Project\s+ID:\s*(.+)$/i,
+      replace: (_, id) => `项目 ID：${id}`
+    },
+    {
+      key: "Used for: {purpose}",
+      pattern: /^Used\s+for:\s*(.+)$/i,
+      replace: (_, p) => `用途：${p}`
+    },
+    {
+      key: "Invalid embed: {url}",
+      pattern: /^Invalid\s+embed:\s*(.+)$/i,
+      replace: (_, u) => `无效的嵌入内容：${u}`
+    },
+    {
+      key: "Blocked: {reason}",
+      pattern: /^Blocked:\s*(.+)$/i,
+      replace: (_, r) => `已阻止：${r}`
+    },
+    {
+      key: "Your Plan: {plan}",
+      pattern: /^Your\s+Plan:\s*(.+)$/i,
+      replace: (_, p) => `当前套餐：${nestedLabel(p)}`
+    },
+    {
+      key: "Switch environment ({env})",
+      pattern: /^Switch\s+environment\s*\((.+)\)$/i,
+      replace: (_, e) => `切换环境 (${e})`
+    },
+    {
+      key: "System default ({name})",
+      pattern: /^System\s+default\s*\((.+)\)$/i,
+      replace: (_, n) => `系统默认 (${nestedLabel(n)})`
+    },
+    {
+      key: "Cost summary: {summary}",
+      pattern: /^Cost\s+summary:\s*(.+)$/i,
+      replace: (_, s) => `费用摘要：${s}`
+    },
+    {
+      key: "Sort and filter conversations ({count} active)",
+      pattern: /^Sort\s+and\s+filter\s+conversations\s*\((\d+)\s+active\)$/i,
+      replace: (_, n) => `排序与筛选对话（${n} 个活跃）`
+    },
+    {
+      key: "Worker sandbox initialization failed: {reason}",
+      pattern: /^Worker\s+sandbox\s+initialization\s+failed:\s*(.+)$/i,
+      replace: (_, r) => `工作区沙箱初始化失败：${r}`
+    },
+    {
+      key: "Authorization code for {target}",
+      pattern: /^Authorization\s+code\s+for\s+(.+)$/i,
+      replace: (_, t) => `${t} 的授权码`
+    },
+    {
+      key: "Auth code for {target}",
+      pattern: /^Auth\s+code\s+for\s+(.+)$/i,
+      replace: (_, t) => `${t} 的授权码`
+    },
+    {
+      key: "Welcome to {name}!",
+      pattern: /^Welcome\s+to\s+(.+?)!$/i,
+      replace: (_, n) => `欢迎使用 ${n}！`
+    },
+    {
+      key: "Loading {name}...",
+      pattern: /^Loading\s+(.+?)(?:\.\.\.|…)$/i,
+      replace: (_, n) => `正在加载 ${nestedLabel(n)}...`
+    },
+    {
+      key: 'Restarted "{name}".',
+      pattern: /^Restarted\s+"(.+)"\.$/i,
+      replace: (_, n) => `已重启“${n}”。`
+    },
+    {
+      key: 'Started "{name}".',
+      pattern: /^Started\s+"(.+)"\.$/i,
+      replace: (_, n) => `已启动“${n}”。`
+    },
+    {
+      key: 'Enabled "{name}".',
+      pattern: /^Enabled\s+"(.+)"\.$/i,
+      replace: (_, n) => `已启用“${n}”。`
+    },
+    {
+      key: 'Deleted "{name}".',
+      pattern: /^Deleted\s+"(.+)"\.$/i,
+      replace: (_, n) => `已删除“${n}”。`
+    },
+    {
+      key: "Using browser · {detail}",
+      pattern: /^Using\s+browser\s*·\s*(.+)$/i,
+      replace: (_, d) => `使用浏览器 · ${nestedLabel(d)}`
+    },
+    {
+      key: "Running for {duration}",
+      pattern: /^Running\s+for\s+(\d+\s*[hms](?:\s+\d+\s*[hms])*|<1s)$/i,
+      replace: (_, d) => `已运行 ${formatDuration(d)}`
+    },
+    {
+      key: "Up {duration}",
+      pattern: /^Up\s+(\d+\s*[hms](?:\s+\d+\s*[hms])*)$/i,
+      replace: (_, d) => `已运行 ${formatDuration(d)}`
+    },
+    {
+      key: "You have {count} conversations in progress. Updating will cancel them and you'll need to manually restart them.",
+      pattern: /^You\s+have\s+(\d+)\s+conversations?\s+in\s+progress\.\s*Updating\s+will\s+cancel\s+them\s+and\s+you'll\s+need\s+to\s+manually\s+restart\s+them\.?$/i,
+      replace: (_, n) => `您当前有 ${n} 个对话正在进行。更新将取消这些对话，更新后需要手动重新启动。`
+    },
+    {
+      key: "You have {count} conversations in progress. Updating will interrupt them, and they will automatically resume once the update completes.",
+      pattern: /^You\s+have\s+(\d+)\s+conversations?\s+in\s+progress\.\s*Updating\s+will\s+interrupt\s+them,\s+and\s+they\s+will\s+automatically\s+resume\s+once\s+the\s+update\s+completes\.?$/i,
+      replace: (_, n) => `您当前有 ${n} 个对话正在进行。更新将暂时中断它们，并在更新完成后自动恢复。`
+    },
+    {
+      key: "Hide {host} from this list",
+      pattern: /^Hide\s+(.+?)\s+from\s+this\s+list$/i,
+      replace: (_, h) => `从列表中隐藏 ${h}`
+    },
+    {
+      key: "Show {host} in the list again",
+      pattern: /^Show\s+(.+?)\s+in\s+the\s+list\s+again$/i,
+      replace: (_, h) => `在列表中重新显示 ${h}`
     }
   ];
 
@@ -1499,6 +1821,14 @@
   }
   function matchTemplate(key) {
     const hasInlineSlot = key.includes('{0}');
+    for (let i = 0; i < customTemplateRules.length; i++) {
+      const rule = customTemplateRules[i];
+      if (rule.inlineOnly && !hasInlineSlot) continue;
+      if (rule.pattern.test(key)) {
+        lastMatchedKeys = [rule.key];
+        return key.replace(rule.pattern, rule.replace);
+      }
+    }
     for (let i = 0; i < TEMPLATE_RULES.length; i++) {
       const rule = TEMPLATE_RULES[i];
       if (rule.inlineOnly && !hasInlineSlot) continue;
@@ -1561,6 +1891,25 @@
     if (attr) return attributeAllowed(node, attr);
     return eligible(node.parentElement, scan);
   }
+  function elementHasActiveTranslation(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    if (inlineGroups.has(el)) return true;
+    for (const attr of TRANSLATABLE_ATTRS) {
+      if (nodeSlots.get(el)?.has(attr)) return true;
+    }
+    for (let child = el.firstChild; child; child = child.nextSibling) {
+      if (child.nodeType === Node.TEXT_NODE && nodeSlots.get(child)?.has('')) return true;
+    }
+    return false;
+  }
+  function syncElementLocFlag(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return;
+    if (languageMode === 'zh' && elementHasActiveTranslation(el)) {
+      el.dataset.gravityboxLoc = '1';
+    } else {
+      delete el.dataset.gravityboxLoc;
+    }
+  }
   function updateValue(node, attr = '', scan = 0) {
     let slots = nodeSlots.get(node);
     const old = slots?.get(attr);
@@ -1568,7 +1917,7 @@
     const el = attr ? node : node.parentElement;
     if (current === null) {
       if (slots) { slots.delete(attr); if (!slots.size) activeNodes.delete(node); }
-      if (el && el.nodeType === Node.ELEMENT_NODE && !slots?.size) delete el.dataset.gravityboxLoc;
+      syncElementLocFlag(el);
       return;
     }
     if (!translatable(node, attr, scan)) {
@@ -1576,7 +1925,7 @@
          drop the slot so a later re-entry starts from the real text instead of a stale value. */
       if (old && current === old.last) setValue(node, attr, old.original);
       if (slots) { slots.delete(attr); if (!slots.size) activeNodes.delete(node); }
-      if (el && el.nodeType === Node.ELEMENT_NODE && !slots?.size) delete el.dataset.gravityboxLoc;
+      syncElementLocFlag(el);
       return;
     }
     if (old?.group) {
@@ -1604,13 +1953,7 @@
     if (current !== targetVal) setValue(node, attr, targetVal);
     auditRecord(original,targetVal,el,attr ? 'attribute' : inferKind(el),nodeSlots.get(node)?.get(attr)?.matchedKeys??[]);
 
-    if (el && el.nodeType === Node.ELEMENT_NODE) {
-      if (languageMode === 'zh' && next !== original) {
-        el.dataset.gravityboxLoc = '1';
-      } else if (languageMode === 'en' || next === original) {
-        delete el.dataset.gravityboxLoc;
-      }
-    }
+    syncElementLocFlag(el);
   }
   /* `input` / `textarea` are PROTECTED so their typed value is never touched, but their
      translated metadata (placeholder / title / aria-label / data-tooltip) is not user content:
@@ -1683,7 +2026,7 @@
       slots.delete('');
       if (!slots.size) activeNodes.delete(node);
     }
-    delete el.dataset.gravityboxLoc;
+    syncElementLocFlag(el);
   }
 
   /* J04 (conservative): the template is the element's direct children rendered as text runs plus
@@ -1752,8 +2095,7 @@
       for (let k = 0; k < items.length; k++) writeGroupSlot(items[k].node, el, k === 0 ? part : '', items[k].original, groupKeys);
     }
     auditRecord(norm, zh, el, 'template', groupKeys);
-    if (languageMode === 'zh') el.dataset.gravityboxLoc = '1';
-    else delete el.dataset.gravityboxLoc;
+    syncElementLocFlag(el);
     for (let i = inlineElements.length - 1; i >= 0; i--) queue.add(inlineElements[i]);
     return true;
   }
@@ -1797,8 +2139,7 @@
       inlineGroupContainers.add(el);
       for (let k = 0; k < items.length; k++) writeGroupSlot(items[k].node, el, k === 0 ? zh : '', items[k].original, groupKeys);
       auditRecord(norm, zh, el, 'template', groupKeys);
-      if (languageMode === 'zh') el.dataset.gravityboxLoc = '1';
-      else delete el.dataset.gravityboxLoc;
+      syncElementLocFlag(el);
       return true;
     }
     const normPlaceholders = placeholderTokens(norm), zhPlaceholders = placeholderTokens(zh);
@@ -1875,6 +2216,8 @@
   }
   function pruneActiveNodes() {
     lastPruneAt = performance.now();
+    if (settingsPaneCache && !settingsPaneCache.root.isConnected) { settingsPaneCache = null; settingsScope = null; settingsScopeScan = -1; }
+    if (!/^\/customizations(?:\/installed)?$/.test(location.pathname)) { pluginCards = []; pluginCardsAt = -1; }
     for (const ref of ownedProjectMarkers) if (!ref.deref()) ownedProjectMarkers.delete(ref);
     for (const node of activeNodes) if (!node.isConnected) activeNodes.delete(node);
     for (const el of inlineGroupContainers) if (!el.isConnected) inlineGroupContainers.delete(el);
@@ -1961,7 +2304,16 @@
     if (!scanning) checkRoute();
     let hasAdded = false;
     for (const mutation of mutations) {
+      const targetEl = mutation.target.nodeType === Node.ELEMENT_NODE ? mutation.target : mutation.target.parentElement;
+      const inStaticProtected = Boolean(
+        targetEl?.closest?.('[data-gravitybox-protect],.monaco-editor,.xterm') &&
+        !targetEl.closest?.('[data-testid="conversation-row-sidebar"],[data-testid*="model"]')
+      );
       if (mutation.type === 'childList') {
+        if (inStaticProtected) {
+          if (mutation.removedNodes.length && [...mutation.removedNodes].some(n => activeNodes.has(n))) reconcileRequested = true;
+          continue;
+        }
         for (const node of mutation.addedNodes) {
           pending.add(node);
           hasAdded = true;
@@ -1970,6 +2322,7 @@
         if (inlineGroups.has(mutation.target)) refreshInlineGroup(mutation.target, ++scanCount);
         if (!projectSearchDirty && mutation.target.nodeType === Node.ELEMENT_NODE && (matches(mutation.target, '[data-testid="project-header"],[data-testid*="project-selector"]') || mutation.target.closest('[data-testid="project-header"],[data-testid*="project-selector"]'))) projectSearchDirty = true;
       } else if (mutation.type === 'characterData') {
+        if (inStaticProtected && !nodeSlots.has(mutation.target)) continue;
         /* Ignore the engine's own text mutations to avoid self-feedback churn. */
         const slot = nodeSlots.get(mutation.target)?.get('');
         if (slot && getValue(mutation.target, '') === slot.last) continue;
@@ -1990,7 +2343,11 @@
     }
     // Mounts and React text updates in settings are handled before paint. The normal page queue
     // retains its existing incremental scheduling and every queue still obeys flush's budget.
-    const settingsPane = systemSettingsPane();
+    const maybeSettings = settingsPaneCache !== null || (hasAdded && [...pending].some(node => {
+      const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+      return el?.closest?.('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]') || el?.querySelector?.('[role="dialog"],[data-testid="settings-root"],[data-testid="settings-dialog"]');
+    }));
+    const settingsPane = maybeSettings ? systemSettingsPane() : null;
     const settingsRoot = settingsPane ? settingsPaneCache?.root : null;
     const settingsChanged = (settingsRoot || settingsPane) && [...pending].some(node => (settingsRoot || settingsPane).contains(node));
     if ((hasAdded || settingsChanged || (pending.size > 0 && pending.size <= 32 && !reconcileRequested)) && !scanning) {
@@ -2015,7 +2372,7 @@
     update(next) {
       if (!active || !next || next.schema !== 1 || typeof next.version !== 'string' || !next.entries) throw new Error('Invalid dictionary');
       checkRoute();
-      const changed = next.version !== dictionary.version;
+      const changed = next.version !== dictionary.version || JSON.stringify(next.templateRules ?? null) !== JSON.stringify(dictionary?.templateRules ?? null);
       if (!changed) return api.refresh();
       rebuildIndex(next);
       dictionaryToastPending = true;
@@ -2051,16 +2408,12 @@
         for (const [attr, slot] of slots) {
           const targetVal = languageMode === 'en' ? slot.original : slot.last;
           setValue(node, attr, targetVal);
-          const el = attr ? node : node.parentElement;
-          if (el && el.nodeType === Node.ELEMENT_NODE) {
-            if (languageMode === 'en') delete el.dataset.gravityboxLoc;
-            else el.dataset.gravityboxLoc = '1';
-          }
+          syncElementLocFlag(attr ? node : node.parentElement);
         }
       }
       try{globalThis.__gravityboxLanguageChanged?.(languageMode);}catch{}
       try{globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(languageMode);}catch{}
-      return { mode: languageMode, activeNodes: activeNodes.size, groups: 0 };
+      return { mode: languageMode, activeNodes: activeNodes.size, groups: inlineGroupContainers.size };
     },
     getLanguageMode() { return languageMode; },
     setShortcutEnabled(enabled){shortcutEnabled=options.path==='/fixture'&&enabled===true;return{enabled:shortcutEnabled};},
@@ -2126,10 +2479,10 @@
       }maxSliceMs=Math.max(maxSliceMs,performance.now()-collectStarted);return [...rows.values()];
     },
     pluginCatalog(){return pluginCatalog();},
-    ruleCatalog(){return TEMPLATE_RULES.map(r=>r.key);},
+    ruleCatalog(){return [...new Set([...customTemplateRules.map(r=>r.key),...TEMPLATE_RULES.map(r=>r.key)])];},
     capabilities(){return TEMPLATE_CAPABILITIES;},
     startAudit(knownKeys = []) {
-      auditKeys = new Map([...knownKeys,...TEMPLATE_RULES.map(r=>r.key)].filter(k => typeof k === 'string').map(k => [normalize(k),k]));
+      auditKeys = new Map([...knownKeys,...customTemplateRules.map(r=>r.key),...TEMPLATE_RULES.map(r=>r.key)].filter(k => typeof k === 'string').map(k => [normalize(k),k]));
       auditExpires = Date.now() + 15 * 60 * 1000; auditTrail.clear();
       return { expiresAt: new Date(auditExpires).toISOString() };
     },
@@ -2138,7 +2491,7 @@
       if(languageMode==='en'||routeExcluded)return{observations:[],unmatchedCount:0,protectedCount:0,languageMode:'en',intentionalEnglish:languageMode==='en',routeExcluded};
       // Only return catalogued UI strings. Unknown text is counted, never copied out of the page.
       const auditStarted=performance.now();
-      const known = new Map([...knownKeys,...TEMPLATE_RULES.map(r=>r.key)].filter(k => typeof k === 'string').map(k => [normalize(k), k]));
+      const known = new Map([...knownKeys,...customTemplateRules.map(r=>r.key),...TEMPLATE_RULES.map(r=>r.key)].filter(k => typeof k === 'string').map(k => [normalize(k), k]));
       const observations = new Map(); let unmatchedCount = 0; let protectedCount = 0; let visited = 0; let truncated = false;
       const scan = ++scanCount;
       refreshProjectNames(scan);
@@ -2189,7 +2542,7 @@
     state() {
       return {
         active, version: dictionary.version, translatedNodes: activeNodes.size,
-        groups: 0,
+        groups: inlineGroupContainers.size,
         observedRoots: observed.size, pending: waiting.size + settingsWaiting.size + pending.size,
         scanCount, maxSliceMs, lastCollectionTruncated, languageMode,routeExcluded,runtimeId:options.runtimeId,
         reconcileChecks, reconcilePasses, reconcilePending: reconcileQueue ? reconcileQueue.nodes.length - reconcileQueue.index : 0,
@@ -2198,8 +2551,8 @@
         skippedRestores, queueTrimmed, droppedBatches
       };
     },
-    dispose() {
-      try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {}
+    dispose(opts) {
+      if (!opts?.keepHud) { try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {} }
       auditKeys = null; auditTrail.clear();
       active = false; observer.disconnect(); clearTimeout(timer); timer = null; reconcileQueue = null;
       if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
@@ -2227,6 +2580,7 @@
       }
       skippedRestores = skipped;
       for (const ref of ownedProjectMarkers) ref.deref()?.classList.remove('gravitybox-project-name'); ownedProjectMarkers.clear();
+      pluginCards = []; pluginCardsAt = -1; settingsPaneCache = null; settingsScope = null; settingsScopeScan = -1;
       if (globalThis.__GRAVITYBOX_BOOT__ === options) delete globalThis.__GRAVITYBOX_BOOT__;
       activeNodes.clear(); observed.clear(); inlineGroupContainers.clear(); unsupportedInlineGroupSet.clear(); delete globalThis[KEY];
       return { restored, skipped, active: false };
@@ -2313,6 +2667,7 @@
     /* pushState() fires no event of its own; a light poll plus the flush/observer checks above catch
        in-app navigation even when the router swaps the URL before it renders the new view. */
     routeTimer = setInterval(checkRoute, 500);
+    if (typeof routeTimer?.unref === 'function') routeTimer.unref();
   } catch {}
   observe(document); schedule(document);
 })();

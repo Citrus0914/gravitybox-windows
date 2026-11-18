@@ -9,6 +9,15 @@ export function includeDictionaryPath(path) {
   return parts[0] !== 'dict' || !parts.slice(1).some(part => part.startsWith('.'));
 }
 
+/** Excludes Finder metadata and README screenshot previews from the code release digest. */
+export function includeSourceDigestPath(relativePath) {
+  const normalized = relativePath.replaceAll('\\', '/');
+  const parts = normalized.split('/');
+  if (parts.includes('.DS_Store')) return false;
+  if (normalized === 'assets/screenshots' || normalized.startsWith('assets/screenshots/')) return false;
+  return includeDictionaryPath(normalized);
+}
+
 /**
  * 源码摘要：发布门禁的唯一真源。
  * 注意：tools/ 与 test/ 也计入，修改发布脚本本身同样会让旧 .cache/verified-release.json 失效，
@@ -19,7 +28,7 @@ export async function sourceDigest(root) {
   async function walk(relative) {
     for (const entry of await readdir(join(root, relative), { withFileTypes: true })) {
       const path = join(relative, entry.name);
-      if (!includeDictionaryPath(path)) continue;
+      if (!includeSourceDigestPath(path)) continue;
       if (entry.isDirectory()) await walk(path);
       else if (entry.isFile()) files.push(path);
     }
@@ -27,10 +36,21 @@ export async function sourceDigest(root) {
   for (const directory of ['src','runtime','native','tools','test','dict','ui-strings','assets','licenses']) await walk(directory);
   if (await exists(join(root, 'vendor'))) await walk('vendor');
   files.push('package.json','package-lock.json','tsconfig.json','README.md','THIRD_PARTY_NOTICES.md');
-  for (const doc of ['LICENSE', 'SECURITY.md']) {
+  for (const doc of [
+    'LICENSE',
+    'SECURITY.md',
+    'README_EN.md',
+    'CHANGELOG.md',
+    'PROJECT.md',
+    '.env.example',
+  ]) {
     if (await exists(join(root, doc))) files.push(doc);
   }
-  const hash = createHash('sha256'); for (const file of files.sort()) hash.update(file).update('\0').update(await readFile(join(root,file))).update('\0'); return hash.digest('hex');
+  if (await exists(join(root, '.github/workflows'))) {
+    await walk('.github/workflows');
+  }
+  const uniqueFiles = [...new Set(files)].sort();
+  const hash = createHash('sha256'); for (const file of uniqueFiles) hash.update(file).update('\0').update(await readFile(join(root,file))).update('\0'); return hash.digest('hex');
 }
 
 async function exists(path) { try { await stat(path); return true; } catch (error) { if (error?.code === 'ENOENT') return false; throw error; } }

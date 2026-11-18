@@ -7,7 +7,9 @@ import Cocoa
 /// Fractions are 0...1 and are converted to percent only here. Legacy percent fields remain a
 /// fallback for older fixtures, but a legacy weekly value is never relabelled as a 5-hour value.
 enum QuotaPresentation {
-    static let staleResetText = "数据已过期"
+    static var staleResetText: String {
+        L10n.t("quota.stale_data", fallback: "数据已过期")
+    }
     private static let extraStandaloneGeminiRegex = try? NSRegularExpression(
         pattern: "^gemini-[4-9](?:\\.[0-9]+)?-([a-z][a-z0-9]*?)(?:-(?:trial|preview|exp|disabled))?$",
         options: [.caseInsensitive]
@@ -29,10 +31,114 @@ enum QuotaPresentation {
             return ""
         }
         var placeholder: String {
-            if stale && !known { return "已过期" }
-            if unknownReason.contains("失败") { return "读取失败" }
-            if unknownReason.contains("未读取") || unknownReason.contains("尚未") { return "未知" }
-            return "未知"
+            if stale && !known { return L10n.t("quota.stale", fallback: "已过期") }
+            if unknownReason.contains("失败") || unknownReason.localizedCaseInsensitiveContains("fail") {
+                return L10n.t("quota.read_failed", fallback: "读取失败")
+            }
+            return L10n.t("common.unknown", fallback: "未知")
+        }
+    }
+
+    struct GroupWindow {
+        var id: String
+        var period: String
+        var label: String
+        var known: Bool
+        var remaining: Double?
+        var stale: Bool
+        var resetCountdown: String
+        var observedAt: Double?
+        var source: String
+        var unknownReason: String = ""
+
+        var percentage: Int? {
+            guard known, let remaining, remaining.isFinite else { return nil }
+            return Int((min(1, max(0, remaining)) * 100).rounded())
+        }
+
+        var localizedLabel: String {
+            QuotaPresentation.localizedWindowLabel(period: period, label: label)
+        }
+
+        var resetText: String {
+            if percentage != nil && stale {
+                return resetCountdown.isEmpty ? staleResetText : "\(resetCountdown) · \(staleResetText)"
+            }
+            if percentage != nil {
+                return resetCountdown
+            }
+            return ""
+        }
+
+        var placeholder: String {
+            placeholder(availability: "unknown")
+        }
+
+        func placeholder(availability: String) -> String {
+            if stale && percentage == nil { return L10n.t("quota.stale", fallback: "已过期") }
+            if availability == "disabled" { return L10n.t("common.unavailable", fallback: "不可用") }
+            if unknownReason.contains("失败") || unknownReason.localizedCaseInsensitiveContains("fail") {
+                return L10n.t("quota.read_failed", fallback: "读取失败")
+            }
+            return L10n.t("common.unknown", fallback: "未知")
+        }
+
+        func asWindow() -> Window {
+            Window(
+                percentage: percentage,
+                known: percentage != nil,
+                stale: stale,
+                resetCountdown: resetCountdown,
+                observedAt: observedAt,
+                source: source,
+                unknownReason: unknownReason.isEmpty ? L10n.t("quota.unknown_reason.api_no_value", fallback: "接口未返回可用数值") : unknownReason
+            )
+        }
+    }
+
+    struct QuotaGroup {
+        var key: String
+        var displayName: String
+        var summaryLabel: String
+        var brands: [String]
+        var isStandalone: Bool
+        var availability: String
+        var quotaState: String
+        var windows: [GroupWindow]
+        var message: String
+
+        var primaryWindow: GroupWindow? {
+            windows.first(where: { $0.percentage != nil && !$0.stale })
+                ?? windows.first(where: { $0.percentage != nil })
+                ?? windows.first
+        }
+
+        var primaryPercentage: Int? {
+            windows.first(where: { $0.percentage != nil && !$0.stale })?.percentage
+                ?? windows.first(where: { $0.percentage != nil })?.percentage
+        }
+
+        func barTitle(for window: GroupWindow) -> String {
+            let name = displayName.isEmpty ? (summaryLabel.isEmpty ? key : summaryLabel) : displayName
+            if !isStandalone {
+                return "\(name) · \(window.localizedLabel)"
+            }
+            if window.percentage != nil || quotaState == "known" || quotaState == "stale" {
+                switch window.period {
+                case "weekly", "5h", "daily":
+                    return L10n.t("quota.model_with_period", ["model": name, "period": window.localizedLabel], fallback: "\(name) · \(window.localizedLabel)")
+                default:
+                    return name
+                }
+            }
+            return name
+        }
+
+        func iconName(for window: GroupWindow) -> String {
+            if isStandalone { return "sparkles" }
+            if window.period == "weekly" || window.id == "weekly" { return "calendar" }
+            if key == "claude" { return "cpu" }
+            return "bolt.fill"
         }
     }
 
@@ -47,25 +153,37 @@ enum QuotaPresentation {
         var message: String
         var observedAt: Double?
         var source: String?
+        var mode: String = ""
+        var pooledInFamily: String = ""
 
         var percentage: Int? {
             guard ["known", "stale"].contains(quotaState), let remaining, remaining.isFinite else { return nil }
             return Int((min(1, max(0, remaining)) * 100).rounded())
         }
         var stale: Bool { quotaState == "stale" }
+        var isDisplayableStandalone: Bool {
+            mode != "unified"
+                && availability != "disabled"
+                && !(quotaState == "not_reported" && percentage == nil)
+        }
         var periodLabel: String {
             switch period {
-            case "5h": return "5小时"
-            case "weekly": return "每周"
-            case "unspecified": return "周期未知"
+            case "5h": return L10n.t("common.period.5h", fallback: "5 小时")
+            case "weekly": return L10n.t("common.period.weekly", fallback: "每周")
+            case "daily": return L10n.t("common.period.daily", fallback: L10n.shared.isEnglish ? "Daily" : "每日")
+            case "unspecified": return L10n.t("quota.model_quota", fallback: "模型配额")
             default: return ""
             }
         }
         var title: String {
             if (quotaState == "known" || quotaState == "stale") && percentage != nil {
                 switch period {
-                case "weekly": return "\(modelName) · 每周"
-                case "5h": return "\(modelName) · 5 小时"
+                case "weekly":
+                    return L10n.t("quota.model_with_period", ["model": modelName, "period": L10n.t("common.period.weekly", fallback: "每周")], fallback: "\(modelName) · 每周")
+                case "5h":
+                    return L10n.t("quota.model_with_period", ["model": modelName, "period": L10n.t("common.period.5h", fallback: "5 小时")], fallback: "\(modelName) · 5 小时")
+                case "daily":
+                    return L10n.t("quota.model_with_period", ["model": modelName, "period": L10n.t("common.period.daily", fallback: L10n.shared.isEnglish ? "Daily" : "每日")], fallback: "\(modelName) · 每日")
                 case "unspecified": return modelName
                 default: return modelName
                 }
@@ -73,11 +191,11 @@ enum QuotaPresentation {
             return modelName
         }
         var placeholder: String {
-            if stale { return "已过期" }
+            if stale { return L10n.t("quota.stale", fallback: "已过期") }
             switch availability {
-            case "disabled": return "不可用"
-            case "available": return "配额未知"
-            default: return "未知"
+            case "disabled": return L10n.t("common.unavailable", fallback: "不可用")
+            case "available": return L10n.t("quota.unknown", fallback: "配额未知")
+            default: return L10n.t("common.unknown", fallback: "未知")
             }
         }
         var resetText: String {
@@ -86,34 +204,34 @@ enum QuotaPresentation {
                 return base + staleResetText
             }
             if quotaState == "known" {
-                if period == "unspecified" { return resetCountdown.isEmpty ? "周期未知" : resetCountdown }
                 return resetCountdown
             }
             switch availability {
             case "disabled": return ""
-            case "available": return "配额未知"
-            default: return "配额未知"
+            case "available": return L10n.t("quota.unknown", fallback: "配额未知")
+            default: return L10n.t("quota.unknown", fallback: "配额未知")
             }
         }
         var compactText: String {
-            if stale { return "\(modelName) · 数据已过期" }
+            if stale { return L10n.t("quota.model_with_period", ["model": modelName, "period": L10n.t("quota.stale_data", fallback: "数据已过期")], fallback: "\(modelName) · 数据已过期") }
             if quotaState == "known" { return modelName }
             if key != "argon" {
                 switch availability {
-                case "disabled": return "\(modelName) · 不可用"
-                default: return "\(modelName) · 配额未知"
+                case "disabled": return L10n.t("quota.model_with_period", ["model": modelName, "period": L10n.t("common.unavailable", fallback: "不可用")], fallback: "\(modelName) · 不可用")
+                default: return L10n.t("quota.model_with_period", ["model": modelName, "period": L10n.t("quota.unknown", fallback: "配额未知")], fallback: "\(modelName) · 配额未知")
                 }
             }
             switch availability {
-            case "disabled": return "Gemini 4 Argon · 不可用"
-            case "available": return "Gemini 4 Argon · 配额未知"
-            default: return "Gemini 4 Argon · 配额未知"
+            case "disabled": return L10n.t("quota.model_with_period", ["model": "Gemini 4 Argon", "period": L10n.t("common.unavailable", fallback: "不可用")], fallback: "Gemini 4 Argon · 不可用")
+            default: return L10n.t("quota.model_with_period", ["model": "Gemini 4 Argon", "period": L10n.t("quota.unknown", fallback: "配额未知")], fallback: "Gemini 4 Argon · 配额未知")
             }
         }
     }
 
     struct Contract {
         var hasContract = false
+        var quotaGroups: [QuotaGroup] = []
+        var synthesizedGroups: [QuotaGroup] = []
         var gemini5h: Window?
         var geminiWeekly: Window?
         var claude5h: Window?
@@ -129,6 +247,15 @@ enum QuotaPresentation {
         var refreshMessage = ""
         var geminiPrimary: PrimaryWindow { primaryWindow(gemini5h, model: geminiModel) }
         var claudePrimary: PrimaryWindow { primaryWindow(claude5h, model: claudeModel) }
+        var displayGroups: [QuotaGroup] {
+            !quotaGroups.isEmpty ? quotaGroups : synthesizedGroups
+        }
+        var coreGroups: [QuotaGroup] {
+            displayGroups.filter { !$0.isStandalone }
+        }
+        var standaloneGroups: [QuotaGroup] {
+            displayGroups.filter { $0.isStandalone }
+        }
         /// Extra standalone models beyond Argon and Carbon (automatically detected new models/groups)
         var extraStandaloneModels: [Argon] {
             standaloneModels.filter { $0.key != "argon" && $0.key != "carbon" }
@@ -141,15 +268,15 @@ enum QuotaPresentation {
     }
 
     private static func primaryWindow(_ fiveHour: Window?, model: Window?) -> PrimaryWindow {
-        if let fiveHour, fiveHour.known && !fiveHour.stale { return PrimaryWindow(window: fiveHour, label: "5 小时") }
+        if let fiveHour, fiveHour.known && !fiveHour.stale { return PrimaryWindow(window: fiveHour, label: L10n.t("common.period.5h", fallback: "5 小时")) }
         if let model, model.known && (!model.stale || fiveHour?.known != true) {
-            return PrimaryWindow(window: model, label: "模型配额")
+            return PrimaryWindow(window: model, label: L10n.t("quota.model_quota", fallback: "模型配额"))
         }
-        return PrimaryWindow(window: fiveHour, label: "5 小时")
+        return PrimaryWindow(window: fiveHour, label: L10n.t("common.period.5h", fallback: "5 小时"))
     }
 
     static func missingWindowPlaceholder(otherPercentage: Int?) -> String {
-        "未知"
+        L10n.t("common.unknown", fallback: "未知")
     }
 
     // MARK: - Parsing
@@ -191,6 +318,79 @@ enum QuotaPresentation {
                       resetCountdown: countdown, observedAt: nil, source: "legacy", unknownReason: unknownReason)
     }
 
+    static func localizedWindowLabel(period: String, label: String) -> String {
+        switch period.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "5h", "fivehour":
+            return L10n.t("common.period.5h", fallback: "5 小时")
+        case "weekly":
+            return L10n.t("common.period.weekly", fallback: "每周")
+        case "daily":
+            return L10n.t("common.period.daily", fallback: L10n.shared.isEnglish ? "Daily" : "每日")
+        case "unspecified":
+            return L10n.t("quota.model_quota", fallback: "模型配额")
+        default:
+            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch trimmed {
+            case "", "周期未知", "Unknown Cycle", "unspecified":
+                return L10n.t("quota.model_quota", fallback: "模型配额")
+            case "5小时", "5 小时", "5 Hours", "5h":
+                return L10n.t("common.period.5h", fallback: "5 小时")
+            case "每周", "Weekly":
+                return L10n.t("common.period.weekly", fallback: "每周")
+            case "每日", "Daily":
+                return L10n.t("common.period.daily", fallback: L10n.shared.isEnglish ? "Daily" : "每日")
+            case "模型配额", "Model Quota":
+                return L10n.t("quota.model_quota", fallback: "模型配额")
+            default:
+                return trimmed
+            }
+        }
+    }
+
+    static func inferredBrands(for title: String) -> [String] {
+        let lower = title.lowercased()
+        if lower.contains("claude") && (lower.contains("gpt") || lower.contains("openai")) { return ["claude", "openai"] }
+        if lower.contains("gemini") || lower.contains("orchestrator") || lower.contains("argon") || lower.contains("carbon") { return ["gemini"] }
+        if lower.contains("claude") { return ["claude"] }
+        if lower.contains("gpt") || lower.contains("openai") { return ["openai"] }
+        return []
+    }
+
+    private static func normalizeBrands(_ rawBrands: [String], fallbackTitle: String, key: String) -> [String] {
+        var normalized: [String] = []
+        for brand in rawBrands {
+            let lower = brand.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let mapped: [String]
+            switch lower {
+            case "gemini":
+                mapped = ["gemini"]
+            case "claude":
+                mapped = ["claude"]
+            case "gpt", "openai":
+                mapped = ["openai"]
+            default:
+                mapped = inferredBrands(for: lower)
+            }
+            for item in mapped where !normalized.contains(item) {
+                normalized.append(item)
+            }
+        }
+        if !normalized.isEmpty { return normalized }
+        return inferredBrands(for: "\(key) \(fallbackTitle)")
+    }
+
+    private static func shortSummaryLabel(key: String, displayName: String) -> String {
+        switch key.lowercased() {
+        case "gemini": return "Gemini"
+        case "claude": return "Claude/GPT"
+        case "argon": return "Argon"
+        case "carbon": return "Carbon"
+        default:
+            let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? key : trimmed
+        }
+    }
+
     private static func window(_ raw: Any?, unknownReason: String) -> Window? {
         guard let raw = dict(raw) else { return nil }
         let knownFlag = boolValue(raw["known"]) ?? false
@@ -202,7 +402,73 @@ enum QuotaPresentation {
         let percentage = knownFlag ? percent(remaining) : nil
         return Window(percentage: percentage, known: knownFlag && percentage != nil,
                       stale: stale, resetCountdown: countdown, observedAt: observed, source: source,
-                      unknownReason: knownFlag ? "接口未返回可用数值" : unknownReason)
+                      unknownReason: knownFlag ? L10n.t("quota.unknown_reason.api_no_value", fallback: "接口未返回可用数值") : unknownReason)
+    }
+
+    private static func groupWindow(_ raw: [String: Any]) -> GroupWindow {
+        let id = text(raw["id"])
+        let period = text(raw["period"]).isEmpty ? (id.isEmpty ? "unspecified" : id) : text(raw["period"])
+        let label = text(raw["label"])
+        let knownFlag = boolValue(raw["known"]) ?? false
+        let remaining = fraction(raw["remaining"])
+        let stale = boolValue(raw["stale"]) ?? false
+        let countdown = text(raw["resetCountdown"])
+        let observed = number(raw["observedAt"])
+        let source = text(raw["source"])
+        let validKnown = knownFlag && remaining != nil
+        return GroupWindow(
+            id: id.isEmpty ? period : id,
+            period: period,
+            label: label,
+            known: validKnown,
+            remaining: validKnown ? remaining : nil,
+            stale: stale,
+            resetCountdown: countdown,
+            observedAt: observed,
+            source: source,
+            unknownReason: validKnown ? "" : L10n.t("quota.unknown_reason.api_no_value", fallback: "接口未返回可用数值")
+        )
+    }
+
+    private static func quotaGroup(_ raw: [String: Any]) -> QuotaGroup? {
+        let key = text(raw["key"])
+        let rawDisplay = text(raw["displayName"])
+        guard !key.isEmpty || !rawDisplay.isEmpty else { return nil }
+        let resolvedKey = key.isEmpty ? rawDisplay.lowercased() : key
+        let displayName: String
+        if !rawDisplay.isEmpty {
+            displayName = (resolvedKey == "gemini" || resolvedKey == "claude") ? rawDisplay : ModelDisplayName.name(rawDisplay)
+        } else if resolvedKey == "gemini" {
+            displayName = "Gemini"
+        } else if resolvedKey == "claude" {
+            displayName = "Claude/GPT"
+        } else if resolvedKey == "argon" {
+            displayName = "Gemini 4 Argon"
+        } else if resolvedKey == "carbon" {
+            displayName = "Gemini 4 Carbon"
+        } else {
+            displayName = ModelDisplayName.name(resolvedKey)
+        }
+        let rawSummary = text(raw["summaryLabel"])
+        let summaryLabel = rawSummary.isEmpty ? shortSummaryLabel(key: resolvedKey, displayName: displayName) : rawSummary
+        let isStandalone = boolValue(raw["isStandalone"]) ?? (resolvedKey != "gemini" && resolvedKey != "claude")
+        let availability = text(raw["availability"]).isEmpty ? "available" : text(raw["availability"])
+        let quotaState = text(raw["quotaState"]).isEmpty ? "not_reported" : text(raw["quotaState"])
+        let rawBrands = raw["brands"] as? [String] ?? []
+        let brands = normalizeBrands(rawBrands, fallbackTitle: displayName, key: resolvedKey)
+        let rawWindows = (raw["windows"] as? [[String: Any]]) ?? []
+        let windows = rawWindows.map { groupWindow($0) }
+        return QuotaGroup(
+            key: resolvedKey,
+            displayName: displayName,
+            summaryLabel: summaryLabel,
+            brands: brands,
+            isStandalone: isStandalone,
+            availability: availability,
+            quotaState: quotaState,
+            windows: windows,
+            message: text(raw["message"])
+        )
     }
 
     private static func argon(_ raw: [String: Any]?, defaultKey: String = "argon", defaultModelName: String = "Gemini 4 Argon") -> Argon? {
@@ -225,12 +491,85 @@ enum QuotaPresentation {
         return Argon(key: key, modelName: resolvedName, availability: availability, quotaState: state,
                      period: raw["period"] as? String, remaining: remaining,
                      resetCountdown: text(raw["resetCountdown"]), message: text(raw["message"]),
-                     observedAt: number(raw["observedAt"]), source: raw["source"] as? String)
+                     observedAt: number(raw["observedAt"]), source: raw["source"] as? String,
+                     mode: text(raw["mode"]), pooledInFamily: text(raw["pooledInFamily"]))
     }
 
     private static func familyWindow(_ familyWindows: [String: Any]?, family: String, key: String, label: String) -> Window? {
         guard let familyWindows = dict(familyWindows?[family]) else { return nil }
-        return window(familyWindows[key], unknownReason: "接口未返回\(label)窗口")
+        return window(familyWindows[key], unknownReason: L10n.t("quota.unknown_reason.window_missing", ["label": label]))
+    }
+
+    private static func makeGroupWindow(id: String, period: String, label: String, window: Window?) -> GroupWindow {
+        GroupWindow(
+            id: id,
+            period: period,
+            label: label,
+            known: window?.known == true,
+            remaining: window?.percentage.map { Double($0) / 100.0 },
+            stale: window?.stale == true,
+            resetCountdown: window?.resetCountdown ?? "",
+            observedAt: window?.observedAt,
+            source: window?.source ?? "",
+            unknownReason: window?.unknownReason ?? ""
+        )
+    }
+
+    private static func makeCoreGroup(key: String, displayName: String, brands: [String], primary: PrimaryWindow, weekly: Window?) -> QuotaGroup {
+        let isModelPrimary = primary.window != nil && primary.label == L10n.t("quota.model_quota", fallback: "模型配额")
+        let firstWindow = makeGroupWindow(
+            id: isModelPrimary ? "model" : "5h",
+            period: isModelPrimary ? "unspecified" : "5h",
+            label: primary.label,
+            window: primary.window
+        )
+        let weeklyWindow = makeGroupWindow(
+            id: "weekly",
+            period: "weekly",
+            label: L10n.t("common.period.weekly", fallback: "每周"),
+            window: weekly
+        )
+        let windows = [firstWindow, weeklyWindow]
+        let hasKnown = windows.contains { $0.percentage != nil }
+        let allStale = hasKnown && windows.filter { $0.percentage != nil }.allSatisfy { $0.stale }
+        return QuotaGroup(
+            key: key,
+            displayName: displayName,
+            summaryLabel: displayName,
+            brands: brands,
+            isStandalone: false,
+            availability: hasKnown ? "available" : "unknown",
+            quotaState: allStale ? "stale" : (hasKnown ? "known" : "not_reported"),
+            windows: windows,
+            message: ""
+        )
+    }
+
+    private static func makeStandaloneGroup(from item: Argon) -> QuotaGroup {
+        let period = item.period ?? "unspecified"
+        let win = GroupWindow(
+            id: period == "unspecified" ? "model" : period,
+            period: period,
+            label: item.periodLabel.isEmpty ? L10n.t("quota.model_quota", fallback: "模型配额") : item.periodLabel,
+            known: item.percentage != nil,
+            remaining: item.remaining,
+            stale: item.stale,
+            resetCountdown: item.resetCountdown,
+            observedAt: item.observedAt,
+            source: item.source ?? "",
+            unknownReason: item.message
+        )
+        return QuotaGroup(
+            key: item.key,
+            displayName: item.modelName,
+            summaryLabel: shortSummaryLabel(key: item.key, displayName: item.modelName),
+            brands: inferredBrands(for: "\(item.key) \(item.modelName)"),
+            isStandalone: true,
+            availability: item.availability,
+            quotaState: item.quotaState,
+            windows: [win],
+            message: item.message
+        )
     }
 
     /// Parses top-level contract fields, falling back to legacy percent fields without inventing
@@ -238,27 +577,32 @@ enum QuotaPresentation {
     static func contract(_ raw: [String: Any]) -> Contract {
         var result = Contract()
         let nested = dict(raw["quota"])
+        let quotaGroupsRaw = (raw["quotaGroups"] as? [[String: Any]]) ?? nested.flatMap { $0["quotaGroups"] as? [[String: Any]] }
         let familyWindows = dict(raw["familyWindows"]) ?? nested.flatMap { dict($0["familyWindows"]) }
         let modelQuota = dict(raw["familyModelQuota"]) ?? nested.flatMap { dict($0["familyModelQuota"]) }
         let argonRaw = dict(raw["argonStatus"]) ?? nested.flatMap { dict($0["argonStatus"]) }
         let carbonRaw = dict(raw["carbonStatus"]) ?? nested.flatMap { dict($0["carbonStatus"]) }
         let standaloneRaw = (raw["standaloneModels"] as? [[String: Any]]) ?? nested.flatMap { $0["standaloneModels"] as? [[String: Any]] }
-        result.hasContract = familyWindows != nil || argonRaw != nil || carbonRaw != nil || modelQuota != nil
-        result.geminiModel = window(modelQuota?["gemini"], unknownReason: "接口未返回模型配额")
-        result.claudeModel = window(modelQuota?["claude"], unknownReason: "接口未返回模型配额")
+        if let quotaGroupsRaw {
+            result.quotaGroups = quotaGroupsRaw.compactMap { quotaGroup($0) }
+        }
+        result.hasContract = !result.quotaGroups.isEmpty || familyWindows != nil || argonRaw != nil || carbonRaw != nil || modelQuota != nil
+        result.geminiModel = window(modelQuota?["gemini"], unknownReason: L10n.t("quota.unknown_reason.model_missing"))
+        result.claudeModel = window(modelQuota?["claude"], unknownReason: L10n.t("quota.unknown_reason.model_missing"))
         result.quotaWarnings = (raw["quotaWarnings"] as? [String]) ?? nested.flatMap { $0["quotaWarnings"] as? [String] } ?? []
         result.quotaWarningCodes = (raw["quotaWarningCodes"] as? [String]) ?? nested.flatMap { $0["quotaWarningCodes"] as? [String] } ?? []
         let refreshState = dict(raw["refreshState"]) ?? nested.flatMap { dict($0["refreshState"]) }
         if let refreshState {
             result.refreshComplete = boolValue(refreshState["complete"])
-            result.refreshMessage = text(refreshState["message"])
+            let errText = text(refreshState["error"])
+            result.refreshMessage = errText.isEmpty ? text(refreshState["message"]) : errText
         }
 
         if let familyWindows, result.hasContract {
-            result.gemini5h = familyWindow(familyWindows, family: "gemini", key: "fiveHour", label: "Gemini 5 小时")
-            result.geminiWeekly = familyWindow(familyWindows, family: "gemini", key: "weekly", label: "Gemini 每周")
-            result.claude5h = familyWindow(familyWindows, family: "claude", key: "fiveHour", label: "Claude/GPT 5 小时")
-            result.claudeWeekly = familyWindow(familyWindows, family: "claude", key: "weekly", label: "Claude/GPT 每周")
+            result.gemini5h = familyWindow(familyWindows, family: "gemini", key: "fiveHour", label: L10n.t("quota.family.gemini_5h"))
+            result.geminiWeekly = familyWindow(familyWindows, family: "gemini", key: "weekly", label: L10n.t("quota.family.gemini_weekly"))
+            result.claude5h = familyWindow(familyWindows, family: "claude", key: "fiveHour", label: L10n.t("quota.family.claude_5h"))
+            result.claudeWeekly = familyWindow(familyWindows, family: "claude", key: "weekly", label: L10n.t("quota.family.claude_weekly"))
         }
         let rawModels = (raw["models"] as? [[String: Any]]) ?? (nested?["models"] as? [[String: Any]]) ?? []
         if let argonRaw {
@@ -279,19 +623,14 @@ enum QuotaPresentation {
             if allArgonDisabled {
                 result.argon = Argon(key: "argon", modelName: "Gemini 4 Argon", availability: "disabled", quotaState: "not_reported", period: nil,
                                      remaining: nil, resetCountdown: "",
-                                     message: "当前账号无 Gemini 4 Argon 权限",
+                                     message: L10n.t("quota.argon.no_permission"),
                                      observedAt: nil, source: "legacy")
             } else if let legacyArgon {
                 result.argon = Argon(key: "argon", modelName: "Gemini 4 Argon", availability: "unknown", quotaState: "known", period: "unspecified",
                                      remaining: Double(max(0, min(100, legacyArgon))) / 100.0,
                                      resetCountdown: text(raw["argonWeeklyResetCountdown"]),
-                                     message: "旧版接口返回的 Argon 额度未标明周期",
+                                     message: L10n.t("quota.argon.legacy_unspecified"),
                                      observedAt: nil, source: "legacy")
-            } else {
-                result.argon = Argon(key: "argon", modelName: "Gemini 4 Argon", availability: "unknown", quotaState: "not_reported", period: nil,
-                                     remaining: nil, resetCountdown: "",
-                                     message: "本轮接口未返回 Argon 模型记录，无法判断权限或额度 · 不代表无权限",
-                                     observedAt: nil, source: nil)
             }
         }
 
@@ -311,13 +650,13 @@ enum QuotaPresentation {
             if allCarbonDisabled {
                 result.carbon = Argon(key: "carbon", modelName: "Gemini 4 Carbon", availability: "disabled", quotaState: "not_reported", period: nil,
                                       remaining: nil, resetCountdown: "",
-                                      message: "当前账号无 Gemini 4 Carbon 权限（不可用）",
+                                      message: L10n.t("quota.carbon.no_permission"),
                                       observedAt: nil, source: "legacy")
             } else if let legacyCarbon {
                 result.carbon = Argon(key: "carbon", modelName: "Gemini 4 Carbon", availability: "unknown", quotaState: "known", period: "unspecified",
                                       remaining: Double(max(0, min(100, legacyCarbon))) / 100.0,
                                       resetCountdown: text(raw["carbonWeeklyResetCountdown"]),
-                                      message: "Carbon 旧版额度未标明周期（剩余 \(legacyCarbon)%）",
+                                      message: L10n.t("quota.carbon.legacy_unspecified", ["pct": legacyCarbon]),
                                       observedAt: nil, source: "legacy")
             } else if let enabledCarbon = carbonModels.first(where: { ($0["disabled"] as? Bool) != true }) {
                 let ownPct = (enabledCarbon["own_percentage"] as? Int) ?? ((enabledCarbon["percentage_known"] as? Bool == true) ? (enabledCarbon["percentage"] as? Int) : nil)
@@ -326,25 +665,15 @@ enum QuotaPresentation {
                     result.carbon = Argon(key: "carbon", modelName: "Gemini 4 Carbon", availability: "available", quotaState: "known", period: "unspecified",
                                           remaining: Double(max(0, min(100, ownPct))) / 100.0,
                                           resetCountdown: cd,
-                                          message: "Carbon 模型记录存在，已取得未标明窗口的额度（剩余 \(ownPct)%）",
+                                          message: L10n.t("quota.carbon.available_unspecified", ["pct": ownPct]),
                                           observedAt: nil, source: "legacy")
                 } else {
                     result.carbon = Argon(key: "carbon", modelName: "Gemini 4 Carbon", availability: "available", quotaState: "not_reported", period: nil,
                                           remaining: nil, resetCountdown: "",
-                                          message: "存在 Carbon 模型记录，但本轮未返回可用配额数值",
+                                          message: L10n.t("quota.carbon.available_no_value"),
                                           observedAt: nil, source: "legacy")
                 }
-            } else {
-                result.carbon = Argon(key: "carbon", modelName: "Gemini 4 Carbon", availability: "unknown", quotaState: "not_reported", period: nil,
-                                      remaining: nil, resetCountdown: "",
-                                      message: "本轮接口未返回 Carbon 模型记录，无法判断权限或额度 · 不代表无权限",
-                                      observedAt: nil, source: nil)
             }
-        }
-
-        if result.carbon == nil {
-            result.carbon = Argon(key: "carbon", modelName: "Gemini 4 Carbon", availability: "unknown", quotaState: "not_reported", period: nil,
-                remaining: nil, resetCountdown: "", message: "本轮未返回 Carbon 配额或权限", observedAt: nil, source: nil)
         }
 
         if let standaloneRaw, !standaloneRaw.isEmpty {
@@ -383,13 +712,13 @@ enum QuotaPresentation {
                 let cd = text(m["reset_countdown"])
                 if isDisabled {
                     list.append(Argon(key: baseKey, modelName: title, availability: "disabled", quotaState: "not_reported", period: nil,
-                                      remaining: nil, resetCountdown: "", message: "当前账号无 \(title) 权限（不可用）", observedAt: nil, source: "legacy"))
+                                      remaining: nil, resetCountdown: "", message: L10n.t("quota.standalone.no_permission", ["title": title], fallback: "当前账号无 \(title) 权限（不可用）"), observedAt: nil, source: "legacy"))
                 } else if let pct {
                     list.append(Argon(key: baseKey, modelName: title, availability: "available", quotaState: "known", period: "unspecified",
-                                      remaining: Double(max(0, min(100, pct))) / 100.0, resetCountdown: cd, message: "\(title) 配额已取得", observedAt: nil, source: "legacy"))
+                                      remaining: Double(max(0, min(100, pct))) / 100.0, resetCountdown: cd, message: L10n.t("quota.standalone.acquired", ["title": title], fallback: "\(title) 配额已取得"), observedAt: nil, source: "legacy"))
                 } else {
                     list.append(Argon(key: baseKey, modelName: title, availability: "available", quotaState: "not_reported", period: nil,
-                                      remaining: nil, resetCountdown: "", message: "存在 \(title) 模型记录，但本轮未返回可用配额数值", observedAt: nil, source: "legacy"))
+                                      remaining: nil, resetCountdown: "", message: L10n.t("quota.standalone.available_no_value", ["title": title], fallback: "存在 \(title) 模型记录，但本轮未返回可用配额数值"), observedAt: nil, source: "legacy"))
                 }
             }
             result.standaloneModels = list
@@ -402,28 +731,95 @@ enum QuotaPresentation {
             let gWeekRaw = (raw["geminiWeeklyRemaining"] as? Int) ?? (raw["weeklyRemaining"] as? Int)
             let c5Raw = raw["claudeFiveHourRemaining"] as? Int
             let cWeekRaw = raw["claudeWeeklyRemaining"] as? Int
-            let sentinel = g5Countdown.contains("以周限额为准")
+            let fiveHourMode = (raw["geminiFiveHourPeriodMode"] as? String ?? "").lowercased()
+            let sentinel = fiveHourMode == "weekly_only"
+                || g5Countdown.contains("以周限额为准")
+                || g5Countdown.localizedCaseInsensitiveContains("weekly limit")
             if sentinel {
                 result.gemini5h = Window(percentage: nil, known: false, stale: false, resetCountdown: "",
                                          observedAt: nil, source: "legacy",
-                                         unknownReason: "仅返回每周窗口，5 小时窗口未返回")
+                                         unknownReason: L10n.t("quota.unknown_reason.weekly_only", fallback: "仅返回每周窗口，5 小时窗口未返回"))
             } else if let g5Raw {
                 let cd = g5Countdown.isEmpty && gWeekRaw == nil ? text(raw["geminiResetCountdown"]) : g5Countdown
-                result.gemini5h = fallbackWindow(percentValue: g5Raw, countdown: cd, unknownReason: "接口未返回 5 小时窗口")
+                result.gemini5h = fallbackWindow(percentValue: g5Raw, countdown: cd, unknownReason: L10n.t("quota.unknown_reason.5h_missing", fallback: "接口未返回 5 小时窗口"))
             }
             if let gWeekRaw {
                 let cd = gWeekCountdown.isEmpty && g5Raw == nil ? text(raw["geminiResetCountdown"]) : gWeekCountdown
-                result.geminiWeekly = fallbackWindow(percentValue: gWeekRaw, countdown: cd, unknownReason: "接口未返回每周窗口")
+                result.geminiWeekly = fallbackWindow(percentValue: gWeekRaw, countdown: cd, unknownReason: L10n.t("quota.unknown_reason.weekly_missing", fallback: "接口未返回每周窗口"))
             }
             if let c5Raw {
                 result.claude5h = fallbackWindow(percentValue: c5Raw, countdown: text(raw["claudeFiveHourResetCountdown"]),
-                                                unknownReason: "接口未返回 Claude/GPT 5 小时窗口")
+                                                unknownReason: L10n.t("quota.unknown_reason.claude_5h_missing", fallback: "接口未返回 Claude/GPT 5 小时窗口"))
             }
             if let cWeekRaw {
                 let cd = text(raw["claudeWeeklyResetCountdown"]).isEmpty && c5Raw == nil
                     ? text(raw["claudeResetCountdown"]) : text(raw["claudeWeeklyResetCountdown"])
-                result.claudeWeekly = fallbackWindow(percentValue: cWeekRaw, countdown: cd, unknownReason: "接口未返回 Claude/GPT 每周窗口")
+                result.claudeWeekly = fallbackWindow(percentValue: cWeekRaw, countdown: cd, unknownReason: L10n.t("quota.unknown_reason.claude_weekly_missing", fallback: "接口未返回 Claude/GPT 每周窗口"))
             }
+        }
+
+        // Backfill Window / Argon fields when a payload supplies quotaGroups without legacy familyWindows
+        if !result.quotaGroups.isEmpty {
+            if let gGroup = result.quotaGroups.first(where: { $0.key.lowercased() == "gemini" }) {
+                if result.gemini5h == nil, let w5 = gGroup.windows.first(where: { $0.period == "5h" || $0.period == "fiveHour" || $0.id == "5h" || $0.id == "fiveHour" || $0.id == "five_hour" }) {
+                    result.gemini5h = w5.asWindow()
+                }
+                if result.geminiWeekly == nil, let ww = gGroup.windows.first(where: { $0.period == "weekly" || $0.id == "weekly" }) {
+                    result.geminiWeekly = ww.asWindow()
+                }
+                if result.geminiModel == nil, let wm = gGroup.windows.first(where: { $0.period == "unspecified" || $0.id == "model" || $0.id == "model_quota" }) {
+                    result.geminiModel = wm.asWindow()
+                }
+            }
+            if let cGroup = result.quotaGroups.first(where: { let k = $0.key.lowercased(); return k == "claude" || k == "claude_gpt" }) {
+                if result.claude5h == nil, let w5 = cGroup.windows.first(where: { $0.period == "5h" || $0.period == "fiveHour" || $0.id == "5h" || $0.id == "fiveHour" || $0.id == "five_hour" }) {
+                    result.claude5h = w5.asWindow()
+                }
+                if result.claudeWeekly == nil, let ww = cGroup.windows.first(where: { $0.period == "weekly" || $0.id == "weekly" }) {
+                    result.claudeWeekly = ww.asWindow()
+                }
+                if result.claudeModel == nil, let wm = cGroup.windows.first(where: { $0.period == "unspecified" || $0.id == "model" || $0.id == "model_quota" }) {
+                    result.claudeModel = wm.asWindow()
+                }
+            }
+            if result.standaloneModels.isEmpty {
+                let standalone = result.quotaGroups.filter { $0.isStandalone }.map { grp -> Argon in
+                    let w = grp.primaryWindow ?? grp.windows.first
+                    return Argon(
+                        key: grp.key,
+                        modelName: grp.displayName,
+                        availability: grp.availability,
+                        quotaState: grp.quotaState,
+                        period: w?.period,
+                        remaining: w?.remaining,
+                        resetCountdown: w?.resetCountdown ?? "",
+                        message: grp.message,
+                        observedAt: w?.observedAt,
+                        source: w?.source,
+                        mode: "standalone",
+                        pooledInFamily: ""
+                    )
+                }
+                result.standaloneModels = standalone
+                if result.argon == nil { result.argon = standalone.first(where: { $0.key == "argon" }) }
+                if result.carbon == nil { result.carbon = standalone.first(where: { $0.key == "carbon" }) }
+            }
+        } else {
+            var groups: [QuotaGroup] = [
+                makeCoreGroup(key: "gemini", displayName: "Gemini", brands: ["gemini"], primary: result.geminiPrimary, weekly: result.geminiWeekly),
+                makeCoreGroup(key: "claude", displayName: "Claude/GPT", brands: ["claude", "openai"], primary: result.claudePrimary, weekly: result.claudeWeekly)
+            ]
+            var seenStandaloneKeys = Set<String>()
+            var candidates = result.standaloneModels
+            if let a = result.argon, !candidates.contains(where: { $0.key == a.key }) { candidates.insert(a, at: 0) }
+            if let c = result.carbon, !candidates.contains(where: { $0.key == c.key }) { candidates.append(c) }
+            for item in candidates {
+                let k = item.key.lowercased()
+                guard !k.isEmpty, !seenStandaloneKeys.contains(k), item.isDisplayableStandalone else { continue }
+                seenStandaloneKeys.insert(k)
+                groups.append(makeStandaloneGroup(from: item))
+            }
+            result.synthesizedGroups = groups
         }
         return result
     }
@@ -434,30 +830,322 @@ enum QuotaPresentation {
     /// but unknown/stale windows are labelled instead of fabricated.
     static func menuQuotaText(_ raw: [String: Any]) -> String {
         let contract = contract(raw)
+        let unknownTxt = L10n.t("common.unknown", fallback: "未知")
         func part(_ name: String, _ window: Window?) -> String {
-            guard let window else { return "\(name) 未知" }
+            guard let window else { return "\(name) \(unknownTxt)" }
             if let percentage = window.percentage {
-                return "\(name) \(percentage)%" + (window.stale ? " · 数据已过期" : "")
+                return "\(name) \(percentage)%" + (window.stale ? " · \(staleResetText)" : "")
             }
-            return "\(name) 未知"
+            return "\(name) \(unknownTxt)"
         }
-        var line = "Gemini " + part(contract.geminiPrimary.label, contract.geminiPrimary.window) + " · " + part("每周", contract.geminiWeekly)
-        if contract.quotaWarnings.isEmpty && contract.refreshComplete == false { line += " · 部分刷新" }
+        let weeklyShort = L10n.t("quota.short.weekly", fallback: "每周")
+        var line = L10n.t("quota.menu_line.prefix", [
+            "primary": part(contract.geminiPrimary.label, contract.geminiPrimary.window),
+            "weekly": part(weeklyShort, contract.geminiWeekly)
+        ], fallback: "Gemini " + part(contract.geminiPrimary.label, contract.geminiPrimary.window) + " · " + part(weeklyShort, contract.geminiWeekly))
+        if contract.quotaWarnings.isEmpty && contract.refreshComplete == false {
+            line += L10n.t("quota.menu_line.partial", fallback: " · 部分刷新")
+        }
         return line
     }
 
     static func menuAccountSummary(_ raw: [String:Any]) -> String {
         let value = contract(raw)
-        func part(_ name: String, _ primary: PrimaryWindow, _ weekly: Window?) -> String {
-            let first = primary.window?.known == true ? primary.window : nil
-            guard let window = first ?? weekly else { return "\(name) 未知" }
-            if window.stale { return "\(name) 已过期" }
-            guard let pct = window.percentage else { return "\(name) 未知" }
-            return "\(name) \(first == nil ? "每周" : primary.label.replacingOccurrences(of: " ", with: "")) \(pct == 0 ? "已耗尽" : "\(pct)%")"
+        let unknownTxt = L10n.t("common.unknown", fallback: "未知")
+        let staleTxt = L10n.t("quota.stale", fallback: "已过期")
+        let exhaustedTxt = L10n.t("quota.exhausted", fallback: "已耗尽")
+        let fiveHourLabel = L10n.t("common.period.5h", fallback: "5 小时")
+        var lines: [String] = []
+        for group in value.displayGroups {
+            let name = group.summaryLabel.isEmpty ? group.displayName : group.summaryLabel
+            if !group.isStandalone {
+                guard let win = group.windows.first(where: { $0.percentage != nil }) else {
+                    lines.append("\(name) \(unknownTxt)")
+                    continue
+                }
+                if win.stale {
+                    lines.append("\(name) \(staleTxt)")
+                    continue
+                }
+                guard let pct = win.percentage else {
+                    lines.append("\(name) \(unknownTxt)")
+                    continue
+                }
+                let locLabel = win.localizedLabel
+                let periodShort = locLabel == fiveHourLabel
+                    ? L10n.t("quota.short.5h", fallback: "5小时")
+                    : locLabel.replacingOccurrences(of: " ", with: "")
+                lines.append("\(name) \(periodShort) \(pct == 0 ? exhaustedTxt : "\(pct)%")")
+            } else if let win = group.primaryWindow, let pct = win.percentage {
+                if win.stale {
+                    lines.append("\(name) \(staleTxt)")
+                } else {
+                    lines.append("\(name) \(pct == 0 ? exhaustedTxt : "\(pct)%")")
+                }
+            }
         }
-        let g = part("Gemini", value.geminiPrimary, value.geminiWeekly)
-        let c = part("Claude/GPT", value.claudePrimary, value.claudeWeekly)
-        return [g,c].joined(separator:"\n")
+        return lines.joined(separator: "\n")
+    }
+
+    struct MonitoredScopeChoice: Equatable {
+        var title: String
+        var key: String
+        var isSeparator: Bool = false
+
+        static var separator: MonitoredScopeChoice {
+            MonitoredScopeChoice(title: "", key: "", isSeparator: true)
+        }
+    }
+
+    private struct ActiveScopeProfile {
+        var isUltra: Bool
+        var isPro: Bool
+        var isFree: Bool
+        var standalones: [QuotaGroup]
+        var geminiStandalones: [QuotaGroup]
+        var geminiAvailable: Bool
+        var claudeAvailable: Bool
+
+        var hasStandalonePool: Bool { !standalones.isEmpty }
+        var hasGeminiStandalonePool: Bool { !geminiStandalones.isEmpty }
+        var hasOnlyArgonStandalone: Bool {
+            geminiStandalones.count == 1 && geminiStandalones[0].key.lowercased() == "argon"
+        }
+    }
+
+    private static func activeScopeProfile(_ activeAccount: [String: Any]?) -> ActiveScopeProfile {
+        let tierRaw = (
+            (activeAccount?["subscription_tier"] as? String)
+                ?? (activeAccount?["activeTier"] as? String)
+                ?? (dict(activeAccount?["quota"])?["subscription_tier"] as? String)
+                ?? ""
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let upper = tierRaw.uppercased()
+        let isUltra = upper.contains("ULTRA") || upper.contains("ENTERPRISE")
+        let isPro = !isUltra && (upper.contains("PRO") || upper.contains("AI PREMIUM") || upper.contains("TEAM") || upper.contains("BUSINESS") || upper.contains("WORKSPACE") || upper.contains("PLUS"))
+        let isFree = !isUltra && !isPro && (upper.contains("FREE") || upper.contains("STARTER") || upper.contains("TRIAL"))
+
+        guard let activeAccount else {
+            return ActiveScopeProfile(
+                isUltra: false,
+                isPro: false,
+                isFree: false,
+                standalones: [],
+                geminiStandalones: [],
+                geminiAvailable: true,
+                claudeAvailable: true
+            )
+        }
+
+        let parsed = contract(activeAccount)
+        let standalones = parsed.standaloneGroups.filter { $0.availability != "disabled" }
+        let geminiStandalones = standalones.filter {
+            $0.brands.contains("gemini") || inferredBrands(for: "\($0.key) \($0.displayName)").contains("gemini")
+        }
+        let core = parsed.coreGroups
+        let geminiAvailable = core.isEmpty || core.contains { $0.key.lowercased() == "gemini" && $0.availability != "disabled" }
+        let claudeAvailable = core.isEmpty || core.contains {
+            let k = $0.key.lowercased()
+            return (k == "claude" || k == "claude_gpt") && $0.availability != "disabled"
+        }
+
+        return ActiveScopeProfile(
+            isUltra: isUltra,
+            isPro: isPro,
+            isFree: isFree,
+            standalones: standalones,
+            geminiStandalones: geminiStandalones,
+            geminiAvailable: geminiAvailable,
+            claudeAvailable: claudeAvailable
+        )
+    }
+
+    private static func normalizeMonitoredAlias(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        switch lower {
+        case "", "all", "全部可用模型", "all available models", "全部主力模型", "all core models":
+            return "all"
+        case "gemini_all", "all gemini models", "gemini 全系模型", "gemini 全系（含 argon）", "all gemini (incl. argon)":
+            return "gemini_all"
+        case "gemini", "gemini（基础池）", "gemini (base pool)":
+            return "gemini"
+        case "claude", "3p", "claude/gpt":
+            return "claude"
+        case "argon", "gemini 4 argon", "gemini-4-argon":
+            return "argon"
+        case "carbon", "gemini 4 carbon", "gemini-4-carbon":
+            return "carbon"
+        default:
+            return trimmed
+        }
+    }
+
+    static func monitoredScopeChoices(for activeAccount: [String: Any]?) -> [MonitoredScopeChoice] {
+        let profile = activeScopeProfile(activeAccount)
+        var choices: [MonitoredScopeChoice] = []
+
+        let allTitle = profile.hasStandalonePool
+            ? L10n.t("accounts.smart_switch.monitored.all_core", fallback: "全部主力模型")
+            : L10n.t("accounts.smart_switch.monitored.all_available", fallback: "全部可用模型")
+        choices.append(MonitoredScopeChoice(title: allTitle, key: "all"))
+
+        if profile.hasGeminiStandalonePool {
+            let geminiAllTitle = profile.hasOnlyArgonStandalone
+                ? L10n.t("accounts.smart_switch.monitored.gemini_all_argon", fallback: "Gemini 全系（含 Argon）")
+                : L10n.t("accounts.smart_switch.monitored.gemini_all", fallback: "Gemini 全系模型")
+            choices.append(MonitoredScopeChoice(title: geminiAllTitle, key: "gemini_all"))
+        }
+
+        choices.append(.separator)
+
+        if profile.geminiAvailable {
+            let geminiTitle = profile.hasGeminiStandalonePool
+                ? L10n.t("accounts.smart_switch.monitored.gemini_base", fallback: "Gemini（基础池）")
+                : "Gemini"
+            choices.append(MonitoredScopeChoice(title: geminiTitle, key: "gemini"))
+        }
+        if profile.claudeAvailable {
+            choices.append(MonitoredScopeChoice(title: "Claude/GPT", key: "claude"))
+        }
+
+        var seenKeys = Set(choices.filter { !$0.isSeparator }.map { $0.key.lowercased() })
+        var seenTitles = Set(choices.filter { !$0.isSeparator }.map { $0.title.lowercased() })
+        for group in profile.standalones {
+            let displayTitle = (!group.displayName.isEmpty ? group.displayName : group.key).trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawKey = (!group.key.isEmpty ? group.key : displayTitle).trimmingCharacters(in: .whitespacesAndNewlines)
+            let keyLower = rawKey.lowercased()
+            let titleLower = displayTitle.lowercased()
+            guard !keyLower.isEmpty, !seenKeys.contains(keyLower), !seenTitles.contains(titleLower) else { continue }
+            seenKeys.insert(keyLower)
+            seenTitles.insert(titleLower)
+            choices.append(MonitoredScopeChoice(title: displayTitle, key: rawKey))
+        }
+        return choices
+    }
+
+    static func effectiveMonitoredModelKey(_ raw: String, activeAccount: [String: Any]?) -> String {
+        let normalized = normalizeMonitoredAlias(raw)
+        let normLower = normalized.lowercased()
+        let choices = monitoredScopeChoices(for: activeAccount).filter { !$0.isSeparator }
+
+        if let matched = choices.first(where: { $0.key.lowercased() == normLower || $0.title.lowercased() == normLower }) {
+            return matched.key
+        }
+
+        if normLower == "gemini_all" || inferredBrands(for: normLower).contains("gemini") {
+            if let activeAccount {
+                let parsed = contract(activeAccount)
+                if normLower == "argon", parsed.argon?.mode == "unified", parsed.argon?.pooledInFamily == "claude",
+                   choices.contains(where: { $0.key == "claude" }) {
+                    return "claude"
+                }
+                if normLower == "carbon", parsed.carbon?.mode == "unified", parsed.carbon?.pooledInFamily == "claude",
+                   choices.contains(where: { $0.key == "claude" }) {
+                    return "claude"
+                }
+            }
+            if choices.contains(where: { $0.key == "gemini" }) {
+                return "gemini"
+            }
+        }
+
+        if (normLower.contains("claude") || normLower.contains("gpt") || normLower.contains("openai") || normLower.contains("anthropic")),
+           choices.contains(where: { $0.key == "claude" }) {
+            return "claude"
+        }
+
+        return choices.first?.key ?? "all"
+    }
+
+    static func monitoredScopeSubtitle(for selectedKey: String, activeAccount: [String: Any]?) -> String {
+        let profile = activeScopeProfile(activeAccount)
+        let effective = effectiveMonitoredModelKey(selectedKey, activeAccount: activeAccount)
+        switch effective.lowercased() {
+        case "all":
+            if profile.hasStandalonePool {
+                if profile.hasOnlyArgonStandalone || profile.isPro {
+                    return L10n.t("policy.row.monitored.sub.pro_all", fallback: "监测 Gemini 与 Claude/GPT 主力池，不受 Argon 独立周限额影响")
+                }
+                return L10n.t("policy.row.monitored.sub.dyn_all", fallback: "监测核心主力配额池，不受独立子模型单项限额影响")
+            }
+            if profile.isUltra {
+                return L10n.t("policy.row.monitored.sub.ultra_all", fallback: "同时监测 Gemini（已含 Argon / Carbon）与 Claude/GPT 配额池")
+            }
+            if profile.isFree {
+                return L10n.t("policy.row.monitored.sub.free_all", fallback: "同时监测当前免费账号可用的基础 Gemini 与 Claude/GPT 配额池")
+            }
+            return L10n.t("policy.row.monitored.sub.generic_all", fallback: "同时监测当前账号可用的 Gemini 与 Claude/GPT 配额池")
+        case "gemini_all":
+            if profile.hasOnlyArgonStandalone || (profile.isPro && profile.geminiStandalones.contains(where: { $0.key.lowercased() == "argon" })) {
+                return L10n.t("policy.row.monitored.sub.pro_gemini_all", fallback: "同时盯住基础 Gemini 与独立 Argon 周配额，任一偏低即提示切换")
+            }
+            return L10n.t("policy.row.monitored.sub.dyn_gemini_all", fallback: "同时盯住基础 Gemini 与独立 Gemini 子模型配额，任一偏低即提示切换")
+        case "gemini":
+            if profile.hasGeminiStandalonePool {
+                if profile.hasOnlyArgonStandalone || profile.isPro {
+                    return L10n.t("policy.row.monitored.sub.pro_gemini_base", fallback: "仅监测基础 Gemini 共享池，Pro 套餐下不含独立计费的 Argon")
+                }
+                return L10n.t("policy.row.monitored.sub.dyn_gemini_base", fallback: "仅监测基础 Gemini 共享池，不含独立计费的子模型配额")
+            }
+            if profile.isUltra {
+                return L10n.t("policy.row.monitored.sub.ultra_gemini", fallback: "Ultra 套餐已将 Argon 与 Carbon 并入此共享池，一并监测")
+            }
+            if profile.isFree {
+                return L10n.t("policy.row.monitored.sub.free_gemini", fallback: "仅监测免费套餐可用的基础 Gemini 配额池")
+            }
+            return L10n.t("policy.row.monitored.sub.generic_gemini", fallback: "仅监测当前账号的 Gemini 共享配额池")
+        case "claude":
+            return L10n.t("policy.row.monitored.sub.claude", fallback: "仅监测 Claude 与 GPT 模型共享配额池")
+        case "argon":
+            if profile.isPro {
+                return L10n.t("policy.row.monitored.sub.pro_argon", fallback: "仅监测 Pro 套餐独立的 Gemini 4 Argon 每周配额")
+            }
+            return L10n.t("policy.row.monitored.sub.standalone", ["model": "Gemini 4 Argon"], fallback: "仅监测当前账号独立的 Gemini 4 Argon 配额池")
+        default:
+            let modelTitle = monitoredModelDisplayName(effective, activeAccount: activeAccount, accounts: activeAccount.map { [$0] } ?? [])
+            return L10n.t("policy.row.monitored.sub.standalone", ["model": modelTitle], fallback: "仅监测当前账号独立的 \(modelTitle) 配额池")
+        }
+    }
+
+    static func monitoredModelDisplayName(_ raw: String, activeAccount: [String: Any]?, accounts: [[String: Any]] = []) -> String {
+        if let activeAccount {
+            let effective = effectiveMonitoredModelKey(raw, activeAccount: activeAccount)
+            let choices = monitoredScopeChoices(for: activeAccount).filter { !$0.isSeparator }
+            if let matched = choices.first(where: { $0.key.lowercased() == effective.lowercased() }) {
+                return matched.title
+            }
+            return monitoredModelDisplayName(effective, accounts: accounts)
+        }
+        return monitoredModelDisplayName(raw, accounts: accounts)
+    }
+
+    static func monitoredModelDisplayName(_ raw: String, accounts: [[String: Any]]) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch trimmed.lowercased() {
+        case "", "all":
+            return L10n.t("accounts.smart_switch.monitored.all_available", fallback: "全部可用模型")
+        case "gemini_all":
+            return L10n.t("accounts.smart_switch.monitored.gemini_all", fallback: "Gemini 全系模型")
+        case "gemini":
+            return "Gemini"
+        case "claude", "3p", "claude/gpt":
+            return "Claude/GPT"
+        case "argon", "gemini 4 argon":
+            return "Gemini 4 Argon"
+        case "carbon", "gemini 4 carbon":
+            return "Gemini 4 Carbon"
+        default:
+            let lower = trimmed.lowercased()
+            for acc in accounts {
+                if let matched = contract(acc).standaloneGroups.first(where: {
+                    $0.key.lowercased() == lower || $0.displayName.lowercased() == lower
+                }) {
+                    return matched.displayName
+                }
+            }
+            return ModelDisplayName.name(trimmed)
+        }
     }
 
     static func warningSummary(_ contract: Contract, excluding: [String] = []) -> String {
@@ -472,17 +1160,23 @@ enum QuotaPresentation {
                 return warning
             }.filter { !excluding.contains($0) && seen.insert($0).inserted }
             if !messages.isEmpty {
-                return messages.prefix(2).joined(separator: "；") + (messages.count > 2 ? "；另有 \(messages.count - 2) 项配额提示" : "")
+                let sep = L10n.shared.isEnglish ? "; " : "；"
+                let more = messages.count > 2 ? L10n.t("quota.warning.more_suffix", ["count": messages.count - 2], fallback: "；另有 \(messages.count - 2) 项配额提示") : ""
+                return messages.prefix(2).joined(separator: sep) + more
             }
             if !excluding.isEmpty { return "" }
         }
-        if contract.refreshComplete == false { return "本轮配额刷新部分完成；未返回的窗口等待下次刷新。" }
+        if contract.refreshComplete == false { return L10n.t("quota.warning.partial_refresh", fallback: "本轮配额刷新部分完成；未返回的窗口等待下次刷新。") }
         return ""
     }
 
     static func fingerprint(_ raw: [String: Any]) -> String {
-        let fields = ["familyWindows", "familyModelQuota", "argonStatus", "carbonStatus", "standaloneModels", "refreshState", "quotaWarnings"].reduce(into: [String: Any]()) {
+        let nested = dict(raw["quota"])
+        var fields = ["quotaGroups", "familyWindows", "familyModelQuota", "argonStatus", "carbonStatus", "standaloneModels", "refreshState", "quotaWarnings", "subscription_tier"].reduce(into: [String: Any]()) {
             if let value = raw[$1] { $0[$1] = value }
+        }
+        if fields["quotaGroups"] == nil, let qGroups = nested?["quotaGroups"] {
+            fields["quotaGroups"] = qGroups
         }
         guard let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
               let value = String(data: data, encoding: .utf8) else { return "" }

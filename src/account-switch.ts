@@ -10,6 +10,7 @@ import { AccountsManager, SystemKeychainAdapter, syncAccountToKeychain, type Key
 import { ProtobufWriter as Writer } from './protobuf.js';
 import { replaceTopicRow } from './account-state.js';
 export { replaceTopicRow } from './account-state.js';
+import { bt } from './i18n.js';
 
 const run = promisify(execFile);
 const TOKEN = 'antigravityUnifiedStateSync.oauthToken';
@@ -78,14 +79,14 @@ export class DatabaseTransaction {
       }
     });
   }
-  private fail() { this.failed = true; this.pending?.reject(new Error('登录数据库操作失败，未提交数据库事务')); this.pending = undefined; }
+  private fail() { this.failed = true; this.pending?.reject(new Error(bt('switch.err.db_tx_failed'))); this.pending = undefined; }
   async sql(sql: string): Promise<string> {
-    if (this.failed) throw new Error('登录数据库连接已关闭');
+    if (this.failed) throw new Error(bt('switch.err.db_closed'));
     const marker = `GB_${randomUUID()}`;
     const response = new Promise<string>((resolve, reject) => { this.pending = { marker, resolve, reject }; });
     this.child.stdin.write(`${sql}\n.print ${marker}\n`);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    try { return await Promise.race([response, new Promise<never>((_, reject) => { timer = setTimeout(() => { this.child.kill(); reject(new Error('登录数据库繁忙，请稍后重试')); }, 6000); })]); }
+    try { return await Promise.race([response, new Promise<never>((_, reject) => { timer = setTimeout(() => { this.child.kill(); reject(new Error(bt('switch.err.db_busy'))); }, 6000); })]); }
     finally { clearTimeout(timer); }
   }
   async begin() { await this.sql('.timeout 3000\n.mode json\nBEGIN IMMEDIATE;'); }
@@ -197,27 +198,27 @@ export class AccountSwitchService {
     if (record.version !== 1 || !['prepared', 'committed'].includes(record.phase) || record.databasePath !== dbPath ||
         !Array.isArray(record.files) || record.files.some(f => !allowed.has(f.path) &&
           !(f.path.startsWith(join(this.options.stateDir, 'accounts') + '/') && /^[a-zA-Z0-9_-]+\.json$/.test(f.path.slice(join(this.options.stateDir, 'accounts').length + 1))))) {
-      throw new Error('撤销恢复记录身份不匹配，原材料已保留');
+      throw new Error(bt('switch.err.rollback_identity'));
     }
     const currentJournal = JSON.parse(await readFile(this.journalPath, 'utf8')) as Journal;
     const original = record.originalJournal;
     const knownJournals = [original, { ...original, status: 'rolling-back' }, this.completedRollback(original)];
-    if (!knownJournals.some(value => JSON.stringify(value) === JSON.stringify(currentJournal))) throw new Error('切号恢复记录已被外部修改，停止覆盖');
-    if (await this.optionalRegular(dbPath) !== record.hadDatabase) throw new Error('登录数据库已变化，撤销恢复材料已保留');
-    const tx = record.hadDatabase ? new DatabaseTransaction(dbPath) : undefined;
+    if (!knownJournals.some(value => JSON.stringify(value) === JSON.stringify(currentJournal))) throw new Error(bt('switch.err.journal_modified'));
+    if (await this.optionalRegular(dbPath) !== record.hadDatabase) throw new Error(bt('switch.err.db_changed_rollback_kept'));
+    const tx = record.hadDatabase ? this.database(dbPath) : undefined;
     try {
       await tx?.begin();
       const rows = tx ? await tx.rows() : {};
       const isBefore = rowsDigest(rows) === rowsDigest(record.rowsBefore), isAfter = rowsDigest(rows) === rowsDigest(record.rowsAfter);
-      if (!isBefore && !isAfter) throw new Error('登录数据库已被外部修改，停止自动补偿');
+      if (!isBefore && !isAfter) throw new Error(bt('switch.err.db_external_modified'));
       const committed = isAfter && (!isBefore || record.phase === 'committed' || currentJournal.status === 'rolled-back');
       for (const file of record.files) {
         await this.regular(file.path);
         const value = await readFile(file.path, 'utf8');
-        if (value !== file.before && value !== file.after) throw new Error('账号文件已被外部修改，停止自动补偿');
+        if (value !== file.before && value !== file.after) throw new Error(bt('switch.err.account_file_external'));
       }
       const password = await this.keychain.readPassword('gemini', 'antigravity');
-      if (password !== record.keychainBefore && password !== record.keychainAfter) throw new Error('钥匙串已被外部修改，停止自动补偿');
+      if (password !== record.keychainBefore && password !== record.keychainAfter) throw new Error(bt('switch.err.keychain_external'));
       for (const file of record.files) {
         const desired = committed ? file.after : file.before;
         if (await readFile(file.path, 'utf8') !== desired) await atomicText(file.path, desired);
@@ -241,11 +242,11 @@ export class AccountSwitchService {
       new Set([this.target.appPath, '/Applications/Antigravity.app', '/Applications/Antigravity - Insiders.app']),
     ).map(p => p + '/Contents/');
     const running = this.options.isRunning ? await this.options.isRunning() :
-      (await run('/bin/ps', ['-ax', '-o', 'args='])).stdout.split('\n').some(line => {
+      (await run('/bin/ps', ['-ax', '-ww', '-o', 'args='], { timeout: 3000 })).stdout.split('\n').some(line => {
         const trimmed = line.trim();
         return candidatePrefixes.some(prefix => trimmed.startsWith(prefix));
       });
-    if (running) throw new Error('请先保存工作并手动退出 Antigravity（如运行了 Insiders，也请退出），再切换账号；GravityBox 不会结束或重启应用');
+    if (running) throw new Error(bt('switch.err.stop_app_first'));
   }
   private async archivePreviousJournal(previous: Journal) {
     const backupsDir = join(this.options.stateDir, 'account-switch-backups');
@@ -278,7 +279,7 @@ export class AccountSwitchService {
 
   private async regular(path: string) {
     const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error('拒绝修改身份不匹配的登录文件');
+    if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error(bt('switch.err.invalid_login_file'));
   }
   private async optionalRegular(path: string): Promise<boolean> {
     try {
@@ -295,7 +296,7 @@ export class AccountSwitchService {
     return withProcessLease(
       path,
       () => this.manager.runExclusive(operation),
-      { timeoutMs: 0, busyMessage: '已有账号切换或恢复操作，请等待完成' }
+      { timeoutMs: 0, busyMessage: bt('switch.err.busy') }
     );
   }
   private async restoreFiles(files: SavedFile[], keychainBefore: string | null, keychainAfter: string, keychainAfterDigest?: string) {
@@ -303,27 +304,27 @@ export class AccountSwitchService {
       const value = await readFile(file.path, 'utf8');
       const matchesBefore = value === file.before;
       const matchesAfter = (file.afterDigest ? sha256(value) === file.afterDigest : false) || value === file.after;
-      if (!matchesBefore && !matchesAfter) throw new Error('切换后登录文件已变化，停止自动回滚以保留新状态');
+      if (!matchesBefore && !matchesAfter) throw new Error(bt('switch.err.files_changed_after'));
     }
     const current = await this.keychain.readPassword('gemini', 'antigravity');
     const matchesKeychainBefore = current === keychainBefore;
     const matchesKeychainAfter = (keychainAfter && keychainAfter !== '[REDACTED]' && current === keychainAfter) || (keychainAfterDigest && current !== null && sha256(current) === keychainAfterDigest);
-    if (!matchesKeychainBefore && !matchesKeychainAfter) throw new Error('钥匙串已由其他程序更新，停止自动回滚');
+    if (!matchesKeychainBefore && !matchesKeychainAfter) throw new Error(bt('switch.err.keychain_updated'));
     for (const file of files) await atomicText(file.path, file.before);
     if (keychainBefore === null) await this.keychain.deletePassword('gemini', 'antigravity');
     else await this.keychain.writePassword('gemini', 'antigravity', keychainBefore);
   }
   async switchAccount(id: string, target = 'all') {
-    if (!['all', 'app'].includes(target)) throw new Error('目前仅支持切换 Antigravity 桌面账号');
+    if (!['all', 'app'].includes(target)) throw new Error(bt('switch.err.desktop_only'));
     return this.locked(async () => {
       await this.guardStopped();
       await this.reconcileRollback();
       let previous: Journal | undefined;
-      try { previous = JSON.parse(await readFile(this.journalPath, 'utf8')); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('切换恢复记录无法读取，请先检查数据目录'); }
-      if (previous && !['complete', 'rolled-back', 'cleared'].includes(previous.status)) throw new Error('上次切换未完成，请先使用“撤销上次账号切换”恢复');
+      try { previous = JSON.parse(await readFile(this.journalPath, 'utf8')); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(bt('switch.err.journal_unreadable')); }
+      if (previous && !['complete', 'rolled-back', 'cleared'].includes(previous.status)) throw new Error(bt('switch.err.previous_incomplete'));
       const acc = await this.manager.getAccount(id);
-      if (!acc || acc.disabled || acc.validation_blocked) throw new Error('目标账号不可用');
-      if (!acc.token.access_token || acc.token.access_token === 'pending_refresh' || acc.token.expiry_timestamp <= Date.now() / 1000 + 30) throw new Error('请先刷新此账号配额以更新登录凭据');
+      if (!acc || acc.disabled || acc.validation_blocked) throw new Error(bt('switch.err.account_unavailable'));
+      if (!acc.token.access_token || acc.token.access_token === 'pending_refresh' || acc.token.expiry_timestamp <= Date.now() / 1000 + 30) throw new Error(bt('switch.err.refresh_credentials_first'));
       const db = join(this.options.profile, 'User', 'globalStorage', 'state.vscdb');
       const hasDb = await this.optionalRegular(db);
       const transaction = hasDb ? this.database(db) : undefined;
@@ -357,7 +358,7 @@ export class AccountSwitchService {
         if (transaction) await transaction.replace(after);
         await this.keychain.writePassword('gemini', 'antigravity', keychainAfter);
         for (const file of files) {
-          if (await readFile(file.path, 'utf8') !== file.before) throw new Error('账号记录已变化，请刷新后重试');
+          if (await readFile(file.path, 'utf8') !== file.before) throw new Error(bt('switch.err.record_changed_retry'));
           await atomicText(file.path, file.after);
         }
         await this.guardStopped();
@@ -377,17 +378,17 @@ export class AccountSwitchService {
             afterDigest: f.afterDigest,
           })),
         });
-        return { switchedTo: acc.email, message: '登录记录已切换；下次打开 Antigravity 后生效' };
+        return { switchedTo: acc.email, message: bt('switch.msg.switched') };
       } catch (error) {
         if (!committed) {
           await transaction?.finish(false).catch(() => {});
           if (journal) {
-            try { await this.restoreFiles(journal.files, journal.keychainBefore, journal.keychainAfter, journal.keychainAfterDigest); await atomicJson(this.journalPath, { ...journal, status: 'rolled-back' }); }
-            catch { throw new Error('切换未完成，部分恢复被外部变化阻止；恢复记录已保留在数据目录'); }
+            try { await this.restoreFiles(journal.files, journal.keychainBefore, journal.keychainAfter, journal.keychainAfterDigest); await atomicJson(this.journalPath, this.completedRollback(journal)); }
+            catch { throw new Error(bt('switch.err.restore_blocked')); }
           }
-          throw new Error(error instanceof Error ? error.message : '切换失败，原状态已恢复');
+          throw new Error(error instanceof Error ? error.message : bt('switch.err.switch_failed_restored'));
         }
-        throw new Error('登录记录已提交，但完成记录未保存；请保留数据目录供恢复核查');
+        throw new Error(bt('switch.err.committed_journal_unsaved'));
       } finally { await transaction?.close(); }
     });
   }
@@ -398,26 +399,26 @@ export class AccountSwitchService {
       const interruptedUndo = await this.optionalRegular(this.rollbackPath);
       const pending=interruptedUndo||!['complete','rolled-back','cleared'].includes(journal.status);
       return {available:journal.status!=='cleared'||interruptedUndo,status:interruptedUndo?'rollback-pending':journal.status,createdAt:journal.at,expiresAt,pending,expired:!pending&&(!expiresAt||Date.parse(expiresAt)<Date.now()),digest:sha256(raw),containsCredentials:interruptedUndo||!!Object.keys(journal.before??{}).length||!!journal.keychainBefore};
-    } catch(error) {if((error as NodeJS.ErrnoException).code==='ENOENT')return{available:false}; throw new Error('恢复记录无法读取，原文件已保留');}
+    } catch(error) {if((error as NodeJS.ErrnoException).code==='ENOENT')return{available:false}; throw new Error(bt('switch.err.recovery_unreadable'));}
   }
   async clearRecovery(expectedDigest: string) {
     return this.locked(async()=>{
-      if (await this.optionalRegular(this.rollbackPath)) throw new Error('撤销尚未完成，恢复材料不可清除；请先重试撤销');
+      if (await this.optionalRegular(this.rollbackPath)) throw new Error(bt('switch.err.rollback_unfinished_clear'));
       const raw=await readFile(this.journalPath,'utf8'), journal=JSON.parse(raw) as Journal;
-      if(sha256(raw)!==expectedDigest)throw new Error('恢复记录已变化，请重新预览');
-      if(!['complete','rolled-back'].includes(journal.status))throw new Error('未完成的切号恢复材料不可清除');
+      if(sha256(raw)!==expectedDigest)throw new Error(bt('switch.err.recovery_changed_repreview'));
+      if(!['complete','rolled-back'].includes(journal.status))throw new Error(bt('switch.err.incomplete_clear_forbidden'));
       await atomicJson(this.journalPath,{version:1,status:'cleared',at:journal.at,clearedAt:new Date().toISOString(),before:{},after:{},files:[],keychainBefore:null,keychainAfter:''});
-      return {message:'已清除完成记录中的登录恢复凭据，保留操作时间'};
+      return {message:bt('switch.msg.recovery_cleared')};
     });
   }
   async rollback() {
     return this.locked(async () => {
       await this.guardStopped();
-      if (await this.reconcileRollback() === 'rolled-back') return { message: '已完成上次中断的账号恢复；下次打开 Antigravity 后生效' };
+      if (await this.reconcileRollback() === 'rolled-back') return { message: bt('switch.msg.interrupted_restored') };
       const journal = JSON.parse(await readFile(this.journalPath, 'utf8')) as Journal;
-      if (journal.status === 'rolled-back') throw new Error('上次切换已撤销');
-      if (journal.status === 'cleared') throw new Error('恢复材料已由用户清除');
-      if (journal.status === 'complete' && (!Number.isFinite(Date.parse(journal.at)) || Date.now()-Date.parse(journal.at)>7*86400000)) throw new Error('完成记录已超过 7 天撤销期；恢复材料仍保留在本地数据目录中供核对');
+      if (journal.status === 'rolled-back') throw new Error(bt('switch.err.already_rolled_back'));
+      if (journal.status === 'cleared') throw new Error(bt('switch.err.already_cleared'));
+      if (journal.status === 'complete' && (!Number.isFinite(Date.parse(journal.at)) || Date.now()-Date.parse(journal.at)>7*86400000)) throw new Error(bt('switch.err.expired_7d'));
       const db = join(this.options.profile, 'User', 'globalStorage', 'state.vscdb');
       const hasDb = await this.optionalRegular(db);
       const transaction = hasDb ? this.database(db) : undefined;
@@ -433,9 +434,9 @@ export class AccountSwitchService {
           const currentDigest = rowsDigest(rows);
           const matchesAfterDigest = journal.afterDigest ? currentDigest === journal.afterDigest : false;
           const matchesAfterRows = journal.after ? currentCanonical === JSON.stringify(Object.entries(journal.after).sort()) : false;
-          if (!matchesBefore && !matchesAfterDigest && !matchesAfterRows) throw new Error('登录数据库已变化，停止自动回滚以保留新状态');
+          if (!matchesBefore && !matchesAfterDigest && !matchesAfterRows) throw new Error(bt('switch.err.db_changed_abort_rollback'));
         } else {
-          if (Object.keys(journal.before || {}).length > 0) throw new Error('登录数据库已变化，停止自动回滚以保留新状态');
+          if (Object.keys(journal.before || {}).length > 0) throw new Error(bt('switch.err.db_changed_abort_rollback'));
         }
         const snapshots: SavedFile[] = [];
         for (const file of journal.files) {
@@ -454,15 +455,15 @@ export class AccountSwitchService {
         record.phase = 'committed'; await atomicJson(this.rollbackPath, record);
         await atomicJson(this.journalPath, this.completedRollback(journal));
         await unlink(this.rollbackPath);
-        return { message: '已恢复切换前的账号记录；下次打开 Antigravity 后生效' };
+        return { message: bt('switch.msg.restored_previous') };
       } catch (error) {
         await transaction?.finish(false).catch(() => {});
         await transaction?.close();
         if (record) {
           try {
-            if (await this.reconcileRollback() === 'rolled-back') return { message: '已恢复切换前的账号记录；下次打开 Antigravity 后生效' };
+            if (await this.reconcileRollback() === 'rolled-back') return { message: bt('switch.msg.restored_previous') };
           } catch {
-            throw new Error('撤销未完成，自动补偿受阻；恢复记录已保留，请退出 Antigravity 后重试撤销');
+            throw new Error(bt('switch.err.rollback_blocked'));
           }
         }
         throw error;

@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { openAsarSync } from './asar.js';
+import { bt } from './i18n.js';
 
 export type ApplicationChannel = 'stable';
 export type ApplicationArchitecture = 'legacy-hub' | 'wcv-hub';
@@ -89,8 +90,8 @@ export function probeBundleCapabilities(
 
 export function applicationChannel(value: unknown): ApplicationChannel {
   if (value === undefined || value === 'stable') return 'stable';
-  if (value === 'insiders') throw new Error('GravityBox 仅支持 Antigravity 正式版');
-  throw new Error('应用版本选择无效');
+  if (value === 'insiders') throw new Error(bt('app_target.stable_only'));
+  throw new Error(bt('app_target.invalid_channel'));
 }
 
 /** Only persisted legacy configuration is migrated; explicit channel requests are rejected. */
@@ -101,7 +102,7 @@ export function savedApplicationChannel(value: unknown): ApplicationChannel {
 function assertStablePaths(appPath: string, profile?: string): void {
   if (basename(appPath) === 'Antigravity - Insiders.app' ||
       (profile && basename(profile) === 'Antigravity - Insiders')) {
-    throw new Error('GravityBox 仅支持 Antigravity 正式版');
+    throw new Error(bt('app_target.stable_only'));
   }
 }
 

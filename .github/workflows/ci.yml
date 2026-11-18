@@ -2,9 +2,9 @@ name: CI Verification
 
 on:
   pull_request:
-    branches: [main, 'feature/**']
+    branches: [main, 'feature/**', 'release/**', '[0-9]*.[0-9]*.[0-9]*']
   push:
-    branches: [main, 'feature/**']
+    branches: [main, 'feature/**', 'release/**', '[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
 
 concurrency:
@@ -52,7 +52,7 @@ jobs:
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             case "$file" in
-              README.md|README_EN.md|CHANGELOG.md|LICENSE|LICENSE.*|docs/*|assets/*|.github/ISSUE_TEMPLATE/*|.github/PULL_REQUEST_TEMPLATE/*)
+              README.md|README_EN.md|CHANGELOG.md|CODE_OF_CONDUCT.md|CONTRIBUTING.md|docs/*|assets/screenshots/*|assets/model-icons/sources.json|.github/ISSUE_TEMPLATE/*|.github/PULL_REQUEST_TEMPLATE.md)
                 ;;
               *)
                 echo "Code-affecting change detected: $file"
@@ -169,6 +169,14 @@ jobs:
 
       - name: Headless Browser Regression Suite
         run: node test/browser.mjs
+
+      - name: Upload Browser Regression Reports on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-e2e-logs
+          path: 质检报告/
+          if-no-files-found: ignore
 
   native-swift:
     name: Native Swift Compile & Tests

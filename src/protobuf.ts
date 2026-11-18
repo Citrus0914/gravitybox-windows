@@ -2,29 +2,38 @@
  * Shared TypeScript Protobuf wire-level decoding and encoding helpers.
  */
 
-export function decodeVarint64(buf: Uint8Array, cursor: { pos: number }): bigint {
+function readVarint64Checked(buf: Uint8Array, cursor: { pos: number }): { value: bigint; ok: boolean } {
   let result = 0n;
   let shift = 0n;
   while (cursor.pos < buf.length && shift <= 63n) {
     const b = BigInt(buf[cursor.pos++]!);
     result |= (b & 0x7fn) << shift;
     shift += 7n;
-    if ((b & 0x80n) === 0n) break;
+    if ((b & 0x80n) === 0n) {
+      return { value: result, ok: true };
+    }
   }
-  return result;
+  // 截断或超过 10 字节且末字节仍带 continuation bit 的损坏 varint：推进至末尾防止后续帧循环或错位读取
+  cursor.pos = buf.length;
+  return { value: 0n, ok: false };
+}
+
+export function decodeVarint64(buf: Uint8Array, cursor: { pos: number }): bigint {
+  return readVarint64Checked(buf, cursor).value;
 }
 
 export function skipProtobufField(buf: Uint8Array, cursor: { pos: number }, wireType: number): boolean {
   if (wireType === 0) {
-    decodeVarint64(buf, cursor);
-    return cursor.pos <= buf.length;
+    return readVarint64Checked(buf, cursor).ok;
   }
   if (wireType === 1) {
     cursor.pos += 8;
     return cursor.pos <= buf.length;
   }
   if (wireType === 2) {
-    const len = Number(decodeVarint64(buf, cursor));
+    const lenParsed = readVarint64Checked(buf, cursor);
+    if (!lenParsed.ok) return false;
+    const len = Number(lenParsed.value);
     if (!Number.isSafeInteger(len) || len < 0 || cursor.pos + len > buf.length) return false;
     cursor.pos += len;
     return true;
@@ -126,8 +135,8 @@ export class ProtobufReader {
         const lenInfo = this.readVarint(buf, newOffset);
         if (!lenInfo) break;
         const [length, contentOffset] = lenInfo;
+        if (!Number.isSafeInteger(length) || length < 0 || contentOffset + length > buf.length) break;
         const end = contentOffset + length;
-        if (end > buf.length) break;
 
         if (fieldNum === targetField) {
           return buf.subarray(contentOffset, end);
@@ -167,7 +176,9 @@ export class ProtobufReader {
       } else if (wireType === 2) {
         const lenInfo = this.readVarint(buf, newOffset);
         if (!lenInfo) break;
-        offset = lenInfo[1] + lenInfo[0];
+        const [length, contentOffset] = lenInfo;
+        if (!Number.isSafeInteger(length) || length < 0 || contentOffset + length > buf.length) break;
+        offset = contentOffset + length;
       } else if (wireType === 1) {
         offset = newOffset + 8;
       } else if (wireType === 5) {
@@ -221,9 +232,5 @@ export class ProtobufWriter {
 
   static encodeVarintField(fieldNumber: number, value: number | bigint): Buffer {
     return this.encodeField(fieldNumber, 0, this.encodeVarint(value));
-  }
-
-  static encodeUint64(fieldNumber: number, value: number | bigint): Buffer {
-    return this.encodeVarintField(fieldNumber, value);
   }
 }

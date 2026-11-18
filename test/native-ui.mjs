@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {mkdtemp,readFile,mkdir,rm,writeFile} from 'node:fs/promises';
+import {mkdtemp,readFile,mkdir,rm,writeFile,copyFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -29,6 +29,14 @@ test('当前五页原生布局、菜单完整身份、部分计价与真实切�
   for(const name of report.captures){const data=await readFile(join(output,name));assert.equal(data.subarray(1,4).toString(),'PNG');assert.ok(data.length>10000);}
   for(const panel of ['light-menu-panel-usage.png','light-menu-panel-quota.png','light-menu-panel-accounts.png','dark-menu-panel-usage.png','dark-menu-panel-quota.png','dark-menu-panel-accounts.png']){const data=await readFile(join(output,panel));assert.equal(data.subarray(1,4).toString(),'PNG');assert.ok(data.length>10000);}
   for(const sheet of ['light-maintenance-sheet.png','dark-maintenance-sheet.png']){const data=await readFile(join(output,sheet));assert.equal(data.subarray(1,4).toString(),'PNG');assert.ok(data.length>10000);}
+  assert.ok(Array.isArray(report.enCaptures) && report.enCaptures.length === 12);
+  for(const name of report.enCaptures){const data=await readFile(join(output,name));assert.equal(data.subarray(1,4).toString(),'PNG');assert.ok(data.length>10000);}
+  if(process.env.GRAVITYBOX_COPY_SCREENSHOTS_TO){
+    await mkdir(process.env.GRAVITYBOX_COPY_SCREENSHOTS_TO,{recursive:true});
+    for(const file of ['en-light-880x580-3.png','en-dark-880x580-3.png','en-light-880x580-0.png','en-dark-880x580-0.png','en-light-menu-panel-usage.png','en-dark-menu-panel-usage.png','light-880x580-3.png','dark-880x580-3.png']){
+      await copyFile(join(output,file),join(process.env.GRAVITYBOX_COPY_SCREENSHOTS_TO,file));
+    }
+  }
   await rm(join(output,'failure.log'),{force:true});
  }catch(error){await writeFile(join(output,'failure.log'),String(error.stdout??'')+String(error.stderr??'')+String(error));throw error;}
  finally {await rm(temp,{recursive:true,force:true});}

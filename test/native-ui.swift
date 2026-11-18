@@ -53,13 +53,16 @@ import Cocoa
         application.setActivationPolicy(interactive ? .regular : .accessory)
         let state = URL(fileURLWithPath:CommandLine.arguments[1]), output = URL(fileURLWithPath:CommandLine.arguments[2])
         try FileManager.default.createDirectory(at:output,withIntermediateDirectories:true)
+        L10n.shared.setLanguage("zh-Hans", notify: false)
         let assistant = Assistant(state:state)
         assistant.configuration = try ConfigurationStore(state:state)
         assistant.configuration.value.navigationVersion = 5
+        assistant.configuration.value.appLanguage = "zh-Hans"
         assistant.bridge = BackendBridge(resources:state,state:state)
         assistant.reachable = true
-        let status: [String:Any] = ["mode":"adaptive","windows":1,"entries":4300,"appVersion":"2.25.0","liveAccountEmail":"alex@example.invalid","activeAccountEmail":"alex@example.invalid","accountsRevision":"fixture","pid":-1]
-        assistant.statusValue = LiveStatus(status)
+        var fixtureStatus: [String:Any] = ["mode":"adaptive","windows":1,"entries":4300,"appVersion":"2.25.0","liveAccountEmail":"alex@example.invalid","activeAccountEmail":"alex@example.invalid","accountsRevision":"fixture","pid":-1,"configuredLanguage":"zh-Hans","locale":"zh-Hans","translationEnabled":true]
+        let status = fixtureStatus
+        assistant.statusValue = LiveStatus(fixtureStatus)
         func bucket(_ percent: Double, reset: String = "2小时后重置") -> [String:Any] {
             ["remaining":percent/100,"known":true,"stale":false,"source":"live","observedAt":Date().timeIntervalSince1970,"resetCountdown":reset]
         }
@@ -71,7 +74,7 @@ import Cocoa
         accounts[2]["subscription_tier"] = "FREE"
         accounts[2]["familyWindows"] = ["gemini":["weekly":bucket(100,reset:"6天23小时后重置")],"claude":["weekly":bucket(100,reset:"6天23小时后重置")]]
         accounts[2]["familyModelQuota"] = ["gemini":bucket(100,reset:"4小时59分后重置"),"claude":bucket(100,reset:"6天23小时后重置")]
-        var activeId = "a", switches = 0, preflightState = "safe", lastTranslationCommand: String? = nil, lastHudCommandEnabled: Bool? = nil
+        var activeId = "a", switches = 0, preflightState = "safe", lastLanguageCommand: String? = nil, lastHudCommandEnabled: Bool? = nil
         assistant.activeAccountId = activeId; assistant.cachedAccounts = accounts
         let models:[[String:Any]] = [
             ["model":"gemini-3.8-flash-n","totalTokens":90800000,"promptTokens":4000000,"candidatesTokens":300000,"requestCount":695,"estimatedUsd":10.77,"priced":true,"pricingStatus":"historical"],
@@ -92,7 +95,7 @@ import Cocoa
         let totals:[String:Any] = ["totalTokens":98200000,"promptTokens":4700000,"cachedTokens":93100000,"candidatesTokens":310000,"requestCount":756,"estimatedUsd":23.78,"pricedModels":4,"unpricedModels":0,"databasesScanned":343,"databasesDiscovered":343,"availability":"complete","scanScopeDescription":"全部 343 个会话数据库","lastScannedAt":Date().timeIntervalSince1970]
         assistant.bridge.fixtureReply = { payload in
             switch payload["command"] as? String {
-            case "status": return ["ok":true,"status":status,"tasks":[],"taskRevision":0]
+            case "status": return ["ok":true,"status":fixtureStatus,"tasks":[],"taskRevision":0]
             case "account_list": return ["ok":true,"activeId":activeId,"accounts":accounts,"pendingSwitch":false]
             case "auto_switch_get": return ["ok":true,"config":["enabled":false,"strategy":"priority","monitored_model":"all"]]
             case "dashboard_summary": return ["ok":true,"accounts":accounts.first(where:{$0["id"] as? String == activeId})!.merging(["activeName":"Alex","activeEmail":"alex@example.invalid","activeTier":"PRO","liveAccountEmail":"alex@example.invalid","isLiveVerified":true]) { _, new in new },"usage":["todayTokens":98200000,"totalTokens":3000000000,"estimatedUsd":23.78,"allTimeEstimatedUsd":410.25,"requestCount":756,"totalRequestCount":27175,"todayPricedModels":4,"todayUnpricedModels":0,"pricedModels":4,"unpricedModels":0,"databasesScanned":343,"databasesDiscovered":343,"availability":"complete"]]
@@ -123,11 +126,16 @@ import Cocoa
                     ])
                     statefulSum = 1_074_790_400
                 }
+                let latestSnap: [String: Any] = ["id": "GravityBox-缓存-1729900800000", "timestamp": 1729900800, "totalBytes": 312_475_648, "fileCount": 3180, "snapshotPath": "/tmp/gb-snap-latest"]
                 return [
                     "ok": true,
                     "token": "fixture-token",
                     "retentionDays": reqRetention,
                     "entries": scanEntries,
+                    "buckets": [
+                        "runtimeCache": ["id": "runtime_cache", "bytes": safeSum, "clearableBytes": safeSum, "fileCount": 3842, "available": true],
+                        "historyLogs": ["id": "history_logs", "bytes": statefulSum, "clearableBytes": statefulSum, "fileCount": statefulSum > 0 ? 1122 : 0, "subagentCount": statefulSum > 0 ? 142 : 0, "retentionDays": reqRetention, "available": statefulSum > 0]
+                    ],
                     "safeBytes": safeSum,
                     "statefulBytes": statefulSum,
                     "totalBytes": safeSum + statefulSum,
@@ -141,6 +149,7 @@ import Cocoa
                         ["id": "GravityBox-缓存-1729900800000", "timestamp": 1729900800, "totalBytes": 312_475_648, "fileCount": 3180, "items": ["Cache", "AgentBrowserCache", "OrphanAgentData"], "itemTitles": ["网络与静态资源缓存", "浏览器沙箱加速缓存", "已删对话残留与临时文件"], "movedCount": 3, "restorable": true, "interrupted": false],
                         ["id": "GravityBox-缓存-1729814400000", "timestamp": 1729814400, "totalBytes": 642_252_800, "fileCount": 1120, "items": ["AgentSubagentDatabases", "AgentTaskStepLogs"], "itemTitles": ["历史子智能体轨迹库", "历史任务与步骤输出日志"], "movedCount": 2, "restorable": true, "interrupted": false]
                     ],
+                    "latestRestorableSnapshot": latestSnap,
                     "running": true,
                     "browserBusy": false,
                     "scannedAt": Int(Date().timeIntervalSince1970)
@@ -155,14 +164,20 @@ import Cocoa
             ]
             case "account_switch": switches += 1; activeId = payload["id"] as? String ?? activeId; return ["ok":true,"message":"隔离事务完成"]
             case "account_recovery_info": return ["ok":true,"available":false]
-            case "pause": lastTranslationCommand = "pause"; return ["ok":true]
-            case "resume": lastTranslationCommand = "resume"; return ["ok":true]
+            case "language_set":
+                let lang = payload["language"] as? String ?? "system"
+                lastLanguageCommand = lang
+                let resolved = lang == "en" ? "en" : "zh-Hans"
+                fixtureStatus["configuredLanguage"] = lang
+                fixtureStatus["locale"] = resolved
+                fixtureStatus["translationEnabled"] = resolved == "zh-Hans"
+                fixtureStatus["mode"] = resolved == "zh-Hans" ? "adaptive" : "paused"
+                return ["ok":true,"status":fixtureStatus]
             case "hud_set":
                 let enabled = payload["enabled"] as? Bool ?? true
                 lastHudCommandEnabled = enabled
-                var nextStatus = status
-                nextStatus["hudEnabled"] = enabled
-                return ["ok":true,"status":nextStatus]
+                fixtureStatus["hudEnabled"] = enabled
+                return ["ok":true,"status":fixtureStatus]
             default: return ["ok":true]
             }
         }
@@ -212,8 +227,26 @@ import Cocoa
             let policy = AccountPolicySheet(app:assistant,config:["strategy":"priority","monitored_model":"gemini","reserve_percentage":10,"candidate_min_percentage":30],saved:{})
             policy.show(in:window,onDismiss:{})
             policy.window.appearance = NSAppearance(named:appearance); pump()
-            check(policy.modelPopup.itemTitles == ["Gemini 全系模型","Gemini","Claude/GPT","Gemini 4 Argon","Gemini 4 Carbon"], "Model popup must expose Gemini 全系模型, Gemini, Claude/GPT, Gemini 4 Argon, and Gemini 4 Carbon")
+            let policyMenuItems = policy.modelPopup.menu?.items ?? []
+            check(policyMenuItems.filter { !$0.isSeparatorItem }.map(\.title) == ["全部主力模型","Gemini 全系（含 Argon）","Gemini（基础池）","Claude/GPT","Gemini 4 Argon"], "Model popup must expose adaptive Pro options with base/combined disambiguation")
+            check(policyMenuItems.count == 6 && policyMenuItems[2].isSeparatorItem, "Model popup must separate combined and single-pool sections")
+            check(policy.monitoredSubLabel.stringValue == "仅监测基础 Gemini 共享池，Pro 套餐下不含独立计费的 Argon", "Initial monitored scope subtitle explains Pro base Gemini boundary")
+            if let geminiAllIdx = policyMenuItems.firstIndex(where: { ($0.representedObject as? String) == "gemini_all" }) {
+                policy.modelPopup.selectItem(at: geminiAllIdx)
+                policy.monitoredScopeChanged()
+                check(policy.monitoredSubLabel.stringValue == "同时盯住基础 Gemini 与独立 Argon 周配额，任一偏低即提示切换", "Changing monitored scope updates subtitle live")
+            } else {
+                check(false, "Expected gemini_all menu item")
+            }
+            if let geminiIdx = policyMenuItems.firstIndex(where: { ($0.representedObject as? String) == "gemini" }) {
+                policy.modelPopup.selectItem(at: geminiIdx)
+                policy.monitoredScopeChanged()
+            }
             check(policy.strategyPopup.frame.width == policy.modelPopup.frame.width, "Policy popups must share uniform width")
+            check(policy.modelPopup.frame.width >= 150 && policy.modelPopup.frame.width <= 195, "Pro policy popups must tightly fit longest option without 220pt bloat (got \(policy.modelPopup.frame.width))")
+            check(policy.modelPopup.frame.width >= Design.fittedPopUpWidth(policy.modelPopup) - 0.5 && policy.strategyPopup.frame.width >= Design.fittedPopUpWidth(policy.strategyPopup) - 0.5, "Policy popups must never truncate longest option")
+            check((policy.window.contentView?.frame.height ?? 999) < 395, "Policy sheet content height must hug content instead of 436pt excess gap (got \(policy.window.contentView?.frame.height ?? -1))")
+            check(policy.fieldsCard.frame.height <= (groupStack(policy.fieldsCard)?.fittingSize.height ?? 0) + 34, "Policy fields card must not leave blank space below 候选准入下限 (cardH=\(policy.fieldsCard.frame.height), stackFitH=\(groupStack(policy.fieldsCard)?.fittingSize.height ?? 0))")
             var dynamicAccount = accounts[0]
             dynamicAccount["standaloneModels"] = [
                 ["key":"argon","displayName":"Gemini 4 Argon","availability":"available","quotaState":"known","period":"weekly","remaining":0.008],
@@ -222,8 +255,9 @@ import Cocoa
             ]
             assistant.cachedAccounts = [dynamicAccount]
             let dynamicPolicy = AccountPolicySheet(app:assistant,config:["strategy":"priority","monitored_model":"xenon","reserve_percentage":10,"candidate_min_percentage":30],saved:{})
-            check(dynamicPolicy.modelPopup.itemTitles == ["Gemini 全系模型","Gemini","Claude/GPT","Gemini 4 Argon","Gemini 4 Carbon","Gemini 4 Xenon"], "Model popup must auto-detect new standalone models")
+            check((dynamicPolicy.modelPopup.menu?.items ?? []).filter { !$0.isSeparatorItem }.map(\.title) == ["全部主力模型","Gemini 全系模型","Gemini（基础池）","Claude/GPT","Gemini 4 Argon","Gemini 4 Xenon"], "Model popup must auto-detect active standalone models while omitting disabled ones")
             check(dynamicPolicy.modelPopup.selectedItem?.title == "Gemini 4 Xenon", "Model popup must select configured dynamic model")
+            check(dynamicPolicy.monitoredSubLabel.stringValue == "仅监测当前账号独立的 Gemini 4 Xenon 配额池", "Dynamic standalone scope shows targeted subtitle")
             assistant.cachedAccounts = accounts
             for popup in [policy.strategyPopup, policy.modelPopup] {
                 check(popup.focusRingType == .none && popup.cell?.focusRingType == NSFocusRingType.none, "Installed popup cell must not restore the square focus bezel")
@@ -266,14 +300,34 @@ import Cocoa
             maintSheet.sheet.appearance = NSAppearance(named: appearance)
             maintSheet.cachePage.fetch(force: true); pump()
             maintSheet.sheet.contentView?.layoutSubtreeIfNeeded(); pump()
-            check(maintSheet.cachePage.retentionPopup.itemTitles == ["保留近 7 天", "保留近 30 天", "全部非活跃"], "Maintenance sheet must expose 3 retention window choices")
-            check(!maintSheet.cachePage.snapshotPopup.isHidden && maintSheet.cachePage.snapshotPopup.numberOfItems == 2, "Maintenance recovery footer must expose multi-snapshot selector when >=2 restorable snapshots exist")
-            check(maintSheet.cachePage.selectedNames == Set(["Cache", "AgentBrowserCache", "PartitionsCache", "OrphanAgentData"]), "Maintenance default selection must check safe items only and leave history slimming items unchecked")
+            check(maintSheet.sheet.frame.width == MaintenanceSheetController.sheetWidth, "Maintenance sheet must use compact 620pt width")
+            check(maintSheet.cachePage.retentionPopup.itemTitles == ["清理 7 天前", "清理 30 天前", "清理全部非活跃"], "Maintenance sheet must expose 3 inline retention window choices")
+            check(maintSheet.cachePage.retentionPopup.fittingSize.width <= 126 && maintSheet.cachePage.retentionPopup.fittingSize.width >= Design.fittedPopUpWidth(maintSheet.cachePage.retentionPopup) - 0.5, "Maintenance retentionPopup must tightly fit longest option without excess width (got \(maintSheet.cachePage.retentionPopup.fittingSize.width), expected ~\(Design.fittedPopUpWidth(maintSheet.cachePage.retentionPopup)))")
+            check(maintSheet.cachePage.historySubtitleLabel.stringValue.contains("保留近 7 天"), "Maintenance 7d retention must disclose 7-day preservation: \(maintSheet.cachePage.historySubtitleLabel.stringValue)")
+            maintSheet.cachePage.retentionPopup.selectItem(at: 1)
+            maintSheet.cachePage.retentionWindowChanged(); pump()
+            maintSheet.sheet.contentView?.layoutSubtreeIfNeeded()
+            check(maintSheet.cachePage.historySubtitleLabel.stringValue.contains("保留近 30 天"), "Maintenance 30d retention must dynamically disclose 30-day preservation: \(maintSheet.cachePage.historySubtitleLabel.stringValue)")
+            maintSheet.cachePage.retentionPopup.selectItem(at: 2)
+            maintSheet.cachePage.retentionWindowChanged(); pump()
+            maintSheet.sheet.contentView?.layoutSubtreeIfNeeded()
+            check(maintSheet.cachePage.historySubtitleLabel.stringValue.contains("清理所有非活跃对话"), "Maintenance 0d retention must dynamically explain all inactive cleanup: \(maintSheet.cachePage.historySubtitleLabel.stringValue)")
+            let zeroDayNatW = (maintSheet.cachePage.historySubtitleLabel.stringValue as NSString).size(withAttributes: [.font: maintSheet.cachePage.historySubtitleLabel.font!]).width
+            check(maintSheet.cachePage.historySubtitleLabel.bounds.width + 1.5 >= floor(zeroDayNatW), "Maintenance 0d historySubtitleLabel must not truncate (\(maintSheet.cachePage.historySubtitleLabel.stringValue)): \(maintSheet.cachePage.historySubtitleLabel.bounds.width) < \(zeroDayNatW)")
+            maintSheet.cachePage.retentionPopup.selectItem(at: 0)
+            maintSheet.cachePage.retentionWindowChanged(); pump()
+            maintSheet.sheet.contentView?.layoutSubtreeIfNeeded()
+            check(maintSheet.cachePage.runtimeCacheSwitch.state == .on && maintSheet.cachePage.historyLogsSwitch.state == .off, "Maintenance default switches must enable runtime cache and keep history logs off")
+            check(maintSheet.cachePage.selectedScopes == ["runtime_cache"], "Maintenance default selectedScopes must contain runtime_cache only")
+            check(maintSheet.cachePage.clearButton.isEnabled && maintSheet.cachePage.clearButton.title == "一键清理", "Maintenance primary CTA must display 一键清理")
+            check(!maintSheet.cachePage.restoreLatestButton.isHidden && maintSheet.cachePage.restoreLatestButton.title == "撤回上次清理", "Maintenance footer card must expose single-click 撤回上次清理 when restorable snapshot exists")
             check(!maintSheet.cachePage.sheetDoneButton.isHidden && maintSheet.cachePage.sheetDoneButton.title == "完成", "Maintenance sheet must display 完成 button")
-            check(maintSheet.cachePage.selectedSummaryBadge.title == "已选 4 项", "Maintenance selectedSummaryBadge must update from 正在扫描 to 已选 4 项 after scan completes")
-            check(maintSheet.cachePage.breakdownWarningLabel.isHidden, "Maintenance breakdownWarningLabel must stay hidden when no items are blocked")
-            check(maintSheet.cachePage.sheetDoneButton.frame.minY < maintSheet.cachePage.view.frame.minY, "Maintenance 完成 button must sit in pinned bottom footer below scroll area")
-            check(maintSheet.cachePage.sheetDoneButton.frame.maxX > maintSheet.cachePage.clearButton.frame.minX, "Maintenance 完成 button must align at bottom-right")
+            check(maintSheet.cachePage.sheetDoneButton.frame.minY < maintSheet.cachePage.view.frame.minY, "Maintenance 完成 button must sit in pinned bottom footer below card area")
+            check(maintSheet.cachePage.sheetDoneButton.frame.maxX >= maintSheet.cachePage.clearButton.frame.minX, "Maintenance 完成 button must align at bottom-right")
+            for maintLbl in [maintSheet.cachePage.reclaimableTitleLabel, maintSheet.cachePage.reclaimableValueLabel, maintSheet.cachePage.heroSubtitleLabel, maintSheet.cachePage.safeLegendLabel, maintSheet.cachePage.statefulLegendLabel, maintSheet.cachePage.protectedLegendLabel, maintSheet.cachePage.runtimeTitleLabel, maintSheet.cachePage.runtimeSubtitleLabel, maintSheet.cachePage.historyTitleLabel, maintSheet.cachePage.historySubtitleLabel, maintSheet.cachePage.recoveryTitleLabel, maintSheet.cachePage.recoverySubtitleLabel] where !maintLbl.isHidden && !maintLbl.stringValue.isEmpty {
+                let natW = (maintLbl.stringValue as NSString).size(withAttributes: [.font: maintLbl.font!]).width
+                check(maintLbl.bounds.width + 1.5 >= floor(natW), "Maintenance label must not truncate (\(maintLbl.stringValue)): \(maintLbl.bounds.width) < \(natW)")
+            }
             try capture(maintSheet.sheet.contentView!, output.appendingPathComponent("\(theme)-maintenance-sheet.png"))
             maintSheet.closeSheet(); pump()
             let allAccounts = accounts
@@ -314,10 +368,39 @@ import Cocoa
         let updatedCards = assistant.accountsPage!.cardsStack.arrangedSubviews
         check(updatedCards.count == initialCards.count && zip(initialCards, updatedCards).allSatisfy { $0 === $1 }, "Countdown tick must update account cards in place without rebuilding card views")
         assistant.preferencesController?.showMaintenanceSheet(); pump()
-        let initialCacheRows = assistant.cachePage!.itemsStack.arrangedSubviews
-        assistant.cachePage!.fetch(force: true); pump()
-        let updatedCacheRows = assistant.cachePage!.itemsStack.arrangedSubviews
-        check(updatedCacheRows.count == initialCacheRows.count && zip(initialCacheRows, updatedCacheRows).allSatisfy { $0 === $1 }, "Cache scan must reuse checklist row views when item order is unchanged")
+        let liveCache = assistant.cachePage!
+        let initialScopeRows = liveCache.scopeStack.arrangedSubviews
+        liveCache.fetch(force: true); pump()
+        let updatedScopeRows = liveCache.scopeStack.arrangedSubviews
+        check(updatedScopeRows.count == 3 && zip(initialScopeRows, updatedScopeRows).allSatisfy { $0 === $1 }, "3-card CachePage must retain fixed 2-switch scope views across scans without rebuilding")
+        let baseSelectedBytes = liveCache.selectedReclaimableBytes
+        let baseConfirmBody = liveCache.buildRunningClearConfirmationBody()
+        check(baseConfirmBody.contains("4") && (baseConfirmBody.contains("3,842") || baseConfirmBody.contains("3842")), "Stage-2 running confirmation must dynamically disclose selected category and file counts: \(baseConfirmBody)")
+        liveCache.runtimeInfoButton.performClick(nil); pump()
+        check(liveCache.activePopoverKind == .runtime && liveCache.detailPopover?.behavior == .transient && liveCache.runtimeInfoButton.isActivePopover, "Clicking runtimeInfoButton must open transient runtime NSPopover")
+        let rtPopTexts = allTextValues(liveCache.detailPopover!.contentViewController!.view)
+        check(rtPopTexts.contains("应用运行缓存明细") && rtPopTexts.contains("网络与静态资源缓存") && rtPopTexts.contains("浏览器沙箱加速缓存"), "Runtime popover must render itemized cache titles: \(rtPopTexts)")
+        liveCache.legendProtectedTrigger.performClick(nil); pump()
+        check(liveCache.activePopoverKind == .protected && !liveCache.runtimeInfoButton.isActivePopover && liveCache.legendProtectedTrigger.isActivePopover, "Clicking protected legend must replace runtime popover with protected popover")
+        let protPopTexts = allTextValues(liveCache.detailPopover!.contentViewController!.view)
+        check(protPopTexts.contains("受自动保护的核心数据") && protPopTexts.contains("永不触碰") && protPopTexts.contains("工作区与核心账号凭据") && protPopTexts.contains("Agent 历史对话与上下文库"), "Protected popover must render positive core-data inventory: \(protPopTexts)")
+        liveCache.historyInfoButton.performClick(nil); pump()
+        check(liveCache.activePopoverKind == .history && liveCache.historyInfoButton.isActivePopover, "Clicking historyInfoButton must open history logs popover")
+        let histPopTexts = allTextValues(liveCache.detailPopover!.contentViewController!.view)
+        check(histPopTexts.contains { $0.contains("后台运行日志明细") } && histPopTexts.contains("历史子智能体轨迹库") && histPopTexts.contains { $0.contains("账单保护") }, "History popover must disclose subagent DBs and billing archive guard: \(histPopTexts)")
+        liveCache.recoveryTriggerView.performClick(nil); pump()
+        check(liveCache.activePopoverKind == .snapshot && liveCache.recoveryTriggerView.isActivePopover, "Clicking recoveryTriggerView with restorable snapshot must open snapshot audit popover")
+        let snapPopTexts = allTextValues(liveCache.detailPopover!.contentViewController!.view)
+        check(snapPopTexts.contains("上次清理快照清单") && snapPopTexts.contains("网络与静态资源缓存") && snapPopTexts.contains { $0.contains("3,180") || $0.contains("3180") }, "Snapshot popover must disclose staged file count and item titles: \(snapPopTexts)")
+        liveCache.recoveryTriggerView.performClick(nil); pump()
+        check(liveCache.activePopoverKind == nil && liveCache.detailPopover == nil, "Clicking same trigger again must toggle popover closed")
+        liveCache.historyLogsSwitch.state = .on
+        liveCache.historyScopeToggled()
+        let combinedConfirmBody = liveCache.buildRunningClearConfirmationBody()
+        check(liveCache.selectedScopes == ["runtime_cache", "history_logs"] && liveCache.selectedReclaimableBytes > baseSelectedBytes && combinedConfirmBody.contains("6") && (combinedConfirmBody.contains("4,964") || combinedConfirmBody.contains("4964")), "Toggling historyLogsSwitch on must dynamically add history_logs scope, Hero bytes, and confirmation counts")
+        liveCache.historyLogsSwitch.state = .off
+        liveCache.historyScopeToggled()
+        check(liveCache.selectedScopes == ["runtime_cache"] && liveCache.selectedReclaimableBytes == baseSelectedBytes, "Toggling historyLogsSwitch off must restore runtime_cache-only Hero bytes")
         assistant.preferencesController?.maintenanceSheet?.closeSheet(); pump()
 
         // Verify three-tab MenuPanelController (用量｜配额｜账号)
@@ -408,8 +491,10 @@ import Cocoa
         menuPanel.selectTab(1, persist: false); pump()
         check(menuPanel.selectedTab == 1 && menuPanel.headerRefreshButton.title == "刷新" && menuPanel.headerRefreshButton.toolTip == nil, "Quota tab must keep fixed button title and zero hover tooltip")
         check(menuPanel.quotaAccountNameLabel.stringValue == "Alex" && menuPanel.quotaGemini5h.valueLabel.stringValue == "91%", "Quota tab must display active account identity and contract quota")
-        check(menuPanel.quotaCarbon.valueLabel.stringValue == "未知", "Missing Carbon response must be unknown even for PRO")
-        check(menuPanel.quotaCarbon.valueLabel.stringValue != "不可用", "Missing model cannot imply disabled")
+        check(menuPanel.quotaStatusBadge.isHidden, "Quota tab must hide redundant current/selected pill badge when live account matches")
+        let quotaGroupTexts = allTextValues(menuPanel.quotaGroupsContainer)
+        check(quotaGroupTexts.contains("Gemini 4 Argon") && !quotaGroupTexts.contains("Gemini 4 Carbon"), "PRO menu quota tab must render real Argon without synthesizing fake Carbon")
+        check(!quotaGroupTexts.contains(where: { $0.contains("周期未知") }), "Menu quota tab must never display 周期未知")
         check(menuPanel.quotaFooterLabel.stringValue.hasPrefix("更新于 ") && !menuPanel.quotaFooterLabel.stringValue.contains("采样于"), "Quota tab footer must use concise 更新于 timestamp")
         check(menuPanel.quotaFooterLabel.superview === menuPanel.quotaRoot, "Quota tab footer must reside directly in quotaRoot")
         menuPanel.selectTab(2, persist: false); pump()
@@ -432,6 +517,8 @@ import Cocoa
         var switchedAccountId: String? = nil
         var toggledAccountId: String? = nil
         if let firstCard = menuPanel.accountsCardsStack.arrangedSubviews.first as? MenuExpandableAccountCardView {
+            let firstTexts = allTextValues(firstCard)
+            check(!firstTexts.contains("当前账号") && !firstTexts.contains("已选记录"), "Menu accounts first card must not display redundant 当前账号 or 已选记录 pill")
             firstCard.onSwitchAccount = { switchedAccountId = $0 }
             firstCard.onToggleExpand = { toggledAccountId = $0 }
             firstCard.headerButton.performClick(nil)
@@ -548,6 +635,32 @@ import Cocoa
         check(assistant.currentPage == 2 && assistant.usageSelectedPeriod == 2, "Footer deep-link from Usage tab must navigate to UsagePage and carry selected period")
         check(assistant.usagePage!.donutChart.totalUsd == 23.78, "Donut chart must receive total equivalent USD")
         check(!assistant.usagePage!.donutChart.isHidden, "Donut chart must be visible when priced models exist")
+        do {
+            let sixModels: [[String: Any]] = models + [
+                ["model": "gemini-4-hydrogen", "totalTokens": 1200000, "promptTokens": 400000, "candidatesTokens": 50000, "requestCount": 14, "estimatedUsd": 2.40, "priced": true],
+                ["model": "gemini-4-carbon", "totalTokens": 800000, "promptTokens": 250000, "candidatesTokens": 40000, "requestCount": 9, "estimatedUsd": 1.15, "priced": true]
+            ]
+            let usage = assistant.usagePage!
+            usage.applyUsagePayload([
+                "ok": true, "period": "30d", "snapshotId": "six-model-snapshot",
+                "summary": totals.merging(["estimatedUsd": 27.33]) { _, n in n },
+                "byModel": sixModels, "todayHourly": [], "dailyTrends": []
+            ], period: "30d", segIdx: 2, requestKey: "six-model-test")
+            window.contentView?.layoutSubtreeIfNeeded(); pump()
+            func findRequestCard(_ v: NSView) -> NSView? {
+                if v.identifier?.rawValue == "requests-cache-card" { return v }
+                for s in v.subviews { if let found = findRequestCard(s) { return found } }
+                return nil
+            }
+            if let reqCard = findRequestCard(usage.view) {
+                let trackFrame = reqCard.convert(usage.cacheTrack.bounds, from: usage.cacheTrack)
+                let bottomGap = reqCard.isFlipped ? (reqCard.bounds.height - trackFrame.maxY) : trackFrame.minY
+                check(usage.donutLegendStack.arrangedSubviews.count == 5, "6 priced models must render 5 legend rows (got \(usage.donutLegendStack.arrangedSubviews.count))")
+                check(bottomGap <= 34, "requests-cache-card must distribute slack symmetrically instead of leaving large bottom gap below cacheTrack (bottomGap=\(bottomGap))")
+            } else {
+                check(false, "requests-cache-card must exist in UsagePage")
+            }
+        }
         // Verify rapid page switching does not leave blank view host or drop views
         assistant.selectPage(0); assistant.selectPage(1); assistant.selectPage(0); pump()
         check(assistant.currentPage == 0, "Rapid switching must end on page 0")
@@ -561,6 +674,20 @@ import Cocoa
             "todayHourly": todayHourly
         ]
         ov.update(force: true)
+        let curHour = Calendar.current.component(.hour, from: Date())
+        let expectedCurHourPrefix = String(format: "今日 %02d:00 · ", locale: Locale(identifier: "en_US_POSIX"), curHour)
+        check(ov.trendDetailLabel.stringValue.hasPrefix(expectedCurHourPrefix), "Overview trend detail must default to current hour (got \(ov.trendDetailLabel.stringValue))")
+        if ov.todayTrendChart.points.count == 24 {
+            ov.todayTrendChart.onHoverPoint?(ov.todayTrendChart.points[0])
+            check(ov.trendDetailLabel.stringValue == "今日 00:00 · 0 Token", "Overview trend detail must show 今日 00:00 · 0 Token when hovering 00:00 (got \(ov.trendDetailLabel.stringValue))")
+            ov.todayTrendChart.onHoverPoint?(ov.todayTrendChart.points[14])
+            check(ov.trendDetailLabel.stringValue == "今日 14:00 · 19.6M Token", "Overview trend detail must show 今日 14:00 · 19.6M Token when hovering 14:00 (got \(ov.trendDetailLabel.stringValue))")
+            ov.todayTrendChart.onHoverPoint?(nil)
+            check(ov.trendDetailLabel.stringValue.hasPrefix(expectedCurHourPrefix), "Overview trend detail must restore current hour when hover exits")
+        }
+        ov.syncTrendDetailLabel(currentHour: 3)
+        check(ov.trendDetailLabel.stringValue == "今日 03:00 · 0 Token" || ov.trendDetailLabel.stringValue == "今日 03:00 · 尚未到达", "Overview trend detail helper must format 03:00 accurately (got \(ov.trendDetailLabel.stringValue))")
+        ov.syncTrendDetailLabel()
         check(ov.rightBentoTitleLabel.stringValue == "今日活跃模型", "Overview right Bento card title must be 今日活跃模型")
         check(ov.rightBentoCountBadge.title == "Top 2 / 共 4 个", "Overview right Bento count badge must show Top 2 / 共 4 个")
         check(ov.bentoRightStack.arrangedSubviews.count == 2, "Overview Bento right stack must display 2 subrows")
@@ -568,7 +695,9 @@ import Cocoa
         check(!findButtons(ov.view).contains { $0.title == "管理账号" }, "Overview hero card must not display 管理账号 button")
         if let firstBox = ov.bentoRightStack.arrangedSubviews.first as? NSBox {
             func findBadges(_ v: NSView) -> [PillBadge] { (v as? PillBadge).map { [$0] } ?? v.subviews.flatMap { findBadges($0) } }
+            func findShareBars(_ v: NSView) -> [BentoShareBarView] { (v as? BentoShareBarView).map { [$0] } ?? v.subviews.flatMap { findShareBars($0) } }
             check(findBadges(firstBox).allSatisfy { $0.isHidden }, "Active model row must move USD into subtitle without showing a pill badge")
+            check(findShareBars(firstBox).count == 1 && findShareBars(firstBox)[0].fraction > 0.7, "Active model subrow must render token share progress bar")
             check(firstBox.accessibilityLabel()?.contains("Gemini 3.8 Flash") == true || firstBox.accessibilityLabel()?.contains("gemini-3.8-flash") == true, "Subrow box must expose VoiceOver accessibility label")
             check(firstBox.toolTip == nil || firstBox.toolTip?.isEmpty == true, "Overview Bento subrows must be read-only without deep-link tooltip")
             check(firstBox.accessibilityRole() == .group, "Subrow box must be an accessible display group, not a button")
@@ -802,9 +931,10 @@ import Cocoa
 
             if let maintSheet = assistant.preferencesController?.maintenanceSheet {
                 maintSheet.show(in: window); pump()
-                check(window.activeSheetWindow === maintSheet.sheet, "Maintenance sheet must attach before dismissAllSheetsAndPopovers verification")
+                maintSheet.cachePage.runtimeInfoButton.performClick(nil); pump()
+                check(window.activeSheetWindow === maintSheet.sheet && maintSheet.cachePage.detailPopover != nil, "Maintenance sheet and detailPopover must attach before dismissAllSheetsAndPopovers verification")
                 assistant.dismissAllSheetsAndPopovers(); pump()
-                check(window.activeSheetWindow == nil, "dismissAllSheetsAndPopovers must cleanly end attached modal sheets")
+                check(window.activeSheetWindow == nil && maintSheet.cachePage.detailPopover == nil && maintSheet.cachePage.activePopoverKind == nil, "dismissAllSheetsAndPopovers must cleanly end attached modal sheets and detail popovers")
             }
         }
 
@@ -854,6 +984,21 @@ import Cocoa
             check(PillBadge.isNeutralOrInactiveTint(c, in: darkApp), "Neutral/inactive tint must be recognized in Dark mode")
         }
         check(!PillBadge.isNeutralOrInactiveTint(Design.blue, in: lightApp), "Active blue tint must not be treated as neutral/inactive")
+        for scale in [TierBadge.Scale.regular, .compact] {
+            check(scale.iconSize(for: .free) == 0, "FREE TierBadge must not reserve icon space for a bullseye")
+            check(scale.iconSize(for: .pro) > 0, "PRO TierBadge must retain single-sparkle icon space")
+            check(scale.iconSize(for: .ultra) > scale.iconSize(for: .pro), "ULTRA TierBadge must retain twin-sparkle icon space")
+            let freeBadge = TierBadge("FREE", scale: scale)
+            let proBadge = TierBadge("PRO", scale: scale)
+            freeBadge.frame = NSRect(origin: .zero, size: freeBadge.intrinsicContentSize)
+            freeBadge.layoutSubtreeIfNeeded()
+            if let freeLbl = freeBadge.subviews.compactMap({ $0 as? NSTextField }).first {
+                let leftGap = freeLbl.frame.minX
+                let rightGap = freeBadge.bounds.width - freeLbl.frame.maxX
+                check(abs(leftGap - rightGap) <= 1.0, "FREE TierBadge text must sit symmetrically centered without leading bullseye offset (left=\(leftGap), right=\(rightGap))")
+            }
+            check(proBadge.intrinsicContentSize.width > 0 && freeBadge.intrinsicContentSize.width > 0, "TierBadge intrinsic width must be positive")
+        }
 
         // Capture Overview in idle (0 active models, 0 hourly tokens) to verify unified inactive capsules
         assistant.selectPage(0); window.setFrame(NSRect(origin: window.frame.origin, size: NSSize(width: 960, height: 640)), display: true); pump()
@@ -941,19 +1086,34 @@ import Cocoa
         assistant.selectPage(3); window.setContentSize(NSSize(width: 1060, height: 760)); pump()
         try capture(window.contentView!, output.appendingPathComponent("stable-settings.png"))
 
-        // Verify translationSwitch target-based state toggling and error-recovery behavior
-        check(stableSettings.translationSwitch.isEnabled == true, "translationSwitch must be enabled when reachable")
-        check((stableSettings.translationSwitch as AnyObject) is DesignSwitch && (stableSettings.hudSwitch as AnyObject) is DesignSwitch && (stableAccounts.autoSwitchToggle as AnyObject) is DesignSwitch, "Switches must use DesignSwitch to stay blue when window is unfocused")
-        check(stableSettings.translationSwitch.state == .on, "translationSwitch must be on when status mode is adaptive")
-        check(stableSettings.translationSwitch.toolTip == nil, "translationSwitch must not display hover tooltip")
+        // Verify languagePopup, More menu language submenu, reachability, and live zh-Hans <-> en hot-switching
+        check(stableSettings.languagePopup.isEnabled == true, "languagePopup must be enabled for supported Antigravity")
+        check((stableSettings.hudSwitch as AnyObject) is DesignSwitch && (stableAccounts.autoSwitchToggle as AnyObject) is DesignSwitch, "Switches must use DesignSwitch to stay blue when window is unfocused")
+        check(stableSettings.languagePopup.cell is DesignPopUpCell, "languagePopup must use DesignPopUpCell")
+        check(stableSettings.languagePopup.fittingSize.width <= 110 && stableSettings.languagePopup.fittingSize.width >= Design.fittedPopUpWidth(stableSettings.languagePopup) - 0.5, "Chinese languagePopup must tightly fit longest option (got \(stableSettings.languagePopup.fittingSize.width))")
+        check(stableSettings.refresh.fittingSize.width <= 112 && stableSettings.refresh.fittingSize.width >= Design.fittedPopUpWidth(stableSettings.refresh) - 0.5, "Chinese refresh popup must tightly fit longest option (got \(stableSettings.refresh.fittingSize.width))")
+        check(stableSettings.languagePopup.itemArray.compactMap { $0.representedObject as? String } == ["system", "zh-Hans", "en"], "languagePopup must expose system, zh-Hans, and en options")
+        check((stableSettings.languagePopup.selectedItem?.representedObject as? String) == "zh-Hans", "languagePopup must select zh-Hans when configuredLanguage=zh-Hans")
+        check(stableSettings.languagePopup.toolTip == nil && stableSettings.hudSwitch.toolTip == nil, "Settings language/hud controls must not display hover tooltips")
 
-        // Verify More Menu (…) includes 对话状态栏 right below 界面汉化
+        let unsupportedPrev = assistant.statusValue
+        assistant.statusValue = LiveStatus(["mode": "unsupported", "appVersion": "2.25.0"])
+        stableSettings.update()
+        check(stableSettings.languagePopup.isEnabled == false && stableSettings.hudSwitch.isEnabled == false, "languagePopup and hudSwitch must disable in unsupported mode")
+        assistant.statusValue = unsupportedPrev
+        stableSettings.update()
+
+        // Verify More Menu (…) includes 显示语言 submenu directly above 对话状态栏
         let moreMenu = assistant.buildMoreMenu()
         let moreTitles = moreMenu.items.map(\.title)
-        if let transIdx = moreTitles.firstIndex(of: "界面汉化"), let hudIdx = moreTitles.firstIndex(of: "对话状态栏") {
-            check(hudIdx == transIdx + 1, "对话状态栏 must sit directly below 界面汉化 in More menu")
+        if let langIdx = moreTitles.firstIndex(of: "显示语言"), let hudIdx = moreTitles.firstIndex(of: "对话状态栏") {
+            check(hudIdx == langIdx + 1, "对话状态栏 must sit directly below 显示语言 in More menu")
+            let subCodes = moreMenu.items[langIdx].submenu?.items.compactMap { $0.representedObject as? String } ?? []
+            check(subCodes == ["system", "zh-Hans", "en"], "显示语言 submenu must expose system, zh-Hans, and en items")
+            let checkedItem = moreMenu.items[langIdx].submenu?.items.first { ($0.representedObject as? String) == "zh-Hans" }
+            check(checkedItem?.state == .on, "显示语言 submenu must checkmark active configured language")
         } else {
-            check(false, "More menu must contain both 界面汉化 and 对话状态栏")
+            check(false, "More menu must contain both 显示语言 and 对话状态栏")
         }
 
         // Verify global zero-tooltip requirement across all pages and menu panel
@@ -969,77 +1129,105 @@ import Cocoa
             check(found == nil, "Global tooltip cleanup violated on view: \(found ?? "")")
         }
 
-        // 0. Verify unreachable backend (e.g. Node process blocked by Gatekeeper quarantine): switch stays greyed out
+        // Verify unreachable backend disables HUD switch & menu toggle while preserving language selection
         assistant.reachable = false
         stableSettings.update()
-        check(stableSettings.translationSwitch.isEnabled == false, "translationSwitch must remain greyed out / disabled when backend is unreachable due to Gatekeeper quarantine interception")
-        check(stableSettings.translationSwitch.toolTip == nil, "translationSwitch must not show hover tooltip when backend is unreachable")
+        check(stableSettings.hudSwitch.isEnabled == false && stableSettings.hudSwitch.toolTip == nil, "hudSwitch must disable without tooltip when backend is unreachable")
         let menuDisabled = assistant.buildMoreMenu()
-        let toggleDisabled = menuDisabled.items.first { $0.title == "界面汉化" }
-        check(toggleDisabled?.isEnabled == false, "Menu bar translation toggle must be disabled when backend is unreachable")
-
+        check(menuDisabled.items.first { $0.title == "对话状态栏" }?.isEnabled == false, "Menu bar HUD toggle must be disabled when backend is unreachable")
         assistant.reachable = true
         stableSettings.update()
-        check(stableSettings.translationSwitch.isEnabled == true, "translationSwitch must become enabled once backend is reachable after quarantine clearance")
-        let menuEnabled = assistant.buildMoreMenu()
-        let toggleEnabled = menuEnabled.items.first { $0.title == "界面汉化" }
-        check(toggleEnabled?.isEnabled == true, "Menu bar translation toggle must become enabled once backend is reachable")
+        check(stableSettings.hudSwitch.isEnabled == true, "hudSwitch must re-enable once backend becomes reachable")
 
-        // 1. User flips switch from ON to OFF
-        stableSettings.translationSwitch.state = .off
-        stableSettings.toggleTranslation()
-        pump()
-        check(lastTranslationCommand == "pause", "Flipping translationSwitch to off must send pause command")
+        // Verify live global hot-switch to English across main window, more menu, and menu panel
+        var enCaptures: [String] = []
+        let enFontWindowSize = NSSize(width: 880, height: 580)
+        assistant.setGlobalLanguage("en"); pump()
+        check(lastLanguageCommand == "en", "setGlobalLanguage(en) must send language_set(en)")
+        check(L10n.shared.currentLocale == "en" && assistant.configuration.value.appLanguage == "en", "setGlobalLanguage(en) must update L10n locale and configuration")
+        check(assistant.statusValue.translationEnabled == false, "English mode must disable Antigravity translation injection")
+        check(assistant.names == ["Overview", "Accounts", "Usage", "Settings", "About"], "Sidebar tabs must hot-switch to English: \(assistant.names)")
+        check(assistant.launchApplicationButton?.title == "Open Antigravity", "Sidebar primary CTA must hot-switch to English")
+        if let enWinItems = NSApp.windowsMenu?.items {
+            let enWinTitles = enWinItems.map(\.title)
+            check(["Close Window", "Minimize", "Zoom"].allSatisfy { enWinTitles.contains($0) }, "English Window menu must expose Close Window, Minimize, and Zoom: \(enWinTitles)")
+            let zoomItem = enWinItems.first { $0.title == "Zoom" }
+            check(zoomItem?.action == #selector(NSWindow.performZoom(_:)) && zoomItem?.target == nil, "English Zoom menu item must dispatch performZoom(_:) via responder chain")
+        } else {
+            check(false, "NSApp.windowsMenu must be installed in English mode")
+        }
+        let enMoreMenu = assistant.buildMoreMenu()
+        let enMoreTitles = enMoreMenu.items.map(\.title)
+        check(enMoreTitles.contains("Display Language") && enMoreTitles.contains("Session HUD") && enMoreTitles.contains("Settings…"), "More menu must hot-switch to English: \(enMoreTitles)")
 
-        // 2. User flips switch from OFF to ON
-        stableSettings.translationSwitch.state = .on
-        stableSettings.toggleTranslation()
-        pump()
-        check(lastTranslationCommand == "resume", "Flipping translationSwitch to on must send resume command")
+        window.setContentSize(enFontWindowSize)
+        for (theme, appearance) in [("light", NSAppearance.Name.aqua), ("dark", NSAppearance.Name.darkAqua)] {
+            window.appearance = NSAppearance(named: appearance)
+            for page in 0..<5 {
+                assistant.selectPage(page); pump(); window.contentView?.layoutSubtreeIfNeeded()
+                let capName = "en-\(theme)-880x580-\(page).png"
+                try capture(window.contentView!, output.appendingPathComponent(capName))
+                enCaptures.append(capName)
+                check((window.contentView?.fittingSize.width ?? 0) <= 880, "English page \(page) (\(theme)) exceeds 880pt minimum window width")
+            }
+        }
+        // Assert no CJK Han leakage on static Settings & About UI views when active locale is English
+        assistant.selectPage(3); pump()
+        let enSettings = assistant.preferencesController!
+        check((enSettings.languagePopup.selectedItem?.representedObject as? String) == "en", "English Settings languagePopup must select en")
+        check(enSettings.languagePopup.fittingSize.width <= 136 && enSettings.languagePopup.fittingSize.width >= Design.fittedPopUpWidth(enSettings.languagePopup) - 0.5, "English languagePopup must tightly fit longest option (got \(enSettings.languagePopup.fittingSize.width))")
+        check(enSettings.refresh.fittingSize.width <= 128 && enSettings.refresh.fittingSize.width >= Design.fittedPopUpWidth(enSettings.refresh) - 0.5, "English refresh popup must tightly fit longest option (got \(enSettings.refresh.fittingSize.width))")
+        let hanPattern = "[\\u4E00-\\u9FFF]"
+        let allowedNativeNames = Set(L10n.shared.supportedLocales.map(\.nativeName))
+        let localizedViews: [(String, NSView)] = [("Settings", enSettings.view!), ("About", assistant.aboutPage!.view)]
+        for (label, view) in localizedViews {
+            let leaks = allTextValues(view).filter { !allowedNativeNames.contains($0) && $0.range(of: hanPattern, options: .regularExpression) != nil }
+            check(leaks.isEmpty, "English \(label) page must not contain untranslated Chinese labels: \(leaks)")
+        }
 
-        // 3. User attempts to turn ON translation when system is in error mode (switch is OFF)
-        assistant.statusValue = LiveStatus(["mode": "error", "message": "连接中断", "appVersion": "2.29.1"])
-        stableSettings.update()
-        check(stableSettings.translationSwitch.state == .off, "translationSwitch must be off when status mode is error")
-        check(stableSettings.translationSwitch.toolTip == nil, "translationSwitch must not display hover tooltip in error mode")
-        // User flips switch ON to recover/retry
-        stableSettings.translationSwitch.state = .on
-        stableSettings.toggleTranslation()
-        pump()
-        check(lastTranslationCommand == "resume", "Turning on translationSwitch from error mode must send resume (not pause!)")
-        check(assistant.statusValue.enabled == true, "Optimistic state after turning on translationSwitch must report enabled == true")
+        // Capture Light/Dark English MenuPanel usage snapshots
+        let enMenuPanel = assistant.ensureMenuPanelController()
+        let enPanelHost = NSWindow(contentRect: NSRect(x: 0, y: 0, width: MenuPanelController.panelWidth, height: MenuPanelController.defaultPanelHeight), styleMask: [.titled], backing: .buffered, defer: false)
+        enPanelHost.contentViewController = enMenuPanel
+        for (theme, appearance) in [("light", NSAppearance.Name.aqua), ("dark", NSAppearance.Name.darkAqua)] {
+            enPanelHost.appearance = NSAppearance(named: appearance)
+            enMenuPanel.selectTab(0, persist: false); enMenuPanel.panelWillOpen(); pump()
+            enPanelHost.setContentSize(enMenuPanel.preferredContentSize); enPanelHost.contentView?.layoutSubtreeIfNeeded(); pump()
+            let panelName = "en-\(theme)-menu-panel-usage.png"
+            try capture(enPanelHost.contentView!, output.appendingPathComponent(panelName))
+            enCaptures.append(panelName)
+        }
+        check(enMenuPanel.tokensTile.titleLabel.stringValue == "Tokens" && enMenuPanel.requestsTile.titleLabel.stringValue == "Requests" && enMenuPanel.costTile.titleLabel.stringValue == "Est. API Cost", "English MenuPanel KPI tiles must use English titles")
+        enPanelHost.orderOut(nil)
 
-        // 4. Verify LiveStatus.enabled respects translationEnabled during starting/error states
-        let pausedStartingStatus = LiveStatus(["mode": "starting", "translationEnabled": false, "appVersion": "2.29.1"])
-        check(pausedStartingStatus.enabled == false, "starting mode with translationEnabled=false must report enabled == false")
-        assistant.statusValue = pausedStartingStatus
-        stableSettings.update()
-        check(stableSettings.translationSwitch.state == .off, "translationSwitch must stay off when starting in paused mode")
-        stableSettings.translationSwitch.state = .on
-        stableSettings.toggleTranslation()
-        pump()
-        check(lastTranslationCommand == "resume" && assistant.statusValue.enabled == true, "Turning on switch during paused starting state must send resume and optimistically enable")
-
-        // 5. Menu bar toggle command toggling based on perceived enabled state
-        assistant.statusValue = LiveStatus(["mode": "adaptive", "appVersion": "2.29.1"])
-        assistant.toggleTranslation()
-        pump()
-        check(lastTranslationCommand == "pause", "Menu toggleTranslation when enabled must send pause")
-        assistant.statusValue = LiveStatus(["mode": "paused", "appVersion": "2.29.1"])
-        assistant.toggleTranslation()
-        pump()
-        check(lastTranslationCommand == "resume", "Menu toggleTranslation when paused must send resume")
-
-        // Restore normal status
-        assistant.statusValue = LiveStatus(status)
-        stableSettings.update()
-        check(stableSettings.hudSwitch.isEnabled == true && stableSettings.hudSwitch.state == .on, "hudSwitch must default to on and enabled when translation is active")
-        stableSettings.hudSwitch.state = .off
-        stableSettings.toggleHud()
+        // Hot-switch back to Simplified Chinese and verify restoration
+        assistant.setGlobalLanguage("zh-Hans"); pump()
+        check(lastLanguageCommand == "zh-Hans" && L10n.shared.currentLocale == "zh-Hans", "setGlobalLanguage(zh-Hans) must restore Simplified Chinese locale")
+        check(assistant.names == ["总览", "账号", "用量", "设置", "关于"], "Sidebar tabs must restore to Chinese")
+        if let zhWinItems = NSApp.windowsMenu?.items {
+            let zhWinTitles = zhWinItems.map(\.title)
+            check(["关闭窗口", "最小化", "缩放"].allSatisfy { zhWinTitles.contains($0) }, "Chinese Window menu must expose 关闭窗口, 最小化, and 缩放: \(zhWinTitles)")
+            let zoomItem = zhWinItems.first { $0.title == "缩放" }
+            check(zoomItem?.action == #selector(NSWindow.performZoom(_:)) && zoomItem?.target == nil, "Chinese 缩放 menu item must dispatch performZoom(_:) via responder chain")
+            check(!window.collectionBehavior.contains(.fullScreenPrimary), "Main window must keep + zoom button behavior without fullScreenPrimary")
+        } else {
+            check(false, "NSApp.windowsMenu must be installed in Chinese mode")
+        }
+        window.appearance = nil
+        window.setContentSize(NSSize(width: 1060, height: 760))
+        assistant.selectPage(3); pump()
+        fixtureStatus["translationEnabled"] = true
+        fixtureStatus["mode"] = "adaptive"
+        assistant.statusValue = LiveStatus(fixtureStatus)
+        let restoredSettings = assistant.preferencesController!
+        restoredSettings.update()
+        check(restoredSettings.hudSwitch.isEnabled == true && restoredSettings.hudSwitch.state == .on, "hudSwitch must default to on and enabled when translation is active")
+        restoredSettings.hudSwitch.state = .off
+        restoredSettings.toggleHud()
         pump()
         check(lastHudCommandEnabled == false && assistant.configuration.value.hudEnabled == false, "Turning off hudSwitch must send hud_set(false) and persist hudEnabled=false")
-        stableSettings.hudSwitch.state = .on
-        stableSettings.toggleHud()
+        restoredSettings.hudSwitch.state = .on
+        restoredSettings.toggleHud()
         pump()
         check(lastHudCommandEnabled == true && assistant.configuration.value.hudEnabled == true, "Turning on hudSwitch must send hud_set(true) and persist hudEnabled=true")
 
@@ -1199,6 +1387,7 @@ import Cocoa
                 "pricingStatus": ["gemini-3.8-flash": "confirmed", "gemini-4-hydrogen": "confirmed"],
             ])
             check(pricingSheet.sheet.contentView != nil, "PricingSyncSheetController must populate native sheet view")
+            check(hasNonEmptyTooltip(pricingSheet.sheet.contentView!) == nil, "PricingSyncSheetController must have zero hover tooltips even with sourceUrl")
             func allPricingButtons(_ v: NSView) -> [NSButton] { (v as? NSButton).map { [$0] } ?? v.subviews.flatMap { allPricingButtons($0) } }
             check(!allPricingButtons(pricingSheet.sheet.contentView!).contains { $0.title == "复制价格表" }, "PricingSyncSheetController must remove 复制价格表 button")
             check(pricingSheet.closeBtn.title == "完成", "PricingSyncSheetController exit button must be titled 完成")
@@ -1218,6 +1407,98 @@ import Cocoa
             ])
             check(!pricingSheet.subtitleLabel.isHidden && pricingSheet.subtitleLabel.stringValue == "检查提示：offline", "PricingSyncSheetController must show concise failure reason without unit suffix")
             check(pricingSheet.summaryPill.title.hasSuffix("· 1 款"), "PricingSyncSheetController pill must display failed check time and active count: \(pricingSheet.summaryPill.title)")
+
+            // Real-time active / tier-aware / unpriced live / collapsible retired section assertions (zh-Hans)
+            let tierPricingPayload: [String: Any] = [
+                "synced": true,
+                "version": "2026-11-16",
+                "status": ["lastCheckAt": 1794539910722.0, "modelCount": 6],
+                "unpricedLiveModels": [
+                    ["key": "gemini-4.5-live", "displayName": "Gemini 4.5 Live", "disabled": false],
+                    ["key": "gemini-4.5-locked", "displayName": "Gemini 4.5 Locked", "disabled": true]
+                ],
+                "prices": [
+                    "gemini-4-other": ["input": 1.2, "output": 6.0, "cached": 0.12],
+                    "gemini-4-carbon": ["input": 2.0, "output": 10.0, "cached": 0.2],
+                    "gemini-4-argon": ["input": 1.5, "output": 7.5, "cached": 0.15],
+                    "gemini-3.8-flash": ["input": 0.75, "output": 3.75, "cached": 0.075]
+                ],
+                "retiredPrices": [
+                    "gemini-2.5-pro": ["input": 1.25, "output": 10.0, "cached": 0.31],
+                    "claude-3.5-sonnet": ["input": 3.0, "output": 15.0, "cached": 0.3]
+                ],
+                "pricingStatus": [
+                    "gemini-3.8-flash": "confirmed",
+                    "gemini-4-argon": "confirmed",
+                    "gemini-4-carbon": "confirmed",
+                    "gemini-4-other": "confirmed",
+                    "gemini-2.5-pro": "historical",
+                    "claude-3.5-sonnet": "confirmed"
+                ],
+                "modelCatalogState": [
+                    "gemini-4.5-live": ["availability": "unpriced_live", "displayName": "Gemini 4.5 Live"],
+                    "gemini-4.5-locked": ["availability": "unpriced_live", "displayName": "Gemini 4.5 Locked"],
+                    "gemini-3.8-flash": ["availability": "available", "displayName": "Gemini 3.8 Flash", "activeTier": "PRO"],
+                    "gemini-4-argon": ["availability": "tier_locked", "displayName": "Gemini 4 Argon", "activeTier": "FREE"],
+                    "gemini-4-carbon": ["availability": "other_tier_only", "displayName": "Gemini 4 Carbon", "availableInTiers": ["ULTRA"], "activeTier": "PRO"],
+                    "gemini-4-other": ["availability": "other_tier_only", "displayName": "Gemini 4 Other", "availableInTiers": []],
+                    "gemini-2.5-pro": ["availability": "retired", "displayName": "Gemini 2.5 Pro"],
+                    "claude-3.5-sonnet": ["availability": "retired", "displayName": "Claude 3.5 Sonnet"]
+                ]
+            ]
+            pricingSheet.retiredExpanded = true
+            pricingSheet.show(in: testParentWindow, payload: tierPricingPayload)
+            pump()
+            check(pricingSheet.retiredExpanded == false, "PricingSyncSheetController.show must reset retiredExpanded to false")
+            check(pricingSheet.summaryPill.title.hasSuffix("· 6 款"), "summaryPill must count only active + unpriced live (6), excluding retired: \(pricingSheet.summaryPill.title)")
+            check(pricingSheet.renderedSummaryLines.count == 6, "renderedSummaryLines must contain 6 active/unpriced entries (got \(pricingSheet.renderedSummaryLines.count))")
+            check(pricingSheet.renderedSummaryLines[0].contains("gemini-4.5-live [新上线 · 待同步费率]"), "First card must be unpriced live model: \(pricingSheet.renderedSummaryLines)")
+            check(pricingSheet.renderedSummaryLines[1].contains("gemini-4.5-locked [新上线 · 待同步费率]") && pricingSheet.renderedSummaryLines[1].contains("当前套餐未解锁"), "Disabled unpriced live model must include tier_locked badge")
+            check(pricingSheet.renderedSummaryLines[2].hasPrefix("gemini-3.8-flash [已核对]"), "Available rank must precede tier_locked: \(pricingSheet.renderedSummaryLines)")
+            check(pricingSheet.renderedSummaryLines[3].hasPrefix("gemini-4-argon [已核对]") && pricingSheet.renderedSummaryLines[3].contains("当前套餐未解锁"), "tier_locked rank must follow available")
+            check(pricingSheet.renderedSummaryLines[4].hasPrefix("gemini-4-carbon [已核对]") && pricingSheet.renderedSummaryLines[4].contains("其他套餐可用 (ULTRA)"), "other_tier_only must sort alphabetically and include named tiers")
+            check(pricingSheet.renderedSummaryLines[5].hasPrefix("gemini-4-other [已核对]") && pricingSheet.renderedSummaryLines[5].contains("其他套餐可用"), "other_tier_only with empty availableInTiers must use generic badge")
+            check(!pricingSheet.renderedSummaryLines.contains { $0.contains("gemini-2.5-pro") || $0.contains("claude-3.5-sonnet") }, "retiredPrices must be absent from renderedSummaryLines")
+            check(pricingSheet.retiredToggleBtn?.isBordered == false && pricingSheet.retiredToggleBtn?.title == "▸ 已下架模型（2 款 · 仅用于历史账单核算）", "Collapsed retiredToggleBtn must show collapsed count title: \(pricingSheet.retiredToggleBtn?.title ?? "nil")")
+            check(pricingSheet.retiredListStack?.isHidden == true, "retiredListStack must be hidden by default")
+            check(pricingSheet.renderedRetiredSummaryLines.count == 2 && pricingSheet.renderedRetiredSummaryLines[0].contains("claude-3.5-sonnet [已核对]") && pricingSheet.renderedRetiredSummaryLines[1].contains("gemini-2.5-pro [历史基准]"), "renderedRetiredSummaryLines must track retired models sorted by key")
+            let visibleSheetTexts = allTextValues(pricingSheet.sheet.contentView!)
+            check(visibleSheetTexts.contains("Gemini 4 Argon") && visibleSheetTexts.contains("Gemini 4.5 Live") && visibleSheetTexts.contains("已在 Antigravity 检测到该模型，等待公开价格表补充单价"), "Sheet must render displayName and unpriced live description")
+            func findPricingScrollView(_ v: NSView) -> NSScrollView? {
+                if let sv = v as? NSScrollView { return sv }
+                for sub in v.subviews { if let found = findPricingScrollView(sub) { return found } }
+                return nil
+            }
+            var preExpandScrollY: CGFloat?
+            if let sv = findPricingScrollView(pricingSheet.sheet.contentView!) {
+                let docH = sv.documentView?.bounds.height ?? 0
+                let clipH = sv.contentView.bounds.height
+                let targetY = min(30.0, max(0.0, docH - clipH))
+                sv.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+                sv.reflectScrolledClipView(sv.contentView)
+                preExpandScrollY = sv.contentView.bounds.origin.y
+            }
+            pricingSheet.retiredToggleBtn?.performClick(nil); pump()
+            check(pricingSheet.retiredExpanded == true && pricingSheet.retiredListStack?.isHidden == false, "Clicking retiredToggleBtn must expand retiredListStack")
+            check(pricingSheet.retiredToggleBtn?.title == "▾ 已下架模型（2 款 · 仅用于历史账单核算）", "Expanded retiredToggleBtn must show expanded count title: \(pricingSheet.retiredToggleBtn?.title ?? "nil")")
+            if let beforeY = preExpandScrollY, let sv = findPricingScrollView(pricingSheet.sheet.contentView!) {
+                let afterY = sv.contentView.bounds.origin.y
+                check(abs(afterY - beforeY) <= 1.0, "Expanding retired section must not jump scroll to bottom (before=\(beforeY), after=\(afterY))")
+            }
+            pricingSheet.retiredToggleBtn?.performClick(nil); pump()
+            check(pricingSheet.retiredExpanded == false && pricingSheet.retiredListStack?.isHidden == true, "Clicking retiredToggleBtn again must collapse retiredListStack")
+            pricingSheet.closeSheet(); pump()
+
+            // Retired-only payload must show toggle button without empty-state message
+            pricingSheet.apply(payload: [
+                "synced": true,
+                "prices": [:],
+                "retiredPrices": ["gemini-2.5-pro": ["input": 1.25, "output": 10.0, "cached": 0.31]],
+                "pricingStatus": ["gemini-2.5-pro": "historical"],
+                "modelCatalogState": ["gemini-2.5-pro": ["availability": "retired", "displayName": "Gemini 2.5 Pro"]],
+                "status": ["modelCount": 0]
+            ])
+            check(pricingSheet.retiredToggleBtn != nil && !allTextValues(pricingSheet.sheet.contentView!).contains("暂无可用的模型价格基准记录"), "Retired-only payload must not show empty-state label")
             var checks = 0
             let manager = isolated.updateManager
             manager.checkTransport = { request, completion in
@@ -1288,6 +1569,7 @@ import Cocoa
 
         // Production account quota updates reuse card views, including unchanged snapshots.
         do {
+            if assistant.accountsPage == nil { assistant.selectPage(1); pump() }
             let page = assistant.accountsPage!
             let windows = ["gemini":["fiveHour":bucket(80),"weekly":bucket(90)],"claude":["fiveHour":bucket(100),"weekly":bucket(70)]]
             let base: [String: Any] = ["id":"gate-account", "email":"gate@example.invalid", "revision":"gate-revision", "familyWindows":windows]
@@ -1303,21 +1585,628 @@ import Cocoa
                 page.fetch(["accounts":[changed], "activeId":"gate-account"])
                 check(quotaViews(page.view).contains { $0.titleLabel.stringValue == title && $0.percentageKnown && $0.percentage == Int(percent) }, "Production card refresh observes \(family)/\(key)")
                 check(page.cardsStack.arrangedSubviews.count == cards.count && zip(cards,page.cardsStack.arrangedSubviews).allSatisfy { $0 === $1 }, "Account quota changes reuse existing card views")
+                let cardTexts = allTextValues(page.cardsStack)
+                check(!cardTexts.contains("当前账号") && !cardTexts.contains("已选记录"), "Accounts page active card must not display redundant 当前账号 or 已选记录 pill")
             }
         }
 
         // Production dashboard identity handling includes mismatch, missing identity and offline states.
         do {
+            if assistant.dashboardPage == nil { assistant.selectPage(0); pump() }
             let page = assistant.dashboardPage!
             for (verified, liveEmail, expectedStatus) in [(true,"other@example.invalid","账号不一致"),(true,"gate@example.invalid",""),(true,"",""),(false,"","")] {
                 page.renderSummary(["accounts":["activeEmail":"gate@example.invalid", "isLiveVerified":verified, "liveAccountEmail":liveEmail]], isStaleFallback:false)
                 check(page.accountStatusLabel.stringValue == expectedStatus, "Production dashboard identity status for \(liveEmail)")
                 check(page.activeEmailLabel.stringValue == "gate@example.invalid", "Identity warning preserves saved email")
-                check(page.currentAccountPill.title == (verified ? "当前账号" : "已选记录"), "Offline state cannot claim a verified current account")
+                check(page.currentAccountPill.isHidden, "Dashboard must hide redundant currentAccountPill across verified/mismatch/offline states")
+                let dashTexts = allTextValues(page.view)
+                check(!dashTexts.contains("当前账号") && !dashTexts.contains("已选记录"), "Dashboard must never render 当前账号 or 已选记录 pill")
             }
         }
 
-        let result:[String:Any] = ["stableOnlySelectionPassed":true,"nativeLayouts":captures.count,"captures":captures,"menuCaptures":6,"safeSwitchSharedFlowPassed":true,"emailWidthPassed":true,"partialPricingPassed":true,"nativeAssertions":assertionCount,"scope":"isolated synthetic AppKit fixture; not installed-app acceptance"]
+        // Phase A 1.1.1 regressions: P0-04/P0-06/P0-07, P1-01/P1-09/P1-21/P1-24/P1-25/P1-27/P1-28/P1-29
+        do {
+            let p1Host = Assistant(state: state.appendingPathComponent("p1-regressions"))
+            p1Host.configuration = try ConfigurationStore(state: p1Host.state)
+            p1Host.bridge = BackendBridge(resources: state, state: p1Host.state)
+            p1Host.reachable = true
+            var usageEventsFetches = 0
+            p1Host.bridge.fixtureReply = { request in
+                let cmd = request["command"] as? String ?? ""
+                if cmd == "usage_events" {
+                    usageEventsFetches += 1
+                    let offset = request["offset"] as? Int ?? 0
+                    return [
+                        "ok": true, "snapshotId": "log-snap", "generated_at": 1700000000,
+                        "scope": "2 DBs", "total": 450,
+                        "rows": [["model": "gemini-test", "timestamp_seconds": 1700000000, "input_tokens": 100 + offset, "output_tokens": 50, "cached_tokens": 25, "cache_write_tokens": 25]]
+                    ]
+                }
+                if cmd == "maintenance_scan" {
+                    return [
+                        "ok": true, "token": "scan-tok-1", "running": false,
+                        "retentionDays": request["retentionDays"] as? Int ?? 7,
+                        "scannedAt": 1700000000, "totalBytes": 4096, "totalFiles": 4,
+                        "entries": [
+                            ["name": "Cache", "bytes": 2048, "fileCount": 2, "clearable": true, "category": "safe"],
+                            ["name": "GPUCache", "bytes": 1024, "fileCount": 1, "clearable": true, "category": "safe"],
+                            ["name": "Code Cache", "bytes": 1024, "fileCount": 1, "clearable": true, "category": "safe"]
+                        ],
+                        "snapshots": [
+                            ["id": "snap-1", "timestamp": 1700000000, "totalBytes": 1024, "restorable": true, "items": ["Cache"]],
+                            ["id": "snap-2", "timestamp": 1699990000, "totalBytes": 1024, "restorable": true, "items": ["GPUCache"]]
+                        ]
+                    ]
+                }
+                return [
+                    "ok": true, "period": request["period"] as? String ?? "today",
+                    "selectedAccountId": "all", "snapshotId": "p109-snap",
+                    "summary": [
+                        "availability": "complete",
+                        "totalTokens": 300,
+                        "promptTokens": 50,
+                        "cachedTokens": 50,
+                        "cacheWriteTokens": 100,
+                        "requestCount": 3,
+                        "estimatedUsd": 0.15,
+                        "databasesScanned": 2,
+                        "databasesDiscovered": 2
+                    ],
+                    "byModel": [["model": "claude-sonnet-4.5", "totalTokens": 300, "inputTokens": 50, "outputTokens": 100, "requestCount": 3, "priced": false]],
+                    "dailyTrends": [],
+                    "todayHourly": [["hour": "2026-11-15 10:00", "totalTokens": 300, "requestCount": 3]]
+                ]
+            }
+
+            // P0-04 + P1-09: usage page cacheWriteTokens denominator + structured pricing_warning_codes
+            let uPage = UsagePage(app: p1Host)
+            uPage.fetch(force: true); pump()
+            check(uPage.cacheRateMetric.stringValue == "25.0%", "P1-09: UsagePage cacheHitRate denominator must include cacheWriteTokens (expected 25.0%, got \(uPage.cacheRateMetric.stringValue))")
+            uPage.updateReadStatus([
+                "databasesScanned": 2, "databasesDiscovered": 2,
+                "pricing_warning_codes": ["legacy_json_migrated", "legacy_ledger_migrated", "historical_receipts_locked"],
+                "pricing_warnings": ["Custom localized migration", "Another internal migration", "Locked receipts notice"]
+            ])
+            check(uPage.footerBox.isHidden, "P0-04: pricing_warning_codes must filter internal migration warnings regardless of text")
+            uPage.updateReadStatus([
+                "databasesScanned": 2, "databasesDiscovered": 2,
+                "pricing_warnings": ["Legacy JSON archive", "Legacy ledger preserved", "Historical cost receipts"]
+            ])
+            check(uPage.footerBox.isHidden, "P0-04: English legacy warning prefixes must remain filtered")
+            uPage.updateReadStatus([
+                "databasesScanned": 2, "databasesDiscovered": 2,
+                "pricing_warning_codes": ["pricing_rate_anomaly"],
+                "pricing_warnings": ["Pricing interval check needed"]
+            ])
+            check(!uPage.footerBox.isHidden && uPage.statusSummary.stringValue.contains("Pricing interval check needed"), "P0-04: Unknown warning codes must stay visible")
+            check(InterfaceText.isInternalDualWindowError("Dual window unavailable") && InterfaceText.isInternalDualWindowError("双周期缺失") && !InterfaceText.isInternalDualWindowError("HTTP 500"), "P0-04: Dual window error helper must handle English and Chinese")
+
+            // P1-09 + P1-28 + P0-07: MenuPanel cacheWriteTokens, unavailable clearing, cachedRecommendedAccountId + language reopen
+            L10n.shared.setLanguage("zh-Hans", notify: false)
+            p1Host.cachedUsageReportsByPeriod["today"] = [
+                "snapshotId": "menu-p109",
+                "summary": [
+                    "availability": "complete",
+                    "totalTokens": 300,
+                    "promptTokens": 50,
+                    "cachedTokens": 50,
+                    "cacheWriteTokens": 100,
+                    "requestCount": 3,
+                    "estimatedUsd": 0.15,
+                    "databasesScanned": 2,
+                    "databasesDiscovered": 2
+                ],
+                "byModel": [["model": "gemini-test", "totalTokens": 300]],
+                "todayHourly": [["hour": "2026-11-15 10:00", "totalTokens": 300, "requestCount": 3]]
+            ]
+            p1Host.cachedAccounts = [
+                ["id": "a", "email": "a@example.invalid", "name": "Alpha", "subscription_tier": "PRO"],
+                ["id": "b", "email": "b@example.invalid", "name": "Beta", "subscription_tier": "PRO"]
+            ]
+            p1Host.activeAccountId = "a"
+            p1Host.cachedRecommendedAccountId = "b"
+            let mPanel = p1Host.ensureMenuPanelController()
+            mPanel.selectTab(0, persist: false); mPanel.panelWillOpen(); pump()
+            check(mPanel.cacheTile.valueLabel.stringValue == "25.0%", "P1-09: MenuPanel cacheTile must include cacheWriteTokens in denominator")
+            check(!mPanel.trendChart.buckets.isEmpty && !mPanel.modelsListStack.arrangedSubviews.isEmpty, "MenuPanel chart and models must populate on complete data")
+
+            p1Host.cachedUsageReportsByPeriod["today"] = ["summary": ["availability": "unavailable"]]
+            mPanel.panelWillOpen(); pump()
+            check(mPanel.trendChart.buckets.isEmpty && mPanel.modelsListStack.arrangedSubviews.isEmpty && mPanel.modelsHeaderCountLabel.stringValue.isEmpty && mPanel.toggleModelsButton.isHidden, "P1-28: Unavailable state must clear old MenuPanel trend chart and model rows")
+
+            mPanel.selectTab(2, persist: false); mPanel.panelWillOpen(); pump()
+            check(allTextValues(mPanel.accountsCardsStack).contains("推荐备用"), "P0-07: MenuPanel must read cachedRecommendedAccountId even before AccountsPage opens")
+            p1Host.setGlobalLanguage("en"); pump()
+            check(p1Host.menuPanelController == nil && p1Host.menuPopover?.contentViewController == nil, "P0-07: Closed popover controller and contentViewController must clear on language switch")
+            let reopenedPanel = p1Host.ensureMenuPanelController()
+            reopenedPanel.selectTab(2, persist: false); reopenedPanel.panelWillOpen(); pump()
+            check(allTextValues(reopenedPanel.accountsCardsStack).contains("Recommended") && !allTextValues(reopenedPanel.accountsCardsStack).contains("推荐备用"), "P0-07: Recreated MenuPanel must preserve recommendation badge in English")
+
+            // P1-28: UsageLog jumpToPage single fetch on blurred Enter
+            let sheetHostWin = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 620), styleMask: [.titled], backing: .buffered, defer: false)
+            let logCtrl = UsageLogController(app: p1Host, period: "today")
+            logCtrl.show(in: sheetHostWin) {}
+            pump()
+            check(usageEventsFetches == 1, "UsageLog initial show must trigger one fetch")
+            logCtrl.sheet.makeFirstResponder(logCtrl.pageNumber)
+            logCtrl.pageNumber.stringValue = "2"
+            logCtrl.jumpToPage(); pump()
+            check(usageEventsFetches == 2, "P1-28: UsageLog jumpToPage + focus loss must not double-fetch usage_events (got \(usageEventsFetches))")
+            logCtrl.closeSheet(); pump()
+
+            // P1-28: Maintenance busy-state locks scanButton, clearButton, switches, retentionPopup & restoreLatestButton
+            L10n.shared.setLanguage("zh-Hans", notify: false)
+            let cacheCtrl = CachePage(app: p1Host)
+            cacheCtrl.fetch(force: true); pump()
+            cacheCtrl.fetch(force: true)
+            check(cacheCtrl.busy && !cacheCtrl.scanButton.isEnabled && !cacheCtrl.retentionPopup.isEnabled && !cacheCtrl.clearButton.isEnabled && !cacheCtrl.runtimeCacheSwitch.isEnabled && !cacheCtrl.historyLogsSwitch.isEnabled && !cacheCtrl.restoreLatestButton.isEnabled, "P1-28: Maintenance busy state must disable all interactive controls during scan")
+            pump()
+            check(!cacheCtrl.busy && cacheCtrl.scanButton.isEnabled && cacheCtrl.runtimeCacheSwitch.isEnabled && cacheCtrl.restoreLatestButton.isEnabled, "Maintenance scan completion must restore interactive controls")
+
+            // Verify blocked sub-items (e.g. symlinked GPUCache) are silently skipped in 2-bucket projection & smart_clear dispatches scopes cleanly
+            var smartClearedScopes: [String] = []
+            let prevP1Reply = p1Host.bridge.fixtureReply
+            p1Host.bridge.fixtureReply = { request in
+                let cmd = request["command"] as? String ?? ""
+                if cmd == "maintenance_scan" {
+                    return [
+                        "ok": true, "token": "scan-tok-partial-block", "running": false,
+                        "retentionDays": 7, "scannedAt": 1700000010, "totalBytes": 3072, "totalFiles": 3,
+                        "trashDir": "/tmp/gb-fallback-trash", "usingFallbackTrash": true,
+                        "entries": [
+                            ["name": "Cache", "bytes": 2048, "fileCount": 2, "clearable": true, "category": "safe", "defaultSelected": true],
+                            ["name": "Code Cache", "bytes": 1024, "fileCount": 1, "clearable": true, "category": "safe", "defaultSelected": true],
+                            ["name": "GPUCache", "bytes": 0, "fileCount": 0, "clearable": false, "reason": "缓存含符号链接，已跳过", "category": "safe", "defaultSelected": true]
+                        ],
+                        "snapshots": []
+                    ]
+                }
+                if cmd == "maintenance_smart_clear" {
+                    smartClearedScopes = (request["scopes"] as? [String]) ?? []
+                    return ["ok": true, "moved": 2, "clearedBytes": 3072, "trashDir": "/tmp/gb-fallback-trash", "usingFallbackTrash": true, "supersededSnapshotPaths": []]
+                }
+                return prevP1Reply?(request) ?? ["ok": true]
+            }
+            cacheCtrl.fetch(force: true); pump()
+            check(cacheCtrl.clearButton.isEnabled && cacheCtrl.runtimeBucketBytes == 3072 && cacheCtrl.restoreLatestButton.isHidden && cacheCtrl.usingFallbackTrash && cacheCtrl.activeTrashPath == "/tmp/gb-fallback-trash", "Blocked sub-item must be silently skipped while keeping healthy runtime bucket enabled")
+            cacheCtrl.clearSelectedCaches(); pump()
+            check(smartClearedScopes == ["runtime_cache"], "clearSelectedCaches must dispatch maintenance_smart_clear with active scopes")
+            p1Host.bridge.fixtureReply = prevP1Reply
+            sheetHostWin.orderOut(nil)
+
+            // P0-06: Open modal sheets remain alive & interactive while background window re-localizes on language change
+            assistant.setGlobalLanguage("zh-Hans"); pump()
+            assistant.selectPage(3); pump()
+            let sheetObj = PricingSyncSheetController(app: assistant)
+            assistant.preferencesController?.pricingSheet = sheetObj
+            sheetObj.show(in: window, payload: ["synced": true, "prices": [:], "status": ["modelCount": 0]]) { [weak prefs = assistant.preferencesController] in
+                prefs?.pricingSheet = nil
+            }
+            pump()
+            check(window.activeSheetWindow === sheetObj.sheet, "P0-06: PricingSyncSheetController must attach before language switch")
+            assistant.setGlobalLanguage("en"); pump()
+            check(window.activeSheetWindow === sheetObj.sheet && sheetObj.closeBtn.target != nil, "P0-06: PricingSyncSheetController must stay retained and responsive across live language change")
+            check(assistant.names == ["Overview", "Accounts", "Usage", "Settings", "About"], "P0-06: Background main window must re-localize while modal sheet stays open")
+            sheetObj.closeBtn.performClick(nil); pump()
+            check(window.activeSheetWindow == nil, "P0-06: PricingSyncSheetController close button must dismiss cleanly after language switch")
+
+            assistant.selectPage(1); pump()
+            let policySheet = AccountPolicySheet(app: assistant, config: ["strategy": "priority", "monitored_model": "gemini", "reserve_percentage": 10, "candidate_min_percentage": 30]) {}
+            assistant.accountsPage?.policySheet = policySheet
+            policySheet.show(in: window) { [weak page = assistant.accountsPage] in
+                page?.policySheet = nil
+            }
+            pump()
+            check(window.activeSheetWindow === policySheet.window, "P0-06: AccountPolicySheet must attach before language switch")
+            assistant.setGlobalLanguage("zh-Hans"); pump()
+            check(window.activeSheetWindow === policySheet.window && assistant.names == ["总览", "账号", "用量", "设置", "关于"], "P0-06: AccountPolicySheet must stay open while background window switches back to Chinese")
+            policySheet.cancel(); pump()
+            check(window.activeSheetWindow == nil, "P0-06: AccountPolicySheet cancel must work after language switch")
+
+            // P1-01, P1-21, P1-25, P1-27, P1-29 English assertions
+            assistant.setGlobalLanguage("en"); pump()
+            let updateBuild = assistant.updateManager.currentBuildDisplay
+            check((Int(updateBuild) ?? 0) >= 10101, "P1-01: UpdateManager currentBuildDisplay fallback/build must be >= 10101 (got \(updateBuild))")
+            let updaterScript = AppUpdateManager.buildDetachedUpdaterScript(myPid: 99999, workDirPath: "/tmp/gb-upd", i18nDirPath: "/tmp/gb-upd/i18n", appLanguage: "en")
+            let expectedUpdaterExport = String(AppUpdateManager.shellQuote("export GRAVITYBOX_I18N_DIR=" + AppUpdateManager.shellQuote("/tmp/gb-upd/i18n") + " GRAVITYBOX_LANGUAGE=" + AppUpdateManager.shellQuote("en")).dropFirst().dropLast())
+            check(updaterScript.contains(expectedUpdaterExport), "P1-21: Updater script must propagate GRAVITYBOX_I18N_DIR and GRAVITYBOX_LANGUAGE")
+            let cleanedNotes = AppUpdateManager.formatReleaseNotes("## Checksum\nsha256: abc\n## Release Notes\n- English layout polish\n")
+            check(!cleanedNotes.contains("Checksum") && cleanedNotes.contains("English layout polish"), "P1-25: Boilerplate heading filter must drop English Checksum sections")
+            let wideRefreshBtn = InlineRefreshButton("Check for Updates", width: 124, target: nil, action: #selector(PricingSyncSheetController.closeSheet))
+            check(wideRefreshBtn.intrinsicContentSize.width > 124, "P1-27: InlineRefreshButton must expand beyond 124pt for longer English label (got \(wideRefreshBtn.intrinsicContentSize.width))")
+
+            assistant.selectPage(0); pump()
+            check(assistant.dashboardPage?.usageMetric.allowsDefaultTighteningForTruncation == true, "P1-27: Overview cost metric must enable allowsDefaultTighteningForTruncation")
+            let enModelRow = ModelUsageRow(name: "unpriced-test", tokens: "100", input: "50", output: "50", requests: 1, cost: L10n.t("menu_panel.usage.unpriced"), share: 100, isUnpriced: true)
+            check(enModelRow.costLabel.textColor == Design.secondary && enModelRow.costLabel.stringValue != "未计价", "P1-25: English unpriced model row must style cleanly without Chinese sentinel")
+
+            let enUsagePage = UsagePage(app: p1Host)
+            enUsagePage.fetch(force: true); pump()
+            let usageTexts = allTextValues(enUsagePage.view)
+            check(usageTexts.allSatisfy { $0.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) == nil }, "P1-29: English UsagePage must not leak Chinese characters: \(usageTexts.filter { $0.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) != nil })")
+            let enMaintSheet = MaintenanceSheetController(app: p1Host)
+            enMaintSheet.cachePage.fetch(force: true); pump()
+            enMaintSheet.sheet.contentView?.layoutSubtreeIfNeeded(); pump()
+            let maintTexts = allTextValues(enMaintSheet.sheet.contentView!)
+            check(maintTexts.allSatisfy { $0.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) == nil }, "English MaintenanceSheetController must not leak Chinese characters: \(maintTexts.filter { $0.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) != nil })")
+            check(hasNonEmptyTooltip(enMaintSheet.sheet.contentView!) == nil, "MaintenanceSheetController must have zero hover tooltips")
+            for enLbl in [enMaintSheet.cachePage.reclaimableTitleLabel, enMaintSheet.cachePage.reclaimableValueLabel, enMaintSheet.cachePage.heroSubtitleLabel, enMaintSheet.cachePage.safeLegendLabel, enMaintSheet.cachePage.statefulLegendLabel, enMaintSheet.cachePage.protectedLegendLabel, enMaintSheet.cachePage.runtimeTitleLabel, enMaintSheet.cachePage.runtimeSubtitleLabel, enMaintSheet.cachePage.historyTitleLabel, enMaintSheet.cachePage.historySubtitleLabel, enMaintSheet.cachePage.recoveryTitleLabel, enMaintSheet.cachePage.recoverySubtitleLabel] where !enLbl.isHidden && !enLbl.stringValue.isEmpty {
+                let natW = (enLbl.stringValue as NSString).size(withAttributes: [.font: enLbl.font!]).width
+                check(enLbl.bounds.width + 1.5 >= floor(natW), "English Maintenance label must not truncate (\(enLbl.stringValue)): \(enLbl.bounds.width) < \(natW)")
+            }
+            // Verify all 4 Maintenance NSPopover kinds & running confirmation in English mode (both minimal fixture & Chinese-titled main fixture) emit zero CJK & zero tooltips
+            let enMainCache = assistant.cachePage ?? CachePage(app: assistant)
+            enMainCache.fetch(force: true); pump()
+            for (hostLabel, targetCache) in [("minimal", enMaintSheet.cachePage), ("mainFixture", enMainCache)] {
+                let confirmEn = targetCache.buildRunningClearConfirmationBody()
+                check(confirmEn.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) == nil && (confirmEn.contains("selected categories") || confirmEn.contains("selected category")), "English \(hostLabel) confirmation body must not leak CJK: \(confirmEn)")
+                for kind in [CachePage.DetailKind.runtime, .history, .protected, .snapshot] {
+                    targetCache.openDetailPopover(kind, relativeTo: targetCache.runtimeInfoButton)
+                    guard let popView = targetCache.detailPopover?.contentViewController?.view else {
+                        check(false, "English \(hostLabel) popover \(kind.rawValue) must build contentViewController")
+                        continue
+                    }
+                    let popTexts = allTextValues(popView)
+                    let popLeaks = popTexts.filter { $0.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) != nil }
+                    check(popLeaks.isEmpty, "English \(hostLabel) \(kind.rawValue) popover must not leak Chinese characters: \(popLeaks)")
+                    check(hasNonEmptyTooltip(popView) == nil, "English \(hostLabel) \(kind.rawValue) popover must have zero hover tooltips")
+                    if kind == .runtime {
+                        check(popTexts.contains("App Runtime Caches") && popTexts.contains("Network & Static Asset Cache"), "English \(hostLabel) runtime popover must localize catalog titles: \(popTexts)")
+                    } else if kind == .protected {
+                        check(popTexts.contains("Protected Core Data") && popTexts.contains("Never Touched"), "English \(hostLabel) protected popover must render Never Touched badge: \(popTexts)")
+                    } else if kind == .snapshot {
+                        check(popTexts.contains("Last Cleanup Snapshot") && popTexts.contains("Network & Static Asset Cache"), "English \(hostLabel) snapshot popover must localize snapshot itemTitles: \(popTexts)")
+                    }
+                }
+                targetCache.dismissDetailPopover()
+            }
+
+            // English pricing sheet localization & live language switch coverage
+            let enPricingHost = Assistant(state: state.appendingPathComponent("en-pricing-sheet"))
+            enPricingHost.configuration = try ConfigurationStore(state: enPricingHost.state)
+            enPricingHost.bridge = BackendBridge(resources: state, state: enPricingHost.state)
+            let enPricingPayload: [String: Any] = [
+                "synced": true,
+                "status": ["lastCheckAt": 1794539910722.0, "modelCount": 4],
+                "unpricedLiveModels": [
+                    ["key": "gemini-4.5-live", "displayName": "Gemini 4.5 Live", "disabled": false]
+                ],
+                "prices": [
+                    "gemini-3.8-flash": ["input": 0.75, "output": 3.75, "cached": 0.075],
+                    "gemini-4-argon": ["input": 1.5, "output": 7.5, "cached": 0.15],
+                    "gemini-4-carbon": ["input": 2.0, "output": 10.0, "cached": 0.2]
+                ],
+                "retiredPrices": [
+                    "claude-3.5-sonnet": ["input": 3.0, "output": 15.0, "cached": 0.3],
+                    "gemini-2.5-pro": ["input": 1.25, "output": 10.0, "cached": 0.31]
+                ],
+                "pricingStatus": [
+                    "gemini-3.8-flash": "confirmed",
+                    "gemini-4-argon": "confirmed",
+                    "gemini-4-carbon": "confirmed",
+                    "claude-3.5-sonnet": "confirmed",
+                    "gemini-2.5-pro": "historical"
+                ],
+                "modelCatalogState": [
+                    "gemini-4.5-live": ["availability": "unpriced_live", "displayName": "Gemini 4.5 Live"],
+                    "gemini-3.8-flash": ["availability": "available", "displayName": "Gemini 3.8 Flash"],
+                    "gemini-4-argon": ["availability": "tier_locked", "displayName": "Gemini 4 Argon"],
+                    "gemini-4-carbon": ["availability": "other_tier_only", "displayName": "Gemini 4 Carbon", "availableInTiers": ["ULTRA"]],
+                    "claude-3.5-sonnet": ["availability": "retired", "displayName": "Claude 3.5 Sonnet"],
+                    "gemini-2.5-pro": ["availability": "retired", "displayName": "Gemini 2.5 Pro"]
+                ]
+            ]
+            assistant.setGlobalLanguage("zh-Hans"); pump()
+            let enPricingSheet = PricingSyncSheetController(app: enPricingHost)
+            enPricingSheet.show(in: window, payload: enPricingPayload)
+            pump()
+            check(enPricingSheet.retiredToggleBtn?.title == "▸ 已下架模型（2 款 · 仅用于历史账单核算）", "Live switch test starts in zh-Hans before switching to en")
+            assistant.setGlobalLanguage("en"); pump()
+            check(enPricingSheet.retiredToggleBtn?.title == "▸ Deprecated Models (2 · Historical Ledger Only)", "Live setGlobalLanguage(\"en\") must localize collapsed toggle title: \(enPricingSheet.retiredToggleBtn?.title ?? "nil")")
+            enPricingSheet.retiredToggleBtn?.performClick(nil); pump()
+            check(enPricingSheet.retiredToggleBtn?.title == "▾ Deprecated Models (2 · Historical Ledger Only)", "Expanded English toggle title must match spec: \(enPricingSheet.retiredToggleBtn?.title ?? "nil")")
+            let enPricingTexts = allTextValues(enPricingSheet.sheet.contentView!)
+            check(enPricingTexts.contains("New · Rate Pending") && enPricingTexts.contains("Locked on Current Plan") && enPricingTexts.contains("Active on ULTRA") && enPricingTexts.contains("Deprecated") && enPricingTexts.contains("Detected in Antigravity; awaiting public pricing feed rate"), "English pricing sheet must localize all new badges and descriptions: \(enPricingTexts)")
+            let enPricingCjkLeaks = enPricingTexts.filter { $0.range(of: "[\\u4E00-\\u9FFF]", options: .regularExpression) != nil }
+            check(enPricingCjkLeaks.isEmpty, "English pricing sheet must not leak Chinese characters: \(enPricingCjkLeaks)")
+            enPricingSheet.closeSheet(); pump()
+
+            assistant.setGlobalLanguage("zh-Hans"); pump()
+
+            // Dynamic per-tier quotaGroups across Overview, Accounts, MenuPanel, and ModelIcons
+            check(ModelIcons.brands(for: "Orchestrator (Argon)") == ["gemini"], "Orchestrator group resolves Gemini brand icon")
+
+            let ultraAcc: [String: Any] = [
+                "id": "ultra-1",
+                "name": "Ultra User",
+                "email": "ultra@example.invalid",
+                "subscription_tier": "ULTRA",
+                "status": "normal",
+                "is_current": true,
+                "quotaGroups": [
+                    [
+                        "key": "gemini",
+                        "displayName": "Gemini",
+                        "summaryLabel": "Gemini",
+                        "brands": ["gemini"],
+                        "isStandalone": false,
+                        "availability": "available",
+                        "quotaState": "known",
+                        "windows": [
+                            ["id": "five_hour", "period": "5h", "label": "5 小时", "known": true, "remaining": 0.64, "stale": false, "resetCountdown": "4小时后重置"],
+                            ["id": "weekly", "period": "weekly", "label": "每周", "known": true, "remaining": 0.64, "stale": false, "resetCountdown": "6天后重置"]
+                        ]
+                    ],
+                    [
+                        "key": "claude_gpt",
+                        "displayName": "Claude/GPT",
+                        "summaryLabel": "Claude/GPT",
+                        "brands": ["claude", "gpt"],
+                        "isStandalone": false,
+                        "availability": "available",
+                        "quotaState": "known",
+                        "windows": [
+                            ["id": "five_hour", "period": "5h", "label": "5 小时", "known": true, "remaining": 1.0, "stale": false, "resetCountdown": "5小时后重置"],
+                            ["id": "weekly", "period": "weekly", "label": "每周", "known": true, "remaining": 1.0, "stale": false, "resetCountdown": "7天后重置"]
+                        ]
+                    ]
+                ]
+            ]
+            let proAcc: [String: Any] = [
+                "id": "pro-1",
+                "name": "Pro User",
+                "email": "pro@example.invalid",
+                "subscription_tier": "PRO",
+                "status": "normal",
+                "is_current": true,
+                "quotaGroups": [
+                    ["key": "gemini", "displayName": "Gemini", "summaryLabel": "Gemini", "brands": ["gemini"], "isStandalone": false, "availability": "available", "quotaState": "known", "windows": [["id": "five_hour", "period": "5h", "label": "5 小时", "known": true, "remaining": 0.53, "stale": false], ["id": "weekly", "period": "weekly", "label": "每周", "known": true, "remaining": 0.53, "stale": false]]],
+                    ["key": "claude_gpt", "displayName": "Claude/GPT", "summaryLabel": "Claude/GPT", "brands": ["claude", "gpt"], "isStandalone": false, "availability": "available", "quotaState": "known", "windows": [["id": "five_hour", "period": "5h", "label": "5 小时", "known": true, "remaining": 0.76, "stale": false], ["id": "weekly", "period": "weekly", "label": "每周", "known": true, "remaining": 0.76, "stale": false]]],
+                    ["key": "argon", "displayName": "Gemini 4 Argon", "summaryLabel": "Argon", "brands": ["gemini"], "isStandalone": true, "availability": "available", "quotaState": "known", "windows": [["id": "weekly", "period": "weekly", "label": "每周", "known": true, "remaining": 0.64, "stale": false, "resetCountdown": "6天后重置"]]]
+                ]
+            ]
+            let freeAcc: [String: Any] = [
+                "id": "free-1",
+                "name": "Free User",
+                "email": "free@example.invalid",
+                "subscription_tier": "FREE",
+                "status": "normal",
+                "is_current": true,
+                "familyWindows": [
+                    "gemini": ["model_quota": ["remaining": 1.0, "known": true, "stale": false]],
+                    "claude": ["model_quota": ["remaining": 0.8, "known": true, "stale": false]]
+                ],
+                "argonStatus": ["availability": "disabled", "quotaState": "not_reported"]
+            ]
+
+            let ultraDashAcc: [String: Any] = [
+                "activeEmail": "ultra@example.invalid",
+                "activeName": "Ultra User",
+                "activeTier": "ULTRA",
+                "isLiveVerified": true,
+                "quotaGroups": ultraAcc["quotaGroups"] ?? []
+            ]
+            let proDashAcc: [String: Any] = [
+                "activeEmail": "pro@example.invalid",
+                "activeName": "Pro User",
+                "activeTier": "PRO",
+                "isLiveVerified": true,
+                "quotaGroups": proAcc["quotaGroups"] ?? []
+            ]
+            let freeDashAcc: [String: Any] = [
+                "activeEmail": "free@example.invalid",
+                "activeName": "Free User",
+                "activeTier": "FREE",
+                "isLiveVerified": true,
+                "familyWindows": freeAcc["familyWindows"] ?? [:],
+                "argonStatus": freeAcc["argonStatus"] ?? [:]
+            ]
+
+            let dashHost = Assistant(state: state.appendingPathComponent("dyn-dash"))
+            dashHost.configuration = try ConfigurationStore(state: dashHost.state)
+            dashHost.bridge = BackendBridge(resources: state, state: dashHost.state)
+            dashHost.reachable = false
+
+            let ultraDash = DashboardPage(app: dashHost)
+            ultraDash.view.frame = NSRect(x: 0, y: 0, width: 920, height: 760)
+            ultraDash.renderSummary(["accounts": ultraDashAcc], isStaleFallback: false)
+            ultraDash.view.layoutSubtreeIfNeeded(); pump()
+            let ultraDashTexts = allTextValues(ultraDash.view)
+            check(ultraDash.standaloneDivider.isHidden && ultraDash.standaloneQuotaStack.isHidden, "Ultra overview must hide standalone divider and rows")
+            check(!ultraDashTexts.contains(where: { $0.contains("Argon") || $0.contains("Carbon") || $0.contains("周期未知") }), "Ultra overview must not show Argon, Carbon, or 周期未知")
+            check(ultraDash.trendTitleLabel.stringValue == "今日时段消耗" && ultraDash.trendTitleLabel.bounds.width >= 60, "Overview trend title must remain visible without collapsing to 0pt")
+            check(ultraDash.trendDetailLabel.stringValue.hasPrefix("今日 ") && ultraDash.trendDetailLabel.bounds.width >= 110, "Overview trend detail subtitle must have enough horizontal room without truncating at 920px (got width=\(ultraDash.trendDetailLabel.bounds.width))")
+            check(ultraDash.todayPeakBadge.frame.minX > ultraDash.trendTitleLabel.frame.maxX + 8, "Overview peak pill badge must align to trailing edge after trend title")
+            check(ultraDash.todayTrendChart.bounds.height > 100 && ultraDash.todayTrendChart.bounds.height <= 114.5, "Overview trend chart must cap vertical bar height at <= 114pt while keeping compact clarity (got \(ultraDash.todayTrendChart.bounds.height))")
+
+            let proDash = DashboardPage(app: dashHost)
+            proDash.view.frame = NSRect(x: 0, y: 0, width: 920, height: 760)
+            proDash.renderSummary(["accounts": proDashAcc], isStaleFallback: false)
+            proDash.view.layoutSubtreeIfNeeded(); pump()
+            let proDashTexts = allTextValues(proDash.view)
+            check(!proDash.standaloneDivider.isHidden && !proDash.standaloneQuotaStack.isHidden, "Pro overview must show standalone Argon row")
+            check(proDashTexts.contains("Gemini 4 Argon · 每周") && !proDashTexts.contains(where: { $0.contains("Carbon") || $0.contains("周期未知") }), "Pro overview must show Gemini 4 Argon · 每周 without Carbon or 周期未知")
+
+            let freeDash = DashboardPage(app: dashHost)
+            freeDash.view.frame = NSRect(x: 0, y: 0, width: 920, height: 760)
+            freeDash.renderSummary(["accounts": freeDashAcc], isStaleFallback: false)
+            freeDash.view.layoutSubtreeIfNeeded(); pump()
+            check(freeDash.standaloneDivider.isHidden && freeDash.standaloneQuotaStack.isHidden, "Free overview with disabled Argon must show zero standalone rows")
+
+            let singleWindowFreeGroups: [[String: Any]] = [
+                [
+                    "key": "gemini",
+                    "displayName": "Gemini",
+                    "summaryLabel": "Gemini",
+                    "brands": ["gemini"],
+                    "isStandalone": false,
+                    "availability": "available",
+                    "quotaState": "known",
+                    "windows": [
+                        ["id": "weekly", "period": "weekly", "label": "每周", "known": true, "remaining": 1.0, "stale": false, "resetCountdown": "6天23小时后重置"]
+                    ]
+                ],
+                [
+                    "key": "claude_gpt",
+                    "displayName": "Claude/GPT",
+                    "summaryLabel": "Claude/GPT",
+                    "brands": ["claude", "gpt"],
+                    "isStandalone": false,
+                    "availability": "available",
+                    "quotaState": "known",
+                    "windows": [
+                        ["id": "weekly", "period": "weekly", "label": "每周", "known": true, "remaining": 1.0, "stale": false, "resetCountdown": "6天23小时后重置"]
+                    ]
+                ]
+            ]
+            let singleWinFreeDashAcc: [String: Any] = [
+                "activeEmail": "free1w@example.invalid",
+                "activeName": "Alex",
+                "activeTier": "FREE",
+                "isLiveVerified": true,
+                "quotaLastUpdated": Date().timeIntervalSince1970,
+                "quotaGroups": singleWindowFreeGroups
+            ]
+            let singleWinFreeDash = DashboardPage(app: dashHost)
+            singleWinFreeDash.view.frame = NSRect(x: 0, y: 0, width: 920, height: 760)
+            singleWinFreeDash.renderSummary(["accounts": singleWinFreeDashAcc], isStaleFallback: false)
+            singleWinFreeDash.view.layoutSubtreeIfNeeded(); pump()
+            check(singleWinFreeDash.coreQuotaStack.arrangedSubviews.count == 1, "Single-window FREE core groups must pair side-by-side into 1 two-column row")
+            if let pairedRow = singleWinFreeDash.coreQuotaStack.arrangedSubviews.first as? NSStackView {
+                check(pairedRow.arrangedSubviews.count == 2 && pairedRow.arrangedSubviews.allSatisfy { $0 is QuotaBarView }, "Paired FREE core row must render two QuotaBarViews side-by-side")
+            }
+
+            for (tierName, dashPage) in [("ULTRA", ultraDash), ("PRO", proDash), ("FREE", freeDash), ("FREE-1W", singleWinFreeDash)] {
+                if let scroll = dashPage.view as? NSScrollView, let doc = scroll.documentView {
+                    let bentoBottom = doc.convert(dashPage.bentoRow.bounds, from: dashPage.bentoRow).maxY
+                    let viewportH = scroll.contentView.bounds.height
+                    check(abs(viewportH - 708) <= 1.0 && abs(bentoBottom - (viewportH - 16)) <= 2.0, "\(tierName) overview must adaptively expand vertically to fill viewport down to 16pt bottom margin (bentoBottom=\(bentoBottom), viewportH=\(viewportH))")
+                } else {
+                    check(false, "Overview view must be an NSScrollView")
+                }
+            }
+            check(ultraDash.refreshQuotaButton.intrinsicContentSize.width <= 96 && ultraDash.refreshQuotaButton.intrinsicContentSize.width >= 84, "Chinese QuotaRefreshButton must use compact width (got \(ultraDash.refreshQuotaButton.intrinsicContentSize.width))")
+            let idleRefreshW = ultraDash.refreshQuotaButton.intrinsicContentSize.width
+            ultraDash.refreshQuotaButton.setRefreshState(busy: true, available: true, error: nil)
+            ultraDash.refreshQuotaButton.frame = NSRect(x: 0, y: 0, width: idleRefreshW, height: 28)
+            ultraDash.refreshQuotaButton.layoutSubtreeIfNeeded()
+            check(ultraDash.refreshQuotaButton.intrinsicContentSize.width == idleRefreshW && ultraDash.refreshQuotaButton.spinner.frame.minX >= 10, "Busy QuotaRefreshButton must preserve constant width while centering spinner+label group")
+            ultraDash.refreshQuotaButton.setRefreshState(busy: false, available: true, error: nil)
+
+            // Capture 1024x710 Dark verification screenshots for Ultra / Pro / Free Overview and 3-tier Accounts
+            let prevWinSize = window.frame.size
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.setFrame(NSRect(origin: window.frame.origin, size: NSSize(width: 1024, height: 710)), display: true)
+            assistant.selectPage(0); pump()
+            var tierMetricHeights: [String: CGFloat] = [:]
+            var tierModelCounts: [String: Int] = [:]
+            var tierBadges: [String: String] = [:]
+            for (slug, accPayload) in [("ultra", ultraDashAcc), ("pro", proDashAcc), ("free", singleWinFreeDashAcc)] {
+                var enriched = accPayload
+                enriched["quotaLastUpdated"] = Date().timeIntervalSince1970
+                assistant.overview!.renderSummary([
+                    "accounts": enriched,
+                    "usage": ["todayTokens": 303_000_000, "totalTokens": 3_770_000_000, "estimatedUsd": 75.37, "allTimeEstimatedUsd": 679.89, "requestCount": 2381, "totalRequestCount": 33949, "todayPricedModels": 4, "todayUnpricedModels": 0, "pricedModels": 4, "unpricedModels": 0, "databasesScanned": 343, "databasesDiscovered": 343, "availability": "complete", "todayByModel": models, "todayHourly": todayHourly]
+                ], isStaleFallback: false)
+                window.contentView?.layoutSubtreeIfNeeded(); pump()
+                window.contentView?.layoutSubtreeIfNeeded()
+                tierMetricHeights[slug] = assistant.overview!.tokenMetricCard?.bounds.height ?? 0
+                tierModelCounts[slug] = assistant.overview!.bentoRightStack.arrangedSubviews.count
+                tierBadges[slug] = assistant.overview!.rightBentoCountBadge.title
+                try capture(window.contentView!, output.appendingPathComponent("verify-dark-overview-\(slug).png"))
+            }
+            let proMetricH = tierMetricHeights["pro"] ?? 0
+            let ultraMetricH = tierMetricHeights["ultra"] ?? 0
+            let freeMetricH = tierMetricHeights["free"] ?? 0
+            check(proMetricH >= 132 && abs(proMetricH - ultraMetricH) <= 2.0 && abs(proMetricH - freeMetricH) <= 2.0, "1024x710 KPI cards must stay tall and uniform across PRO/ULTRA/FREE (got pro=\(proMetricH), ultra=\(ultraMetricH), free=\(freeMetricH))")
+            check(tierModelCounts["pro"] == 2 && tierBadges["pro"] == "Top 2 / 共 4 个", "1024x710 PRO overview must render Top 2 active models (got \(tierModelCounts["pro"] ?? -1), \(tierBadges["pro"] ?? ""))")
+            check(tierModelCounts["ultra"] == 2 && tierBadges["ultra"] == "Top 2 / 共 4 个", "1024x710 ULTRA overview must render Top 2 active models (got \(tierModelCounts["ultra"] ?? -1), \(tierBadges["ultra"] ?? ""))")
+            check(tierModelCounts["free"] == 3 && tierBadges["free"] == "Top 3 / 共 4 个", "1024x710 1-row FREE overview must auto-expand to Top 3 active models (got \(tierModelCounts["free"] ?? -1), \(tierBadges["free"] ?? ""))")
+            let singleWinFreeCardAcc: [String: Any] = [
+                "id": "free-1w",
+                "name": "Alex",
+                "email": "free1w@example.invalid",
+                "subscription_tier": "FREE",
+                "status": "normal",
+                "quota": ["last_updated": Date().timeIntervalSince1970],
+                "quotaGroups": singleWindowFreeGroups
+            ]
+            var ultraCardWithStamp = ultraAcc; ultraCardWithStamp["quota"] = ["last_updated": Date().timeIntervalSince1970]
+            var proCardWithStamp = proAcc; proCardWithStamp["quota"] = ["last_updated": Date().timeIntervalSince1970]; proCardWithStamp["is_current"] = false
+            assistant.selectPage(1); pump()
+            assistant.accountsPage!.fetch(["accounts": [ultraCardWithStamp, proCardWithStamp, singleWinFreeCardAcc], "activeId": "ultra-1"]); pump()
+            window.contentView?.layoutSubtreeIfNeeded(); pump()
+            try capture(window.contentView!, output.appendingPathComponent("verify-dark-accounts-3tiers.png"))
+            assistant.quotaRefreshing = true
+            assistant.updateQuotaRefreshControls()
+            window.contentView?.layoutSubtreeIfNeeded(); pump()
+            try capture(window.contentView!, output.appendingPathComponent("verify-dark-accounts-refreshing.png"))
+            assistant.quotaRefreshing = false
+            assistant.updateQuotaRefreshControls()
+            window.setFrame(NSRect(origin: window.frame.origin, size: prevWinSize), display: true)
+
+            let dynAccountsHost = Assistant(state: state.appendingPathComponent("dyn-quota-groups"))
+            dynAccountsHost.configuration = try ConfigurationStore(state: dynAccountsHost.state)
+            dynAccountsHost.bridge = BackendBridge(resources: state, state: dynAccountsHost.state)
+            dynAccountsHost.reachable = true
+            dynAccountsHost.cachedAccounts = [ultraAcc, proAcc]
+            dynAccountsHost.activeAccountId = "ultra-1"
+            dynAccountsHost.statusValue = LiveStatus(["running": true, "runningChannel": "stable", "liveAccountEmail": "ultra@example.invalid"])
+            dynAccountsHost.bridge.fixtureReply = { request in
+                let cmd = request["command"] as? String ?? ""
+                if cmd == "account_list" {
+                    return ["ok": true, "accounts": [ultraAcc, proAcc], "activeId": "ultra-1"]
+                }
+                if cmd == "smart_switch_status" || cmd == "auto_switch_get" {
+                    return ["ok": true, "config": ["enabled": true, "strategy": "priority", "monitored_model": "argon", "reserve_percentage": 10, "candidate_min_percentage": 30]]
+                }
+                return ["ok": true]
+            }
+            let dynAccountsPage = AccountsPage(app: dynAccountsHost)
+            dynAccountsPage.view.frame = NSRect(x: 0, y: 0, width: 920, height: 760)
+            dynAccountsPage.fetch(["accounts": [ultraAcc, proAcc], "activeId": "ultra-1"]); pump()
+            dynAccountsPage.fetchPolicy(); pump()
+            check(dynAccountsPage.policySubtitleLabel.stringValue == "监测 Gemini · 剩余 ≤ 10% 时推荐候选（≥ 30%）", "Ultra active account must display pooled Gemini summary even if saved policy says argon")
+            let ultraScopedPolicy = AccountPolicySheet(app: dynAccountsHost, config: ["strategy": "priority", "monitored_model": "argon", "reserve_percentage": 10, "candidate_min_percentage": 30], saved: {})
+            ultraScopedPolicy.window.contentView?.layoutSubtreeIfNeeded()
+            check((ultraScopedPolicy.modelPopup.menu?.items ?? []).filter { !$0.isSeparatorItem }.map(\.title) == ["全部可用模型", "Gemini", "Claude/GPT"], "Ultra active account policy popup must not leak standby Pro account's Gemini 4 Argon")
+            check(ultraScopedPolicy.modelPopup.selectedItem?.title == "Gemini", "Ultra active account policy popup must remap argon selection to Gemini")
+            check(ultraScopedPolicy.strategyPopup.frame.width == ultraScopedPolicy.modelPopup.frame.width, "Ultra policy popups must share uniform width")
+            check(ultraScopedPolicy.modelPopup.frame.width <= 130 && ultraScopedPolicy.modelPopup.frame.width >= Design.fittedPopUpWidth(ultraScopedPolicy.modelPopup) - 0.5, "Ultra policy popups must shrink tightly to longest option without 220pt bloat (got \(ultraScopedPolicy.modelPopup.frame.width))")
+            check((ultraScopedPolicy.window.contentView?.frame.height ?? 999) < 395 && ultraScopedPolicy.fieldsCard.frame.height <= (groupStack(ultraScopedPolicy.fieldsCard)?.fittingSize.height ?? 0) + 34, "Ultra policy sheet must hug content without bottom blank space (contentH=\(ultraScopedPolicy.window.contentView?.frame.height ?? -1), cardH=\(ultraScopedPolicy.fieldsCard.frame.height))")
+            check(ultraScopedPolicy.monitoredSubLabel.stringValue == "Ultra 套餐已将 Argon 与 Carbon 并入此共享池，一并监测", "Ultra policy popup explains Argon/Carbon inclusion")
+            if let ultraCardBox = dynAccountsPage.cardsStack.arrangedSubviews.first {
+                let ultraExpandedTexts = allTextValues(ultraCardBox)
+                check(!ultraExpandedTexts.contains(where: { $0.contains("Argon") || $0.contains("Carbon") || $0.contains("周期未知") }), "Ultra expanded account card omits Argon, Carbon, and 周期未知")
+            } else {
+                check(false, "Expected Ultra expanded account card")
+            }
+            if let proCardBox = dynAccountsPage.cardsStack.arrangedSubviews.dropFirst().first {
+                let proExpandedTexts = allTextValues(proCardBox)
+                check(proExpandedTexts.contains("Gemini 4 Argon · 每周") && !proExpandedTexts.contains(where: { $0.contains("Carbon") || $0.contains("周期未知") }), "Pro expanded account card shows Gemini 4 Argon · 每周 without Carbon")
+            } else {
+                check(false, "Expected Pro expanded account card")
+            }
+            dynAccountsPage.toggleCollapseAllAccounts(); pump()
+            let dynAccountsTexts = allTextValues(dynAccountsPage.cardsStack)
+            check(dynAccountsTexts.contains { $0.contains("Gemini 64%") && $0.contains("Claude/GPT 100%") && !$0.contains("Argon") }, "Ultra account summary omits Argon/Carbon")
+            check(dynAccountsTexts.contains { $0.contains("Gemini 53%") && $0.contains("Claude/GPT 76%") && $0.contains("Argon 64%") }, "Pro account summary includes Argon 64%")
+
+            let dynMenu = MenuPanelController(app: dynAccountsHost)
+            dynMenu.loadViewIfNeeded()
+            dynMenu.selectTab(1, persist: false); pump()
+            let dynMenuQuotaTexts = allTextValues(dynMenu.quotaGroupsContainer)
+            check(dynMenuQuotaTexts.contains("Gemini") && dynMenuQuotaTexts.contains("Claude/GPT") && !dynMenuQuotaTexts.contains(where: { $0.contains("Argon") || $0.contains("Carbon") || $0.contains("周期未知") }), "Ultra menu quota tab omits Argon, Carbon, and 周期未知")
+            dynMenu.selectTab(2, persist: false); pump()
+            if let ultraCard = dynMenu.accountsCardsStack.arrangedSubviews.compactMap({ $0 as? MenuExpandableAccountCardView }).first {
+                let ultraCardTexts = allTextValues(ultraCard.detailContainer)
+                check(!ultraCardTexts.contains(where: { $0.contains("Argon") || $0.contains("Carbon") || $0.contains("周期未知") }), "Ultra menu account card omits Argon, Carbon, and 周期未知")
+            } else {
+                check(false, "Expected Ultra MenuExpandableAccountCardView")
+            }
+        }
+
+        let result:[String:Any] = ["stableOnlySelectionPassed":true,"nativeLayouts":captures.count,"captures":captures,"enCaptures":enCaptures,"menuCaptures":6,"safeSwitchSharedFlowPassed":true,"emailWidthPassed":true,"partialPricingPassed":true,"nativeAssertions":assertionCount,"scope":"isolated synthetic AppKit fixture; not installed-app acceptance"]
         try JSONSerialization.data(withJSONObject:result,options:[.prettyPrinted,.sortedKeys]).write(to:output.appendingPathComponent("native-ui-results.json"))
         window.orderOut(nil)
         print("24 current-page native layouts and 4 menu states; fixture checks passed")

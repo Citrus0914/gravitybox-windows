@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join, relative, resolve, sep } from 'node:path';
+import { bt } from './i18n.js';
 
 export type CacheCategory = 'safe' | 'stateful';
 export type CacheSection = 'runtime' | 'history';
@@ -121,219 +122,110 @@ export function normalizeRetentionDays(raw: unknown): number {
   return 7;
 }
 
-export const CACHE_METADATA: Record<string, CacheItemMetadata> = {
-  'Cache': {
-    title: '网络与静态资源缓存',
-    subtitle: '界面资源与临时网络缓存',
-    icon: 'internaldrive',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'Code Cache': {
-    title: 'V8 字节码编译缓存',
-    subtitle: 'JS / Wasm 预编译加速缓存',
-    icon: 'cpu',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'GPUCache': {
-    title: '图形与着色器缓存',
-    subtitle: 'Metal 与 WebGL 着色器缓存',
-    icon: 'sparkles.rectangle.stack',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'DawnCache': {
-    title: 'WebGPU 图形加速缓存',
-    subtitle: 'Dawn 引擎图形管线缓存',
-    icon: 'cube.transparent',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'DawnWebGPUCache': {
-    title: 'WebGPU 管线缓存',
-    subtitle: 'WebGPU 管线与着色器缓存',
-    icon: 'cube.transparent',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'DawnGraphiteCache': {
-    title: 'Graphite 渲染管线缓存',
-    subtitle: 'Chromium 图形管线预编译缓存',
-    icon: 'cube.transparent',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'GraphiteDawnCache': {
-    title: 'Graphite 着色器加速缓存',
-    subtitle: '图形后端着色器与管线缓存',
-    icon: 'sparkles.rectangle.stack',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'ShaderCache': {
-    title: '底层着色器缓存',
-    subtitle: '图形驱动预编译着色器缓存',
-    icon: 'sparkles.rectangle.stack',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'CachedData': {
-    title: '工作区运行编译缓存',
-    subtitle: '主进程与渲染进程脚本缓存',
-    icon: 'memorychip',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'CachedExtensionVSIXs': {
-    title: '扩展安装包残留',
-    subtitle: '插件安装遗留的 VSIX 压缩包',
-    icon: 'shippingbox',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'CachedProfilesData': {
-    title: '配置快照临时缓存',
-    subtitle: '配置切换生成的临时加速缓存',
-    icon: 'doc.badge.gearshape',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'Crashpad': {
-    title: '崩溃转储与诊断残留',
-    subtitle: '历史崩溃报告与诊断转储',
-    icon: 'exclamationmark.triangle',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'logs': {
-    title: '历史运行日志',
-    subtitle: '应用与扩展宿主运行日志',
-    icon: 'doc.text',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'blob_storage': {
-    title: '临时二进制块缓存',
-    subtitle: '运行期临时二进制块数据',
-    icon: 'archivebox',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'PartitionsCache': {
-    title: '内嵌视图子分区缓存',
-    subtitle: '隔离视图静态资源与编译缓存',
-    icon: 'square.split.2x2',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'AgentBrowserCache': {
-    title: '浏览器沙箱加速缓存',
-    subtitle: '内置浏览器缓存（保留登录与 Cookie）',
-    icon: 'globe',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'OrphanAgentData': {
-    title: '崩溃日志与临时媒体',
-    subtitle: '已删对话碎片、崩溃日志与临时媒体',
-    icon: 'trash.slash',
-    category: 'safe',
-    section: 'runtime',
-    defaultSelected: true,
-  },
-  'AgentTaskStepLogs': {
-    title: '历史任务与步骤输出日志',
-    subtitle: '非活跃对话的终端、步骤日志与草稿',
-    icon: 'terminal',
-    category: 'stateful',
-    section: 'history',
-    defaultSelected: false,
-    impactWarning: '清理中间运行日志，主对话与正式产物完好保留',
-  },
-  'AgentVerboseTranscripts': {
-    title: '全量冗余转录与分片镜像',
-    subtitle: '非活跃对话冗余转录（保留精简版）',
-    icon: 'doc.on.doc',
-    category: 'stateful',
-    section: 'history',
-    defaultSelected: false,
-    impactWarning: '仅移除冗余大体积镜像，对话界面与紧凑版记录不受影响',
-  },
-  'AgentSubagentDatabases': {
-    title: '历史子智能体轨迹库',
-    subtitle: '已完成子智能体库（账单已归档）',
-    icon: 'arrow.triangle.branch',
-    category: 'stateful',
-    section: 'history',
-    defaultSelected: false,
-    impactWarning: '主对话与历史账单完好保留，旧子智能体内部过程不再展开',
-  },
-  'Service Worker': {
-    title: '后台服务工作线程',
-    subtitle: '按需清理 · 清理后重新初始化扩展后台状态',
-    icon: 'gearshape.2',
-    category: 'stateful',
-    defaultSelected: false,
-    impactWarning: '重置扩展后台状态',
-  },
-  'Session Storage': {
-    title: '内嵌视图会话缓存',
-    subtitle: '按需清理 · 清理后重置部分内嵌视图临时会话',
-    icon: 'rectangle.stack',
-    category: 'stateful',
-    defaultSelected: false,
-    impactWarning: '重置临时会话状态',
-  },
-  'WebStorage': {
-    title: 'Web 视图持久缓存',
-    subtitle: '按需清理 · 清理后重置扩展内嵌网页状态',
-    icon: 'globe',
-    category: 'stateful',
-    defaultSelected: false,
-    impactWarning: '重置内嵌网页状态',
-  },
-  'Local Storage': {
-    title: '扩展与站点本地存储',
-    subtitle: '按需清理 · 清理后可能需重新授权部分扩展',
-    icon: 'externaldrive.badge.person.crop',
-    category: 'stateful',
-    defaultSelected: false,
-    impactWarning: '可能需重新授权扩展',
-  },
-  'Cookies': {
-    title: '网络会话与授权凭据',
-    subtitle: '按需清理 · 清理后部分服务需重新登录授权',
-    icon: 'key.horizontal',
-    category: 'stateful',
-    defaultSelected: false,
-    impactWarning: '清理后需重新登录授权',
-  },
-  'Network Persistent State': {
-    title: '网络连接协商状态',
-    subtitle: '按需清理 · 清理后重新协商网络连接参数',
-    icon: 'network',
-    category: 'stateful',
-    defaultSelected: false,
-    impactWarning: '重置网络连接偏好',
-  },
+export const MAINTENANCE_SCOPES = ['runtime_cache', 'history_logs'] as const;
+export type MaintenanceScope = (typeof MAINTENANCE_SCOPES)[number];
+
+export function normalizeMaintenanceScopes(raw: unknown): MaintenanceScope[] {
+  if (raw === undefined) {
+    return ['runtime_cache'];
+  }
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw Error(bt('maintenance.err.invalid_selection'));
+  }
+  const allowed = new Set<string>(MAINTENANCE_SCOPES);
+  const selected = new Set<MaintenanceScope>();
+  for (const item of raw) {
+    if (typeof item !== 'string' || !allowed.has(item)) {
+      throw Error(bt('maintenance.err.invalid_selection'));
+    }
+    selected.add(item as MaintenanceScope);
+  }
+  return MAINTENANCE_SCOPES.filter(scope => selected.has(scope));
+}
+
+export function namesForMaintenanceScopes(scopes: readonly MaintenanceScope[]): string[] {
+  const names: string[] = [];
+  if (scopes.includes('runtime_cache')) {
+    names.push(...ALL_SAFE_CACHE_NAMES);
+  }
+  if (scopes.includes('history_logs')) {
+    names.push(...HISTORY_SLIMMING_NAMES);
+  }
+  return Array.from(new Set(names));
+}
+
+interface CacheCatalogSpec {
+  key: string;
+  icon: string;
+  category: CacheCategory;
+  section?: CacheSection;
+  defaultSelected: boolean;
+  hasImpact?: boolean;
+}
+
+const CACHE_CATALOG_SPECS: Record<string, CacheCatalogSpec> = {
+  'Cache': { key: 'cache', icon: 'internaldrive', category: 'safe', section: 'runtime', defaultSelected: true },
+  'Code Cache': { key: 'code_cache', icon: 'cpu', category: 'safe', section: 'runtime', defaultSelected: true },
+  'GPUCache': { key: 'gpu_cache', icon: 'sparkles.rectangle.stack', category: 'safe', section: 'runtime', defaultSelected: true },
+  'DawnCache': { key: 'dawn_cache', icon: 'cube.transparent', category: 'safe', section: 'runtime', defaultSelected: true },
+  'DawnWebGPUCache': { key: 'dawn_webgpu_cache', icon: 'cube.transparent', category: 'safe', section: 'runtime', defaultSelected: true },
+  'DawnGraphiteCache': { key: 'dawn_graphite_cache', icon: 'cube.transparent', category: 'safe', section: 'runtime', defaultSelected: true },
+  'GraphiteDawnCache': { key: 'graphite_dawn_cache', icon: 'sparkles.rectangle.stack', category: 'safe', section: 'runtime', defaultSelected: true },
+  'ShaderCache': { key: 'shader_cache', icon: 'sparkles.rectangle.stack', category: 'safe', section: 'runtime', defaultSelected: true },
+  'CachedData': { key: 'cached_data', icon: 'memorychip', category: 'safe', section: 'runtime', defaultSelected: true },
+  'CachedExtensionVSIXs': { key: 'cached_vsix', icon: 'shippingbox', category: 'safe', section: 'runtime', defaultSelected: true },
+  'CachedProfilesData': { key: 'cached_profiles', icon: 'doc.badge.gearshape', category: 'safe', section: 'runtime', defaultSelected: true },
+  'Crashpad': { key: 'crashpad', icon: 'exclamationmark.triangle', category: 'safe', section: 'runtime', defaultSelected: true },
+  'logs': { key: 'logs', icon: 'doc.text', category: 'safe', section: 'runtime', defaultSelected: true },
+  'blob_storage': { key: 'blob_storage', icon: 'archivebox', category: 'safe', section: 'runtime', defaultSelected: true },
+  'PartitionsCache': { key: 'partitions_cache', icon: 'square.split.2x2', category: 'safe', section: 'runtime', defaultSelected: true },
+  'AgentBrowserCache': { key: 'agent_browser_cache', icon: 'globe', category: 'safe', section: 'runtime', defaultSelected: true },
+  'OrphanAgentData': { key: 'orphan_agent_data', icon: 'trash.slash', category: 'safe', section: 'runtime', defaultSelected: true },
+  'AgentTaskStepLogs': { key: 'task_step_logs', icon: 'terminal', category: 'stateful', section: 'history', defaultSelected: false, hasImpact: true },
+  'AgentVerboseTranscripts': { key: 'verbose_transcripts', icon: 'doc.on.doc', category: 'stateful', section: 'history', defaultSelected: false, hasImpact: true },
+  'AgentSubagentDatabases': { key: 'subagent_dbs', icon: 'arrow.triangle.branch', category: 'stateful', section: 'history', defaultSelected: false, hasImpact: true },
+  'Service Worker': { key: 'service_worker', icon: 'gearshape.2', category: 'stateful', defaultSelected: false, hasImpact: true },
+  'Session Storage': { key: 'session_storage', icon: 'rectangle.stack', category: 'stateful', defaultSelected: false, hasImpact: true },
+  'WebStorage': { key: 'web_storage', icon: 'globe', category: 'stateful', defaultSelected: false, hasImpact: true },
+  'Local Storage': { key: 'local_storage', icon: 'externaldrive.badge.person.crop', category: 'stateful', defaultSelected: false, hasImpact: true },
+  'Cookies': { key: 'cookies', icon: 'key.horizontal', category: 'stateful', defaultSelected: false, hasImpact: true },
+  'Network Persistent State': { key: 'network_state', icon: 'network', category: 'stateful', defaultSelected: false, hasImpact: true },
 };
+
+export function getCacheMetadata(name: string): CacheItemMetadata | undefined {
+  const spec = CACHE_CATALOG_SPECS[name];
+  if (!spec) return undefined;
+  return {
+    title: bt(`maintenance.catalog.${spec.key}.title`),
+    subtitle: bt(`maintenance.catalog.${spec.key}.sub`),
+    icon: spec.icon,
+    category: spec.category,
+    ...(spec.section ? { section: spec.section } : {}),
+    defaultSelected: spec.defaultSelected,
+    ...(spec.hasImpact ? { impactWarning: bt(`maintenance.catalog.${spec.key}.impact`) } : {}),
+  };
+}
+
+export const CACHE_METADATA: Record<string, CacheItemMetadata> = new Proxy({} as Record<string, CacheItemMetadata>, {
+  get(target, prop, receiver) {
+    if (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(CACHE_CATALOG_SPECS, prop)) {
+      return getCacheMetadata(prop);
+    }
+    return Reflect.get(target, prop, receiver);
+  },
+  has(_target, prop) {
+    return typeof prop === 'string' && Object.prototype.hasOwnProperty.call(CACHE_CATALOG_SPECS, prop);
+  },
+  ownKeys() {
+    return Object.keys(CACHE_CATALOG_SPECS);
+  },
+  getOwnPropertyDescriptor(_target, prop) {
+    if (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(CACHE_CATALOG_SPECS, prop)) {
+      return { enumerable: true, configurable: true, value: getCacheMetadata(prop) };
+    }
+    return undefined;
+  },
+});
 
 const execFileAsync = promisify(execFile);
 const PROCESS_SNAPSHOT_TTL_MS = 250;
@@ -372,9 +264,11 @@ export async function readProcessCommands(): Promise<string[] | null> {
 export function hasAntigravityCommand(commands: string[], appPath = '/Applications/Antigravity.app'): boolean {
   const appRoots = Array.from(new Set([appPath, '/Applications/Antigravity.app']));
   const macOsPrefixes = appRoots.map(p => p + '/Contents/MacOS/');
+  const frameworkPrefixes = appRoots.map(p => p + '/Contents/Frameworks/');
   const lsPrefixes = appRoots.map(p => p + '/Contents/Resources/bin/language_server');
   return commands.some(trimmed =>
     macOsPrefixes.some(prefix => trimmed.startsWith(prefix)) ||
+    frameworkPrefixes.some(prefix => trimmed.startsWith(prefix)) ||
     lsPrefixes.some(prefix => trimmed.startsWith(prefix) || trimmed.includes(prefix))
   );
 }
@@ -398,6 +292,7 @@ export async function browserProfileRunning(browserProfileDir: string): Promise<
 export interface CacheMaintenanceOptions {
   appPath?: string;
   stateDir?: string;
+  fallbackTrashDir?: string;
   geminiDir?: string;
   browserRunning?: () => Promise<boolean>;
   archiveDatabases?: (dbPaths: string[]) => Promise<unknown>;

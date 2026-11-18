@@ -7,6 +7,10 @@ final class UsageEventCard: NSView {
     let outputLabel = text("", size: 11, weight: .medium)
     let cacheWriteLabel = text("", size: 11, weight: .medium)
     let cacheLabel = text("", size: 11, weight: .medium)
+    private let inputTitleLabel = text(L10n.t("usage_event.input"), size: 11, color: Design.secondary)
+    private let outputTitleLabel = text(L10n.t("usage_event.output"), size: 11, color: Design.secondary)
+    private let cacheReadTitleLabel = text(L10n.t("usage_event.cache_read"), size: 11, color: Design.secondary)
+    private let cacheWriteTitleLabel = text(L10n.t("usage_event.cache_write"), size: 11, color: Design.secondary)
     let modelIcon = symbol("sparkles", size: 16, color: Design.secondary)
     private let card = DesignCardBox()
     private var hoverTracking: NSTrackingArea?
@@ -24,7 +28,14 @@ final class UsageEventCard: NSView {
             }
         }
     }
-    private static let dateFormat: DateFormatter = { let f = DateFormatter(); f.locale = Locale(identifier: "zh_CN"); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f }()
+    private static let dateFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
+    deinit { hoverMotion.cancel() }
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         identifier = NSUserInterfaceItemIdentifier("usage-event-card")
@@ -34,8 +45,7 @@ final class UsageEventCard: NSView {
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
         timeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         timeLabel.setContentCompressionResistancePriority(.required, for: .vertical)
-        func metric(_ title: String, _ value: NSTextField) -> NSView {
-            let titleLbl = text(title, size: 11, color: Design.secondary)
+        func metric(_ titleLbl: NSTextField, _ value: NSTextField) -> NSView {
             titleLbl.setContentCompressionResistancePriority(.required, for: .vertical)
             value.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
             value.setContentCompressionResistancePriority(.required, for: .vertical)
@@ -45,7 +55,12 @@ final class UsageEventCard: NSView {
         }
         let heading = horizontal([modelIcon, modelLabel, flexibleSpace(), timeLabel], spacing: 8)
         heading.alignment = .centerY
-        let tokens = horizontal([metric("输入", inputLabel), metric("输出", outputLabel), metric("缓存读取", cacheLabel), metric("缓存写入", cacheWriteLabel)], spacing: 10)
+        let tokens = horizontal([
+            metric(inputTitleLabel, inputLabel),
+            metric(outputTitleLabel, outputLabel),
+            metric(cacheReadTitleLabel, cacheLabel),
+            metric(cacheWriteTitleLabel, cacheWriteLabel)
+        ], spacing: 10)
         tokens.distribution = .fillEqually
         tokens.alignment = .centerY
         let body = vertical([heading, tokens], spacing: 7)
@@ -92,8 +107,11 @@ final class UsageEventCard: NSView {
         }
     }
     func configure(_ event: [String:Any], highlight: String = "") {
-        let rawModel = event["model"] as? String ?? "未知模型"
-        let model = rawModel
+        inputTitleLabel.stringValue = L10n.t("usage_event.input")
+        outputTitleLabel.stringValue = L10n.t("usage_event.output")
+        cacheReadTitleLabel.stringValue = L10n.t("usage_event.cache_read")
+        cacheWriteTitleLabel.stringValue = L10n.t("usage_event.cache_write")
+        let model = InterfaceText.localizedModelLabel(event["model"] as? String)
         if !highlight.isEmpty, let range = model.range(of: highlight, options: .caseInsensitive) {
             let attr = NSMutableAttributedString(string: model, attributes: [
                 .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
@@ -109,10 +127,10 @@ final class UsageEventCard: NSView {
             modelLabel.attributedStringValue = NSAttributedString(string: model, attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor])
         }
         modelLabel.setAccessibilityLabel(model)
-        enableTextCopy(modelLabel, value: rawModel, title: "复制模型 ID")
+        enableTextCopy(modelLabel, value: model, title: L10n.t("overview.copy_model_id"))
         let stamp = doubleVal(event,"timestamp_seconds")
-        timeLabel.stringValue = stamp > 0 ? Self.dateFormat.string(from:Date(timeIntervalSince1970:stamp)) : "时间未知"
-        inputLabel.stringValue = intVal(event,"input_tokens").formatted(); outputLabel.stringValue = intVal(event,"output_tokens").formatted(); cacheLabel.stringValue = intVal(event,"cached_tokens").formatted();cacheWriteLabel.stringValue = intVal(event,"cache_write_tokens").formatted()
+        timeLabel.stringValue = stamp > 0 ? Self.dateFormat.string(from:Date(timeIntervalSince1970:stamp)) : L10n.t("usage_event.time_unknown")
+        inputLabel.stringValue = InterfaceText.formatInteger(intVal(event, "input_tokens")); outputLabel.stringValue = InterfaceText.formatInteger(intVal(event, "output_tokens")); cacheLabel.stringValue = InterfaceText.formatInteger(intVal(event, "cached_tokens")); cacheWriteLabel.stringValue = InterfaceText.formatInteger(intVal(event, "cache_write_tokens"))
         if let brand = ModelIcons.brands(for:model).first,let image = ModelIcons.image(brand) { modelIcon.image = image; modelIcon.contentTintColor = ModelIcons.tintColor(for: image) }
         else { modelIcon.image = NSImage(systemSymbolName:"sparkles",accessibilityDescription:nil); modelIcon.contentTintColor = Design.secondary }
     }

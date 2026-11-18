@@ -12,20 +12,45 @@ struct BackendFailure: LocalizedError {
 final class BackendBridge {
     let state: URL
     let resources: URL
-    private var child: Process?
-    private var generation = 0
-    private(set) var isLaunching = false
-    private(set) var isRestarting = false
+    private let stateLock = NSLock()
+    private var _child: Process?
+    private var _generation = 0
+    private var _isLaunching = false
+    private var _isRestarting = false
+    private var _preferredLocale: String?
     private let queue = DispatchQueue(label: "local.gravitybox.bridge", qos: .userInitiated)
     private let controlQueue = DispatchQueue(label:"local.gravitybox.control",qos:.userInitiated,attributes:.concurrent)
-    private let controlSemaphore = DispatchSemaphore(value: 4)
+    private let controlSemaphore = DispatchSemaphore(value: 8)
     private static let maxReplyBytes = 4_000_000
     #if NATIVE_UI_TEST
     var fixtureReply: (([String:Any]) -> [String:Any])?
     #endif
     var onExit: ((String) -> Void)?
+
+    private var child: Process? {
+        get { stateLock.withLock { _child } }
+        set { stateLock.withLock { _child = newValue } }
+    }
+    private var generation: Int {
+        get { stateLock.withLock { _generation } }
+        set { stateLock.withLock { _generation = newValue } }
+    }
+    private(set) var isLaunching: Bool {
+        get { stateLock.withLock { _isLaunching } }
+        set { stateLock.withLock { _isLaunching = newValue } }
+    }
+    private(set) var isRestarting: Bool {
+        get { stateLock.withLock { _isRestarting } }
+        set { stateLock.withLock { _isRestarting = newValue } }
+    }
+    var preferredLocale: String? {
+        get { stateLock.withLock { _preferredLocale } }
+        set { stateLock.withLock { _preferredLocale = newValue } }
+    }
     var ownedPID: Int32? { child?.processIdentifier }
-    var isOwnedProcessRunning: Bool { isLaunching || child?.isRunning == true }
+    var isOwnedProcessRunning: Bool {
+        stateLock.withLock { _isLaunching || _child?.isRunning == true }
+    }
 
     init(resources: URL, state: URL) { self.resources = resources; self.state = state }
 
@@ -44,25 +69,6 @@ final class BackendBridge {
             }
         }
         #endif
-    }
-
-    /// Restore the old channel's injected UI before opening the new channel's helper.
-    func restart(completion: @escaping (Result<Void, Error>) -> Void) {
-        guard !isRestarting else { return }
-        generation += 1
-        isRestarting = true
-        queue.async { [self] in
-            let result = Result {
-                if let child, child.isRunning {
-                    _ = try request(["command": "stop"])
-                    let deadline = Date().addingTimeInterval(10)
-                    while child.isRunning && Date() < deadline { usleep(50_000) }
-                    guard !child.isRunning else { throw BackendFailure(message: "旧连接尚未退出，未连接另一个版本。") }
-                }
-                try startChildProcess()
-            }
-            DispatchQueue.main.async { self.isRestarting = false; completion(result) }
-        }
     }
 
     /// 读取进程启动参数（KERN_PROCARGS2）。放在 Backend.swift 内，保证本文件可脱离 Assistant.swift 独立编译。
@@ -209,7 +215,7 @@ final class BackendBridge {
         Self.clearQuarantineIfNeeded(at: resources)
         Self.clearQuarantineIfNeeded(at: node)
         guard FileManager.default.isExecutableFile(atPath: node.path) else {
-            throw BackendFailure(message: "运行环境缺失。请重新安装完整的 GravityBox 安装包。")
+            throw BackendFailure(message: L10n.t("backend.error.runtime_missing", fallback: "运行环境缺失。请重新安装完整的 GravityBox 安装包。"))
         }
         let fm = FileManager.default
         try fm.createDirectory(at: state, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -239,12 +245,22 @@ final class BackendBridge {
         let handle = try FileHandle(forWritingTo: log)
         do { try handle.seekToEnd() } catch { try? handle.close(); throw error }
         let process = Process(); process.executableURL = node
-        process.arguments = ["--max-old-space-size=256", resources.appendingPathComponent("core/dist/main.js").path, "--state-dir", state.path]
+        var arguments = ["--max-old-space-size=256", resources.appendingPathComponent("core/dist/main.js").path, "--state-dir", state.path]
+        if let preferredLocale, !preferredLocale.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            arguments.append(contentsOf: ["--locale", preferredLocale])
+        }
+        let systemLocales = Locale.preferredLanguages
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if !systemLocales.isEmpty {
+            arguments.append(contentsOf: ["--system-locales", systemLocales.joined(separator: ",")])
+        }
+        process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice; process.standardError = handle
         process.terminationHandler = { [weak self] process in
             DispatchQueue.main.async {
                 guard let self, !self.isRestarting, self.child?.processIdentifier == process.processIdentifier else { return }
-                self.onExit?("本机服务已停止 · \(process.terminationStatus)")
+                self.onExit?(L10n.t("backend.error.service_stopped", ["code": process.terminationStatus]))
             }
         }
         do { try process.run() } catch { try? handle.close(); throw error }
@@ -254,17 +270,19 @@ final class BackendBridge {
 
     func send(_ payload: [String: Any], completion: @escaping (Result<[String: Any], Error>) -> Void) {
         let requestGeneration = generation
-        guard !isRestarting else { completion(.failure(BackendFailure(message: "正在切换目标应用，请稍候。"))); return }
+        guard !isRestarting else { completion(.failure(BackendFailure(message: L10n.t("backend.error.switching_target")))); return }
         #if NATIVE_UI_TEST
-        if let fixtureReply { let reply = fixtureReply(payload); DispatchQueue.main.async { if reply["ok"] as? Bool == false { completion(.failure(BackendFailure(message: reply["error"] as? String ?? "测试失败"))) } else { completion(.success(reply)) } }; return }
+        if let fixtureReply { let reply = fixtureReply(payload); DispatchQueue.main.async { if reply["ok"] as? Bool == false { completion(.failure(BackendFailure(message: reply["error"] as? String ?? L10n.t("assistant.action_incomplete", fallback: "操作未完成")))) } else { completion(.success(reply)) } }; return }
         #endif
         let command = payload["command"] as? String ?? ""
         let readOnlyCommands: Set<String> = [
-            "status", "task_list", "task_cancel", "usage_cancel", "ping",
+            "status", "task_list", "task_cancel", "usage_cancel", "ping", "stop",
             "dashboard_summary", "account_list", "account_get", "account_switch_preflight",
+            "account_oauth_status", "account_oauth_cancel", "maintenance_preflight",
             "maintenance_scan", "maintenance_history", "usage_summary", "usage_events",
             "usage_snapshot_release", "usage_ledger_review", "auto_switch_get",
-            "account_recovery_info", "api_pricing_get", "pricing_sync_status"
+            "account_recovery_info", "api_pricing_get", "pricing_sync_status",
+            "quota_refresh", "quota_refresh_start"
         ]
         let isReadOnlyAutoSwitch = command == "auto_switch_best" && (payload["execute"] as? Bool != true)
         let useControlThrottle = readOnlyCommands.contains(command) || isReadOnlyAutoSwitch
@@ -273,15 +291,21 @@ final class BackendBridge {
             if useControlThrottle { controlSemaphore.wait() }
             defer { if useControlThrottle { controlSemaphore.signal() } }
             let result = Result { try request(payload) }
-            DispatchQueue.main.async { guard requestGeneration == self.generation else { return }; completion(result) }
+            DispatchQueue.main.async {
+                guard requestGeneration == self.generation else {
+                    completion(.failure(BackendFailure(message: L10n.t("backend.error.switching_target"))))
+                    return
+                }
+                completion(result)
+            }
         }
     }
 
     func request(_ payload: [String: Any]) throws -> [String: Any] {
         var last: BackendFailure?
-        let isBooting = child?.isRunning == true
-        let maxAttempts = isBooting ? 8 : 3
-        let delays: [useconds_t] = [35_000, 50_000, 75_000, 100_000, 140_000, 180_000, 220_000]
+        let isBooting = isOwnedProcessRunning
+        let maxAttempts = isBooting ? 12 : 3
+        let delays: [useconds_t] = [18_000, 25_000, 35_000, 50_000, 70_000, 95_000, 130_000, 170_000, 220_000]
         for attempt in 0..<maxAttempts {
             do { return try performRequest(payload) }
             catch let failure as BackendFailure {
@@ -290,7 +314,7 @@ final class BackendBridge {
                 usleep(delays[min(attempt, delays.count - 1)])
             }
         }
-        throw last ?? BackendFailure(message: "后台尚未连接。请稍候，或点击重新连接。")
+        throw last ?? BackendFailure(message: L10n.t("backend.error.not_connected", fallback: "后台尚未连接。请稍候，或点击重新连接。"))
     }
 
     private func performRequest(_ payload: [String: Any]) throws -> [String: Any] {
@@ -304,24 +328,24 @@ final class BackendBridge {
         try writeAll(data, fd: fd, deadline: deadline)
         let value = try readReply(fd: fd, deadline: deadline)
         if value["ok"] as? Bool == false {
-            throw BackendFailure(message: value["error"] as? String ?? value["message"] as? String ?? "操作未完成")
+            throw BackendFailure(message: value["error"] as? String ?? value["message"] as? String ?? L10n.t("assistant.action_incomplete", fallback: "操作未完成"))
         }
         return value
     }
 
     private func openSocket(deadline: Date) throws -> Int32 {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw BackendFailure(message: "无法建立本机连接", retryable: true) }
+        guard fd >= 0 else { throw BackendFailure(message: L10n.t("backend.error.socket_open", fallback: "无法建立本机连接"), retryable: true) }
         // Writing to a socket whose peer already closed raises SIGPIPE on macOS, which kills the app.
         var one: Int32 = 1
         guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
-            Darwin.close(fd); throw BackendFailure(message: "无法建立本机连接", retryable: true)
+            Darwin.close(fd); throw BackendFailure(message: L10n.t("backend.error.socket_open", fallback: "无法建立本机连接"), retryable: true)
         }
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
         var address = sockaddr_un(); address.sun_family = sa_family_t(AF_UNIX)
         let path = state.appendingPathComponent("control.sock").path
         let bytes = path.utf8CString; let capacity = MemoryLayout.size(ofValue: address.sun_path)
-        guard bytes.count <= capacity else { Darwin.close(fd); throw BackendFailure(message: "数据目录路径过长") }
+        guard bytes.count <= capacity else { Darwin.close(fd); throw BackendFailure(message: L10n.t("backend.error.socket_path_too_long", fallback: "数据目录路径过长")) }
         _ = withUnsafeMutablePointer(to: &address.sun_path) { pointer in
             pointer.withMemoryRebound(to: CChar.self, capacity: capacity) { strncpy($0, path, capacity) }
         }
@@ -334,14 +358,14 @@ final class BackendBridge {
         }
         if connected != 0 {
             guard errno == EINPROGRESS else {
-                Darwin.close(fd); throw BackendFailure(message: "后台尚未连接。请稍候，或点击重新连接。", retryable: true)
+                Darwin.close(fd); throw BackendFailure(message: L10n.t("backend.error.not_connected", fallback: "后台尚未连接。请稍候，或点击重新连接。"), retryable: true)
             }
             var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
             let wait = Int32(max(1, min(deadline.timeIntervalSinceNow, 2)) * 1000)
             let ready = poll(&descriptor, 1, wait)
             var socketError: Int32 = 0; var length = socklen_t(MemoryLayout<Int32>.size)
             if ready <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length) != 0 || socketError != 0 {
-                Darwin.close(fd); throw BackendFailure(message: "后台尚未连接。请稍候，或点击重新连接。", retryable: true)
+                Darwin.close(fd); throw BackendFailure(message: L10n.t("backend.error.not_connected", fallback: "后台尚未连接。请稍候，或点击重新连接。"), retryable: true)
             }
         }
         // Keep nonblocking mode: send/recv deadlines must survive peer backpressure.
@@ -358,12 +382,12 @@ final class BackendBridge {
                     var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
                     let remaining = Int32(max(0, deadline.timeIntervalSinceNow) * 1000)
                     if remaining <= 0 || poll(&descriptor, 1, remaining) <= 0 {
-                        throw BackendFailure(message: "本机请求未能完整发送")
+                        throw BackendFailure(message: L10n.t("backend.error.request_send_incomplete", fallback: "本机请求未能完整发送"))
                     }
                     continue
                 }
                 if sent < 0 && errno == EINTR { continue }
-                throw BackendFailure(message: "本机请求未能完整发送")
+                throw BackendFailure(message: L10n.t("backend.error.request_send_incomplete", fallback: "本机请求未能完整发送"))
             }
         }
     }
@@ -372,24 +396,24 @@ final class BackendBridge {
         var reply = Data(); var buffer = [UInt8](repeating: 0, count: 65_536)
         while true {
             let remaining = Int32(max(0, deadline.timeIntervalSinceNow) * 1000)
-            if remaining <= 0 { throw BackendFailure(message: "后台响应超时，请稍后重试") }
+            if remaining <= 0 { throw BackendFailure(message: L10n.t("backend.error.reply_timeout", fallback: "后台响应超时，请稍后重试")) }
             var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let ready = poll(&descriptor, 1, min(remaining, 5_000))
             if ready == 0 { continue }
-            if ready < 0 { if errno == EINTR { continue }; throw BackendFailure(message: "后台响应无效或连接已中断") }
+            if ready < 0 { if errno == EINTR { continue }; throw BackendFailure(message: L10n.t("backend.error.reply_invalid", fallback: "后台响应无效或连接已中断")) }
             let count = Darwin.recv(fd, &buffer, buffer.count, 0)
             if count > 0 {
                 reply.append(buffer, count: count)
-                if reply.count > Self.maxReplyBytes { throw BackendFailure(message: "后台响应超出大小限制") }
+                if reply.count > Self.maxReplyBytes { throw BackendFailure(message: L10n.t("backend.error.reply_too_large", fallback: "后台响应超出大小限制")) }
                 if reply.last == 0x0A { break }
                 continue
             }
-            if count == 0 { throw BackendFailure(message: "后台响应无效或连接已中断") }
+            if count == 0 { throw BackendFailure(message: L10n.t("backend.error.reply_invalid", fallback: "后台响应无效或连接已中断")) }
             if errno == EAGAIN || errno == EINTR { continue }
-            throw BackendFailure(message: "后台响应无效或连接已中断")
+            throw BackendFailure(message: L10n.t("backend.error.reply_invalid", fallback: "后台响应无效或连接已中断"))
         }
         guard let value = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
-            throw BackendFailure(message: "后台响应无效或连接已中断")
+            throw BackendFailure(message: L10n.t("backend.error.reply_invalid", fallback: "后台响应无效或连接已中断"))
         }
         return value
     }
@@ -420,7 +444,10 @@ final class BackendBridge {
             completed = true
             lock.unlock()
             if shouldRun {
-                DispatchQueue.main.async { completion() }
+                DispatchQueue.main.async {
+                    self.isRestarting = false
+                    completion()
+                }
             }
         }
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout + 0.4) {

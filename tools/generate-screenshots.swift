@@ -12,7 +12,7 @@ let appVersion: String = {
        let version = json["version"] as? String, !version.isEmpty {
         return version
     }
-    return "1.1.0"
+    return "1.1.1"
 }()
 let sourceDir = root.appendingPathComponent("质检报告/\(appVersion)-改造验收/原生布局")
 let targetDir = root.appendingPathComponent("assets/screenshots")
@@ -226,7 +226,7 @@ func composeHero(mainWin: NSBitmapImageRep, menuWin: NSBitmapImageRep, isDark: B
     cg.restoreGState()
     
     // 菜单栏面板放置在右下
-    // 原始逻辑尺寸 396x644 (792x1288)，缩放到 316x515
+    // 原始逻辑尺寸 424x644 (848x1288)，缩放到 339x515
     let menuScale: CGFloat = 0.80
     let menuW = (CGFloat(menuWin.pixelsWide) / 2.0) * menuScale
     let menuH = (CGFloat(menuWin.pixelsHigh) / 2.0) * menuScale

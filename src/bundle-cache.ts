@@ -1,6 +1,7 @@
 import {stat} from 'node:fs/promises';
 import {join} from 'node:path';
 import {fetchBundleWithHash} from './bundle.js';
+import {bt} from './i18n.js';
 /** Memory-only identity-bound fingerprint cache; source bodies are never retained. */
 export class BundleCache {
   downloads=0;downloadedBytes=0;
@@ -20,7 +21,7 @@ export class BundleCache {
     const pending=this.pending.get(key);if(pending)return {...await pending,cacheHit:true};
     const load=(async()=>{
       const result=await fetcher(origin);this.downloads++;this.downloadedBytes+=result.bytes;
-      if(key!==await this.key(app,pid,version,origin))throw new Error('应用资源在读取期间发生变化');
+      if(key!==await this.key(app,pid,version,origin))throw new Error(bt('bundle_cache.changed'));
       this.hashes.set(key,result.hash);while(this.hashes.size>2)this.hashes.delete(this.hashes.keys().next().value!);
       return {hash:result.hash,source:result.source,cacheHit:false};
     })();

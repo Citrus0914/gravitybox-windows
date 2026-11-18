@@ -1,5 +1,7 @@
 import { normalizeModelId } from '../model-identity.js';
+import { getEffectiveModelPriceAlias, getRemoteModelSpec, MODEL_CAPACITIES, MODEL_NAMES } from '../model-catalog.js';
 import { resolveDatabaseModelFullName } from '../usage-types.js';
+import { bt } from '../i18n.js';
 /**
  * Antigravity 模型有效上下文窗口阈值映射目录
  * 严格对齐 Antigravity 官方运行时与 assets/model-catalog.json 标准上下文阈值 (<=200K / 256K / 128K)
@@ -82,43 +84,30 @@ const MODEL_CAPACITY_RULES: readonly ModelFamilyRule[] = [
   },
 ];
 
-const DISPLAY_NAME_MAP: Record<string, string> = {
-  'gemini-4-argon': 'Gemini 4 Argon',
+const INTERNAL_DISPLAY_NAME_OVERRIDES: Record<string, string> = {
   'gemini-4-argon-trial': 'Gemini 4 Argon Trial',
-  'gemini-4-carbon': 'Gemini 4 Carbon',
   'gemini-4-carbon-trial': 'Gemini 4 Carbon Trial',
-  'gemini-4-hydrogen': 'Gemini 4 Hydrogen',
-  'gemini-3.9-flash': 'Gemini 3.9 Flash',
-  'gemini-3.8-flash': 'Gemini 3.8 Flash',
   'gemini-3.8-flash-control': 'Gemini 3.8 Flash',
   'gemini-3.8-flash-n': 'Gemini 3.8 Flash',
   'gemini-3.8-flash-tiered': 'Gemini 3.8 Flash',
   'gemini-3.8-flash-exp-a': 'Gemini 3.8 Flash',
-  'gemini-3.8-pro': 'Gemini 3.8 Pro',
-  'gemini-3.7-flash': 'Gemini 3.7 Flash',
   'gemini-3.7-flash-tiered': 'Gemini 3.7 Flash',
   'gemini-3.7-flash-safety-le': 'Gemini 3.7 Flash',
-  'gemini-3.6-flash': 'Gemini 3.6 Flash',
   'gemini-3.6-flash-tiered': 'Gemini 3.6 Flash',
   'gemini-3.6-flash-exp-a': 'Gemini 3.6 Flash',
-  'gemini-3.5-flash': 'Gemini 3.5 Flash',
   'gemini-3-flash': 'Gemini 3 Flash',
   'gemini-3-flash-a': 'Gemini 3 Flash',
-  'gemini-3.1-pro': 'Gemini 3.1 Pro',
   'gemini-pro-default': 'Gemini Pro',
-  'gemini-2.5-pro': 'Gemini 2.5 Pro',
-  'gemini-2.5-flash': 'Gemini 2.5 Flash',
-  'claude-sonnet-5-5': 'Claude Sonnet 5.5',
-  'claude-opus-5-5': 'Claude Opus 5.5',
-  'claude-sonnet-4-6': 'Claude Sonnet 4.6',
-  'claude-opus-4-6': 'Claude Opus 4.6',
-  'claude-3-7-sonnet': 'Claude 3.7 Sonnet',
-  'claude-3-5-sonnet': 'Claude 3.5 Sonnet',
-  'claude-3-5-haiku': 'Claude 3.5 Haiku',
-  'gpt-4o': 'GPT-4o',
-  'gpt-4o-mini': 'GPT-4o mini',
-  'gpt-oss-120b': 'GPT-OSS 120B',
 };
+
+function formatCompactCapacity(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const m = tokens / 1_000_000;
+    return `${Number.isInteger(m) ? m : Number(m.toFixed(1))}M`;
+  }
+  const k = Math.round(tokens / 1_000);
+  return `${k}K`;
+}
 
 function autoFormatDynamicModelName(normalizedId: string): string | null {
   const geminiMatch = normalizedId.match(/^gemini-([4-9](?:\.\d+)?)-([a-z][a-z0-9]*?)(?:-(trial|preview|exp))?$/i);
@@ -130,13 +119,18 @@ function autoFormatDynamicModelName(normalizedId: string): string | null {
       : '';
     return `Gemini ${ver} ${code}${suffix}`;
   }
+  const claudeMatch = normalizedId.match(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)$/i);
+  if (claudeMatch) {
+    const tier = claudeMatch[1]!.charAt(0).toUpperCase() + claudeMatch[1]!.slice(1).toLowerCase();
+    return `Claude ${tier} ${claudeMatch[2]}.${claudeMatch[3]}`;
+  }
   return null;
 }
 
 /**
  * 归一化前端 DOM 探针或 SQLite gen_metadata 传入的模型字符串，解析对应的 Antigravity 有效上下文阈值与展示名称
  */
-export function resolveModelCapacity(rawModelInput?: string | null): ModelCapacitySpec {
+export function resolveModelCapacity(rawModelInput?: string | null, depth = 0): ModelCapacitySpec {
   const raw = typeof rawModelInput === 'string' ? rawModelInput.trim() : '';
   if (!raw) {
     return {
@@ -152,14 +146,20 @@ export function resolveModelCapacity(rawModelInput?: string | null): ModelCapaci
   const withoutApiPrefix = raw.replace(/^models\//i, '').trim();
   const cleanedRaw = (withoutApiPrefix || raw)
     .replace(/^[+\s·•]+|[⌃⌄^\s]+$/g, '')
-    .replace(/[（(]\s*(?:High|Medium|Low|Extra\s+Low|Thinking|高|中|低|思考)\s*[）)]/gi, '')
-    .replace(/\s+(?:High|Medium|Low|Extra\s+Low|Thinking)\b.*$/i, '')
+    .replace(/[（(]\s*(?:Extra\s+High|Extra\s+Low|XHigh|High|Medium|Low|Max|Thinking|高|中|低|思考)\s*[）)]/gi, '')
+    .replace(/\s+(?:Extra\s+High|Extra\s+Low|XHigh|High|Medium|Low|Max|Thinking)\b.*$/i, '')
     .trim();
 
-  if (/\borchestrator\b|^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M66[789]$/i.test(cleanedRaw)) {
-    const resolvedAlias = resolveDatabaseModelFullName(cleanedRaw, cleanedRaw);
-    if (resolvedAlias && resolvedAlias !== '未知模型' && resolvedAlias !== cleanedRaw) {
-      return resolveModelCapacity(resolvedAlias);
+  if (depth < 2) {
+    const directDynamicAlias = getEffectiveModelPriceAlias(cleanedRaw);
+    if (directDynamicAlias && directDynamicAlias.toLowerCase() !== cleanedRaw.toLowerCase()) {
+      return resolveModelCapacity(directDynamicAlias, depth + 1);
+    }
+    if (/\borchestrator\b|^gemini-flash-worker(?:-agy)?$|^MODEL_PLACEHOLDER_M\d+$/i.test(cleanedRaw)) {
+      const resolvedAlias = resolveDatabaseModelFullName(cleanedRaw, cleanedRaw);
+      if (resolvedAlias && resolvedAlias !== '未知模型' && resolvedAlias !== 'Unknown Model' && resolvedAlias !== bt('usage.unknown_model') && resolvedAlias !== cleanedRaw) {
+        return resolveModelCapacity(resolvedAlias, depth + 1);
+      }
     }
   }
 
@@ -172,13 +172,40 @@ export function resolveModelCapacity(rawModelInput?: string | null): ModelCapaci
     .replace(/^-+|-+$/g, '');
 
   normalizedId = normalizeModelId(normalizedId)
-    .replace(/(?:-(?:high|medium|low|extra-low|thinking|latest))+$/, '');
+    .replace(/(?:-(?:extra-high|extra-low|xhigh|high|medium|low|max|thinking|latest))+$/, '');
 
+  if (depth < 2) {
+    const normalizedAlias = getEffectiveModelPriceAlias(normalizedId);
+    if (normalizedAlias && normalizedAlias.toLowerCase() !== normalizedId) {
+      return resolveModelCapacity(normalizedAlias, depth + 1);
+    }
+  }
+
+  const remoteSpec = getRemoteModelSpec(normalizedId);
+  const bundledCapacity =
+    Object.hasOwn(MODEL_CAPACITIES, normalizedId) &&
+    typeof MODEL_CAPACITIES[normalizedId] === 'number' &&
+    MODEL_CAPACITIES[normalizedId]! > 0
+      ? MODEL_CAPACITIES[normalizedId]!
+      : undefined;
   const displayName =
-    DISPLAY_NAME_MAP[normalizedId] ||
+    remoteSpec?.displayName ||
+    INTERNAL_DISPLAY_NAME_OVERRIDES[normalizedId] ||
+    (Object.hasOwn(MODEL_NAMES, normalizedId) ? MODEL_NAMES[normalizedId] : undefined) ||
     autoFormatDynamicModelName(normalizedId) ||
     cleanedRaw ||
     raw;
+
+  const explicitCap = remoteSpec?.capacityTokens ?? bundledCapacity;
+  if (explicitCap) {
+    return {
+      modelId: normalizedId,
+      displayName,
+      capacityTokens: explicitCap,
+      capacityCompact: formatCompactCapacity(explicitCap),
+      isFallback: false,
+    };
+  }
 
   for (const rule of MODEL_CAPACITY_RULES) {
     if (rule.pattern.test(normalizedId)) {
@@ -192,9 +219,19 @@ export function resolveModelCapacity(rawModelInput?: string | null): ModelCapaci
     }
   }
 
+  if (remoteSpec?.displayName) {
+    return {
+      modelId: normalizedId,
+      displayName,
+      capacityTokens: DEFAULT_CONTEXT_CAPACITY_TOKENS,
+      capacityCompact: '200K',
+      isFallback: false,
+    };
+  }
+
   return {
     modelId: normalizedId || 'unknown-model',
-    displayName: cleanedRaw || raw || 'Unknown Model',
+    displayName: cleanedRaw || raw || bt('usage.unknown_model'),
     capacityTokens: DEFAULT_CONTEXT_CAPACITY_TOKENS,
     capacityCompact: '~200K',
     isFallback: true,

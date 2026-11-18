@@ -13,10 +13,12 @@
 /dist/
 /build/
 /.cache/
+.cache/test-chrome*
 /reports/
 /质检报告/
 /成品/
 /dict/.backups/
+/dict/.imports/
 /文档/当前版本验收摘要.json
 /vendor/
 *.dmg

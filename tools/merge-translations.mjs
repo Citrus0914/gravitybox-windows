@@ -32,7 +32,7 @@ import { atomicJson } from '../dist/files.js';
 import { preservedIdentifier, PROPER_NOUNS, GLOSSARY_RULES } from '../dist/coverage.js';
 export { PROPER_NOUNS, GLOSSARY_RULES };
 
-const placeholderTokens = (text) => (text.match(/\{\{?\w+\}?\}|\$\d+|%[sd]/g) ?? []).sort().join('|');
+const placeholderTokens = (text) => (text.match(/\{\{?[a-zA-Z0-9_.-]+\}?\}|\$\{[^}]+\}|\$\d+|%(?:\d+\$)?[sdifu]/g) ?? []).sort().join('|');
 const hasCJK = (text) => /[\u3400-\u9fff]/.test(text);
 const inKeyAsWord = (key, noun) => new RegExp(`(?:^|[^A-Za-z])${noun.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^A-Za-z])`, 'i').test(key);
 
@@ -132,9 +132,13 @@ export function validateTranslations(items, existing, { allowOverride = false } 
   const accepted = [];
   const rejected = [...runtime.rejected];
   for (const row of runtime.accepted) {
-    if (normalize(row.zh) === row.key) { rejected.push({ key: row.key, reason: '译文与原文相同（英文原文不能当译文）' }); continue; }
-    if (!hasCJK(row.zh)) { rejected.push({ key: row.key, reason: '译文缺少中文字符（英文原文不能当译文）' }); continue; }
-    const dropped = REQUIRED_PROPER_NOUNS.filter(noun => inKeyAsWord(row.key, noun) && !row.zh.includes(noun));
+    const isAllowedIdentifier =
+      preservedIdentifier(row.key) ||
+      /^[\w\-./\\]+$/.test(row.key) ||
+      /^(Alt|Ctrl|Cmd|Shift)\+/i.test(row.key);
+    if (!isAllowedIdentifier && normalize(row.zh) === row.key) { rejected.push({ key: row.key, reason: '译文与原文相同（英文原文不能当译文）' }); continue; }
+    if (!isAllowedIdentifier && !hasCJK(row.zh)) { rejected.push({ key: row.key, reason: '译文缺少中文字符（英文原文不能当译文）' }); continue; }
+    const dropped = REQUIRED_PROPER_NOUNS.filter(noun => inKeyAsWord(row.key, noun) && !row.zh.toLowerCase().includes(noun.toLowerCase()));
     if (dropped.length) { rejected.push({ key: row.key, reason: `专有名词被译掉：${dropped.join(', ')}` }); continue; }
     accepted.push({ key: row.key, zh: normalize(row.zh) });
   }
@@ -189,7 +193,7 @@ async function main() {
   // 合并进目标层（保留已有内容）
   try { const previous=await readFile(out,'utf8'); await atomicJson(join(dirname(out),'.backups',basename(out)+'.'+Date.now()+'.json'),JSON.parse(previous)); } catch(error) { if(error.code!=='ENOENT')throw error; }
   for (const { key, zh } of accepted) layer[key] = zh;
-  const sorted = Object.fromEntries(Object.entries(layer).sort(([a], [b]) => a.localeCompare(b)));
+  const sorted = Object.fromEntries(Object.entries(layer).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
   await mkdir(dirname(out), { recursive: true });
   validateEntries(sorted);
   await atomicJson(out, sorted);

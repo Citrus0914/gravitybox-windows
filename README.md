@@ -7,7 +7,7 @@
 
   <p>
     <strong>面向 Apple Silicon macOS 的轻量级 Antigravity 辅助工具箱</strong><br />
-    原汁原味 Swift AppKit 界面 · IDE 对话状态栏 · 双周期配额看板 · 只读 SQLite 用量与费用核算 · 运行时双语热适配
+    原汁原味 Swift AppKit 双语界面（中 / En） · IDE 对话状态栏 · 双周期配额看板 · 只读 SQLite 用量与费用核算 · 运行时双语热适配
   </p>
 
   <p>
@@ -71,7 +71,7 @@ GravityBox 专注于在不修改官方 Antigravity 应用包的前提下，补�
 
 - **会话速率胶囊**：实时统计对话轮次、当轮/累计思考耗时、工具执行耗时、首字延迟（TTFT，自动排除思维链空闲耗时以还原真实吞吐 `tok/s`），并在流式生成或后台子智能体运行期间呈现呼吸态动画。
 - **Token 与成本胶囊**：即时核算总 Token、未缓存输入、缓存读取与输出明细，结合当前模型命中率与官方计价区间计算**本次估算费用**及**缓存已节省费用**。
-- **上下文窗口胶囊**：依据当前绑定模型的真实上下文容量，动态绘制系统提示词、工具定义与对话消息的三色构成条，高水位时提供清晰预警提醒。
+- **上下文窗口胶囊**：依据当前绑定模型的真实上下文容量，实时核算缓存复用上下文、本步新增输入与本步生成输出构成，并直观呈现峰值上下文与自动压缩次数徽章。
 
 ---
 
@@ -88,6 +88,7 @@ GravityBox 专注于在不修改官方 Antigravity 应用包的前提下，补�
 - **开源公开计价基准**：内建模型费率账本与生效区间版本校验，可选在设置页开启"自动更新价格基准"同步最新公开模型费率。
 
 ### 3. 非侵入式双语热适配（中 / En）
+- **应用级中英双语切换（`GravityBox v1.1.1`）**：GravityBox 原生 AppKit 主控制台、常驻菜单栏面板、后端提示与 Telemetry HUD 现已全面支持 **跟随系统 / 简体中文 / English** 三档实时切换（基于 `assets/i18n/` 外置语言包零重启热刷新），默认自动匹配您的 macOS 系统语言。
 - **零改包运行**：通过 Chrome DevTools Protocol (`CDP`) 注入隔离运行时，实现菜单、侧栏、弹窗与新版本的动态热更新双语切换，官方应用更新后可平稳跟随。
 - **内容绝对隔离**：对话编辑器草稿、历史对话正文、代码块、终端输出、工作区路径与专有品牌名受到 DOM 选择器与词库边界严格保护，绝不篡改。
 - **可逆异常降级**：DOM 结构变化或连接断开时自动回退至最后一份有效状态或官方原版英文，不抛出侵入式报错。
@@ -214,13 +215,13 @@ GravityBox 专注于在不修改官方 Antigravity 应用包的前提下，补�
 - **应用内更新检查**：默认保持完全静默关闭；可在主窗口 **关于** 页手动点击“检查更新”或按需开启自动检查 GitHub Releases。
 
 <details>
-<summary>进阶可选：为自构建版本配置 Google OAuth 官方配额查询凭据</summary>
+<summary>进阶可选：配置 Google OAuth 官方配额查询凭据</summary>
 
-仅使用本地只读配额探测、HUD 状态栏、SQLite 用量分析与运行时汉化功能时，**无需配置任何 OAuth 凭据**。如果您从源码构建或需要自定义 OAuth 客户端 ID 配合实时配额 API 使用，可在启动环境或自定义构建变量中提供：
+仅使用「保存当前账号」、本地只读配额探测、HUD 状态栏、SQLite 用量分析与运行时汉化功能时，**无需配置任何 OAuth 凭据**。如需使用在线浏览器 OAuth 登录或后台静默刷新备用账号 Token，可将自建的 OAuth 客户端凭据写入 `~/Library/Application Support/GravityBox/.env`（适用于从访达/启动台直接打开 `.app` 的正式安装包），或在源码启动环境中提供：
 
 ```bash
-export GRAVITYBOX_GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
-export GRAVITYBOX_GOOGLE_CLIENT_SECRET="your-client-secret"
+GRAVITYBOX_GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
+GRAVITYBOX_GOOGLE_CLIENT_SECRET="your-client-secret"
 ```
 
 </details>
@@ -274,12 +275,12 @@ npm run package:mac
 
 ```text
 gravitybox/
-├── native/          # Swift 6 / AppKit 原生主控制台、菜单栏面板与内置更新器
-├── src/             # TypeScript 核心引擎（IPC、四阶段切号、配额融合、SQLite 用量账本、HUD 编排）
-├── runtime/         # CDP 注入运行时代码（增量翻译引擎、DOM 边界保护与对话状态栏 UI）
+├── native/          # Swift 6 / AppKit 原生主控制台、菜单栏面板、L10n 本地化与内置更新器
+├── src/             # TypeScript 核心引擎（IPC、双语 i18n、四阶段切号、配额融合、SQLite 账本、HUD 编排）
+├── runtime/         # CDP 注入运行时代码（增量翻译引擎、DOM 边界保护与双语对话状态栏 HUD）
 ├── dict/            # 多版本 UI 双语词典、冻结映射与公共术语规则
-├── assets/          # 应用图标、高清实机截图、公开计价基准 (pricing-feed.json) 与模型列表
-├── test/            # 单元测试、并发/边界集成测试、无头 Chromium 回归与 Swift UI 自检
+├── assets/          # 应用图标、双语语言包 (i18n/)、高清实机截图、计价基准 (pricing-feed.json) 与模型目录
+├── test/            # 单元测试、中英双语基础/原生测试、无头 Chromium 回归与 Swift 原生 UI 自检
 └── tools/           # 门禁校验脚本、截图排版脚本、macOS 应用与 DMG 打包脚本
 ```
 

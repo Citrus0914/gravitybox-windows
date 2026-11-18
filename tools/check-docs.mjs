@@ -19,6 +19,23 @@ async function readText(path) { try { return await readFile(path, 'utf8'); } cat
 async function readJson(path) { try { return JSON.parse(await readFile(path, 'utf8')); } catch { return null; } }
 const shorten = (value) => { const text = String(value); return text.length > 22 ? `${text.slice(0, 18)}…` : text; };
 
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function lastAccountExampleEmail(text) {
+  let last = null;
+  for (const match of text.matchAll(/[\w.+-]+@(?:[\w-]+\.)+[A-Za-z]{2,}/g)) {
+    const email = match[0].toLowerCase();
+    const prefix = text.slice(Math.max(0, match.index - 7), match.index).toLowerCase();
+    if (email.endsWith('@users.noreply.github.com') || prefix === 'mailto:') continue;
+    last = match;
+  }
+  if (!last) return null;
+  const line = text.slice(0, last.index).split('\n').length;
+  return { text: last[0], line };
+}
+
 export function lastClaim(text, regex) {
   let last = null;
   for (const match of text.matchAll(regex)) last = match;
@@ -72,6 +89,10 @@ export async function checkDocs({
   summaryPath = join(root, '文档', '当前版本验收摘要.json'),
   agentsPath = join(root, 'AGENTS.md'),
   readmePath = join(root, 'README.md'),
+  readmeEnPath = join(root, 'README_EN.md'),
+  changelogPath = join(root, 'CHANGELOG.md'),
+  projectPath = join(root, 'PROJECT.md'),
+  screenshotsReadmePath = join(root, 'assets/screenshots/README.md'),
   installedApp = '/Applications/GravityBox.app',
   accountsPath = join(homedir(), 'Library', 'Application Support', 'GravityBox', 'accounts.json'),
   facts: injectedFacts,
@@ -125,7 +146,8 @@ export async function checkDocs({
       }
     }
     // 版本号
-    const versionClaim = lastClaim(text, /#\s*GravityBox\s+(\d+\.\d+\.\d+)/g) ?? lastClaim(text, /GravityBox\s+(\d+\.\d+\.\d+)\s*$/gm);
+    const versionClaim = lastClaim(text, /#\s*GravityBox\s+v?(\d+\.\d+\.\d+)/g)
+      ?? lastClaim(text, /GravityBox\s+(?:\(\s*)?[`*]?v?(\d+\.\d+\.\d+)[`*]?(?:\s*\))?/gm);
     if (versionClaim && facts.version) verify('error', 'DOC_VERSION_MISMATCH', file, versionClaim.line, `版本 ${versionClaim.groups[0]} ≠ 实际 ${facts.version}`, versionClaim.groups[0] === facts.version);
     if (!sourceOnly) {
       // 测试数（只看最近一次声明，兼容历史段落）
@@ -144,11 +166,11 @@ export async function checkDocs({
       if (digestClaim && facts.digest) verify('error', 'DOC_SOURCE_STALE', file, digestClaim.line, `sourceDigest ${shorten(digestClaim.groups[0])} ≠ 当前 ${shorten(facts.digest)}`, facts.digest.startsWith(digestClaim.groups[0]) || digestClaim.groups[0].startsWith(facts.digest));
       const revisionClaim = lastClaim(text, /revision[^\n]{0,30}?\b([0-9a-f]{8,64})\b/gi);
       if (revisionClaim && facts.digest) verify('error', 'DOC_REVISION_STALE', file, revisionClaim.line, `revision ${shorten(revisionClaim.groups[0])} ≠ 当前 ${facts.digest.slice(0, 8)}`, facts.digest.startsWith(revisionClaim.groups[0]) || revisionClaim.groups[0].startsWith(facts.digest.slice(0, 8)));
-      // 账号示例：最近一次提到的邮箱必须与当前激活账号一致（号池存在性另行提示）
-      const emailClaim = lastClaim(text, /[\w.+-]+@[\w-]+\.[A-Za-z]{2,}/g);
+      // 账号示例：最近一次提到的邮箱必须与当前激活账号一致（错误文案不回显本机号池明文邮箱）
+      const emailClaim = lastAccountExampleEmail(text);
       if (emailClaim) {
         const claimedEmail = emailClaim.text.toLowerCase();
-        if (facts.currentAccountEmail) verify('error', 'DOC_ACCOUNT_STALE', file, emailClaim.line, `账号示例 ${emailClaim.text} ≠ 当前账号 ${facts.currentAccountEmail}${facts.accountEmails.length ? `（号池：${facts.accountEmails.join('、')}）` : ''}`, claimedEmail === facts.currentAccountEmail.toLowerCase());
+        if (facts.currentAccountEmail) verify('error', 'DOC_ACCOUNT_STALE', file, emailClaim.line, `账号示例 ${emailClaim.text} ≠ 当前激活账号（号池共 ${facts.accountEmails.length} 个账号）`, claimedEmail === facts.currentAccountEmail.toLowerCase());
         else if (facts.accountEmails.length) add('warning', 'DOC_ACCOUNT_UNVERIFIED', file, emailClaim.line, `无法确认当前账号，账号示例 ${emailClaim.text} 未比对`);
       }
     }
@@ -156,6 +178,53 @@ export async function checkDocs({
 
   if (existsSync(agentsPath)) await checkDocFile('AGENTS.md', agentsPath);
   await checkDocFile('README.md', readmePath);
+  if (existsSync(readmeEnPath)) await checkDocFile('README_EN.md', readmeEnPath);
+
+  if (existsSync(changelogPath) && facts.version) {
+    const changelogText = await readText(changelogPath);
+    if (changelogText === null) {
+      add('error', 'DOC_MISSING', 'CHANGELOG.md', null, '缺少文档文件');
+    } else {
+      const escapedVersion = escapeRegExp(facts.version);
+      const hasSection = new RegExp(`^##\\s+\\[${escapedVersion}\\](?:\\s|$)`, 'm').test(changelogText);
+      verify('error', 'CHANGELOG_VERSION_MISSING', 'CHANGELOG.md', null, `CHANGELOG.md 缺少 ## [${facts.version}] 条目`, hasSection);
+      const unreleasedClaim = lastClaim(changelogText, /^\[Unreleased\]:\s*(.+)$/gm);
+      if (unreleasedClaim) {
+        verify(
+          'error',
+          'CHANGELOG_UNRELEASED_LINK_STALE',
+          'CHANGELOG.md',
+          unreleasedClaim.line,
+          `[Unreleased] 对比链接未指向 v${facts.version}...HEAD`,
+          new RegExp(`/compare/v${escapedVersion}\\.\\.\\.HEAD\\s*$`).test(unreleasedClaim.groups[0]),
+        );
+        const hasVersionLink = new RegExp(`^\\[${escapedVersion}\\]:\\s*https?://`, 'm').test(changelogText);
+        verify('error', 'CHANGELOG_VERSION_LINK_MISSING', 'CHANGELOG.md', null, `CHANGELOG.md 缺少 [${facts.version}] 对比链接`, hasVersionLink);
+      }
+    }
+  }
+
+  if (existsSync(projectPath) && facts.version) {
+    const projectText = await readText(projectPath);
+    if (projectText !== null) {
+      const projectClaim = lastClaim(projectText, /GravityBox\s*(?:\(\s*)?[`*]?v?(\d+\.\d+\.\d+)[`*]?(?:\s*\))?/gm);
+      if (projectClaim) {
+        verify('error', 'DOC_VERSION_MISMATCH', 'PROJECT.md', projectClaim.line, `版本 ${projectClaim.groups[0]} ≠ 实际 ${facts.version}`, projectClaim.groups[0] === facts.version);
+      } else {
+        verify('error', 'DOC_VERSION_MISSING', 'PROJECT.md', null, `PROJECT.md 未声明当前版本 ${facts.version}`, false);
+      }
+    }
+  }
+
+  if (existsSync(screenshotsReadmePath) && facts.version) {
+    const screenshotsText = await readText(screenshotsReadmePath);
+    if (screenshotsText !== null) {
+      const aboutClaim = lastClaim(screenshotsText, /about\.png[^\n]*?\bv?(\d+\.\d+\.\d+)\b/g);
+      if (aboutClaim) {
+        verify('error', 'DOC_VERSION_MISMATCH', 'assets/screenshots/README.md', aboutClaim.line, `about.png 说明版本 ${aboutClaim.groups[0]} ≠ 实际 ${facts.version}`, aboutClaim.groups[0] === facts.version);
+      }
+    }
+  }
 
   const errors = issues.filter(issue => issue.level === 'error').length;
   return { ok: errors === 0, issues, checked, errorCount: errors, warningCount: issues.length - errors, facts };

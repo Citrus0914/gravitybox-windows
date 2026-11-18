@@ -20,8 +20,8 @@
 | **主窗口 · 总览** | `overview.png` | `dark-overview.png` | `2200×1520` | 账号配额双周期看板、当日消耗趋势与活跃模型 Top |
 | **主窗口 · 账号** | `accounts.png` | `dark-accounts.png` | `2200×1520` | 多账号卡片、状态徽标与原子事务安全切换入口 |
 | **主窗口 · 用量** | `usage.png` | `dark-usage.png` | `2200×1520` | 分周期 Token 核算、API 费用估算与缓存命中率趋势 |
-| **主窗口 · 设置** | `settings.png` | `dark-settings.png` | `2200×1520` | 界面汉化、对话状态栏、自动更新价格基准与存储管理 |
-| **主窗口 · 关于** | `about.png` | `dark-about.png` | `2200×1520` | 版本信息（v1.1.0）、应用内更新检测与目标版本状态 |
+| **主窗口 · 设置** | `settings.png` | `dark-settings.png` | `2200×1520` | 显示语言（跟随系统 / 简体中文 / English）、界面汉化、对话状态栏、自动更新价格基准与存储管理 |
+| **主窗口 · 关于** | `about.png` | `dark-about.png` | `2200×1520` | 版本信息（v1.1.1）、应用内更新检测与目标版本状态 |
 | **菜单栏 · 用量** | `menubar.png` | `dark-menubar.png` | `792×1288` | 菜单栏面板默认“用量”视图 |
 | **菜单栏 · 配额** | `menubar-quota.png` | `dark-menubar-quota.png` | `792×1118` | 菜单栏面板“配额”与备用账号推荐 |
 | **菜单栏 · 账号** | `menubar-accounts.png` | `dark-menubar-accounts.png` | `792×1162` | 菜单栏面板一键安全切号入口 |

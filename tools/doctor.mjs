@@ -21,11 +21,13 @@ if(!skipNative){
 }
 if(!ready){process.stderr.write('先运行 npm run setup:dev 准备依赖；缺少系统开发工具时按 macOS 提示安装。\n');process.exit(1);}
 
-// Git pre-push hook 门禁配置
+// Git pre-commit / pre-push hook 门禁配置
 let hooksConfigured = false;
-const hookPath = join(root, '.githooks/pre-push');
-if (existsSync(hookPath)) {
-  try { chmodSync(hookPath, 0o755); } catch {}
+for (const hookName of ['pre-commit', 'pre-push']) {
+  const hookPath = join(root, '.githooks', hookName);
+  if (setup && existsSync(hookPath)) {
+    try { chmodSync(hookPath, 0o755); } catch {}
+  }
 }
 if (existsSync(join(root, '.git'))) {
   try {
@@ -46,5 +48,5 @@ if (existsSync(join(root, '.git'))) {
 }
 
 if(setup)run(['run','build']);
-process.stdout.write(`GravityBox ${version} 开发环境已就绪${existsSync(join(root,'dist/main.js'))?'，编译输出存在':'；运行 npm run build 生成编译输出'}${hooksConfigured ? '；Git 门禁钩子已就绪' : '；提示：运行 npm run setup:dev 可自动启用 Git pre-push 门禁钩子'}。\n`);
+process.stdout.write(`GravityBox ${version} 开发环境已就绪${existsSync(join(root,'dist/main.js'))?'，编译输出存在':'；运行 npm run build 生成编译输出'}${hooksConfigured ? '；Git 门禁钩子已就绪' : '；提示：运行 npm run setup:dev 可自动启用 Git pre-commit / pre-push 门禁钩子'}。\n`);
 

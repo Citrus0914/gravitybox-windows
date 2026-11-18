@@ -102,11 +102,11 @@
             "platform": "Google Cloud 标准 Global API",
             "conditions": "参考 Gemini 4 Carbon 标准 Global API 文本基准估算",
             "checkedAt": "2026-11-02",
-            "validUntil": "2026-12-01T00:00:00Z",
+            "validUntil": "2026-11-30T23:59:59Z",
             "verification": "historical"
           },
           "validFrom": null,
-          "validUntil": "2026-12-01T00:00:00Z"
+          "validUntil": "2026-11-30T23:59:59Z"
         },
         {
           "model": "gemini-4-carbon-trial",
@@ -661,6 +661,14 @@
       "input": 2.0,
       "output": 12.0,
       "cached": 0.2,
+      "contextTiers": [
+        {
+          "thresholdTokens": 200000,
+          "input": 4.0,
+          "output": 18.0,
+          "cached": 0.4
+        }
+      ],
       "provenance": {
         "sourceUrl": "https://cloud.google.com/model-garden/pricing?hl=en",
         "platform": "Google Cloud 标准 Global API",
@@ -1074,6 +1082,7 @@
   },
   "aliases": {
     "gemini-pro-orchestrator-g1-pro": "gemini-4-argon",
+    "gemini-pro-orchestrator-argon": "gemini-4-argon",
     "gemini-pro-orchestrator": "gemini-4-argon",
     "orchestrator (argon)": "gemini-4-argon",
     "Orchestrator (Argon)": "gemini-4-argon",
@@ -1083,19 +1092,46 @@
     "gemini-flash-worker": "gemini-3.8-flash",
     "Gemini Flash": "gemini-3.8-flash",
     "gemini-flash": "gemini-3.8-flash",
+    "gemini-4-hydrogen-tiered": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-low": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-medium": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-high": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-xhigh": "gemini-4-hydrogen",
+    "gemini-4-hydrogen-tiered-extra-high": "gemini-4-hydrogen",
     "MODEL_PLACEHOLDER_M667": "gemini-4-carbon",
     "MODEL_PLACEHOLDER_M668": "gemini-4-argon",
-    "MODEL_PLACEHOLDER_M669": "gemini-3.8-flash"
+    "MODEL_PLACEHOLDER_M669": "gemini-3.8-flash",
+    "MODEL_PLACEHOLDER_M681": "gemini-4-argon"
   },
+  "activeModels": [
+    "gemini-4-carbon",
+    "gemini-4-argon",
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gpt-oss-120b"
+  ],
   "feedModels": [
     "gemini-3.8-flash",
+    "gemini-3.8-pro",
+    "gemini-3.1-pro",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
     "gemini-4-argon",
     "gemini-4-carbon",
     "gemini-4-hydrogen",
     "claude-opus-5-5",
     "claude-sonnet-5-5",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-3-7-sonnet",
+    "claude-3-5-sonnet",
+    "claude-3-5-haiku",
+    "gpt-4o",
+    "gpt-4o-mini",
     "gpt-oss-120b"
   ],
-  "pricingVersion": "2026-11-13",
-  "pricingUpdatedAt": "2026-11-13T00:00:00Z"
+  "pricingVersion": "2026-11-17",
+  "pricingUpdatedAt": "2026-11-17T00:00:00Z"
 }

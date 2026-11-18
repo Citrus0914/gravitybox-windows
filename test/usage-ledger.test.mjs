@@ -182,7 +182,7 @@ test('账号下钻筛选器：首项全部账号，后续依次排列真实账�
     manager.setKnownAccounts([
       { id: 'acc_siensen', email: 'account-one@example.invalid', name: '测试账号一' },
       { id: 'acc_zhangli', email: 'account-two@example.invalid', name: '测试账号二' },
-      { id: 'acc_wenqi', email: 'account-three@example.invalid', name: 'Fixture Three' },
+      { id: 'acc_three', email: 'account-three@example.invalid', name: 'Fixture Three' },
     ]);
 
     manager.discoverDatabaseFiles = async () => ['synthetic'];

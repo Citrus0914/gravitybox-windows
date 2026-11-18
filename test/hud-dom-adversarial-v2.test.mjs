@@ -109,5 +109,39 @@ describe('DOM & 布局对抗性复验 (直接验证 runtime/hud-popover.js 与 r
       assert.equal(posRight.arrowPixelOffset, 261);
       assert.equal(posRight.arrowPixelOffset + 7, 268);
     });
+
+    it('左右分栏下聊天输入框缩窄时，Popover 严格夹紧在左分栏可见边界内，不越界被右侧窗口覆盖', () => {
+      setupMockBrowser(1280, 800);
+      const rightWindow = {
+        getBoundingClientRect: () => ({ left: 320, top: 0, width: 960, height: 800, right: 1280, bottom: 800 }),
+      };
+      const leftChatSlot = {
+        contains: (el) => el === narrowedRightCapsule,
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 320, height: 800, right: 320, bottom: 800 }),
+      };
+      const splitRoot = {
+        children: [leftChatSlot, rightWindow],
+        parentElement: null,
+      };
+      const convView = {
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 320, height: 800, right: 320, bottom: 800 }),
+      };
+      const narrowedRightCapsule = {
+        getBoundingClientRect: () => ({ left: 230, width: 80, top: 700, right: 310, bottom: 722 }),
+        closest: (sel) => {
+          if (String(sel).includes('conversation-view')) return convView;
+          if (String(sel).includes('data-split-root')) return splitRoot;
+          return null;
+        },
+      };
+
+      const pos = computeUpwardPopoverPosition(narrowedRightCapsule, 312, 190, 12, 8, 12);
+      assert.equal(pos.width, 296, '320px 窄分栏下 312px 上下文卡片应自适应缩容至 296px');
+      assert.equal(pos.left, 12);
+      assert.ok(
+        pos.left + pos.width <= 320 - 12,
+        `Popover 右边缘 (${pos.left + pos.width}px) 不得穿入 x=320 的右侧窗口`
+      );
+    });
   });
 });

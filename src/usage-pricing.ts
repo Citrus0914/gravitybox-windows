@@ -2,9 +2,15 @@ import { readFile } from 'node:fs/promises';
 import { atomicJson, readOptionalJson } from './files.js';
 import { APP_VERSION } from './version.js';
 import {
+  FEED_MODEL_KEYS,
+  resetAndRegisterRemoteModelMetadata,
+  sanitizeRemoteModelMetadata,
+} from './model-catalog.js';
+import {
   DEFAULT_API_PRICES,
   DEFAULT_PRICING_FEED_URLS,
   PRICING_METADATA,
+  isInternalNonChatModelId,
   mergePricingEntries,
   resolvePricingFromTable,
   validateRawPrices,
@@ -12,6 +18,7 @@ import {
   type ApiPricingEntry,
   type ApiPricingInterval,
 } from './pricing.js';
+import { bt } from './i18n.js';
 
 export interface PricingSyncMutableState {
   lastRemoteSyncAt: number;
@@ -24,31 +31,49 @@ export interface PricingSyncMutableState {
   lastSyncedVersion: string;
 }
 
+export function compareDatedFeedVersion(left: string, right: string): number | null {
+  const pattern = /^(\d{4}-\d{2}-\d{2})(?:[.-]r?(\d+))?$/i;
+  const leftMatch = left.trim().match(pattern);
+  const rightMatch = right.trim().match(pattern);
+  if (!leftMatch || !rightMatch) return null;
+  const dateDiff = leftMatch[1]!.localeCompare(rightMatch[1]!);
+  if (dateDiff !== 0) return dateDiff;
+  const leftRev = leftMatch[2] ? Number.parseInt(leftMatch[2], 10) : 0;
+  const rightRev = rightMatch[2] ? Number.parseInt(rightMatch[2], 10) : 0;
+  return leftRev - rightRev;
+}
+
 export async function loadRawPricingTable(
   remotePricingCachePath: string,
   pricingCachePath: string
-): Promise<{ merged: Record<string, ApiPricingEntry>; warnings: string[] }> {
+): Promise<{ merged: Record<string, ApiPricingEntry>; warnings: string[]; publicKeys: Set<string> }> {
   const warnings: string[] = [];
   const merged: Record<string, ApiPricingEntry> = Object.assign(Object.create(null), DEFAULT_API_PRICES);
+  const publicKeys = new Set<string>(FEED_MODEL_KEYS);
 
   // 1. 尝试合并本地远程缓存（禁止早于内置目录日期的旧远端缓存降级覆盖较新的官方目录）
+  resetAndRegisterRemoteModelMetadata({});
   try {
     const rawRemote = await readFile(remotePricingCachePath, 'utf8');
     const parsedRemote = JSON.parse(rawRemote);
     const remotePrices = parsedRemote && typeof parsedRemote === 'object' && parsedRemote.prices ? parsedRemote.prices : parsedRemote;
     const remoteVer = typeof parsedRemote?.feedVersion === 'string' ? parsedRemote.feedVersion.trim() : '';
-    const isOlderDatedFeed = /^\d{4}-\d{2}-\d{2}$/.test(remoteVer)
-      && /^\d{4}-\d{2}-\d{2}$/.test(PRICING_METADATA.version)
-      && remoteVer < PRICING_METADATA.version;
+    const cmpToBuiltin = compareDatedFeedVersion(remoteVer, PRICING_METADATA.version);
+    const isOlderDatedFeed = cmpToBuiltin !== null && cmpToBuiltin < 0;
+    resetAndRegisterRemoteModelMetadata(parsedRemote, { onlyNewEntries: isOlderDatedFeed });
     if (remotePrices && typeof remotePrices === 'object' && !Array.isArray(remotePrices)) {
       const filteredRemote = isOlderDatedFeed
         ? Object.fromEntries(Object.entries(remotePrices).filter(([k]) => !Object.hasOwn(merged, k)))
         : remotePrices;
-      mergePricingEntries(merged, filteredRemote, '远程价格条目待修复：', warnings);
+      const remoteAccepted = new Set<string>();
+      mergePricingEntries(merged, filteredRemote, bt('pricing.warn.remote_entry_prefix'), warnings, remoteAccepted);
+      for (const k of remoteAccepted) {
+        if (!isInternalNonChatModelId(k)) publicKeys.add(k);
+      }
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      warnings.push('远程价格缓存无法读取');
+      warnings.push(bt('pricing.warn.remote_cache_unreadable'));
     }
   }
 
@@ -57,15 +82,19 @@ export async function loadRawPricingTable(
     const rawCustom = await readFile(pricingCachePath, 'utf8');
     const cached = JSON.parse(rawCustom);
     if (cached && typeof cached === 'object' && !Array.isArray(cached)) {
-      mergePricingEntries(merged, cached, '自定义价格条目待修复：', warnings);
+      const customAccepted = new Set<string>();
+      mergePricingEntries(merged, cached, bt('pricing.warn.custom_entry_prefix'), warnings, customAccepted);
+      for (const k of customAccepted) {
+        if (!isInternalNonChatModelId(k)) publicKeys.add(k);
+      }
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      warnings.push('自定义价格无法读取');
+      warnings.push(bt('pricing.warn.custom_unreadable'));
     }
   }
 
-  return { merged, warnings };
+  return { merged, warnings, publicKeys };
 }
 
 export function resolvePricingTableFromRaw(
@@ -137,21 +166,98 @@ export function selectRemotePricingCandidateUrls(options: {
 }
 
 const MAX_PRICING_FEED_BYTES = 2 * 1024 * 1024;
+const MAX_PRICING_FEED_REDIRECTS = 3;
+
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '[::1]';
+}
 
 export function assertAllowedPricingFeedUrl(rawUrl: unknown): string {
-  if (typeof rawUrl !== 'string' || !rawUrl.trim()) throw new Error('价格源地址无效');
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) throw new Error(bt('pricing.err.url_invalid'));
   let parsed: URL;
   try {
     parsed = new URL(rawUrl.trim());
   } catch {
-    throw new Error('价格源地址格式无效');
+    throw new Error(bt('pricing.err.url_format_invalid'));
   }
-  if (parsed.username || parsed.password) throw new Error('价格源地址不允许内嵌凭据');
+  if (parsed.username || parsed.password) throw new Error(bt('pricing.err.url_credentials_forbidden'));
   if (parsed.protocol === 'https:') return parsed.href;
-  if (parsed.protocol === 'http:' && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '[::1]')) {
+  if (parsed.protocol === 'http:' && isLoopbackHost(parsed.hostname)) {
     return parsed.href;
   }
-  throw new Error('仅允许 HTTPS 官方或受信任价格源地址');
+  throw new Error(bt('pricing.err.https_trusted_only'));
+}
+
+async function fetchBoundedPricingFeed(initialUrl: string, signal: AbortSignal): Promise<Uint8Array> {
+  let currentUrl = assertAllowedPricingFeedUrl(initialUrl);
+  const initialIsHttps = new URL(currentUrl).protocol === 'https:';
+  let res: Response | null = null;
+  for (let hop = 0; hop <= MAX_PRICING_FEED_REDIRECTS; hop += 1) {
+    res = await fetch(currentUrl, {
+      signal,
+      redirect: 'manual',
+      headers: { 'User-Agent': `GravityBox/${APP_VERSION}` },
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers?.get?.('location');
+      if (!loc) throw new Error(`HTTP ${res.status}`);
+      const nextUrl = assertAllowedPricingFeedUrl(new URL(loc, currentUrl).href);
+      const parsedNext = new URL(nextUrl);
+      if (initialIsHttps && parsedNext.protocol !== 'https:') {
+        throw new Error(bt('pricing.err.https_trusted_only'));
+      }
+      currentUrl = nextUrl;
+      continue;
+    }
+    break;
+  }
+  if (!res) throw new Error(bt('pricing.err.url_invalid'));
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(bt('pricing.err.too_many_redirects'));
+  }
+  if (res.url) {
+    const verifiedFinal = assertAllowedPricingFeedUrl(res.url);
+    if (initialIsHttps && new URL(verifiedFinal).protocol !== 'https:') {
+      throw new Error(bt('pricing.err.https_trusted_only'));
+    }
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const contentLen = Number(res.headers.get('content-length') ?? 0);
+  if (Number.isFinite(contentLen) && contentLen > MAX_PRICING_FEED_BYTES) {
+    throw new Error(bt('pricing.err.response_too_large'));
+  }
+  if (res.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_PRICING_FEED_BYTES) {
+          await reader.cancel().catch(() => {});
+          throw new Error(bt('pricing.err.response_too_large'));
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const merged = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return merged;
+  }
+  const rawBuf = await res.arrayBuffer();
+  if (rawBuf.byteLength > MAX_PRICING_FEED_BYTES) {
+    throw new Error(bt('pricing.err.response_too_large'));
+  }
+  return new Uint8Array(rawBuf);
 }
 
 export async function executeRemotePricingSync(options: {
@@ -167,28 +273,31 @@ export async function executeRemotePricingSync(options: {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6000);
     try {
-      const safeUrl = assertAllowedPricingFeedUrl(targetUrl);
-      const res = await fetch(safeUrl, { signal: controller.signal, headers: { 'User-Agent': `GravityBox/${APP_VERSION}` } });
-      if (res.url) assertAllowedPricingFeedUrl(res.url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const contentLen = Number(res.headers.get('content-length') ?? 0);
-      if (Number.isFinite(contentLen) && contentLen > MAX_PRICING_FEED_BYTES) {
-        throw new Error('价格源响应体积超出安全上限');
-      }
-      const rawBuf = await res.arrayBuffer();
-      if (rawBuf.byteLength > MAX_PRICING_FEED_BYTES) {
-        throw new Error('价格源响应体积超出安全上限');
-      }
-      const data = JSON.parse(new TextDecoder('utf-8').decode(rawBuf));
+      const rawBytes = await fetchBoundedPricingFeed(targetUrl, controller.signal);
+      const data = JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
       const prices = data && typeof data === 'object' && data.prices ? data.prices : data;
       const validated = validateRawPrices(prices);
+      const remoteMeta = sanitizeRemoteModelMetadata(data);
       const feedVersion = (data && typeof data === 'object' && typeof data.version === 'string') ? data.version : 'unknown';
+      const cmpToSynced = compareDatedFeedVersion(feedVersion, state.lastSyncedVersion);
+      if (cmpToSynced !== null && cmpToSynced < 0) {
+        throw new Error(bt('pricing.err.feed_version_older', { feedVersion, syncedVersion: state.lastSyncedVersion }));
+      }
+      const cmpToBuiltin = compareDatedFeedVersion(feedVersion, PRICING_METADATA.version);
+      const isOlderDatedFeed = cmpToBuiltin !== null && cmpToBuiltin < 0;
+      const persistedPrices = isOlderDatedFeed
+        ? Object.fromEntries(Object.entries(validated).filter(([k]) => !Object.hasOwn(DEFAULT_API_PRICES, k)))
+        : validated;
+      resetAndRegisterRemoteModelMetadata(remoteMeta, { onlyNewEntries: isOlderDatedFeed });
       await atomicJson(remotePricingCachePath, {
         version: 1,
         syncedAt: new Date(now).toISOString(),
         sourceUrl: targetUrl,
         feedVersion,
-        prices: validated,
+        ...(remoteMeta.aliases ? { aliases: remoteMeta.aliases } : {}),
+        ...(remoteMeta.activeModels ? { activeModels: remoteMeta.activeModels } : {}),
+        ...(remoteMeta.models ? { models: remoteMeta.models } : {}),
+        prices: persistedPrices,
       });
       state.lastRemoteSyncAt = now;
       state.lastCheckAt = now;
@@ -234,9 +343,8 @@ export function buildPricingSyncStatus(options: {
 }) {
   const { autoSyncEnabled, state, remotePricingUrl, modelCount } = options;
   const rawVersion = state.lastSyncedVersion || PRICING_METADATA.version;
-  const effectiveVersion = /^\d{4}-\d{2}-\d{2}$/.test(rawVersion)
-    && /^\d{4}-\d{2}-\d{2}$/.test(PRICING_METADATA.version)
-    && rawVersion < PRICING_METADATA.version
+  const cmpRawToBuiltin = compareDatedFeedVersion(rawVersion, PRICING_METADATA.version);
+  const effectiveVersion = cmpRawToBuiltin !== null && cmpRawToBuiltin < 0
     ? PRICING_METADATA.version
     : rawVersion;
   const effectiveCheckAt = Math.max(state.lastCheckAt, state.lastRemoteSyncAt);

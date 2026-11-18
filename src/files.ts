@@ -2,6 +2,7 @@ import { open, lstat, unlink, mkdir, readFile } from 'node:fs/promises';
 import { renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { bt } from './i18n.js';
 
 export interface AtomicWriteOptions {
   durability?: 'strict' | 'relaxed';
@@ -13,7 +14,7 @@ export async function atomicText(path: string, text: string, signal?: AbortSigna
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   try {
     const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error('拒绝覆盖非本用户的普通文件');
+    if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error(bt('files.refuse_non_user_file'));
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   const temp = `${path}.${randomUUID()}.tmp`;
   try {
@@ -44,7 +45,12 @@ export async function readOptionalJson<T = Record<string, unknown>>(path: string
     return JSON.parse(await readFile(path, 'utf8')) as T;
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-      console.warn(`[GravityBox] 读取可选配置 ${label ?? basenameForLog(path)} 失败: ${sanitizeError((error as Error)?.message ?? String(error))}`);
+      console.warn(
+        bt('files.optional_json_read_failed', {
+          name: label ?? basenameForLog(path),
+          error: sanitizeError((error as Error)?.message ?? String(error)),
+        })
+      );
     }
     return null;
   }
@@ -63,10 +69,10 @@ export async function recoverFileSet(journalPath: string, allowedPaths: string[]
   const changes = JSON.parse(raw).changes as FileChange[];
   if (!Array.isArray(changes) || !changes.length || changes.some(change =>
     !allowedPaths.includes(change.path) || ![change.before, change.after].every(value => value === null || typeof value === 'string')))
-    throw new Error('账号删除恢复记录无效，原件已保留');
+    throw new Error(bt('files.delete_journal_invalid'));
   for (const change of changes) {
     const current = await readOptional(change.path);
-    if (current !== change.before && current !== change.after) throw new Error('账号删除文件已被其他程序修改，恢复材料已保留');
+    if (current !== change.before && current !== change.after) throw new Error(bt('files.delete_file_modified'));
   }
   for (const change of changes) {
     if (await readOptional(change.path) === change.after) continue;
@@ -80,13 +86,13 @@ export async function commitFileSet(journalPath: string, values: { path: string;
   const changes: FileChange[] = [];
   for (const value of values) {
     const info = await lstat(value.path).catch(error => { if (error.code !== 'ENOENT') throw error; return null; });
-    if (info && (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.())) throw new Error('账号删除文件身份不匹配');
+    if (info && (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.())) throw new Error(bt('files.delete_identity_mismatch'));
     changes.push({ ...value, before: await readOptional(value.path) });
   }
   await atomicJson(journalPath, { schema: 1, changes });
   // A crash is completed forward by init; errors retain the journal rather than claiming failure rolled back.
   try { await recoverFileSet(journalPath, changes.map(change => change.path)); }
-  catch { throw new Error('账号移除尚未完成，恢复材料已保留；请重新读取账号完成对账'); }
+  catch { throw new Error(bt('files.delete_incomplete')); }
 }
 
 type AccountCommit = { accountPath:string; indexPath:string; beforeAccount:string|null; beforeIndex:string|null; afterAccount:string; afterIndex:string };
@@ -94,7 +100,7 @@ async function readOptional(path:string) {try{return await readFile(path,'utf8')
 async function restoreCommit(record:AccountCommit, forward:boolean) {
   for(const [path,before,after] of [[record.accountPath,record.beforeAccount,record.afterAccount],[record.indexPath,record.beforeIndex,record.afterIndex]] as const) {
     const current=await readOptional(path);
-    if(current!==before&&current!==after)throw Error('账号提交文件已被其他程序修改，恢复材料已保留');
+    if(current!==before&&current!==after)throw Error(bt('files.commit_modified'));
   }
   for(const [path,value] of [[record.accountPath,forward?record.afterAccount:record.beforeAccount],[record.indexPath,forward?record.afterIndex:record.beforeIndex]] as const) {
     if(await readOptional(path)===value)continue;
@@ -105,7 +111,7 @@ async function restoreCommit(record:AccountCommit, forward:boolean) {
 export async function recoverAccountCommit(indexPath:string):Promise<void> {
   const journalPath=indexPath+'.commit.json',raw=await readOptional(journalPath);if(raw===null)return;
   const record=JSON.parse(raw) as AccountCommit;
-  if(record.indexPath!==indexPath||dirname(record.accountPath)!==join(dirname(indexPath),'accounts')||!record.accountPath.endsWith('.json'))throw Error('账号提交恢复记录无效');
+  if(record.indexPath!==indexPath||dirname(record.accountPath)!==join(dirname(indexPath),'accounts')||!record.accountPath.endsWith('.json'))throw Error(bt('files.commit_journal_invalid'));
   await restoreCommit(record,true);await unlink(journalPath);
 }
 /** Journal before either replacement; errors roll back, crashes are reconciled before reads. */
@@ -113,7 +119,7 @@ export async function commitAccountAndIndex(accountPath:string,accountData:unkno
   await mkdir(dirname(accountPath),{recursive:true,mode:0o700});
   await mkdir(dirname(indexPath),{recursive:true,mode:0o700});
   for(const target of [accountPath,indexPath]) {
-    try {const info=await lstat(target);if(!info.isFile()||info.isSymbolicLink()||info.uid!==process.getuid?.())throw Error('拒绝覆盖非本用户的普通文件');}
+    try {const info=await lstat(target);if(!info.isFile()||info.isSymbolicLink()||info.uid!==process.getuid?.())throw Error(bt('files.refuse_non_user_file'));}
     catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
   }
   const journalPath=indexPath+'.commit.json';
@@ -122,7 +128,7 @@ export async function commitAccountAndIndex(accountPath:string,accountData:unkno
   try {
     signal?.throwIfAborted();await atomicText(accountPath,record.afterAccount);await atomicText(indexPath,record.afterIndex);await unlink(journalPath);
   } catch(error) {
-    try {await restoreCommit(record,false);await unlink(journalPath);}catch{throw Error('账号提交未完成，恢复材料已保留；请重新读取账号以恢复');}
+    try {await restoreCommit(record,false);await unlink(journalPath);}catch{throw Error(bt('files.commit_incomplete'));}
     throw error;
   }
 }

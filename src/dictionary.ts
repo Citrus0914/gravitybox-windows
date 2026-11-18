@@ -1,16 +1,29 @@
 import {withProcessLease} from './process-lock.js';
 import {decodeScopedKey} from './candidates.js';
-import { readFile, readdir, rename, lstat } from 'node:fs/promises';
+import { access, readFile, readdir, rename, lstat } from 'node:fs/promises';
 import { watch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { atomicJson } from './files.js';
 import { SUPPORTED_BUNDLES, normalizeText as normalize } from './bundle.js';
+import { bt, getActiveLocale } from './i18n.js';
 
-export type Dictionary = { schema: 1; version: string; entries: Record<string, string> };
+export type DeclarativeTemplateRule = {
+  key: string;
+  pattern: string;
+  flags?: string;
+  replacement: string;
+  inlineOnly?: boolean;
+};
+export type Dictionary = {
+  schema: 1;
+  version: string;
+  entries: Record<string, string>;
+  templateRules?: DeclarativeTemplateRule[];
+};
 export type LayerCounts = { builtin:number; incremental:number; personal:number };
-export function sourceCategory(source:string):keyof LayerCounts { return source.endsWith('个人覆盖.json') ? 'personal' : source.includes('增量补全') ? 'incremental' : source.startsWith('内置') ? 'builtin' : 'personal'; }
+export function sourceCategory(source:string):keyof LayerCounts { return source.endsWith('个人覆盖.json') ? 'personal' : source.includes('增量补全') ? 'incremental' : (source.startsWith('内置') || source.startsWith('Built-in') || source.startsWith(bt('dictionary.source.builtin'))) ? 'builtin' : 'personal'; }
 export type LayeredDictionary = {
   dictionary: Dictionary;
   /** 被更高层覆盖的词条，供覆盖率报告与发布门禁核对，不静默吞掉 */
@@ -47,7 +60,7 @@ async function migrateLegacyLocked(userDir:string, options:{supportedVersions?:I
     try {
       const existingRaw = await readFile(unifiedPath, 'utf8');
       try {
-        combined = validateEntries(JSON.parse(existingRaw), '现有增量补全');
+        combined = validateEntries(JSON.parse(existingRaw), bt('dictionary.label.existing_incremental'));
       } catch {
         // 现有统一词典损坏：绝不能退回空对象后覆盖原文件！必须保留原件，停止自动合并，避免丢失原内容
         return;
@@ -83,10 +96,10 @@ async function migrateLegacyLocked(userDir:string, options:{supportedVersions?:I
     validateEntries(sorted);
     const expectedDigest = createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
     await atomicJson(unifiedPath, sorted);
-    const checkBack = validateEntries(JSON.parse(await readFile(unifiedPath, 'utf8')), '写入核对');
+    const checkBack = validateEntries(JSON.parse(await readFile(unifiedPath, 'utf8')), bt('dictionary.label.write_check'));
     const actualDigest = createHash('sha256').update(JSON.stringify(Object.fromEntries(Object.entries(checkBack).sort(([a], [b]) => a.localeCompare(b))))).digest('hex');
     if (Object.keys(checkBack).length < Object.keys(sorted).length || actualDigest !== expectedDigest) {
-      throw new Error('迁移核对失败：写入内容哈希或条数与预期不一致');
+      throw new Error(bt('dictionary.err.migration_mismatch'));
     }
 
     // 成功迁移的旧文件：保留在可恢复的 .migrated 备份中，若已存在同名恢复副本则使用唯一后缀禁止覆盖
@@ -164,7 +177,7 @@ async function readIncremental(userDir: string): Promise<IncrementalState | unde
     entries = validateEntries(JSON.parse(raw), INCREMENTAL_DICTIONARY_FILE);
   } catch (error) {
     // 损坏时只读不写：调用方必须能知道“无法安全删除”，又不能让操作覆盖原文件
-    throw new Error(`${INCREMENTAL_DICTIONARY_FILE} 无法解析，已保留原文件：${(error as Error).message}`);
+    throw new Error(bt('dictionary.err.incremental_parse', { file: INCREMENTAL_DICTIONARY_FILE, error: (error as Error).message }));
   }
   return { raw, entries, digest: textDigest(raw) };
 }
@@ -186,17 +199,17 @@ export async function readIncrementalEntries(userDir: string): Promise<{ entries
  * 写入使用原子写 + 写后核对；增量层损坏时抛错且不触碰原文件。
  */
 export async function removeIncrementalEntries(userDir: string, keys: string[], options: IncrementalRemovalOptions = {}): Promise<IncrementalRemoval> {
-  if (!Array.isArray(keys) || !keys.length) throw new Error('需要至少一个待删除增量词条');
-  if (keys.length > 1000) throw new Error('单次最多删除 1000 条增量词条');
+  if (!Array.isArray(keys) || !keys.length) throw new Error(bt('dictionary.err.remove_need_one'));
+  if (keys.length > 1000) throw new Error(bt('dictionary.err.remove_max'));
   const targets = [...new Set(keys.map(key => {
-    if (typeof key !== 'string' || !key.trim()) throw new Error('待删除词条必须是非空文本');
+    if (typeof key !== 'string' || !key.trim()) throw new Error(bt('dictionary.err.remove_empty_key'));
     return normalize(key);
   }))];
   const file = incrementalDictionaryPath(userDir);
   const current = await readIncremental(userDir);
   if (options.expectedDigest !== undefined) {
     const currentDigest = current?.digest ?? textDigest('');
-    if (options.expectedDigest !== currentDigest) throw new Error('增量词典已在其他位置修改，请刷新后重试');
+    if (options.expectedDigest !== currentDigest) throw new Error(bt('dictionary.err.incremental_modified'));
   }
   const entries: Record<string, string> = current ? { ...current.entries } : (Object.create(null) as Record<string, string>);
   const removed: string[] = [];
@@ -219,14 +232,14 @@ export async function removeIncrementalEntries(userDir: string, keys: string[], 
     const writtenRaw = await readFile(file, 'utf8');
     let checkBack: Record<string, string>;
     try {
-      checkBack = validateEntries(JSON.parse(writtenRaw), '增量词典写入核对');
+      checkBack = validateEntries(JSON.parse(writtenRaw), bt('dictionary.label.incremental_write_check'));
     } catch (error) {
-      throw new Error(`增量词典写入核对失败：${(error as Error).message}`);
+      throw new Error(bt('dictionary.err.write_check_failed', { error: (error as Error).message }));
     }
     if (Object.keys(checkBack).length !== Object.keys(entries).length || textDigest(writtenRaw) !== digest) {
-      throw new Error('增量词典写入核对失败：写入内容与预期不一致');
+      throw new Error(bt('dictionary.err.write_mismatch'));
     }
-    for (const key of removed) if (Object.hasOwn(checkBack, key)) throw new Error(`增量词典写入核对失败：${key} 仍在文件中`);
+    for (const key of removed) if (Object.hasOwn(checkBack, key)) throw new Error(bt('dictionary.err.still_present', { key }));
   }
   return {
     ok: true,
@@ -242,7 +255,7 @@ export async function removeIncrementalEntries(userDir: string, keys: string[], 
 
 /** 按补译批次删除：批次 = 一组 key + 可选批次标识，等价于带 batchId 的 removeIncrementalEntries。 */
 export async function removeIncrementalBatch(userDir: string, batch: IncrementalBatch, options: Omit<IncrementalRemovalOptions, 'batchId'> = {}): Promise<IncrementalRemoval> {
-  if (!batch || !Array.isArray(batch.keys)) throw new Error('增量删除批次必须包含 keys 数组');
+  if (!batch || !Array.isArray(batch.keys)) throw new Error(bt('dictionary.err.batch_keys_required'));
   return removeIncrementalEntries(userDir, batch.keys, { ...options, ...(batch.id ? { batchId: batch.id } : {}) });
 }
 
@@ -258,12 +271,12 @@ export async function restoreIncrementalSnapshot(
   let snapshot: IncrementalSnapshot;
   try {
     const parsed = JSON.parse(await readFile(snapshotPath, 'utf8')) as Partial<IncrementalSnapshot>;
-    if (!parsed || parsed.schema !== 1 || !parsed.removed || typeof parsed.removed !== 'object' || Array.isArray(parsed.removed)) throw new Error('缺少 schema/removed');
+    if (!parsed || parsed.schema !== 1 || !parsed.removed || typeof parsed.removed !== 'object' || Array.isArray(parsed.removed)) throw new Error(bt('dictionary.err.missing_schema_removed'));
     snapshot = parsed as IncrementalSnapshot;
   } catch (error) {
-    throw new Error(`增量词典撤销记录无效：${(error as Error).message}`);
+    throw new Error(bt('dictionary.err.undo_invalid', { error: (error as Error).message }));
   }
-  const incoming = validateEntries(snapshot.removed, '增量词典撤销记录');
+  const incoming = validateEntries(snapshot.removed, bt('dictionary.label.undo_snapshot'));
   const current = await readIncremental(userDir);
   const entries: Record<string, string> = current ? { ...current.entries } : (Object.create(null) as Record<string, string>);
   const restored: string[] = [];
@@ -276,9 +289,9 @@ export async function restoreIncrementalSnapshot(
   if (restored.length) {
     await atomicJson(incrementalDictionaryPath(userDir), sortedEntries(entries));
     const writtenRaw = await readFile(incrementalDictionaryPath(userDir), 'utf8');
-    const checkBack = validateEntries(JSON.parse(writtenRaw), '增量词典撤销核对');
+    const checkBack = validateEntries(JSON.parse(writtenRaw), bt('dictionary.label.undo_check'));
     if (Object.keys(checkBack).length !== Object.keys(entries).length || textDigest(writtenRaw) !== textDigest(serialized(entries))) {
-      throw new Error('增量词典撤销写入核对失败：写入内容与预期不一致');
+      throw new Error(bt('dictionary.err.undo_write_mismatch'));
     }
   }
   return { restored: restored.sort(), skipped: skipped.sort(), remaining: Object.keys(entries).length };
@@ -313,31 +326,111 @@ export function compareLayers(a: string, b: string): number {
   }
   return na.localeCompare(nb);
 }
-const PLACEHOLDER_TOKEN_RE = /\{\{?\w+\}?\}|\$\d+|%[sd]/g;
+const PLACEHOLDER_TOKEN_RE = /\{\{?[a-zA-Z0-9_.-]+\}?\}|\$\{[^}]+\}|\$\d+|%(?:\d+\$)?[sdifu]/g;
 const placeholderSignature = (s: string): string =>
   (s.includes('{') || s.includes('$') || s.includes('%'))
     ? (s.match(PLACEHOLDER_TOKEN_RE)?.sort().join('|') ?? '')
     : '';
 
-export function validateEntries(data: unknown, file = '词典'): Record<string, string> {
-  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(`${file} 必须是 JSON 对象`);
+export function validateEntries(data: unknown, file = bt('dictionary.default_file_label')): Record<string, string> {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(bt('dictionary.err.must_be_object', { file }));
   const entries: Record<string, string> = Object.create(null);
   for (const [key, value] of Object.entries(data)) {
-    if (typeof value !== 'string') throw new Error(`${file} 中存在非文本译文`);
+    if (typeof value !== 'string') throw new Error(bt('dictionary.err.non_string_value', { file }));
     const normalized = normalize(key);
     if (!normalized || normalized.length > 2000 || value.length > 4000 || normalized === '__proto__' || normalized === 'constructor' || normalized === 'prototype') {
-      throw new Error(`${file} 中存在无效词条`);
+      throw new Error(bt('dictionary.err.invalid_entry', { file }));
     }
-    if (Object.hasOwn(entries, normalized)) throw new Error(`${file} 中存在规范化后重复词条`);
-    if (placeholderSignature(key) !== placeholderSignature(value)) throw new Error(`${file} 的占位符不匹配`);
+    if (Object.hasOwn(entries, normalized)) throw new Error(bt('dictionary.err.duplicate_normalized', { file }));
+    if (placeholderSignature(key) !== placeholderSignature(value)) throw new Error(bt('dictionary.err.placeholder_mismatch', { file }));
     entries[normalized] = value;
   }
   return entries;
 }
 
-export function dictionaryFromEntries(entries: Record<string, string>): Dictionary {
+function isRepeatableBraceQuantifier(tail: string): boolean {
+  const m = tail.match(/^\{(\d+)(?:,(\d*))?\}/);
+  if (!m) return false;
+  if (m[2] === undefined) return Number(m[1]) >= 2;
+  if (m[2] === '') return true;
+  return Number(m[2]) >= 2;
+}
+
+export function hasNestedQuantifiedGroup(pattern: string): boolean {
+  const groupHasQuantifier: boolean[] = [];
+  let inCharClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === '\\') { i++; continue; }
+    if (ch === '[') { inCharClass = true; continue; }
+    if (ch === ']' && inCharClass) { inCharClass = false; continue; }
+    if (inCharClass) continue;
+    if (ch === '(') {
+      groupHasQuantifier.push(false);
+    } else if (ch === ')') {
+      const innerQuantified = groupHasQuantifier.pop() ?? false;
+      const next = pattern[i + 1] ?? '';
+      const outerRepeats =
+        next === '+' ||
+        next === '*' ||
+        (next === '{' && isRepeatableBraceQuantifier(pattern.slice(i + 1)));
+      const outerOptional = next === '?';
+      if (innerQuantified && (outerRepeats || outerOptional)) return true;
+      if ((innerQuantified || outerRepeats) && groupHasQuantifier.length > 0) {
+        groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+      }
+    } else if (
+      (ch === '+' || ch === '*' || (ch === '{' && isRepeatableBraceQuantifier(pattern.slice(i))))
+      && groupHasQuantifier.length > 0
+    ) {
+      groupHasQuantifier[groupHasQuantifier.length - 1] = true;
+    }
+  }
+  return false;
+}
+
+export function validateTemplateRules(data: unknown): DeclarativeTemplateRule[] {
+  const rawList = Array.isArray(data)
+    ? data
+    : data && typeof data === 'object' && Array.isArray((data as { rules?: unknown }).rules)
+    ? (data as { rules: unknown[] }).rules
+    : [];
+  const out: DeclarativeTemplateRule[] = [];
+  for (const item of rawList) {
+    if (!item || typeof item !== 'object') continue;
+    const candidate = item as Record<string, unknown>;
+    const key = typeof candidate.key === 'string' ? normalize(candidate.key) : '';
+    const pattern = typeof candidate.pattern === 'string' ? candidate.pattern : '';
+    const flags = typeof candidate.flags === 'string' ? candidate.flags : 'i';
+    const replacement = typeof candidate.replacement === 'string' ? candidate.replacement : '';
+    if (!key || key.length > 240 || !pattern || pattern.length > 320 || !pattern.startsWith('^') || !replacement || replacement.length > 400) continue;
+    if (!/^[iu]*$/.test(flags)) continue;
+    if (hasNestedQuantifiedGroup(pattern) || /(\([^)]*[+*][^)]*\))[+*?]/.test(pattern)) continue;
+    try {
+      new RegExp(pattern, flags);
+      out.push({
+        key,
+        pattern,
+        flags,
+        replacement,
+        ...(typeof candidate.inlineOnly === 'boolean' ? { inlineOnly: candidate.inlineOnly } : {}),
+      });
+      if (out.length >= 256) break;
+    } catch {}
+  }
+  return out;
+}
+
+export function dictionaryFromEntries(entries: Record<string, string>, templateRules?: DeclarativeTemplateRule[]): Dictionary {
   const sorted = Object.fromEntries(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b)));
-  return { schema: 1, version: createHash('sha256').update(JSON.stringify(sorted)).digest('hex').slice(0, 16), entries: sorted };
+  const cleanRules = templateRules && templateRules.length > 0 ? templateRules : undefined;
+  const hashPayload = cleanRules ? JSON.stringify({ entries: sorted, templateRules: cleanRules }) : JSON.stringify(sorted);
+  return {
+    schema: 1,
+    version: createHash('sha256').update(hashPayload).digest('hex').slice(0, 16),
+    entries: sorted,
+    ...(cleanRules ? { templateRules: cleanRules } : {}),
+  };
 }
 
 /**
@@ -348,6 +441,7 @@ export function dictionaryFromEntries(entries: Record<string, string>): Dictiona
  * 整份词典加载失败、新词一条都不生效"。覆盖是预期行为，因此这里允许覆盖，
  * 但把每一次覆盖记进 `overrode`，让覆盖率报告与发布门禁能核对，而不是静默吞掉。
  */
+const TEMPLATE_RULES_FILE = 'template-rules.json';
 const MAX_LAYER_FILE_CACHE_ENTRIES = 32;
 const layerFileCache = new Map<string, { mtimeMs: number; size: number; validated: Record<string, string> }>();
 
@@ -362,6 +456,7 @@ function setLayerFileCacheEntry(filePath: string, entry: { mtimeMs: number; size
 
 export async function loadDictionaryLayers(baseDir: string, userDir?: string,targetVersion?:string): Promise<LayeredDictionary> {
   const entries: Record<string, string> = Object.create(null);
+  const templateRuleByKey = new Map<string, DeclarativeTemplateRule>();
   const owner = new Map<string, { file: string; dir: string }>();
   const overrode: { key: string; from: string; to: string }[] = [];
   const files: string[] = [];
@@ -370,6 +465,18 @@ export async function loadDictionaryLayers(baseDir: string, userDir?: string,tar
   for (const dir of userDir ? [baseDir, userDir] : [baseDir]) {
     const names = (await readdir(dir)).filter(name => name.endsWith('.json')).sort(compareLayers);
     for (const file of names) {
+      if (file.toLowerCase() === TEMPLATE_RULES_FILE) {
+        const ruleContent = await readFile(join(dir, file), 'utf8');
+        if (ruleContent.length > 512_000) throw new Error(bt('dictionary.err.size_limit', { file }));
+        let ruleData: unknown;
+        try { ruleData = JSON.parse(ruleContent); } catch { throw new Error(bt('dictionary.err.invalid_json', { file })); }
+        for (const rule of validateTemplateRules(ruleData)) {
+          templateRuleByKey.delete(rule.key);
+          templateRuleByKey.set(rule.key, rule);
+        }
+        files.push(file);
+        continue;
+      }
       const version=file.match(/^(?:增量补全-)?(\d+\.\d+\.\d+)\.json$/)?.[1];
       if(targetVersion&&version&&compareLayers(version+'.json',targetVersion+'.json')>0)continue;
       const filePath = join(dir, file);
@@ -381,16 +488,16 @@ export async function loadDictionaryLayers(baseDir: string, userDir?: string,tar
         validated = cached.validated;
       } else {
         const content = await readFile(filePath, 'utf8');
-        if (content.length > 2_000_000) throw new Error(`${file} 超出词典大小限制`);
+        if (content.length > 2_000_000) throw new Error(bt('dictionary.err.size_limit', { file }));
         let data: unknown;
-        try { data = JSON.parse(content); } catch { throw new Error(`${file} 的 JSON 格式无效`); }
+        try { data = JSON.parse(content); } catch { throw new Error(bt('dictionary.err.invalid_json', { file })); }
         validated = validateEntries(data, file);
         /* 同一个文件里出现重复 JSON 键属于写错（JSON.parse 会静默保留最后一个），必须拦下；
            跨文件重复是分层覆盖，允许。 */
         const seen = new Set<string>();
         for (const match of content.matchAll(/("(?:[^"\\]|\\.)*")\s*:\s*("(?:[^"\\]|\\.)*")/g)) {
           const key = normalize(JSON.parse(match[1]!));
-          if (seen.has(key)) throw new Error(`${file} 存在重复 JSON 键`);
+          if (seen.has(key)) throw new Error(bt('dictionary.err.duplicate_json_key', { file }));
           seen.add(key);
         }
         setLayerFileCacheEntry(filePath, { mtimeMs: st.mtimeMs, size: st.size, validated });
@@ -401,15 +508,33 @@ export async function loadDictionaryLayers(baseDir: string, userDir?: string,tar
         if (previous && (previous.file !== file || previous.dir !== dir) && entries[key] !== value) {
           overrode.push({ key, from: previous.file, to: file });
         }
-        sources[key] = `${dir === baseDir ? '内置' : '个人'} · ${file}`;
+        sources[key] = `${dir === baseDir ? bt('dictionary.source.builtin') : bt('dictionary.source.personal')} · ${file}`;
         entries[key] = value;
         owner.set(key, { file, dir });
       }
       files.push(file);
     }
   }
-  for(const key of Object.keys(entries)){const context=decodeScopedKey(key);if(context&&personalGlobals.has(context.key.toLowerCase())&&sources[key]!=='个人 · 个人覆盖.json'){delete entries[key];delete sources[key];}}
-  return { dictionary: dictionaryFromEntries(entries), overrode, files, sources };
+  for(const key of Object.keys(entries)){const context=decodeScopedKey(key);if(context&&personalGlobals.has(context.key.toLowerCase())&&!sources[key]?.endsWith('个人覆盖.json')){delete entries[key];delete sources[key];}}
+  const mergedRules = templateRuleByKey.size > 0 ? [...templateRuleByKey.values()] : undefined;
+  return { dictionary: dictionaryFromEntries(entries, mergedRules), overrode, files, sources };
+}
+
+export async function resolveDictionaryForLocale(baseDir: string, locale: string): Promise<{ baseDir: string; hasTargetDictionary: boolean }> {
+  const normalized = locale.trim();
+  if (!normalized || normalized === 'en') {
+    return { baseDir, hasTargetDictionary: false };
+  }
+  const localizedDir = join(baseDir, normalized);
+  try {
+    await access(join(localizedDir, 'base.json'));
+    return { baseDir: localizedDir, hasTargetDictionary: true };
+  } catch {
+    if (normalized === 'zh-Hans' || normalized === 'zh') {
+      return { baseDir, hasTargetDictionary: true };
+    }
+    return { baseDir, hasTargetDictionary: false };
+  }
 }
 
 export async function loadDictionary(baseDir: string, userDir?: string,targetVersion?:string): Promise<Dictionary> {
@@ -417,6 +542,7 @@ export async function loadDictionary(baseDir: string, userDir?: string,targetVer
 }
 
 export class DictionaryStore extends EventEmitter {
+  baseDir: string;
   current?: Dictionary;
   lastError?: string;
   sources: Record<string,string> = {};
@@ -439,7 +565,7 @@ export class DictionaryStore extends EventEmitter {
   async selectVersion(version:string):Promise<Dictionary>{
     const next=version==='fixture'?undefined:(version.match(/^(\d+\.\d+\.\d+)/)?.[1]??undefined);
     if(next===this.targetVersion){
-      if(!this.current)throw new Error('词典尚未就绪，无法返回可用词典');
+      if(!this.current)throw new Error(bt('dictionary.err.not_ready'));
       return this.current;
     }
     const previous=this.targetVersion;
@@ -448,9 +574,9 @@ export class DictionaryStore extends EventEmitter {
     if(this.lastError){
       /* 回滚到上一次成功的目标版本；失败由抛出的错误显式暴露，current/layerCounts 保持上一份有效值。 */
       this.targetVersion=previous;
-      throw new Error(`无法加载 ${version} 对应的词典：${this.lastError}`);
+      throw new Error(bt('dictionary.err.load_version_failed', { version, error: this.lastError }));
     }
-    if(!this.current){this.targetVersion=previous;throw new Error('词典尚未就绪，无法返回可用词典');}
+    if(!this.current){this.targetVersion=previous;throw new Error(bt('dictionary.err.not_ready'));}
     return this.current;
   }
   /**
@@ -472,27 +598,39 @@ export class DictionaryStore extends EventEmitter {
   /** 重载词典，失败时抛错（与只记录 lastError 的 reload() 并存，供需要显式失败语义的调用方使用）。 */
   async reloadStrict():Promise<void>{
     await this.reload();
-    if(this.lastError)throw new Error(`词典重载失败，仍在使用上一份有效词典：${this.lastError}`);
+    if(this.lastError)throw new Error(bt('dictionary.err.reload_failed', { error: this.lastError }));
   }
   private chain: Promise<void> = Promise.resolve();
-  constructor(readonly baseDir: string, readonly userDir?: string) { super(); }
+  private sourceLocale = getActiveLocale();
+  constructor(baseDir: string, readonly userDir?: string) { super(); this.baseDir = baseDir; }
+  async setBaseDir(nextBaseDir: string): Promise<void> {
+    const activeLocale = getActiveLocale();
+    if (nextBaseDir === this.baseDir && activeLocale === this.sourceLocale) return;
+    this.baseDir = nextBaseDir;
+    this.sourceLocale = activeLocale;
+    await this.reload();
+  }
   async start(fallback?: Dictionary) {
     if (this.userDir) await migrateLegacyIncrementalDictionaries(this.userDir);
     try { const layered=await loadDictionaryLayers(this.baseDir,this.userDir,this.targetVersion); this.current=layered.dictionary; this.acceptLayers(layered); }
     catch (error) {
       if (!fallback) throw error;
-      this.current = dictionaryFromEntries(validateEntries(fallback.entries, '有效词典缓存'));
+      const validRules = fallback.templateRules ? validateTemplateRules(fallback.templateRules) : undefined;
+      this.current = dictionaryFromEntries(
+        validateEntries(fallback.entries, bt('dictionary.label.valid_cache')),
+        validRules
+      );
       this.lastError = (error as Error).message;
       const fakeSources: Record<string, string> = Object.create(null);
-      for (const k of Object.keys(this.current.entries)) fakeSources[k] = '内置 · 缓存';
-      this.acceptLayers({ dictionary: this.current, overrode: [], files: ['缓存'], sources: fakeSources });
+      for (const k of Object.keys(this.current.entries)) fakeSources[k] = bt('dictionary.source.cache_entry');
+      this.acceptLayers({ dictionary: this.current, overrode: [], files: [bt('dictionary.source.cache_file')], sources: fakeSources });
     }
     for (const dir of (this.userDir ? [this.baseDir, this.userDir] : [this.baseDir])) {
       const watcher = watch(dir, () => {
         clearTimeout(this.timer);
         this.timer = setTimeout(() => void this.reload(), 150);
       });
-      watcher.on('error', () => this.emit('invalid', '词典目录监听失败，请重新打开助手'));
+      watcher.on('error', () => this.emit('invalid', bt('dictionary.err.watcher_failed')));
       this.watchers.push(watcher);
     }
     // Reconcile once after registering native watchers. macOS can coalesce the first rename

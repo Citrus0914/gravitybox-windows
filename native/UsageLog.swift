@@ -19,10 +19,10 @@ func saveUsageJSON(_ report: [String: Any], name: String, window: NSWindow, app:
             DispatchQueue.main.async {
                 switch result {
                 case .success:
-                    app.showMessage("用量记录已导出")
+                    app.showMessage(L10n.t("usage_log.export.done"))
                     onCompletion?(true)
                 case .failure(let error):
-                    app.showMessage("导出失败：\(error.localizedDescription)", error: true)
+                    app.showMessage(L10n.t("usage_log.export.failed", ["error": error.localizedDescription]), error: true)
                     onCompletion?(false)
                 }
             }
@@ -40,31 +40,44 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
     let table = NSTableView()
     let listHost = NSView()
     let scroll = TableScrollView()
-    let emptyTitle = text("正在读取请求记录…", size: 13, weight: .medium, color: Design.secondary)
+    let emptyTitle = text(L10n.t("usage_log.loading_rows"), size: 13, weight: .medium, color: Design.secondary)
     let emptyIcon = NSImageView()
     // F08: filtered/searched empty results get an explicit way back instead of a contradictory footer.
-    let clearFiltersButton = button("清除筛选", target: nil, action: #selector(clearFilters))
+    let clearFiltersButton = button(L10n.t("usage_log.clear_filters"), target: nil, action: #selector(clearFilters))
     let emptyView = NSView()
     var snapshotID: String?
     var loading = false
     var closed = false
+    private var handlingJumpToPage = false
     var searchDebounce: DispatchWorkItem?
-    let period = DesignSegmentedControl(labels: ["今日", "近 7 天", "近 30 天", "全部"], trackingMode: .selectOne, target: nil, action: nil)
-    let status = text("正在读取…", size: 11, color: Design.secondary, wrap: true)
-    let previous = button("上一页", target: nil, action: #selector(previousPage))
-    let next = button("下一页", target: nil, action: #selector(nextPage))
+    let period = DesignSegmentedControl(labels: [L10n.t("usage.period.today"), L10n.t("usage.period.7d"), L10n.t("usage.period.30d"), L10n.t("usage.period.all")], trackingMode: .selectOne, target: nil, action: nil)
+    let status = text(L10n.t("usage_log.loading"), size: 11, color: Design.secondary, wrap: true)
+    let previous = button(L10n.t("usage_log.prev_page"), target: nil, action: #selector(previousPage))
+    let next = button(L10n.t("usage_log.next_page"), target: nil, action: #selector(nextPage))
     let pageNumber = PageNumberField(string: "1")
-    let pageCount = text("/ 1 页", size: 11, color: Design.secondary)
+    let pageCount = text(L10n.t("usage_log.page_count", ["pages": 1]), size: 11, color: Design.secondary)
     var listScope = ""
-    let refreshButton = InlineRefreshButton("刷新", width: 66, target: nil, action: #selector(reloadSnapshot))
-    let exportButton = button("导出…", target: nil, action: #selector(exportRows))
+    private var listScopeFromBackend = false
+    private var lastReadErrorMessage: String?
+    let refreshButton = InlineRefreshButton(L10n.t("common.refresh"), width: 76, target: nil, action: #selector(reloadSnapshot))
+    let exportButton = button(L10n.t("usage.export_btn"), target: nil, action: #selector(exportRows))
+    private let headerTitleLabel = text(L10n.t("usage_log.title"), size: 18, weight: .semibold)
+    private var closeButtonRef: NSButton!
+    private var languageObserver: NSObjectProtocol?
     var rows: [[String: Any]] = []; var offset = 0; var total = 0; var requestRevision = 0
     var onDismiss: (() -> Void)?
     let periods = ["today", "7d", "30d", "all"]
+
+    deinit {
+        searchDebounce?.cancel()
+        if let languageObserver {
+            NotificationCenter.default.removeObserver(languageObserver)
+        }
+    }
     init(app: Assistant, period selected: String) {
         self.app = app; super.init()
-        sheet.title = "请求明细"; sheet.isReleasedWhenClosed = false; table.rowHeight = 64; table.backgroundColor = .clear
-        search.placeholderString = "搜索模型"; search.delegate = self; search.setAccessibilityLabel("搜索请求模型")
+        sheet.title = L10n.t("usage_log.title"); sheet.isReleasedWhenClosed = false; table.rowHeight = 64; table.backgroundColor = .clear
+        search.placeholderString = L10n.t("usage_log.search_placeholder"); search.delegate = self; search.setAccessibilityLabel(L10n.t("usage_log.search_a11y"))
         period.selectedSegment = periods.firstIndex(of: selected) ?? 0; period.controlSize = .regular; period.target = self; period.action = #selector(periodChanged)
         period.translatesAutoresizingMaskIntoConstraints = false; period.heightAnchor.constraint(equalToConstant: 28).isActive = true
         table.headerView = nil; table.gridStyleMask = []; table.intercellSpacing = NSSize(width: 0, height: 8)
@@ -82,7 +95,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         NSLayoutConstraint.activate([emptyIcon.widthAnchor.constraint(equalToConstant: 24), emptyIcon.heightAnchor.constraint(equalToConstant: 24)])
         emptyTitle.alignment = .center
         clearFiltersButton.target = self
-        clearFiltersButton.setAccessibilityLabel("清除搜索筛选")
+        clearFiltersButton.setAccessibilityLabel(L10n.t("usage_log.clear_filters_a11y"))
         clearFiltersButton.isHidden = true
         let empty = vertical([emptyIcon, emptyTitle, clearFiltersButton], spacing: 10); empty.alignment = .centerX
         emptyView.addSubview(empty); empty.translatesAutoresizingMaskIntoConstraints = false
@@ -98,7 +111,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         pageNumber.isBezeled = false
         pageNumber.drawsBackground = false
         pageNumber.delegate = self
-        pageNumber.setAccessibilityLabel("请求明细页码")
+        pageNumber.setAccessibilityLabel(L10n.t("usage_log.page_a11y"))
         pageNumber.target = self
         pageNumber.action = #selector(jumpToPage)
         pageNumber.translatesAutoresizingMaskIntoConstraints = false
@@ -106,7 +119,8 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
             pageNumber.widthAnchor.constraint(equalToConstant: 46),
             pageNumber.heightAnchor.constraint(equalToConstant: 28)
         ])
-        let close = button("完成", target: self, action: #selector(closeSheet)); close.bezelColor = Design.blue; close.keyEquivalent = "\u{1b}"
+        let close = button(L10n.t("usage_log.done"), target: self, action: #selector(closeSheet)); close.bezelColor = Design.blue; close.keyEquivalent = "\u{1b}"
+        closeButtonRef = close
         searchSpinner.style = .spinning; searchSpinner.controlSize = .small; searchSpinner.isDisplayedWhenStopped = false
         searchSpinner.translatesAutoresizingMaskIntoConstraints = false; searchSpinner.isHidden = true
         NSLayoutConstraint.activate([searchSpinner.widthAnchor.constraint(equalToConstant: 16), searchSpinner.heightAnchor.constraint(equalToConstant: 16)])
@@ -116,7 +130,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         let headerActions = horizontal([refreshButton, exportButton], spacing: 8)
         headerActions.alignment = .centerY
         let root = vertical([
-            horizontal([text("请求明细", size: 18, weight: .semibold), flexibleSpace(), headerActions]),
+            horizontal([headerTitleLabel, flexibleSpace(), headerActions]),
             horizontal([searchRow, period], spacing: 12),
             listHost,
             status,
@@ -124,9 +138,74 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         ], spacing: 12)
         let surface = SheetVisualEffectView(); sheet.isOpaque = false; sheet.backgroundColor = .clear; sheet.contentView = surface
         let content = fixedPage(root); surface.addSubview(content); pin(content, to: surface); Design.applyControls(surface)
+        languageObserver = NotificationCenter.default.addObserver(
+            forName: L10n.didChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            if Thread.isMainThread {
+                self?.syncLocalizedChrome()
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.syncLocalizedChrome() }
+            }
+        }
+    }
+
+    private func syncLocalizedChrome() {
+        let title = L10n.t("usage_log.title")
+        sheet.title = title
+        headerTitleLabel.stringValue = title
+        search.placeholderString = L10n.t("usage_log.search_placeholder")
+        search.setAccessibilityLabel(L10n.t("usage_log.search_a11y"))
+        let labels = [L10n.t("usage.period.today"), L10n.t("usage.period.7d"), L10n.t("usage.period.30d"), L10n.t("usage.period.all")]
+        for (idx, lbl) in labels.enumerated() where idx < period.segmentCount {
+            period.setLabel(lbl, forSegment: idx)
+        }
+        refreshButton.title = L10n.t("common.refresh")
+        refreshButton.invalidateIntrinsicContentSize()
+        refreshButton.setAccessibilityLabel(
+            refreshButton.isBusy
+                ? L10n.t("design.inline_refresh.busy", ["title": refreshButton.title], fallback: "\(refreshButton.title)，刷新中")
+                : refreshButton.title
+        )
+        exportButton.title = L10n.t("usage.export_btn")
+        previous.title = L10n.t("usage_log.prev_page")
+        next.title = L10n.t("usage_log.next_page")
+        closeButtonRef.title = L10n.t("usage_log.done")
+        clearFiltersButton.title = L10n.t("usage_log.clear_filters")
+        clearFiltersButton.setAccessibilityLabel(L10n.t("usage_log.clear_filters_a11y"))
+        pageNumber.setAccessibilityLabel(L10n.t("usage_log.page_a11y"))
+        if !listScopeFromBackend && !listScope.isEmpty {
+            listScope = L10n.t("usage_log.scope.default")
+        }
+        let pages = max(1, (total + 199) / 200)
+        pageCount.stringValue = L10n.t("usage_log.page_count", ["pages": InterfaceText.formatInteger(pages)])
+        if loading {
+            status.stringValue = L10n.t("usage_log.loading")
+        } else if let err = lastReadErrorMessage {
+            status.stringValue = L10n.t("usage_log.status.read_failed", ["error": err])
+        } else if rows.isEmpty {
+            if filterActive {
+                status.stringValue = L10n.t("usage_log.status.no_match")
+            } else if total == 0 {
+                status.stringValue = L10n.t("usage_log.status.no_records_period")
+            } else if offset > 0 {
+                status.stringValue = L10n.t("usage_log.status.page_empty", ["total": InterfaceText.formatInteger(total)])
+            } else {
+                status.stringValue = L10n.t("usage_log.status.total", ["total": InterfaceText.formatInteger(total)])
+            }
+        } else {
+            status.stringValue = pageStatus()
+        }
+        updateEmptyState(failed: lastReadErrorMessage != nil)
+        table.reloadData()
     }
     func show(in window: NSWindow, onDismiss: @escaping () -> Void) {
-        self.onDismiss = onDismiss; window.beginSheet(sheet) { [weak self] _ in self?.onDismiss?() }; fetch()
+        self.onDismiss = onDismiss
+        app.presentRetainedSheet(controller: self, sheet: sheet, in: window) { [weak self] _ in
+            self?.onDismiss?()
+        }
+        fetch()
     }
     @objc func reloadSnapshot() {
         guard !loading, !exporting else { return }
@@ -149,7 +228,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         }
     }
     func controlTextDidEndEditing(_ obj: Notification) {
-        guard obj.object as? NSTextField === pageNumber else { return }
+        guard !handlingJumpToPage, !loading, !exporting, obj.object as? NSTextField === pageNumber else { return }
         pageNumber.needsDisplay = true
         let pages = max(1, (total + 199) / 200)
         let current = offset / 200 + 1
@@ -159,28 +238,44 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
             return
         }
         pageNumber.stringValue = "\(number)"
-        if number != current && !loading {
+        if number != current {
             offset = (number - 1) * 200
             fetch()
         }
     }
     @objc func jumpToPage() {
+        guard !handlingJumpToPage, !loading, !exporting else { return }
+        handlingJumpToPage = true
+        defer { handlingJumpToPage = false }
         let pages = max(1, (total + 199) / 200)
         let current = offset / 200 + 1
         let raw = pageNumber.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let number = Int(raw), (1...pages).contains(number) else {
-            status.stringValue = "页码范围 1–\(pages.formatted())"
+            status.stringValue = L10n.t("usage_log.page_range_error", ["pages": InterfaceText.formatInteger(pages)])
             pageNumber.stringValue = "\(current)"
             pageNumber.needsDisplay = true
             return
         }
         pageNumber.stringValue = "\(number)"
-        sheet.makeFirstResponder(nil)
         pageNumber.needsDisplay = true
-        guard number != current else { return }
-        offset = (number - 1) * 200; fetch()
+        if number == current {
+            sheet.makeFirstResponder(nil)
+            return
+        }
+        offset = (number - 1) * 200
+        sheet.makeFirstResponder(nil)
+        fetch()
     }
-    func pageStatus() -> String { rows.isEmpty ? "无请求记录" : "\(listScope) · 共 \(total.formatted()) 条 · 当前 \((offset + 1).formatted())–\((offset + rows.count).formatted()) 条" }
+    func pageStatus() -> String {
+        rows.isEmpty
+            ? L10n.t("usage_log.status.empty")
+            : L10n.t("usage_log.status.page", [
+                "scope": listScope,
+                "total": InterfaceText.formatInteger(total),
+                "start": InterfaceText.formatInteger(offset + 1),
+                "end": InterfaceText.formatInteger(offset + rows.count)
+            ])
+    }
     @objc func previousPage() { offset = max(0, offset - 200); fetch() }
     @objc func nextPage() { offset += 200; fetch() }
     /// F08: true when a search term is narrowing the list (period is part of the query too but the
@@ -203,7 +298,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
             searchSpinner.stopAnimation(nil); searchSpinner.isHidden = true
         }
         previous.isEnabled = false; next.isEnabled = false; exportButton.isEnabled = false
-        status.stringValue = "正在读取…"; status.textColor = Design.secondary; updateEmptyState()
+        status.stringValue = L10n.t("usage_log.loading"); status.textColor = Design.secondary; updateEmptyState()
         requestRevision += 1; let revision = requestRevision
         var payload: [String:Any] = ["command": "usage_events", "period": periods[max(0, period.selectedSegment)], "query": search.stringValue, "offset": offset, "limit": 200]
         if force {
@@ -227,8 +322,10 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
             switch response {
             case .failure(let error):
                 self.snapshotID = nil
-                self.rows = []; self.table.reloadData(); self.status.stringValue = "读取请求记录失败：\(error.localizedDescription)"; self.status.textColor = accessibleDangerColor(); self.emptyTitle.stringValue = "无法读取请求记录"; self.updateEmptyState(failed:true)
+                self.lastReadErrorMessage = error.localizedDescription
+                self.rows = []; self.table.reloadData(); self.status.stringValue = L10n.t("usage_log.status.read_failed", ["error": error.localizedDescription]); self.status.textColor = accessibleDangerColor(); self.emptyTitle.stringValue = L10n.t("usage_log.empty.failed"); self.updateEmptyState(failed:true)
             case .success(let value):
+                self.lastReadErrorMessage = nil
                 self.snapshotID = value["snapshot_id"] as? String
                 self.rows = value["rows"] as? [[String: Any]] ?? []; self.total = intVal(value, "total")
                 let animateTable = Design.shouldAnimate(in: self.table)
@@ -248,18 +345,20 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
                 }
                 self.previous.isEnabled = self.offset > 0; self.next.isEnabled = self.offset + self.rows.count < self.total
                 self.status.textColor = Design.secondary
-                let scope = value["scope"] as? String ?? "本机历史记录"
-                self.listScope = scope; self.pageNumber.stringValue = "\(self.offset / 200 + 1)"; self.pageNumber.isEnabled = self.total > 0; self.pageNumber.needsDisplay = true; self.pageCount.stringValue = "/ \(max(1, (self.total + 199) / 200).formatted()) 页"
+                let rawScope = (value["scope"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                self.listScopeFromBackend = !rawScope.isEmpty
+                let scope = rawScope.isEmpty ? L10n.t("usage_log.scope.default") : rawScope
+                self.listScope = scope; self.pageNumber.stringValue = "\(self.offset / 200 + 1)"; self.pageNumber.isEnabled = self.total > 0; self.pageNumber.needsDisplay = true; self.pageCount.stringValue = L10n.t("usage_log.page_count", ["pages": InterfaceText.formatInteger(max(1, (self.total + 199) / 200))])
                 if self.rows.isEmpty {
                     // F08: never print "N 个 · 0 条 · 当前 0–0"; the footer must match the empty state.
                     if self.filterActive {
-                        self.status.stringValue = "筛选无结果"
+                        self.status.stringValue = L10n.t("usage_log.status.no_match")
                     } else if self.total == 0 {
-                        self.status.stringValue = "当前时间范围暂无请求记录"
+                        self.status.stringValue = L10n.t("usage_log.status.no_records_period")
                     } else if self.offset > 0 {
-                        self.status.stringValue = "本页无记录 · 共 \(self.total.formatted()) 条 · 可返回上一页"
+                        self.status.stringValue = L10n.t("usage_log.status.page_empty", ["total": InterfaceText.formatInteger(self.total)])
                     } else {
-                        self.status.stringValue = "共 \(self.total.formatted()) 条请求记录"
+                        self.status.stringValue = L10n.t("usage_log.status.total", ["total": InterfaceText.formatInteger(self.total)])
                     }
                 } else {
                     self.status.stringValue = self.pageStatus()
@@ -305,31 +404,31 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
                 guard let self, !self.closed else { return }
                 switch result {
                 case .failure(let error):
-                    finishExport(errorMsg: "导出失败：\(error.localizedDescription)")
+                    finishExport(errorMsg: L10n.t("usage_log.export.failed", ["error": error.localizedDescription]))
                 case .success(let value):
                     let returnedID = value["snapshot_id"] as? String
-                    guard let returnedID, !returnedID.isEmpty, snapshotID == nil || snapshotID == returnedID else { finishExport(errorMsg:"统计快照已变化，请重新导出"); return }
+                    guard let returnedID, !returnedID.isEmpty, snapshotID == nil || snapshotID == returnedID else { finishExport(errorMsg: L10n.t("usage_log.export.snapshot_changed")); return }
                     snapshotID = returnedID
                     let stamp = intVal(value, "generated_at")
                     if let old = generation, old != stamp {
-                        finishExport(errorMsg: "统计记录已更新，请重新导出。")
+                        finishExport(errorMsg: L10n.t("usage_log.export.records_updated"))
                         return
                     }
                     generation = stamp; scope = value["scope"] as? String ?? ""
                     let batch = value["rows"] as? [[String: Any]] ?? []; collected += batch
                     let total = intVal(value, "total")
-                    self.status.stringValue = "正在导出 · \(collected.count.formatted())/\(total.formatted()) 条"
+                    self.status.stringValue = L10n.t("usage_log.export.progress", ["loaded": InterfaceText.formatInteger(collected.count), "total": InterfaceText.formatInteger(total)])
                     if collected.count < total && !batch.isEmpty {
                         readPage()
                     } else {
                         let exportedCount = collected.count
-                        let fallbackScope = scope.isEmpty ? "本机历史记录" : scope
-                        self.status.stringValue = "选择保存位置 · \(exportedCount.formatted()) 条"
-                        saveUsageJSON(["period": chosenPeriod, "query": query, "scope": scope, "generatedAt": stamp, "snapshotId":snapshotID ?? "", "rows": collected], name: "GravityBox-请求明细-\(chosenPeriod).json", window: self.sheet, app: self.app) { [weak self] saved in
+                        let fallbackScope = scope.isEmpty ? L10n.t("usage_log.scope.default") : scope
+                        self.status.stringValue = L10n.t("usage_log.export.choose_location", ["count": InterfaceText.formatInteger(exportedCount)])
+                        saveUsageJSON(["period": chosenPeriod, "query": query, "scope": scope, "generatedAt": stamp, "snapshotId":snapshotID ?? "", "rows": collected], name: L10n.t("usage_log.export.filename", ["period": chosenPeriod]), window: self.sheet, app: self.app) { [weak self] saved in
                             guard let self, !self.closed else { return }
                             finishExport()
                             if saved {
-                                self.status.stringValue = "已导出 \(exportedCount.formatted()) 条请求记录 · \(fallbackScope)"
+                                self.status.stringValue = L10n.t("usage_log.export.saved", ["count": InterfaceText.formatInteger(exportedCount), "scope": fallbackScope])
                             } else {
                                 self.status.stringValue = self.pageStatus()
                             }
@@ -346,19 +445,19 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         if failed {
             symbolName = "exclamationmark.triangle"
             emptyIcon.contentTintColor = accessibleWarningColor()
-            emptyTitle.stringValue = "无法读取请求记录"
+            emptyTitle.stringValue = L10n.t("usage_log.empty.failed")
         } else if loading {
             symbolName = "magnifyingglass"
             emptyIcon.contentTintColor = Design.secondary
-            emptyTitle.stringValue = "正在读取请求记录…"
+            emptyTitle.stringValue = L10n.t("usage_log.loading_rows")
         } else if filterActive {
             symbolName = "line.3.horizontal.decrease.circle"
             emptyIcon.contentTintColor = .secondaryLabelColor
-            emptyTitle.stringValue = "筛选无结果"
+            emptyTitle.stringValue = L10n.t("usage_log.status.no_match")
         } else {
             symbolName = "magnifyingglass"
             emptyIcon.contentTintColor = Design.secondary
-            emptyTitle.stringValue = "暂无请求记录"
+            emptyTitle.stringValue = L10n.t("usage_log.empty.none")
         }
         emptyIcon.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
         clearFiltersButton.isHidden = !filterActive || failed || loading

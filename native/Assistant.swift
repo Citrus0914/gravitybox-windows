@@ -26,12 +26,21 @@ extension NSWindow {
 }
 
 final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate, NSTableViewDataSource, NSTableViewDelegate {
-    let names = ["总览", "账号", "用量", "设置", "关于"]
+    var names: [String] {
+        [
+            L10n.t("nav.overview"),
+            L10n.t("nav.accounts"),
+            L10n.t("nav.usage"),
+            L10n.t("nav.settings"),
+            L10n.t("nav.about")
+        ]
+    }
     var bridge: BackendBridge!
     var configuration: ConfigurationStore!
     var item: NSStatusItem!
     var menuPopover: NSPopover?
     var menuPanelController: MenuPanelController?
+    private var activeSheetControllers: [ObjectIdentifier: AnyObject] = [:]
     var window: NSWindow?
     var sidebar = NSTableView()
     let pillSelectionView = PillSelectionView()
@@ -47,8 +56,17 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
     var cachePage: CachePage?
     var preferencesController: PreferencesController?
     var aboutPage: AboutPage?
+    var cachedDashboardBootstrapSummary: [String: Any]?
+    var cachedAccountsBootstrapPayload: [String: Any]?
+    var bootstrappedAccounts = false
+    var bootstrappedUsagePeriods = Set<String>()
+    var lastMaintenanceScanPayload: [String: Any]?
+    var lastMaintenanceScanAt: Date = .distantPast
+    let uiBootstrapQueue = DispatchQueue(label: "local.gravitybox.ui-bootstrap", qos: .utility)
+    var uiBootstrapSaveWorkItem: DispatchWorkItem?
     var cachedAccounts: [[String: Any]] = []
     var activeAccountId: String = ""
+    var cachedRecommendedAccountId: String? = nil
     var pendingAccountTaskId: String?
     var accountSwitchInFlight = false
     var menuTracking = false
@@ -73,8 +91,11 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
     /// 汉化开关命令在途时的乐观目标：期间到达的陈旧状态快照不得把开关弹回旧状态。
     var pendingTranslationTarget: Bool?
     var translationCommandGeneration = 0
+    var pendingLanguageTarget: String?
+    var languageCommandGeneration = 0
     var pendingHudTarget: Bool?
     var hudCommandGeneration = 0
+    var pendingLocalizedRebuildAfterMaintenance = false
     var nextRecoveryAt = Date.distantPast
     #if NATIVE_UI_TEST
     var confirmSwitchForTesting: ((String, @escaping (Bool) -> Void) -> Void)?
@@ -95,6 +116,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
     var timer: Timer?
     var directorySource: DispatchSourceFileSystemObject?
     var refreshInFlight = false
+    var pendingRefreshRequested = false
+    var pendingTaskPollRequested = false
     var quitting = false
     let serviceFootnoteLabel = text("", size: 10.5, color: Design.secondary)
     var configSaveWorkItem: DispatchWorkItem?
@@ -154,7 +177,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         if restartedAfterUpdate {
             for _ in 0..<25 {
                 if Self.findExistingMainPeer() == nil { break }
-                usleep(100_000)
+                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1))
             }
         }
         if let peer = Self.findExistingMainPeer() {
@@ -173,7 +196,9 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             try? configuration.save()
         }
         Self.applicationChannel = effectiveChannel
+        let configuredLanguage = resolveAndPersistInitialLanguage()
         bridge = BackendBridge(resources: resources, state: state)
+        bridge.preferredLocale = configuredLanguage
         bridge.onExit = { [weak self] message in
             guard let self, !self.quitting else { return }
             self.reachable = false; self.failPendingQuotaRefresh(message); self.updateViews()
@@ -182,6 +207,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         if configuration.value.navigationVersion != 5 {
             configuration.value.migrateNavigation(); try? configuration.save()
         }
+        loadUIBootstrapSnapshot()
         installApplicationMenu()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = baseMenuConnectedIcon()
@@ -191,7 +217,15 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         updateStatusItemState()
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(showPanel), name: NSNotification.Name("local.gravitybox.show-panel"), object: nil)
-        bridge.launch { [weak self] result in if case .failure(let error) = result { self?.showMessage(error.localizedDescription, error: true) } }
+        bridge.launch { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.refresh()
+            case .failure(let error):
+                self.showMessage(error.localizedDescription, error: true)
+            }
+        }
         watchState()
         let data = NSAppleEventManager.shared().currentAppleEvent?.paramDescriptor(forKeyword: AEKeyword(keyAEPropData))
         let loginLaunch = data?.enumCodeValue == OSType(keyAELaunchedAsLogInItem)
@@ -205,29 +239,81 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         configureAutoUpdateTimer()
         refresh()
     }
+    func resolveAndPersistInitialLanguage() -> String {
+        let i18nDir = resources.appendingPathComponent("i18n", isDirectory: true)
+        if FileManager.default.fileExists(atPath: i18nDir.path) {
+            L10n.shared.reloadPacks(directory: i18nDir)
+        } else {
+            L10n.shared.reloadPacks()
+        }
+        if let configured = configuration.value.appLanguage?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty {
+            _ = L10n.shared.setLanguage(configured, notify: false)
+            return configured
+        }
+        var migrated = "system"
+        let runtimePrefsURL = state.appendingPathComponent("runtime-preferences.json")
+        if let data = try? Data(contentsOf: runtimePrefsURL),
+           let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let lang = raw["language"] as? String, !lang.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                migrated = lang.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if let enabled = raw["translationEnabled"] as? Bool {
+                migrated = enabled ? "zh-Hans" : "en"
+            }
+        }
+        configuration.value.appLanguage = migrated
+        try? configuration.save()
+        _ = L10n.shared.setLanguage(migrated, notify: false)
+        return migrated
+    }
+
     func installApplicationMenu() {
         let main = NSMenu()
         let app = NSMenu(); let appItem = NSMenuItem(); appItem.submenu = app; main.addItem(appItem)
-        add(app, "关于 GravityBox", #selector(about), "")
-        add(app, "检查更新…", #selector(checkForUpdatesFromMenu), "")
-        app.addItem(.separator()); add(app, "设置…", #selector(showSettings), ",")
-        app.addItem(.separator()); add(app, "隐藏 GravityBox", #selector(NSApplication.hide(_:)), "h", target: NSApp)
-        add(app, "退出 GravityBox", #selector(quit), "q")
-        let edit = NSMenu(title: "编辑"); let editItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: ""); editItem.submenu = edit; main.addItem(editItem)
-        for (title, selector, key) in [("撤销", Selector(("undo:")), "z"), ("剪切", #selector(NSText.cut(_:)), "x"), ("复制", #selector(NSText.copy(_:)), "c"), ("粘贴", #selector(NSText.paste(_:)), "v"), ("全选", #selector(NSText.selectAll(_:)), "a")] { let value = NSMenuItem(title: title, action: selector, keyEquivalent: key); edit.addItem(value) }
-        let view = NSMenu(title: "显示"); let viewItem = NSMenuItem(title: "显示", action: nil, keyEquivalent: ""); viewItem.submenu = view; main.addItem(viewItem)
+        add(app, L10n.t("menu.about"), #selector(about), "")
+        add(app, L10n.t("menu.check_updates"), #selector(checkForUpdatesFromMenu), "")
+        app.addItem(.separator()); add(app, L10n.t("menu.settings"), #selector(showSettings), ",")
+        app.addItem(.separator()); add(app, L10n.t("menu.hide"), #selector(NSApplication.hide(_:)), "h", target: NSApp)
+        add(app, L10n.t("menu.quit"), #selector(quit), "q")
+        let editTitle = L10n.t("menu.edit")
+        let edit = NSMenu(title: editTitle); let editItem = NSMenuItem(title: editTitle, action: nil, keyEquivalent: ""); editItem.submenu = edit; main.addItem(editItem)
+        for (title, selector, key) in [(L10n.t("menu.undo"), Selector(("undo:")), "z"), (L10n.t("menu.cut"), #selector(NSText.cut(_:)), "x"), (L10n.t("menu.copy"), #selector(NSText.copy(_:)), "c"), (L10n.t("menu.paste"), #selector(NSText.paste(_:)), "v"), (L10n.t("menu.select_all"), #selector(NSText.selectAll(_:)), "a")] { let value = NSMenuItem(title: title, action: selector, keyEquivalent: key); edit.addItem(value) }
+        let viewTitle = L10n.t("menu.view")
+        let view = NSMenu(title: viewTitle); let viewItem = NSMenuItem(title: viewTitle, action: nil, keyEquivalent: ""); viewItem.submenu = view; main.addItem(viewItem)
         for (index, name) in names.enumerated() { let value = add(view, name, #selector(menuNavigate(_:)), String(index + 1)); value.tag = index }
-        let windows = NSMenu(title: "窗口"); let windowItem = NSMenuItem(title: "窗口", action: nil, keyEquivalent: ""); windowItem.submenu = windows; main.addItem(windowItem)
-        add(windows, "关闭窗口", #selector(NSWindow.performClose(_:)), "w", target: nil)
-        add(windows, "最小化", #selector(NSWindow.performMiniaturize(_:)), "m", target: nil); NSApp.windowsMenu = windows
+        let windowTitle = L10n.t("menu.window")
+        let windows = NSMenu(title: windowTitle); let windowItem = NSMenuItem(title: windowTitle, action: nil, keyEquivalent: ""); windowItem.submenu = windows; main.addItem(windowItem)
+        add(windows, L10n.t("menu.close_window"), #selector(NSWindow.performClose(_:)), "w", target: nil)
+        add(windows, L10n.t("menu.minimize"), #selector(NSWindow.performMiniaturize(_:)), "m", target: nil)
+        add(windows, L10n.t("menu.zoom"), #selector(NSWindow.performZoom(_:)), "", target: nil)
+        NSApp.windowsMenu = windows
         NSApp.mainMenu = main
     }
     @discardableResult func add(_ menu: NSMenu, _ title: String, _ action: Selector, _ key: String = "", target: AnyObject? = nil) -> NSMenuItem {
         let entry = NSMenuItem(title: title, action: action, keyEquivalent: key); entry.target = target ?? self
         // Responder-chain window commands must not target the application delegate.
-        if action == #selector(NSWindow.performClose(_:)) || action == #selector(NSWindow.performMiniaturize(_:)) { entry.target = nil }
+        if action == #selector(NSWindow.performClose(_:))
+            || action == #selector(NSWindow.performMiniaturize(_:))
+            || action == #selector(NSWindow.performZoom(_:)) {
+            entry.target = nil
+        }
         menu.addItem(entry); return entry
     }
+    func resolvedActiveAccount() -> [String: Any]? {
+        let pool = !cachedAccounts.isEmpty ? cachedAccounts : (accountsPage?.accounts ?? [])
+        guard !pool.isEmpty else { return nil }
+        if !statusValue.liveAccountEmail.isEmpty,
+           let matched = pool.first(where: { ($0["email"] as? String ?? "").caseInsensitiveCompare(statusValue.liveAccountEmail) == .orderedSame }) {
+            return matched
+        }
+        let targetId = !activeAccountId.isEmpty ? activeAccountId : (accountsPage?.activeId ?? "")
+        if !targetId.isEmpty,
+           let matched = pool.first(where: { $0["id"] as? String == targetId }) {
+            return matched
+        }
+        return pool.first
+    }
+
     func resolvedMenuAccount() -> [String:Any]? {
         if !statusValue.liveAccountEmail.isEmpty,
            let matched = cachedAccounts.first(where: { ($0["email"] as? String ?? "").caseInsensitiveCompare(statusValue.liveAccountEmail) == .orderedSame }) {
@@ -324,6 +410,29 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         return controller
     }
 
+    func retainSheetController(_ controller: AnyObject, for sheetWindow: NSWindow) {
+        activeSheetControllers[ObjectIdentifier(sheetWindow)] = controller
+    }
+
+    func releaseSheetController(for sheetWindow: NSWindow) {
+        activeSheetControllers.removeValue(forKey: ObjectIdentifier(sheetWindow))
+    }
+
+    func presentRetainedSheet(
+        controller: AnyObject,
+        sheet sheetWindow: NSWindow,
+        in parent: NSWindow,
+        completionHandler: ((NSApplication.ModalResponse) -> Void)? = nil
+    ) {
+        retainSheetController(controller, for: sheetWindow)
+        parent.beginSheet(sheetWindow) { [weak self, weak sheetWindow] response in
+            if let sheetWindow {
+                self?.releaseSheetController(for: sheetWindow)
+            }
+            completionHandler?(response)
+        }
+    }
+
     func openMenuPopover() {
         guard let button = item?.button else { return }
         let controller = ensureMenuPanelController()
@@ -335,6 +444,9 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             menuPopover = p
             return p
         }()
+        if popover.contentViewController !== controller {
+            popover.contentViewController = controller
+        }
         popover.animates = true
         menuTracking = true
         configureRefreshTimer()
@@ -419,26 +531,47 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
     }
 
     func buildMoreMenu() -> NSMenu {
-        let menu = NSMenu(title: "更多操作")
+        let menu = NSMenu(title: L10n.t("menu.more_actions"))
         menu.showsStateColumn = true
-        let toggle = add(menu, "界面汉化", #selector(toggleTranslation))
         let stateSize = NSSize(width: 13, height: 13)
         let checkmark = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)
-        checkmark?.size = stateSize; checkmark?.isTemplate = true; toggle.onStateImage = checkmark
-        toggle.offStateImage = NSImage(size: stateSize, flipped: false) { _ in true }
-        toggle.state = statusValue.enabled ? NSControl.StateValue.on : NSControl.StateValue.off
-        toggle.isEnabled = reachable && statusValue.mode != "unsupported"
+        checkmark?.size = stateSize; checkmark?.isTemplate = true
+        let emptyCheck = NSImage(size: stateSize, flipped: false) { _ in true }
 
-        let hudToggle = add(menu, "对话状态栏", #selector(toggleHud))
+        let langSubmenu = NSMenu(title: L10n.t("menu.language"))
+        langSubmenu.showsStateColumn = true
+        let configured = pendingLanguageTarget ?? configuration?.value.appLanguage ?? L10n.shared.configuredLanguage
+        let sysItem = NSMenuItem(title: L10n.t("language.system"), action: #selector(selectGlobalLanguageFromMenu(_:)), keyEquivalent: "")
+        sysItem.target = self
+        sysItem.representedObject = "system"
+        sysItem.onStateImage = checkmark
+        sysItem.offStateImage = emptyCheck
+        sysItem.state = configured == "system" ? .on : .off
+        langSubmenu.addItem(sysItem)
+        langSubmenu.addItem(.separator())
+        for meta in L10n.shared.supportedLocales {
+            let entry = NSMenuItem(title: meta.nativeName, action: #selector(selectGlobalLanguageFromMenu(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = meta.code
+            entry.onStateImage = checkmark
+            entry.offStateImage = emptyCheck
+            entry.state = configured == meta.code ? .on : .off
+            langSubmenu.addItem(entry)
+        }
+        let langItem = NSMenuItem(title: L10n.t("menu.language"), action: nil, keyEquivalent: "")
+        langItem.submenu = langSubmenu
+        menu.addItem(langItem)
+
+        let hudToggle = add(menu, L10n.t("settings.hud.title"), #selector(toggleHud))
         hudToggle.onStateImage = checkmark
-        hudToggle.offStateImage = toggle.offStateImage
+        hudToggle.offStateImage = emptyCheck
         hudToggle.state = effectiveHudEnabled() ? NSControl.StateValue.on : NSControl.StateValue.off
         hudToggle.isEnabled = reachable && statusValue.mode != "unsupported"
 
         menu.addItem(.separator())
-        add(menu, "设置…", #selector(showSettingsFromMenuPanel), ",")
+        add(menu, L10n.t("menu.settings"), #selector(showSettingsFromMenuPanel), ",")
         menu.addItem(.separator())
-        add(menu, "退出 GravityBox", #selector(quitFromMenuPanel), "q")
+        add(menu, L10n.t("menu.quit"), #selector(quitFromMenuPanel), "q")
         return menu
     }
 
@@ -475,6 +608,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
     }
 
     @objc func showPanel() {
+        guard !quitting else { return }
         if window == nil {
             let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 1024, height: 710),
@@ -515,7 +649,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             sidebar.intercellSpacing = NSSize(width: 0, height: 4)
             sidebar.dataSource = self
             sidebar.delegate = self
-            sidebar.setAccessibilityLabel("导航")
+            sidebar.setAccessibilityLabel(L10n.t("nav.accessibility", fallback: "导航"))
             sidebar.addSubview(pillSelectionView, positioned: .below, relativeTo: nil)
             pillSelectionView.autoresizingMask = [.width]
 
@@ -551,7 +685,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             ])
 
             let installBtn = SidebarLaunchButton(
-                title: "安装更新",
+                title: L10n.t("sidebar.install_update", fallback: "安装更新"),
                 symbolName: "arrow.down.circle",
                 isUpdatePrompt: true,
                 target: self,
@@ -560,7 +694,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             installBtn.isHidden = true
             installUpdateButton = installBtn
 
-            let globalOpenBtn = SidebarLaunchButton(title: "打开 Antigravity", target: self, action: #selector(openAntigravity))
+            let globalOpenBtn = SidebarLaunchButton(title: L10n.t("sidebar.open_antigravity", fallback: "打开 Antigravity"), target: self, action: #selector(openAntigravity))
             launchApplicationButton = globalOpenBtn
 
             serviceFootnoteLabel.alignment = .left
@@ -662,7 +796,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         return view
     }
     private func navTextColor(selected: Bool) -> NSColor {
-        guard selected else { return Design.primary.withAlphaComponent(0.84) }
+        guard selected else { return Design.dynamicAlpha(Design.primary, 0.84) }
         return NSColor(name: nil) { app in
             app.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
                 ? .white
@@ -739,6 +873,53 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         }
     }
 
+    func applyLocalizedChrome() {
+        installApplicationMenu()
+        if window != nil {
+            let deferPrefsSheetRebuild = preferencesController?.maintenanceSheet != nil || preferencesController?.pricingSheet != nil
+            let deferStorageCacheRebuild = deferPrefsSheetRebuild || cachePage?.busy == true
+            sidebar.setAccessibilityLabel(L10n.t("nav.accessibility", fallback: "导航"))
+            sidebar.reloadData()
+            if names.indices.contains(currentPage) {
+                sidebar.selectRowIndexes(IndexSet(integer: currentPage), byExtendingSelection: false)
+            }
+            updateNavigationAppearance()
+            installUpdateButton?.setDisplayTitle(L10n.t("sidebar.install_update", fallback: "安装更新"))
+            launchApplicationButton?.setDisplayTitle(L10n.t("sidebar.open_antigravity", fallback: "打开 Antigravity"))
+            if let usagePage {
+                usageSelectedPeriod = usagePage.periodSegment.selectedSegment
+                if let scroll = usagePage.view as? NSScrollView {
+                    usageScrollOrigin = scroll.contentView.bounds.origin
+                }
+            }
+            overview = nil
+            accountsPage = nil
+            usagePage = nil
+            if !deferStorageCacheRebuild {
+                cachePage = nil
+            }
+            if !deferPrefsSheetRebuild {
+                pendingLocalizedRebuildAfterMaintenance = deferStorageCacheRebuild
+                preferencesController = nil
+            } else {
+                pendingLocalizedRebuildAfterMaintenance = true
+                preferencesController?.update()
+            }
+            aboutPage = nil
+            navigate(currentPage, force: true)
+        }
+        if menuPopover?.isShown == true {
+            menuPanelController = nil
+            let refreshed = ensureMenuPanelController()
+            menuPopover?.contentViewController = refreshed
+            refreshed.panelWillOpen()
+        } else {
+            menuPanelController = nil
+            menuPopover?.contentViewController = nil
+        }
+        updateViews()
+    }
+
     func selectPage(_ index: Int) {
         guard names.indices.contains(index), window?.activeSheetWindow == nil else { return }; showPanel()
         if sidebar.selectedRow == index { navigate(index) }
@@ -746,12 +927,12 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         updateNavigationAppearance()
     }
     @objc func menuNavigate(_ item: NSMenuItem) { selectPage(item.tag) }
-    func navigate(_ index: Int) {
+    func navigate(_ index: Int, force: Bool = false) {
         guard names.indices.contains(index) else { return }
         let navSignpost = PerformanceSignpost.begin("NavigatePage")
         defer { PerformanceSignpost.end("NavigatePage", navSignpost) }
         let hadContent = !pageHost.subviews.isEmpty
-        if index == currentPage && hadContent { return }
+        if index == currentPage && hadContent && !force { return }
         let previousPage = currentPage
         if let usagePage { usageSelectedPeriod = usagePage.periodSegment.selectedSegment; if let scroll = usagePage.view as? NSScrollView { usageScrollOrigin = scroll.contentView.bounds.origin } }
         currentPage = index
@@ -766,13 +947,13 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             isNewPage = accountsPage == nil
             let page = accountsPage ?? AccountsPage(app: self)
             accountsPage = page
-            page.update()
+            if !isNewPage { page.update() }
             content = page.view
         case 2:
             isNewPage = usagePage == nil
             let page = usagePage ?? UsagePage(app: self)
             usagePage = page
-            page.update()
+            if !isNewPage { page.update() }
             content = page.view
         case 3:
             isNewPage = preferencesController == nil
@@ -790,7 +971,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             isNewPage = overview == nil
             let page = overview ?? DashboardPage(app: self)
             overview = page
-            page.update()
+            if !isNewPage { page.update() }
             content = page.view
         }
         let oldViews = pageHost.subviews.filter { $0 !== content }
@@ -886,36 +1067,66 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             checkAntigravityExitedAndQuitIfNeeded()
         }
         #endif
-        guard !refreshInFlight, !quitting else { return }; refreshInFlight = true
-        if let started = quotaRefreshStartedAt, Date().timeIntervalSince(started) > 45 { failPendingQuotaRefresh("刷新超时，请重试；保留上次配额") }
+        guard !quitting else { return }
+        if refreshInFlight {
+            if taskPollOnly {
+                pendingTaskPollRequested = true
+            } else {
+                pendingRefreshRequested = true
+            }
+            return
+        }
+        refreshInFlight = true
+        if let started = quotaRefreshStartedAt, Date().timeIntervalSince(started) > 45 { failPendingQuotaRefresh(L10n.t("assistant.quota_refresh_timeout", fallback: "刷新超时，请重试；保留上次配额"), cancelBackendTask: true) }
         let needTasks = taskPollOnly || pendingAccountTaskId != nil || quotaRefreshing
         let includeAccounts = !taskPollOnly && (menuTracking || (contentVisible && currentPage <= 1))
+        let previousTaskRev = lastTaskRevision
         bridge.send(["command": "status","includeTasks":needTasks,"includeAccounts":includeAccounts,"tasksSince":reachable ? lastTaskRevision:-1]) { [weak self] result in guard let self else { return }; self.refreshInFlight = false
             switch result {
             case .success(let value):
                 self.updateManager.cleanupAfterSuccessfulLaunch()
-                self.reachable = true; self.recoveryAttempts = 0; self.autoRestartAttempts = 0; var raw=value["status"] as? [String:Any] ?? [:];raw["taskRevision"]=value["taskRevision"];raw["runningTasks"]=value["runningTasks"];self.statusValue=self.mergeStatusSnapshot(raw, previous:self.statusValue);if let rows=value["tasks"] as? [[String:Any]]{self.taskRows=rows;self.lastTaskRevision=value["taskRevision"] as? Int ?? 0}
+                self.reachable = true; self.recoveryAttempts = 0; self.autoRestartAttempts = 0; var raw=value["status"] as? [String:Any] ?? [:];raw["taskRevision"]=value["taskRevision"];raw["runningTasks"]=value["runningTasks"];self.statusValue=self.mergeStatusSnapshot(raw, previous:self.statusValue)
+                var taskRevAdvanced = false
+                if let rows=value["tasks"] as? [[String:Any]] {
+                    self.taskRows=rows
+                    let incomingRev = value["taskRevision"] as? Int ?? 0
+                    taskRevAdvanced = previousTaskRev >= 0 && incomingRev != previousTaskRev
+                    self.lastTaskRevision = incomingRev
+                }
                 if includeAccounts {
-                    let accountsChanged = (!self.statusValue.accountsRevision.isEmpty && self.statusValue.accountsRevision != self.lastFetchedAccountsRevision) || self.statusValue.liveAccountEmail != self.lastFetchedLiveEmail
+                    let accountsChanged = self.bootstrappedAccounts || (!self.statusValue.accountsRevision.isEmpty && self.statusValue.accountsRevision != self.lastFetchedAccountsRevision) || self.statusValue.liveAccountEmail != self.lastFetchedLiveEmail
                     let periodicAccountRefreshDue = (self.menuTracking || (self.contentVisible && self.currentPage == 1)) && Date().timeIntervalSince(self.lastAccountListFetchAt) >= 15.0
                     if self.cachedAccounts.isEmpty || accountsChanged || periodicAccountRefreshDue {
                         self.fetchAccountList(notifyPage: true)
                     }
                 }
-                if let pending = self.pendingAccountTaskId, let task = self.taskRows.first(where: { $0["id"] as? String == pending && $0["state"] as? String != "running" }) {
-                    self.pendingAccountTaskId = nil
-                    if self.quotaRefreshing { self.finishQuotaRefresh(error: task["state"] as? String == "succeeded" ? nil : (task["message"] as? String ?? "配额刷新未完成")) }
-                    else { self.showMessage(task["message"] as? String ?? "账号操作已结束", error: task["state"] as? String != "succeeded"); self.fetchAccountList(notifyPage: true); self.overview?.update(force: true) }
+                if let pending = self.pendingAccountTaskId {
+                    if let task = self.taskRows.first(where: { $0["id"] as? String == pending && $0["state"] as? String != "running" }) {
+                        self.pendingAccountTaskId = nil
+                        if self.quotaRefreshing { self.finishQuotaRefresh(error: task["state"] as? String == "succeeded" ? nil : (task["message"] as? String ?? L10n.t("assistant.quota_refresh_incomplete", fallback: "配额刷新未完成"))) }
+                        else { self.showMessage(task["message"] as? String ?? L10n.t("assistant.account_op_finished", fallback: "账号操作已结束"), error: task["state"] as? String != "succeeded"); self.fetchAccountList(notifyPage: true); self.overview?.update(force: true) }
+                    } else if self.quotaRefreshing && taskRevAdvanced {
+                        self.fetchAccountList(notifyPage: true)
+                        self.overview?.update(force: true)
+                    }
                 }
             case .failure:
                 self.reachable = false
-                self.failPendingQuotaRefresh("本机服务连接中断，保留上次配额")
+                self.failPendingQuotaRefresh(L10n.t("assistant.service_disconnected_keep_quota", fallback: "本机服务连接中断，保留上次配额"))
                 if !self.bridge.isOwnedProcessRunning && !self.bridge.isRestarting && !self.selfHealingPending && self.recoveryAttempts < 3 && Date() >= self.nextRecoveryAt {
                     self.recoveryAttempts += 1; self.nextRecoveryAt = Date().addingTimeInterval(Double(self.recoveryAttempts * 10))
-                    self.bridge.launch()
+                    self.bridge.launch { [weak self] launchResult in
+                        if case .success = launchResult { self?.refresh() }
+                    }
                 }
             }
             self.updateViews()
+            if !self.quitting && (self.pendingRefreshRequested || self.pendingTaskPollRequested) {
+                let needsFull = self.pendingRefreshRequested
+                self.pendingRefreshRequested = false
+                self.pendingTaskPollRequested = false
+                self.refresh(taskPollOnly: !needsFull)
+            }
         }
     }
     func updateServiceFootnote() {
@@ -933,14 +1144,14 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             attributes: [.foregroundColor: dotColor, .font: dotFont]
         )
         attr.append(NSAttributedString(
-            string: "等待本机服务…",
+            string: L10n.t("sidebar.waiting_service", fallback: "等待本机服务…"),
             attributes: [.foregroundColor: Design.secondary.withAlphaComponent(0.90), .font: textFont]
         ))
         serviceFootnoteLabel.attributedStringValue = attr
     }
     func updateViews() {
         item?.button?.toolTip = nil
-        item?.button?.setAccessibilityLabel("GravityBox · "+(reachable ? statusValue.title:"连接已断开"))
+        item?.button?.setAccessibilityLabel("GravityBox · " + (reachable ? statusValue.title : L10n.t("status.disconnected", fallback: "连接已断开")))
         updateStatusItemState()
         updateServiceFootnote()
         if contentVisible {
@@ -967,8 +1178,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
         guard presentedError == nil else { return }
         presentedError = message
         let alert = NSAlert(); alert.alertStyle = .warning
-        alert.messageText = "操作未完成"; alert.informativeText = message
-        alert.addButton(withTitle: "好")
+        alert.messageText = L10n.t("assistant.action_incomplete", fallback: "操作未完成"); alert.informativeText = message
+        alert.addButton(withTitle: L10n.t("common.ok", fallback: "好"))
         presentSheetAlert(alert) { [weak self] _ in self?.presentedError = nil }
         #endif
     }
@@ -1051,8 +1262,12 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
 @main struct GravityBoxMain {
     static func main() {
         if let i = CommandLine.arguments.firstIndex(of: "--install-update"), i + 1 < CommandLine.arguments.count {
+            if let envLang = ProcessInfo.processInfo.environment["GRAVITYBOX_LANGUAGE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !envLang.isEmpty {
+                _ = L10n.shared.setLanguage(envLang, notify: false)
+            }
             do { try UpdateInstaller.run(receiptURL: URL(fileURLWithPath: CommandLine.arguments[i + 1])); exit(0) }
-            catch { fputs("GravityBox 更新未完成；恢复材料已保留。\n", stderr); exit(1) }
+            catch { fputs(L10n.t("assistant.update_incomplete_stderr", fallback: "GravityBox 更新未完成；恢复材料已保留。\n"), stderr); exit(1) }
         }
         if CommandLine.arguments.contains("--lifecycle-agent") {
             AntigravityLifecycleAgent.run()

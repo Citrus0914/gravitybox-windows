@@ -767,4 +767,98 @@ test('AccountsManager: 多账号索引与自定义标签保存读取验证', asy
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("账号与事务 · visual-audit-optimization", { concurrency: false }, async () => {
 test('账号重命名仅更新名称，保持凭据、禁用状态、配额与顺序',async t=>{const d=await mkdtemp(join(tmpdir(),'gb-name-'));t.after(()=>rm(d,{recursive:true,force:true}));const m=new AccountsManager(d);let a=await m.upsertAccount({email:'fixture@example.invalid',refreshToken:'synthetic-refresh',accessToken:'synthetic-access',expiresIn:3600});a.disabled=true;a.disabled_reason='fixture';a.quota={models:[],last_updated:123,quota_groups:[],source:'cloud'};await m.saveAccount(a);const before=JSON.parse(JSON.stringify(await m.getAccount(a.id))),idx=await m.loadIndex();const renamed=await m.renameAccount(a.id,'  新名称  ');assert.equal(renamed.name,'新名称');for(const key of Object.keys(before).filter(k=>k!=='name'))assert.deepEqual(renamed[key],before[key],key);const next=await m.loadIndex();assert.deepEqual(next.accounts.map(a=>a.id),idx.accounts.map(a=>a.id));assert.equal(next.current_account_id,idx.current_account_id);for(const name of[null,undefined,'x'.repeat(81)])await assert.rejects(m.renameAccount(a.id,name));assert.equal((await m.getAccount(a.id)).name,'新名称');const reset=await m.renameAccount(a.id,' ');assert.equal(reset.name,'fixture');for(const key of Object.keys(before).filter(k=>k!=='name'))assert.deepEqual(reset[key],before[key],key);});
+
+test('P1-16 & P1-20: 落盘配额告警/错误跨语种动态重翻译并语义去重，rebuildIndex 失效内存缓存', async t => {
+  const { bt, setActiveLocale, getActiveLocale } = await import('../dist/i18n.js');
+  const { cleanAndLocalizeRefreshError } = await import('../dist/accounts.js');
+  const prevLocale = getActiveLocale();
+  t.after(() => setActiveLocale(prevLocale));
+
+  const d = await mkdtemp(join(tmpdir(), 'gb-p116-'));
+  t.after(() => rm(d, { recursive: true, force: true }));
+  const mgr = new AccountsManager(d);
+
+  setActiveLocale('zh-Hans');
+  const account = await mgr.upsertAccount({
+    email: 'p116@example.invalid',
+    refreshToken: '1//refresh-p116',
+    accessToken: 'access-p116',
+    expiresIn: 3600,
+  });
+  account.quota_refresh_error = bt('account_cloud.refresh_err.missing_families', { labels: 'Claude/GPT、Argon' });
+  account.quota = {
+    models: [],
+    quota_groups: [
+      {
+        display_name: 'Gemini',
+        family: 'gemini',
+        observed_at: Math.floor(Date.now() / 1000),
+        buckets: [
+          {
+            bucket_id: 'gemini-5h',
+            window: '5h',
+            remaining_fraction: 0.75,
+            remaining_fraction_known: true,
+            reset_time: new Date(Date.now() + 3600_000).toISOString(),
+          },
+        ],
+      },
+    ],
+    last_updated: Math.floor(Date.now() / 1000),
+    is_forbidden: false,
+    model_forwarding_rules: {},
+    source: 'cloud',
+    refresh_state: {
+      complete: false,
+      endpointsAttempted: [],
+      endpointsSucceeded: [],
+      missingFamilies: ['claude'],
+      missingWindows: [{ family: 'claude', window: '5h' }],
+      carriedGroups: 0,
+      carriedModels: 0,
+      refreshedAt: Math.floor(Date.now() / 1000),
+      usedFallbackEndpoint: true,
+      error: bt('account_cloud.refresh_state.budget_timeout'),
+    },
+    quota_warnings: [
+      bt('account_cloud.warn.missing_family', { family: 'claude', label: 'Claude/GPT' }),
+      bt('account_cloud.warn.missing_window', { family: 'claude', window: '5h', label: 'Claude/GPT' }),
+      bt('account_cloud.warn.carried', { name: 'Claude', iso: '2026-11-15T00:00:00.000Z' }),
+      bt('account_cloud.warn.budget_timeout'),
+      bt('account_cloud.warn.fallback_endpoint'),
+      bt('account_cloud.warn.argon_disabled'),
+      `UNVERIFIED_CLOUD_SCOPE: ${bt('account_cloud.err.http_3501')}`,
+      'UNVERIFIED_CLOUD_SCOPE: HTTP 403',
+    ],
+  };
+  await mgr.saveAccount(account);
+
+  setActiveLocale('en');
+  const overview = mgr.getAccountQuotaOverview(account);
+  const projected = projectAccountForIpc(account);
+
+  assert.equal(overview.refreshState.error, 'Overall budget timed out; partial results saved');
+  assert.equal(projected.quota_refresh_error, 'Claude/GPT, Argon quota not returned; previous record retained');
+  assert.equal(projected.quota.refresh_state.error, 'Overall budget timed out; partial results saved');
+  assert.equal(overview.quotaWarnings.filter(w => w.startsWith('MISSING_FAMILY:claude:')).length, 1);
+  assert.equal(overview.quotaWarnings.filter(w => w.startsWith('MISSING_WINDOW:claude:5h:')).length, 1);
+  assert.equal(overview.quotaWarnings.filter(w => w.startsWith('ARGON_DISABLED:')).length, 1);
+  assert.ok(overview.quotaWarnings.some(w => w === 'CARRIED:Claude: Carried over from last record (2026-11-15T00:00:00.000Z)'));
+  assert.ok(overview.quotaWarnings.some(w => w.startsWith('REFRESH_BUDGET_TIMEOUT: Quota refresh exceeded overall budget')));
+  assert.ok(overview.quotaWarnings.some(w => w.startsWith('FALLBACK_ENDPOINT: Production endpoint failed')));
+  assert.ok(!overview.quotaWarnings.some(w => /[\u4e00-\u9fff]/.test(w)), `切为英文后不得残留中文告警: ${JSON.stringify(overview.quotaWarnings)}`);
+  assert.ok(projected.quota.quota_warnings.some(w => w === 'UNVERIFIED_CLOUD_SCOPE: HTTP 403 (Official product license verification failed, error 3501; check this account in the official app)'));
+  assert.equal(cleanAndLocalizeRefreshError('历史双周期报错'), null);
+
+  await mgr.loadIndex();
+  const extra = {
+    ...structuredClone(account),
+    id: 'extra-rebuilt',
+    email: 'rebuilt@example.invalid',
+  };
+  await writeFile(join(d, 'accounts', 'extra-rebuilt.json'), JSON.stringify(extra, null, 2));
+  await mgr.rebuildIndex();
+  const afterRebuild = await mgr.loadIndex();
+  assert.ok(afterRebuild.accounts.some(a => a.id === 'extra-rebuilt'), 'rebuildIndex 后 loadIndex 必须读取最新索引');
+});
 });

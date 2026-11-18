@@ -41,7 +41,7 @@ export class CdpHudBridge implements ICdpHudBridge {
   private pollTimer: NodeJS.Timeout | null = null;
   private pollInFlight = false;
   private lastPollStartedAt = 0;
-  private sequenceCounter = 0;
+  private sequenceCounter = Date.now();
   private readonly basePollIntervalMs: number;
   private disposed = false;
 
@@ -80,6 +80,11 @@ export class CdpHudBridge implements ICdpHudBridge {
   ): Promise<void> {
     if (this.disposed || !cdp || !getContextId) return;
     this.targets.set(targetId, { cdp, getContextId });
+    for (const [paneKey, pane] of this.activePanes.entries()) {
+      if (paneKey.startsWith(`${targetId}::`)) {
+        pane.lastMetricsKey = '';
+      }
+    }
     try {
       await cdp.send('Runtime.addBinding', {
         name: HUD_BRIDGE_BINDING_NAME,
@@ -140,7 +145,9 @@ export class CdpHudBridge implements ICdpHudBridge {
     if (parsed.type === 'SESSION_DETACHED') {
       if (!existing || revision !== existing.sessionRevision || conversationId !== existing.conversationId) return;
       this.activePanes.delete(paneKey);
-      this.activePanes.delete(`${targetId}::${cascadeId}`);
+      if (paneSlotId === cascadeId) {
+        this.activePanes.delete(`${targetId}::${cascadeId}`);
+      }
       return;
     }
 
@@ -199,11 +206,18 @@ export class CdpHudBridge implements ICdpHudBridge {
       runningSubagentCount,
       childConversationIds,
       lastUpdatedAt: nowMs,
-      lastMetricsKey: sameConv ? sameConv.lastMetricsKey : '',
+      lastMetricsKey:
+        !sameConv ||
+        parsed.type === 'SESSION_ATTACHED' ||
+        parsed.type === 'REQUEST_REFRESH' ||
+        nextRevision > sameConv.sessionRevision
+          ? ''
+          : sameConv.lastMetricsKey,
       lastActivityAt:
         resolvedStreaming || parsed.type === 'STREAMING_CHANGED' || isSubagentRunning
           ? nowMs
           : sameConv?.lastActivityAt ?? nowMs,
+      ...(sameConv?.autoHealAttempts ? { autoHealAttempts: sameConv.autoHealAttempts } : {}),
     };
 
     this.activePanes.set(paneKey, session);
@@ -244,19 +258,36 @@ export class CdpHudBridge implements ICdpHudBridge {
       return;
     }
 
+    const sessionForFingerprint = metrics.isStreaming
+      ? {
+          ...metrics.session,
+          currentTurnDurationSeconds: 0,
+          currentTurnDurationFormatted: '',
+          currentTurnDurationFormattedEn: '',
+          currentTurnDurationCompactZh: '',
+          currentTurnDurationCompactEn: '',
+          currentTurnModelDurationSeconds: 0,
+          currentTurnToolDurationSeconds: 0,
+          inFlightModelDurationSeconds: 0,
+          inFlightToolDurationSeconds: 0,
+          hasTurnDurationAnchor: (metrics.session.currentTurnDurationSeconds ?? 0) > 0,
+          hasInFlightModelAnchor: (metrics.session.inFlightModelDurationSeconds ?? 0) > 0,
+          hasInFlightToolAnchor: (metrics.session.inFlightToolDurationSeconds ?? 0) > 0,
+        }
+      : {
+          ...metrics.session,
+          currentTurnDurationSeconds: Math.round(metrics.session.currentTurnDurationSeconds ?? 0),
+          currentTurnModelDurationSeconds: Math.round(metrics.session.currentTurnModelDurationSeconds ?? 0),
+          currentTurnToolDurationSeconds: Math.round(metrics.session.currentTurnToolDurationSeconds ?? 0),
+          inFlightModelDurationSeconds: Math.round(metrics.session.inFlightModelDurationSeconds ?? 0),
+          inFlightToolDurationSeconds: Math.round(metrics.session.inFlightToolDurationSeconds ?? 0),
+        };
     const fingerprint = JSON.stringify({
-      session: {
-        ...metrics.session,
-        currentTurnDurationSeconds: Math.round(metrics.session.currentTurnDurationSeconds ?? 0),
-        currentTurnModelDurationSeconds: Math.round(metrics.session.currentTurnModelDurationSeconds ?? 0),
-        currentTurnToolDurationSeconds: Math.round(metrics.session.currentTurnToolDurationSeconds ?? 0),
-        inFlightModelDurationSeconds: Math.round(metrics.session.inFlightModelDurationSeconds ?? 0),
-        inFlightToolDurationSeconds: Math.round(metrics.session.inFlightToolDurationSeconds ?? 0),
-      },
+      session: sessionForFingerprint,
       tokens: metrics.tokens,
       context: metrics.context,
       availability: metrics.availability,
-      observedAt: metrics.observedAt,
+      observedAt: metrics.isStreaming && metrics.availability === 'ready' ? 0 : metrics.observedAt,
       failedChildCount: metrics.failedChildCount,
       isStreaming: metrics.isStreaming,
       activityPhase: metrics.activityPhase,
@@ -312,11 +343,11 @@ export class CdpHudBridge implements ICdpHudBridge {
     if (contextId === undefined) return false;
     const serialized = JSON.stringify(metrics);
     try {
-      await target.cdp.evaluate(
-        `((m) => (globalThis.__gravityboxUpdateHudMetrics ? globalThis.__gravityboxUpdateHudMetrics(m) : globalThis.__GRAVITYBOX_HUD_V1__?.dispatchMetrics?.(m)))(${serialized})`,
+      const accepted = await target.cdp.evaluate(
+        `((m) => Boolean(globalThis.__gravityboxUpdateHudMetrics ? globalThis.__gravityboxUpdateHudMetrics(m) : globalThis.__GRAVITYBOX_HUD_V1__?.dispatchMetrics?.(m)))(${serialized})`,
         contextId
       );
-      return true;
+      return Boolean(accepted);
     } catch {
       // 忽略窗口关闭或导航瞬间的执行上下文失效
       return false;
@@ -352,6 +383,19 @@ export class CdpHudBridge implements ICdpHudBridge {
     } finally {
       this.pollInFlight = false;
     }
+  }
+
+  /**
+   * 语言切换后清空各分栏指纹缓存并立即重推本地化后的 HUD 度量快照
+   */
+  public async refreshAllForLocaleChange(): Promise<void> {
+    if (this.disposed || this.activePanes.size === 0) return;
+    for (const session of this.activePanes.values()) {
+      session.lastMetricsKey = '';
+    }
+    await Promise.allSettled(
+      [...this.activePanes.keys()].map((paneKey) => this.refreshPaneMetrics(paneKey, true))
+    );
   }
 
   public onClientEvent(handler: (event: HudClientEvent) => void): void {

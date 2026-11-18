@@ -6,16 +6,16 @@ final class AboutPage: NSObject {
 
     let versionPill: PillBadge
     let checkUpdateBtn: InlineRefreshButton
-    let installNowBtn = button("立即更新", target: nil, action: #selector(installAvailableUpdate))
-    let cancelDownloadBtn = button("取消下载", target: nil, action: #selector(cancelActiveDownload))
-    let releaseNotesBtn = button("更新日志 ↗", target: nil, action: #selector(openReleasesPage))
+    let installNowBtn = button(L10n.t("about.install_now", fallback: "立即更新"), target: nil, action: #selector(installAvailableUpdate))
+    let cancelDownloadBtn = button(L10n.t("about.cancel_download", fallback: "取消下载"), target: nil, action: #selector(cancelActiveDownload))
+    let releaseNotesBtn = button(L10n.t("about.release_notes", fallback: "更新日志 ↗"), target: nil, action: #selector(openReleasesPage))
     let updateStatusIcon = symbol("checkmark.seal.fill", size: 12, color: Design.secondary)
     let updateStatusLabel = text("", size: 11.5, weight: .medium, color: Design.secondary)
     let updateMetaLabel = text("", size: 11, color: Design.secondary)
     private(set) var statusLine: NSStackView!
     let autoUpdateSwitch = DesignSwitch()
     let versionSpecLabel = text("", size: 12.5, weight: .medium, color: .labelColor)
-    let revealDataBtn = button("在访达中显示", target: nil, action: #selector(revealDataFolder))
+    let revealDataBtn = button(L10n.t("about.reveal_data", fallback: "在访达中显示"), target: nil, action: #selector(revealDataFolder))
     let githubReleasesBtn = button("GitHub ↗", target: nil, action: #selector(openReleasesPage))
     private let heroActions = horizontal([], spacing: 8)
 
@@ -23,7 +23,7 @@ final class AboutPage: NSObject {
         self.app = app
         let ver = app.updateManager.currentVersion
         self.versionPill = pillBadge("v\(ver)", color: Design.blue)
-        self.checkUpdateBtn = InlineRefreshButton("检查更新", width: 92, target: nil, action: #selector(checkForUpdates))
+        self.checkUpdateBtn = InlineRefreshButton(L10n.t("about.check_update", fallback: "检查更新"), width: 124, target: nil, action: #selector(checkForUpdates))
         super.init()
 
         checkUpdateBtn.target = self
@@ -104,8 +104,8 @@ final class AboutPage: NSObject {
         autoUpdateSwitch.state = app.configuration.value.autoUpdateEnabled ? .on : .off
         autoUpdateSwitch.target = self
         autoUpdateSwitch.action = #selector(toggleAutoUpdate)
-        autoUpdateSwitch.setAccessibilityLabel("自动检查更新")
-        let autoTitle = text("自动检查更新", size: 13, weight: .semibold, color: .labelColor)
+        autoUpdateSwitch.setAccessibilityLabel(L10n.t("about.auto_update", fallback: "自动检查更新"))
+        let autoTitle = text(L10n.t("about.auto_update", fallback: "自动检查更新"), size: 13, weight: .semibold, color: .labelColor)
         let autoRow = horizontal([autoTitle, flexibleSpace(), autoUpdateSwitch], spacing: 12)
         autoRow.alignment = .centerY
 
@@ -126,7 +126,7 @@ final class AboutPage: NSObject {
         let dataPathLabel = text(displayStatePath, size: 12, weight: .regular, color: Design.secondary)
         dataPathLabel.lineBreakMode = .byTruncatingMiddle
         dataPathLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        enableTextCopy(dataPathLabel, value: app.state.path, title: "复制目录路径")
+        enableTextCopy(dataPathLabel, value: app.state.path, title: L10n.t("about.copy_data_path", fallback: "复制目录路径"))
 
         func specRow(icon: String, tint: NSColor, key: String, right: NSView) -> NSView {
             let iconBox = tintedIconBox(
@@ -155,9 +155,9 @@ final class AboutPage: NSObject {
         dataRight.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let specsInner = vertical([
-            specRow(icon: "cpu", tint: .systemIndigo, key: "目标应用", right: versionSpecLabel),
+            specRow(icon: "cpu", tint: .systemIndigo, key: L10n.t("about.target_app", fallback: "目标应用"), right: versionSpecLabel),
             divider(),
-            specRow(icon: "folder", tint: .systemOrange, key: "GravityBox 数据目录", right: dataRight)
+            specRow(icon: "folder", tint: .systemOrange, key: L10n.t("about.data_dir", fallback: "GravityBox 数据目录"), right: dataRight)
         ], spacing: 11)
         for child in specsInner.arrangedSubviews { fillWidth(child, in: specsInner) }
         let specsCard = group([specsInner], inset: 14)
@@ -182,10 +182,10 @@ final class AboutPage: NSObject {
             return grp
         }
 
-        let root = pageStack(title: "关于")
+        let root = pageStack(title: L10n.t("about.title", fallback: "关于"))
         root.spacing = 12
         root.addArrangedSubview(heroCard)
-        root.addArrangedSubview(sectionGroup("运行信息", card: specsCard))
+        root.addArrangedSubview(sectionGroup(L10n.t("about.section.runtime", fallback: "运行信息"), card: specsCard))
         root.addArrangedSubview(projectCard)
         fillWidth(heroCard, in: root)
         fillWidth(projectCard, in: root)
@@ -196,7 +196,10 @@ final class AboutPage: NSObject {
         refreshUpdateState()
     }
 
+    private var cachedBuildSummary: String?
+
     private func resolvedBuildSummary() -> String {
+        if let cachedBuildSummary { return cachedBuildSummary }
         var buildStr = (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if buildStr.lowercased().hasPrefix("build ") {
             buildStr = String(buildStr.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -210,10 +213,14 @@ final class AboutPage: NSObject {
                let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let rev = (info["revision"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !rev.isEmpty {
-                return buildStr.isEmpty || buildStr == rev ? rev : "\(buildStr) · \(rev)"
+                let resolved = buildStr.isEmpty || buildStr == rev ? rev : "\(buildStr) · \(rev)"
+                cachedBuildSummary = resolved
+                return resolved
             }
         }
-        return buildStr.isEmpty ? app.updateManager.currentBuildDisplay : buildStr
+        let fallback = buildStr.isEmpty ? app.updateManager.currentBuildDisplay : buildStr
+        cachedBuildSummary = fallback
+        return fallback
     }
 
     private func resolvedAntigravityDisplay() -> String {
@@ -227,7 +234,7 @@ final class AboutPage: NSObject {
         if !liveVer.isEmpty && liveVer != "fixture" {
             return "Antigravity \(liveVer)"
         }
-        return "Antigravity 正式版"
+        return L10n.t("about.antigravity_stable", fallback: "Antigravity 正式版")
     }
 
     private func refreshSpecs() {
@@ -242,7 +249,7 @@ final class AboutPage: NSObject {
             ? "macOS \(osVer.majorVersion).\(osVer.minorVersion).\(osVer.patchVersion)"
             : "macOS \(osVer.majorVersion).\(osVer.minorVersion)"
         let copyText = "GravityBox v\(ver) (\(buildPart)) · \(antigravityPart) · \(osStr) arm64"
-        enableTextCopy(versionSpecLabel, value: copyText, title: "复制版本与环境信息")
+        enableTextCopy(versionSpecLabel, value: copyText, title: L10n.t("about.copy_version_info", fallback: "复制版本与环境信息"))
     }
 
     func syncAutoUpdateSwitch() {
@@ -269,7 +276,7 @@ final class AboutPage: NSObject {
             updateStatusIcon.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = Design.blue
             updateStatusLabel.textColor = Design.secondary
-            updateStatusLabel.stringValue = "正在检查最新版本…"
+            updateStatusLabel.stringValue = L10n.t("about.status.checking", fallback: "正在检查最新版本…")
             updateMetaLabel.stringValue = ""
             updateMetaLabel.isHidden = true
             checkUpdateBtn.isHidden = false
@@ -282,7 +289,7 @@ final class AboutPage: NSObject {
             updateStatusIcon.image = NSImage(systemSymbolName: "checkmark.seal.fill", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = .systemGreen
             updateStatusLabel.textColor = Design.secondary
-            updateStatusLabel.stringValue = "已是最新版本"
+            updateStatusLabel.stringValue = L10n.t("about.status.up_to_date", fallback: "已是最新版本")
             updateMetaLabel.stringValue = ""
             updateMetaLabel.isHidden = true
             checkUpdateBtn.isHidden = false
@@ -295,11 +302,11 @@ final class AboutPage: NSObject {
             updateStatusIcon.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = Design.blue
             updateStatusLabel.textColor = .labelColor
-            updateStatusLabel.stringValue = "发现新版本 \(release.tagName)"
-            updateMetaLabel.stringValue = release.publishedDate.isEmpty ? "" : "发布于 \(release.publishedDate)"
+            updateStatusLabel.stringValue = L10n.t("about.status.available", ["tag": release.tagName], fallback: "发现新版本 \(release.tagName)")
+            updateMetaLabel.stringValue = release.publishedDate.isEmpty ? "" : L10n.t("about.status.published_at", ["date": release.publishedDate], fallback: "发布于 \(release.publishedDate)")
             updateMetaLabel.isHidden = updateMetaLabel.stringValue.isEmpty
             checkUpdateBtn.isHidden = true
-            installNowBtn.title = "立即更新"
+            installNowBtn.title = L10n.t("about.install_now", fallback: "立即更新")
             installNowBtn.isEnabled = true
             installNowBtn.isHidden = false
             cancelDownloadBtn.isHidden = true
@@ -309,8 +316,12 @@ final class AboutPage: NSObject {
             updateStatusIcon.image = NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = Design.blue
             updateStatusLabel.textColor = .labelColor
-            updateStatusLabel.stringValue = "正在下载 \(release.tagName) 更新包…"
-            updateMetaLabel.stringValue = "下载中"
+            updateStatusLabel.stringValue = L10n.t("about.status.downloading", ["tag": release.tagName], fallback: "正在下载 \(release.tagName) 更新包…")
+            if let pct = app.updateManager.downloadProgressPercent, pct > 0 {
+                updateMetaLabel.stringValue = L10n.t("about.status.downloading_progress", ["pct": pct], fallback: "下载中 \(pct)%")
+            } else {
+                updateMetaLabel.stringValue = L10n.t("about.status.downloading_meta", fallback: "下载中")
+            }
             updateMetaLabel.isHidden = false
             checkUpdateBtn.isHidden = true
             installNowBtn.isHidden = true
@@ -322,11 +333,11 @@ final class AboutPage: NSObject {
             updateStatusIcon.image = NSImage(systemSymbolName: "checkmark.shield.fill", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = .systemGreen
             updateStatusLabel.textColor = .labelColor
-            updateStatusLabel.stringValue = "\(release.tagName) 更新包已就绪"
-            updateMetaLabel.stringValue = "已校验"
+            updateStatusLabel.stringValue = L10n.t("about.status.ready", ["tag": release.tagName], fallback: "\(release.tagName) 更新包已就绪")
+            updateMetaLabel.stringValue = L10n.t("about.status.verified_meta", fallback: "已校验")
             updateMetaLabel.isHidden = false
             checkUpdateBtn.isHidden = true
-            installNowBtn.title = "立即更新"
+            installNowBtn.title = L10n.t("about.install_now", fallback: "立即更新")
             installNowBtn.isEnabled = true
             installNowBtn.isHidden = false
             cancelDownloadBtn.isHidden = true
@@ -336,11 +347,11 @@ final class AboutPage: NSObject {
             updateStatusIcon.image = NSImage(systemSymbolName: "gearshape.2.fill", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = Design.blue
             updateStatusLabel.textColor = .labelColor
-            updateStatusLabel.stringValue = "正在准备安装 \(release.tagName)…"
-            updateMetaLabel.stringValue = "安装中"
+            updateStatusLabel.stringValue = L10n.t("about.status.installing", ["tag": release.tagName], fallback: "正在准备安装 \(release.tagName)…")
+            updateMetaLabel.stringValue = L10n.t("about.status.installing_meta", fallback: "安装中")
             updateMetaLabel.isHidden = false
             checkUpdateBtn.isHidden = true
-            installNowBtn.title = "正在安装…"
+            installNowBtn.title = L10n.t("about.installing_btn", fallback: "正在安装…")
             installNowBtn.isEnabled = false
             installNowBtn.isHidden = false
             cancelDownloadBtn.isHidden = true
@@ -350,8 +361,8 @@ final class AboutPage: NSObject {
             updateStatusIcon.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = accessibleWarningColor()
             updateStatusLabel.textColor = .labelColor
-            updateStatusLabel.stringValue = "检查更新未完成：\(message)"
-            updateMetaLabel.stringValue = "可重试"
+            updateStatusLabel.stringValue = L10n.t("about.status.failed", ["message": message], fallback: "检查更新未完成：\(message)")
+            updateMetaLabel.stringValue = L10n.t("about.status.retry_meta", fallback: "可重试")
             updateMetaLabel.isHidden = false
             checkUpdateBtn.isHidden = false
             checkUpdateBtn.setBusy(false, available: true)
@@ -379,6 +390,7 @@ final class AboutPage: NSObject {
     }
 
     @objc func cancelActiveDownload() {
+        cancelDownloadBtn.isEnabled = false
         app.updateManager.cancelDownload()
     }
 
