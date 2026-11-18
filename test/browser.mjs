@@ -910,9 +910,12 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
 
     // 2. 注入实测基准指标并验证 3 胶囊与向上展开 Popover
     await until(async () => {
-      await main.evaluate(`globalThis.__gravityboxUpdateHudMetrics({
+      await main.evaluate(`(() => {
+        const inst = [...globalThis.__GRAVITYBOX_HUD_V1__.manager.instances.values()][0];
+        return globalThis.__gravityboxUpdateHudMetrics({
         conversationId: '4ec6348d-0f58-49db-8aed-6f67dbb78f5d',
-        sessionRevision: [...globalThis.__GRAVITYBOX_HUD_V1__.manager.instances.values()][0].getSessionRevision(),
+        sessionRevision: inst.getSessionRevision(),
+        metricsSequence: Math.max(100000, (inst.lastMetricsSequence || 0) + 1),
         updatedAt: Date.now(),
         isStreaming: false,
         session: {
@@ -983,7 +986,7 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
             messageRatio: 63.181
           }
         }
-      })`, ctx.executionContextId);
+      }); })()`, ctx.executionContextId);
       const txt = await main.evaluate(`document.querySelector('#__gravitybox_hud_host__')?.shadowRoot?.querySelector('#hud-txt-session')?.textContent.replace(/\\s+/g, ' ').trim()`);
       return txt === '1 轮 · 本轮 18s · 90 tok/s';
     });

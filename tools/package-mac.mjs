@@ -128,7 +128,7 @@ async function main() {
   }
   await run('/usr/bin/codesign', ['--force', '--deep', '--sign', '-', '--timestamp=none', app]); await run('/usr/bin/codesign', ['--verify', '--deep', '--strict', app]);
   await run('/bin/ln', ['-s', '/Applications', join(stage, 'Applications')]);
-  const dmg = join(output, `GravityBox-${version}-arm64.dmg`); await run('/usr/bin/hdiutil', ['create', '-ov', '-volname', 'GravityBox', '-srcfolder', stage, '-format', 'ULFO', dmg], { maxBuffer: 2e6 }); await run('/usr/bin/hdiutil', ['verify', dmg], { maxBuffer: 2e6 });
+  const dmg = join(output, `GravityBox-${version}-arm64.dmg`); await run('/usr/bin/hdiutil', ['create', '-ov', '-volname', 'GravityBox', '-fs', 'HFS+', '-srcfolder', stage, '-format', 'ULFO', dmg], { maxBuffer: 2e6 }); await run('/usr/bin/hdiutil', ['verify', dmg], { maxBuffer: 2e6 });
   // hdiutil 校验通过后生成并复核 sidecar（与 `shasum -a 256` 完全一致，覆盖旧文件）；复核失败立即中止，避免发布不可校验的包。
   const sidecar = await writeSha256Sidecar(dmg); const sidecarCheck = await verifySha256Sidecar(dmg); if (sidecarCheck.hash !== sidecar.hash) throw new Error('DMG sha256 校验文件写入后复核不一致，已中止发布');
   // Keep one staging app for final installed-app acceptance, not a duplicate release app.
