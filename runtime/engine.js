@@ -852,11 +852,12 @@
 
     // 8. 模型配额与刷新限额动态提示 (如 You have used some of your weekly limit, it will fully refresh in 20 hours, 52 minutes.)
     {
-      key: "You have used some of your {period} limit, it will fully refresh in {duration}.", pattern: /^You have (used some of|hit) your (weekly|5-hour|\w+) limit, it will fully refresh in (.+?)\.?$/i,
+      key: "You have used some of your {period} limit, it will fully refresh in {duration}.", pattern: /^You have (used some of|hit) your (weekly|daily|5-hour|five[- ]hour|\d+[- ]?(?:hour|day|minute)|\w+) limit, it will fully refresh in (.+?)\.?$/i,
       replace: (_, action, period, time) => {
         const actZh = /hit/i.test(action) ? '已达到' : '已使用了部分';
-        const pMap = { weekly: '每周', '5-hour': '5小时' };
-        const pZh = pMap[period.toLowerCase()] || period;
+        const normP = period.toLowerCase().replace(/\s+/g, ' ');
+        const pMap = { weekly: '每周', daily: '每日', '5-hour': '5小时', 'five-hour': '5小时', 'five hour': '5小时' };
+        const pZh = pMap[normP] || period;
         const timeZh = time
           .replace(/(\d+)\s*days?/gi, '$1天')
           .replace(/(\d+)\s*hours?/gi, '$1小时')

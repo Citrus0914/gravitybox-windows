@@ -1077,7 +1077,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             return
         }
         refreshInFlight = true
-        if let started = quotaRefreshStartedAt, Date().timeIntervalSince(started) > 45 { failPendingQuotaRefresh(L10n.t("assistant.quota_refresh_timeout", fallback: "刷新超时，请重试；保留上次配额")) }
+        if let started = quotaRefreshStartedAt, Date().timeIntervalSince(started) > 45 { failPendingQuotaRefresh(L10n.t("assistant.quota_refresh_timeout", fallback: "刷新超时，请重试；保留上次配额"), cancelBackendTask: true) }
         let needTasks = taskPollOnly || pendingAccountTaskId != nil || quotaRefreshing
         let includeAccounts = !taskPollOnly && (menuTracking || (contentVisible && currentPage <= 1))
         let previousTaskRev = lastTaskRevision

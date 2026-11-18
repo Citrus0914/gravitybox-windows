@@ -27,7 +27,7 @@ const VENDOR_CONTENT_ANCHORS = [
 const INTERNAL_DERIVATIVE_RE = /(?:^|[-_])(?:trial|control|tiered|safety[-_]le|exp[-_][a-z0-9]+|n|a|default)(?:$|[-_])/i;
 
 // 仅作为新模型雷达候选的现代主流对话模型族，过滤老旧历史模型与非文本模态条目
-const MODERN_RADAR_MODEL_RE = /^(?:gemini-(?:3\.[5-9]|4|5)|claude-(?:sonnet|opus|haiku)-[4-9]|gpt-(?:5|6)|o[3-9](?:-|$))/i;
+const MODERN_RADAR_MODEL_RE = /^(?:gemini-(?:3\.[5-9]|[4-9](?:\.\d+)?)|claude-(?:(?:sonnet|opus|haiku)-[4-9]|[4-9](?:[-.]\d+)?-(?:sonnet|opus|haiku))|gpt-(?:4\.[5-9]|[5-9](?:\.\d+)?)|o[3-9](?:-|$))/i;
 const IGNORED_RADAR_SUFFIX_RE = /(?:batch|audio|realtime|image|video|tts|stt|transcribe|embed|moderation|search|deep-research|computer-use|free|:free|:extended)/i;
 
 // 常见目录 key 到官方/LiteLLM 常见别名的补充映射
@@ -69,6 +69,10 @@ const GEMINI_EXTRACTION_SCHEMA = {
           cacheWritePer1M: { type: 'NUMBER' },
           hasContextTiers: { type: 'BOOLEAN' },
           contextThresholdTokens: { type: 'INTEGER' },
+          tierInputPer1M: { type: 'NUMBER' },
+          tierOutputPer1M: { type: 'NUMBER' },
+          tierCachedPer1M: { type: 'NUMBER' },
+          tierCacheWritePer1M: { type: 'NUMBER' },
           promoValidUntil: { type: 'STRING' },
           confidence: { type: 'STRING', enum: ['high', 'medium', 'low'] },
           evidenceQuote: { type: 'STRING' },
@@ -366,7 +370,7 @@ export async function extractPricesWithGemini({ url, vendor, cleanText, targetMo
     `You are auditing official LLM API pricing from ${vendor} (${url}).`,
     'Extract ONLY standard pay-as-you-go Global/Standard API text token pricing in USD per 1M tokens.',
     'Ignore Batch API, Provisioned Throughput, regional premiums, audio/image/video modalities, and deprecated models unless listed below.',
-    'If a model has >200k long-context tiered pricing, record the base (<=200k) rates in inputPer1M/outputPer1M/cachedPer1M and set hasContextTiers=true and contextThresholdTokens=200000.',
+    'If a model has >200k long-context tiered pricing, record the base (<=200k) rates in inputPer1M/outputPer1M/cachedPer1M, set hasContextTiers=true and contextThresholdTokens=200000, and record the >200k rates in tierInputPer1M/tierOutputPer1M/tierCachedPer1M/tierCacheWritePer1M.',
     'Also extract any NEW flagship chat models on this page that are not in the target list below (leave catalogKey empty for genuinely new models).',
     'For each extracted model, include a short verbatim quote from the page in evidenceQuote (<= 160 chars). Never guess missing numbers.',
     '',
@@ -448,6 +452,23 @@ export function evaluateModelConsensus({
     Number.isFinite(official.outputPer1M) &&
     official.outputPer1M > 0;
 
+  const localPrimaryTier =
+    Array.isArray(local.contextTiers) && local.contextTiers.length > 0 ? local.contextTiers[0] : null;
+  const officialHasTierNums =
+    Boolean(officialValid) &&
+    Number.isFinite(official.tierInputPer1M) &&
+    official.tierInputPer1M > 0 &&
+    Number.isFinite(official.tierOutputPer1M) &&
+    official.tierOutputPer1M > 0;
+  const officialTierDiffers =
+    Boolean(officialValid && localPrimaryTier && officialHasTierNums) &&
+    (!ratesClose(localPrimaryTier.input, official.tierInputPer1M) ||
+      !ratesClose(localPrimaryTier.output, official.tierOutputPer1M) ||
+      (Number.isFinite(official.tierCachedPer1M) && !ratesClose(localPrimaryTier.cached, official.tierCachedPer1M)) ||
+      (localPrimaryTier.cacheWrite !== undefined &&
+        Number.isFinite(official.tierCacheWritePer1M) &&
+        !ratesClose(localPrimaryTier.cacheWrite, official.tierCacheWritePer1M)));
+
   const officialDiffers =
     officialValid &&
     (!ratesClose(local.input, official.inputPer1M) ||
@@ -455,7 +476,8 @@ export function evaluateModelConsensus({
       (Number.isFinite(official.cachedPer1M) && !ratesClose(local.cached, official.cachedPer1M)) ||
       (local.cacheWrite !== undefined &&
         Number.isFinite(official.cacheWritePer1M) &&
-        !ratesClose(local.cacheWrite, official.cacheWritePer1M)));
+        !ratesClose(local.cacheWrite, official.cacheWritePer1M)) ||
+      officialTierDiffers);
 
   const litellmDiffers =
     litellm &&
@@ -523,6 +545,8 @@ export function evaluateModelConsensus({
     const localHasTiers = Array.isArray(local.contextTiers) && local.contextTiers.length > 0;
     if (Boolean(official.hasContextTiers) !== localHasTiers) {
       reasons.push('contextTiers阶梯结构与本地不一致');
+    } else if (officialTierDiffers) {
+      reasons.push(`长上下文阶梯价变动(官网 >${official.contextThresholdTokens || localPrimaryTier.maxInputTokens}: $${official.tierInputPer1M}/$${official.tierOutputPer1M}，需人工交叉复核)`);
     }
     if (official.promoValidUntil) {
       const existingUntil = local.validUntil ?? local.provenance?.validUntil ?? '';
@@ -905,6 +929,8 @@ export async function runAutoUpdatePricing(options = {}) {
     decision = 'yellow_needs_review';
   } else if (greenUpdates.length > 0) {
     decision = 'green_auto_merge';
+  } else if (newModelsRadar.length > 0) {
+    decision = 'yellow_needs_review';
   } else if (pageAlerts.length > 0) {
     decision = 'fetch_failed';
   }

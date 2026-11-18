@@ -489,9 +489,13 @@ extension Assistant {
             for waiter in waiters { waiter(res) }
         }
     }
-    func failPendingQuotaRefresh(_ message: String) {
+    func failPendingQuotaRefresh(_ message: String, cancelBackendTask: Bool = false) {
         guard quotaRefreshing || pendingAccountTaskId != nil else { return }
+        let staleTaskId = pendingAccountTaskId
         quotaRefreshing = false; pendingAccountTaskId = nil; quotaRefreshStartedAt = nil
         quotaRefreshError = message; quotaRefreshPollTimer?.invalidate(); quotaRefreshPollTimer = nil
+        if cancelBackendTask, let staleTaskId, !staleTaskId.isEmpty, reachable {
+            bridge.send(["command": "task_cancel", "id": staleTaskId]) { _ in }
+        }
     }
 }

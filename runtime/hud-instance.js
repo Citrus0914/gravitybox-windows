@@ -752,6 +752,7 @@ export class HudInstance {
           const isLateAbortedZeroResolution =
             metrics.session?.turnAborted === true &&
             prevSettled.hadAbortedZeroFallback === true &&
+            metrics.session?.turnAbortedMissingEnd !== true &&
             rawBackendSec > 0;
           const floorSec = isLateAbortedZeroResolution
             ? rawBackendSec
@@ -761,7 +762,7 @@ export class HudInstance {
           );
           const keepAbortedFloor = Boolean(
             metrics.session?.turnAborted === true &&
-              rawBackendSec <= 0 &&
+              (rawBackendSec <= 0 || metrics.session?.turnAbortedMissingEnd === true) &&
               floorSec > rawBackendSec + 1e-6
           );
           this.turnHighWaterMark = keepSubagentFloor || keepAbortedFloor
@@ -789,7 +790,9 @@ export class HudInstance {
           const keepAbortedZeroFallback = Boolean(
             hwMatchesTurn &&
               metrics.session?.turnAborted === true &&
-              rawBackendSec <= 0
+              (rawBackendSec <= 0 ||
+                (metrics.session?.turnAbortedMissingEnd === true &&
+                  rawBackendSec < this.turnHighWaterMark.seconds - 1e-6))
           );
           if (!mergedSubagentRunning && !isTrueSubagentGap && !keepAbortedZeroFallback) {
             this.turnHighWaterMark = null;
@@ -1730,7 +1733,7 @@ export class HudInstance {
     let modelRate = activeModels > 0 ? 1 : 0;
     let toolRate = activeTools > 0 ? 1 : 0;
     const isOptimisticBoot =
-      this.domIsStreaming &&
+      (this.domIsStreaming || (s.isSubagentTrajectory === true && metrics.isStreaming === true)) &&
       !this.isSubagentRunning &&
       ((modelBackendTotal === 0 && toolBackendTotal === 0) || s.awaitingFirstTurnStep === true || awaitingNewTurnFlush);
     if (modelRate === 0 && toolRate === 0 && isOptimisticBoot) {
@@ -2011,7 +2014,10 @@ export class HudInstance {
         frozenTurnSec,
         highWaterCandidate > 0 &&
           (this.turnHighWaterMark?.hasSubagent ||
-            (s.turnAborted === true && (rawBackendTurnSec === null || rawBackendTurnSec <= 0)) ||
+            (s.turnAborted === true &&
+              (rawBackendTurnSec === null ||
+                rawBackendTurnSec <= 0 ||
+                (s.turnAbortedMissingEnd === true && rawBackendTurnSec < highWaterCandidate - 1e-6))) ||
             rawBackendTurnSec === null)
           ? highWaterCandidate
           : 0

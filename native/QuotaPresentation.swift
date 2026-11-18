@@ -921,9 +921,9 @@ enum QuotaPresentation {
                 ?? ""
         ).trimmingCharacters(in: .whitespacesAndNewlines)
         let upper = tierRaw.uppercased()
-        let isUltra = upper.contains("ULTRA")
-        let isPro = !isUltra && upper.contains("PRO")
-        let isFree = upper.contains("FREE") || upper.contains("STARTER") || upper.contains("TRIAL")
+        let isUltra = upper.contains("ULTRA") || upper.contains("ENTERPRISE")
+        let isPro = !isUltra && (upper.contains("PRO") || upper.contains("AI PREMIUM") || upper.contains("TEAM") || upper.contains("BUSINESS") || upper.contains("WORKSPACE") || upper.contains("PLUS"))
+        let isFree = !isUltra && !isPro && (upper.contains("FREE") || upper.contains("STARTER") || upper.contains("TRIAL"))
 
         guard let activeAccount else {
             return ActiveScopeProfile(

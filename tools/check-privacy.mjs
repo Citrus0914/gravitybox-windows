@@ -46,7 +46,8 @@ const BINARY_EXTENSIONS = new Set([
 ]);
 
 const SKIPPED_DIRS = new Set([
-  '.git', 'node_modules', 'dist', '.cache', 'vendor', '质检报告', 'artifacts',
+  '.git', '.agents', 'node_modules', 'dist', 'build', '.cache',
+  'vendor', '质检报告', '成品', 'reports', 'artifacts',
 ]);
 
 const EMAIL_RE = /([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;

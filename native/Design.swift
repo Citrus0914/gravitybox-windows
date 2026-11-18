@@ -636,8 +636,11 @@ func identityHeader(identity: NSView, actions: NSView) -> NSView {
     identityHeight.priority = .defaultHigh; identityHeight.isActive = true
     identity.leadingAnchor.constraint(equalTo: container.leadingAnchor).isActive = true
     if let stack = actions as? NSStackView {
-        let width = stack.arrangedSubviews.reduce(CGFloat(0)) { $0 + max(0, $1.intrinsicContentSize.width) } + CGFloat(max(0, stack.arrangedSubviews.count-1)) * stack.spacing
-        stack.widthAnchor.constraint(equalToConstant: width).isActive = true
+        stack.detachesHiddenViews = true
+        for sub in stack.arrangedSubviews {
+            sub.setContentHuggingPriority(.required, for: .horizontal)
+            sub.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
     }
     actions.setContentHuggingPriority(.required, for: .horizontal)
     actions.setContentCompressionResistancePriority(.required, for: .horizontal)

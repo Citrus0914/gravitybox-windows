@@ -2,7 +2,7 @@ import Foundation
 
 enum ModelDisplayName {
     private static let standaloneGeminiRegex = try? NSRegularExpression(
-        pattern: "^gemini-([4-9](?:\\.[0-9]+)?)-([a-z][a-z0-9]*?)$",
+        pattern: "^gemini-((?:3\\.[5-9]|[4-9](?:\\.[0-9]+)?))-([a-z][a-z0-9]*(?:-[a-z0-9]+)*)$",
         options: [.caseInsensitive]
     )
     private static let catalogNames: [String: String] = {
@@ -72,7 +72,8 @@ enum ModelDisplayName {
         if let match = standaloneGeminiRegex?.firstMatch(in: strippedValue, range: NSRange(location: 0, length: (strippedValue as NSString).length)) {
             let ns = strippedValue as NSString
             let ver = ns.substring(with: match.range(at: 1))
-            let code = ns.substring(with: match.range(at: 2)).capitalized
+            let rawSlug = ns.substring(with: match.range(at: 2))
+            let code = rawSlug.split(separator: "-").map { $0.capitalized }.joined(separator: " ")
             return "Gemini \(ver) \(code)"
         }
         return trimmed
@@ -228,10 +229,23 @@ enum InterfaceText {
         return number + unit
     }
 
+    private static let standardUsdFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        return formatter
+    }()
+
     static func formatUsd(_ value: Double) -> String {
-        if value <= 0 { return "$0.00" }
+        if !value.isFinite || value <= 0 { return "$0.00" }
         if value < 0.001 { return "<$0.001" }
         if value < 0.01 { return String(format: "$%.3f", locale: Locale(identifier: "en_US_POSIX"), value) }
+        if value >= 1000, let grouped = standardUsdFormatter.string(from: NSNumber(value: value)) {
+            return "$" + grouped
+        }
         return String(format: "$%.2f", locale: Locale(identifier: "en_US_POSIX"), value)
     }
 }

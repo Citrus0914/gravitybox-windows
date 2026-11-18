@@ -80,6 +80,11 @@ export class CdpHudBridge implements ICdpHudBridge {
   ): Promise<void> {
     if (this.disposed || !cdp || !getContextId) return;
     this.targets.set(targetId, { cdp, getContextId });
+    for (const [paneKey, pane] of this.activePanes.entries()) {
+      if (paneKey.startsWith(`${targetId}::`)) {
+        pane.lastMetricsKey = '';
+      }
+    }
     try {
       await cdp.send('Runtime.addBinding', {
         name: HUD_BRIDGE_BINDING_NAME,
@@ -201,7 +206,13 @@ export class CdpHudBridge implements ICdpHudBridge {
       runningSubagentCount,
       childConversationIds,
       lastUpdatedAt: nowMs,
-      lastMetricsKey: sameConv ? sameConv.lastMetricsKey : '',
+      lastMetricsKey:
+        !sameConv ||
+        parsed.type === 'SESSION_ATTACHED' ||
+        parsed.type === 'REQUEST_REFRESH' ||
+        nextRevision > sameConv.sessionRevision
+          ? ''
+          : sameConv.lastMetricsKey,
       lastActivityAt:
         resolvedStreaming || parsed.type === 'STREAMING_CHANGED' || isSubagentRunning
           ? nowMs

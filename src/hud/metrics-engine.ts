@@ -2060,6 +2060,14 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const lastTurnStepAborted =
     lastTurnStep !== undefined &&
     (lastTurnStep.status === 4 || lastTurnStep.status === 6 || lastTurnStep.status === 7);
+  const lastTurnStepAbortedMissingEnd =
+    lastTurnStepAborted &&
+    !validSeconds(
+      lastTurnStep!.t_end ??
+        lastTurnStep!.endTimeSeconds ??
+        lastTurnStep!.completedAtSeconds ??
+        lastTurnStep!.finishedGeneratingSeconds
+    );
   const allowForegroundActiveInTurn = allowActiveInference && !(!input.isStreaming && lastTurnStepAborted);
 
   const trackWallStart = (ts: number | null | undefined) => {
@@ -2158,7 +2166,9 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
     if (turnWallStart !== null) {
       if (validSeconds(start)) return start >= turnWallStart - 1;
       if (validSeconds(end)) return end >= turnWallStart - 1;
-      return false;
+      const activeChildNow =
+        availability !== 'cached' && isStepActiveNow(step, isStreaming, allowActiveInference);
+      return Boolean(hasSubagentStepInTurn && activeChildNow);
     }
     if (prevTurnBoundarySeconds !== null) {
       const activeChildNow =
@@ -2223,6 +2233,12 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
           if (!NON_TOOL_STEP_TYPES.has(stepType)) {
             turnToolIntervals.push(toolInterval);
           }
+        }
+      } else if (rawStatus === 4 || rawStatus === 6 || rawStatus === 7) {
+        const terminalEndedTs =
+          rawEnd ?? childStep.completedAtSeconds ?? childStep.finishedGeneratingSeconds;
+        if (validSeconds(terminalEndedTs) && (!validSeconds(start) || terminalEndedTs >= start)) {
+          trackWallEnd(terminalEndedTs);
         }
       }
     }
@@ -2330,7 +2346,15 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
   const currentTurnOutputTpsPending = currentTurnTimedSamples === 0 && isStreaming;
   const currentTurnOutputTpsFormatted =
     currentTurnTimedSamples > 0 ? currentTurnTpsInfo.formatted : isStreaming ? bt('metrics.calculating') : '—';
-  const lastContextStep = contextSteps.length > 0 ? contextSteps[contextSteps.length - 1] : undefined;
+  const TRANSPARENT_HANDOFF_STEP_TYPES = new Set([81, 98, 99, 101, 102, 104]);
+  let effectiveLastCtxIdx = contextSteps.length - 1;
+  while (effectiveLastCtxIdx > lastTurnStartIndex && effectiveLastCtxIdx >= 0) {
+    const candidate = contextSteps[effectiveLastCtxIdx]!;
+    const candidateType = candidate.step_type ?? candidate.stepType ?? 0;
+    if (!TRANSPARENT_HANDOFF_STEP_TYPES.has(candidateType)) break;
+    effectiveLastCtxIdx--;
+  }
+  const lastContextStep = effectiveLastCtxIdx >= 0 ? contextSteps[effectiveLastCtxIdx] : undefined;
   const lastContextStepType = lastContextStep ? (lastContextStep.step_type ?? lastContextStep.stepType ?? 0) : 0;
   const lastContextStepStatus = lastContextStep?.status ?? 3;
   const lastContextToolCompleted =
@@ -2349,7 +2373,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       activeModelStepCount === 0 &&
       activeToolStepCount === 0 &&
       (contextSteps.length === 0 ||
-        lastTurnStartIndex === contextSteps.length - 1 ||
+        lastTurnStartIndex === effectiveLastCtxIdx ||
         ((lastContextStepType === 2 || lastContextStepType === 23) &&
           (lastContextStepStatus === 3 || lastContextStepStatus === 5)) ||
         lastContextToolCompleted)
@@ -2398,6 +2422,7 @@ export function buildConversationHudMetrics(input: ComputeHudMetricsInput): Conv
       subagentSteps: resolvedSubagentSteps,
       hasSubagentInTurn,
       ...(lastTurnStepAborted ? { turnAborted: true } : {}),
+      ...(lastTurnStepAbortedMissingEnd ? { turnAbortedMissingEnd: true } : {}),
       ...(input.isSubagentTrajectory ? { isSubagentTrajectory: true } : {}),
       ...(awaitingFirstTurnStep ? { awaitingFirstTurnStep: true } : {}),
       modelDurationSeconds,
@@ -2574,7 +2599,7 @@ export class ConversationMetricsEngine {
   private readonly recentActiveChildUntilByDb = new Map<string, number>();
   private readonly coldSniffedByDb = new Map<string, { fileId: string; stepCount: number }>();
   private readonly rejectedSniffMtimeByKey = new Map<string, number>();
-  private readonly summariesChildCache = new Map<string, { sig: string; childIds: string[]; terminalChildIds: string[] }>();
+  private readonly summariesChildCache = new Map<string, { sig: string; childIds: string[]; terminalChildIds: string[]; runningChildIds: string[]; selfRunning: boolean }>();
   private summariesMissingUntilMs = 0;
   private sniffDirCache: { at: number; dirMtimeMs: number; allEntries: Array<{ id: string; mtimeMs: number }> } | null = null;
   private sniffDirListCache: { dirMtimeMs: number; dbEntries: Array<{ file: string; id: string }> } | null = null;
@@ -2633,13 +2658,16 @@ export class ConversationMetricsEngine {
   }
 
   private async lookupIndexedChildrenFromSummariesDb(
-    parentIds: string[]
-  ): Promise<{ available: boolean; childIds: Set<string>; terminalChildIds: Set<string> }> {
+    parentIds: string[],
+    selfIds: string[] = []
+  ): Promise<{ available: boolean; childIds: Set<string>; terminalChildIds: Set<string>; runningChildIds: Set<string>; selfRunning: boolean }> {
     const cleanParents = [...new Set(parentIds.map(p => p.trim().toLowerCase()).filter(Boolean))].sort();
-    if (cleanParents.length === 0) return { available: false, childIds: new Set(), terminalChildIds: new Set() };
+    const cleanSelf = [...new Set(selfIds.map(s => s.trim().toLowerCase()).filter(Boolean))].sort();
+    const emptyRes = () => ({ available: false, childIds: new Set<string>(), terminalChildIds: new Set<string>(), runningChildIds: new Set<string>(), selfRunning: false });
+    if (cleanParents.length === 0 && cleanSelf.length === 0) return emptyRes();
     const now = Date.now();
     if (now < this.summariesMissingUntilMs) {
-      return { available: false, childIds: new Set(), terminalChildIds: new Set() };
+      return emptyRes();
     }
     let targetPath = this.summariesDbPath;
     let st = await lstat(targetPath).catch(() => null);
@@ -2648,28 +2676,42 @@ export class ConversationMetricsEngine {
       st = await lstat(altPath).catch(() => null);
       if (!st || !st.isFile() || st.isSymbolicLink()) {
         this.summariesMissingUntilMs = now + 2000;
-        return { available: false, childIds: new Set(), terminalChildIds: new Set() };
+        return emptyRes();
       }
       targetPath = altPath;
     }
     const walSt = await lstat(`${targetPath}-wal`).catch(() => null);
     const sig = `${targetPath}|${st.mtimeMs}:${st.size}:${walSt?.mtimeMs ?? 0}:${walSt?.size ?? 0}`;
-    const cacheKey = cleanParents.join('|');
+    const cacheKey = `p:${cleanParents.join('|')}#s:${cleanSelf.join('|')}`;
     const cached = this.summariesChildCache.get(cacheKey);
     if (cached && cached.sig === sig) {
-      return { available: true, childIds: new Set(cached.childIds), terminalChildIds: new Set(cached.terminalChildIds) };
+      return {
+        available: true,
+        childIds: new Set(cached.childIds),
+        terminalChildIds: new Set(cached.terminalChildIds),
+        runningChildIds: new Set(cached.runningChildIds),
+        selfRunning: cached.selfRunning,
+      };
     }
-    const res = await runSummariesLookupInWorker({ dbPath: targetPath, parentIds: cleanParents });
+    const res = await runSummariesLookupInWorker({ dbPath: targetPath, parentIds: cleanParents, selfIds: cleanSelf });
     if (!res || !res.foundTable) {
-      return { available: false, childIds: new Set(), terminalChildIds: new Set() };
+      return emptyRes();
     }
     if (this.summariesChildCache.size >= MAX_CACHED_CONVERSATIONS && !this.summariesChildCache.has(cacheKey)) {
       const oldest = this.summariesChildCache.keys().next().value;
       if (oldest !== undefined) this.summariesChildCache.delete(oldest);
     }
     const terminalList = Array.isArray(res.terminalChildIds) ? res.terminalChildIds : [];
-    this.summariesChildCache.set(cacheKey, { sig, childIds: res.childIds, terminalChildIds: terminalList });
-    return { available: true, childIds: new Set(res.childIds), terminalChildIds: new Set(terminalList) };
+    const runningList = Array.isArray(res.runningChildIds) ? res.runningChildIds : [];
+    const selfRunning = Boolean(res.selfRunning);
+    this.summariesChildCache.set(cacheKey, { sig, childIds: res.childIds, terminalChildIds: terminalList, runningChildIds: runningList, selfRunning });
+    return {
+      available: true,
+      childIds: new Set(res.childIds),
+      terminalChildIds: new Set(terminalList),
+      runningChildIds: new Set(runningList),
+      selfRunning,
+    };
   }
 
   private setCachedState(dbPath: string, state: CachedConversationState): void {
@@ -3243,13 +3285,23 @@ export class ConversationMetricsEngine {
         Boolean(s.toolCallName && SUBAGENT_TOOL_NAMES.has(s.toolCallName))
     );
 
-    // 优先通过官方 conversation_summaries.db 索引表 O(log N) 精确检索全量子会话（含超时 5 分钟的 Swarm Workers）
+    const isSubagentTrajectory = Boolean(
+      dbPathOverride || (mainState.hasParentMetadataBlob && mainState.referencedUuidsInMetaBlob.size > 0)
+    );
+    // 优先通过官方 conversation_summaries.db 索引表 O(log N) 精确检索全量子会话与分屏子智能体自身运行态
     const indexedSummaryChildren = new Set<string>();
     const terminalSummaryChildren = new Set<string>();
+    const runningSummaryChildren = new Set<string>();
+    let selfSummaryRunning = false;
     let summariesIndexAvailable = false;
-    if (!dbPathOverride && (isSubagentRunning || hasActiveSubagentStep || hasSubagentEvidenceInMain || candidateChildIds.size > 0)) {
+    const shouldQueryChildrenInSummaries =
+      !dbPathOverride && (isSubagentRunning || hasActiveSubagentStep || hasSubagentEvidenceInMain || candidateChildIds.size > 0);
+    const shouldQuerySelfInSummaries = isSubagentTrajectory && mainIsRecent && !isStreaming;
+    if (shouldQueryChildrenInSummaries || shouldQuerySelfInSummaries) {
+      const selfIdentityIds = mainTrajLower ? [mainIdLower, mainTrajLower] : [mainIdLower];
       const summaryLookup = await this.lookupIndexedChildrenFromSummariesDb(
-        mainTrajLower ? [mainIdLower, mainTrajLower] : [mainIdLower]
+        shouldQueryChildrenInSummaries ? selfIdentityIds : [],
+        shouldQuerySelfInSummaries ? selfIdentityIds : []
       );
       summariesIndexAvailable = summaryLookup.available;
       for (const indexedId of summaryLookup.childIds) {
@@ -3261,6 +3313,10 @@ export class ConversationMetricsEngine {
       for (const termId of summaryLookup.terminalChildIds) {
         terminalSummaryChildren.add(termId);
       }
+      for (const runId of summaryLookup.runningChildIds) {
+        runningSummaryChildren.add(runId);
+      }
+      selfSummaryRunning = summaryLookup.selfRunning;
     }
 
     // 反向子会话文件嗅探回退：仅当官方 summaries 索引库不存在或运行期尚未登记任何子会话时启用
@@ -3506,6 +3562,9 @@ export class ConversationMetricsEngine {
                 break;
               }
             }
+            if (!childTurnTerminated && runningSummaryChildren.has(childId)) {
+              childActive = true;
+            }
             if (childActive) {
               if (this.recentActiveChildUntilByDb.has(item.childDbPath)) {
                 this.recentActiveChildUntilByDb.delete(item.childDbPath);
@@ -3517,7 +3576,9 @@ export class ConversationMetricsEngine {
   // 在活跃多子智能体并行期内，只要还有兄弟子库真正处于运行中且主库无否定收尾，保留刚写入且无 step_type=2 终结符的子库短过渡窗（仅防 15s 步间落库抖动，避免兄弟已彻底落定很久后拖尾虚高）
             } else if (!childTurnTerminated && childState.steps.length > 0) {
               const holdUntil = this.recentActiveChildUntilByDb.get(item.childDbPath) ?? 0;
-              const parentCorroboratesActive = Boolean(isSubagentRunning || hasActiveSubagentStep);
+              const parentCorroboratesActive = Boolean(
+                isSubagentRunning || hasActiveSubagentStep || activeChildSubagents > 0 || runningSummaryChildren.size > 0
+              );
               const childMidStepTransition =
                 nowMs - latestChildMtime <= 15_000 && parentCorroboratesActive;
               if ((holdUntil > nowMs && parentCorroboratesActive) || childMidStepTransition) {
@@ -3618,16 +3679,26 @@ export class ConversationMetricsEngine {
       observedAt: mainState.observedAt,
       lastSuccessAt: mainState.lastSuccessAt,
       failedChildCount,
-      // 传入原始前台 isStreaming，使 buildConversationHudMetrics 能准确区分“前台模型生成（常亮蓝）”与“仅后台子智能体运行（呼吸蓝）”
-      isStreaming,
+      // 传入前台流式信号（分屏子智能体无独立停止按钮时结合 summaries.db 实锤 RUNNING 且末步未完结信号保活）
+      isStreaming: Boolean(
+        isStreaming ||
+          (selfSummaryRunning &&
+            mainIsRecent &&
+            !(() => {
+              const tail = normalizedContextSteps[normalizedContextSteps.length - 1];
+              if (!tail) return false;
+              if (tail.stepType === 2 && (tail.status === 3 || tail.status === 5)) return true;
+              return tail.status === 4 || tail.status === 6 || tail.status === 7;
+            })())
+      ),
       activityPhase,
       isSubagentRunning: effectiveSubagentRunning,
       runningSubagentCount: effectiveRunningSubagents,
       subagentCount: dbPathOverride ? undefined : verifiedChildIds.size,
       subagentSteps: totalSubagentSteps,
       totalStepsOverride: mainState.steps.length + totalSubagentSteps,
-      allowDbActiveStepInference: mainIsRecent || isStreaming || effectiveSubagentRunning,
-      isSubagentTrajectory: Boolean(dbPathOverride || (mainState.hasParentMetadataBlob && mainState.referencedUuidsInMetaBlob.size > 0)),
+      allowDbActiveStepInference: mainIsRecent || isStreaming || effectiveSubagentRunning || selfSummaryRunning,
+      isSubagentTrajectory,
       modelId,
       pricingTable,
       genMetadata: mainState.genMetadata,

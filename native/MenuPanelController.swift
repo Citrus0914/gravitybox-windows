@@ -52,6 +52,7 @@ final class MenuPanelController: NSViewController {
     let quotaTierBadge = tierBadge("", scale: .regular)
     let quotaStatusBadge = pillBadge("", color: Design.blue)
     let quotaEmailLabel = text("", size: 11, color: .secondaryLabelColor, wrap: true)
+    /// @testonly 保留供 native-ui 单测读取首个配额进度条快照，生产界面统一通过 quotaGroupsContainer 渲染。
     private(set) var quotaGemini5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时"))
     private(set) var quotaGeminiWeekly = MenuMeterRow(title: L10n.t("common.period.weekly", fallback: "每周"))
     private(set) var quotaClaude5h = MenuMeterRow(title: L10n.t("common.period.5h", fallback: "5 小时"))

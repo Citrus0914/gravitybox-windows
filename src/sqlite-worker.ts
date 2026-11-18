@@ -612,20 +612,28 @@ export interface UsageWorkerScanResult {
 export interface SummariesLookupRequest {
   dbPath: string;
   parentIds: string[];
+  selfIds?: string[];
 }
 
 export interface SummariesLookupResult {
   foundTable: boolean;
   childIds: string[];
   terminalChildIds: string[];
+  runningChildIds: string[];
+  selfRunning: boolean;
 }
 
 const NON_RUNNING_SUMMARY_STATUS_RE =
   /^(?:CASCADE_RUN_STATUS_)?(?:IDLE|UNSPECIFIED|DONE|COMPLETED|CLEARED|ERROR|CANCELL?ED|KILLED)$/i;
+const RUNNING_SUMMARY_STATUS_RE =
+  /^(?:CASCADE_RUN_STATUS_)?(?:RUNNING|IN_PROGRESS|ACTIVE)$/i;
 
 function executeSummariesLookup(req: SummariesLookupRequest): SummariesLookupResult {
   const cleanParents = [...new Set((req.parentIds ?? []).map(p => String(p ?? '').trim().toLowerCase()).filter(Boolean))];
-  if (cleanParents.length === 0) return { foundTable: false, childIds: [], terminalChildIds: [] };
+  const cleanSelfIds = [...new Set((req.selfIds ?? []).map(s => String(s ?? '').trim().toLowerCase()).filter(Boolean))];
+  if (cleanParents.length === 0 && cleanSelfIds.length === 0) {
+    return { foundTable: false, childIds: [], terminalChildIds: [], runningChildIds: [], selfRunning: false };
+  }
   const db = new DatabaseSync(req.dbPath, { readOnly: true });
   try {
     db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 400;');
@@ -633,10 +641,14 @@ function executeSummariesLookup(req: SummariesLookupRequest): SummariesLookupRes
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('conversation_parents', 'conversation_summaries')")
       .all() as Array<{ name?: unknown }>;
     const tableSet = new Set(tables.map(t => String(t.name ?? '')));
-    if (tableSet.size === 0) return { foundTable: false, childIds: [], terminalChildIds: [] };
+    if (tableSet.size === 0) {
+      return { foundTable: false, childIds: [], terminalChildIds: [], runningChildIds: [], selfRunning: false };
+    }
     const childIds = new Set<string>();
     const terminalChildIds = new Set<string>();
-    if (tableSet.has('conversation_parents')) {
+    const runningChildIds = new Set<string>();
+    let selfRunning = false;
+    if (cleanParents.length > 0 && tableSet.has('conversation_parents')) {
       const pCols = new Set(
         (db.prepare('PRAGMA table_info(conversation_parents)').all() as Array<{ name?: unknown }>).map(c => String(c.name ?? ''))
       );
@@ -660,36 +672,57 @@ function executeSummariesLookup(req: SummariesLookupRequest): SummariesLookupRes
       const parentCol = cols.has('parent_conversation_id') ? 'parent_conversation_id' : cols.has('parent_id') ? 'parent_id' : '';
       const hasStatus = cols.has('status');
       const selectStatusSql = hasStatus ? ', status' : '';
-      if (childCol && parentCol) {
+      const classifySummaryStatus = (cid: string, rawStatus: unknown) => {
+        if (!hasStatus || rawStatus === null || rawStatus === undefined) return;
+        const rawSt = String(rawStatus).trim();
+        if (NON_RUNNING_SUMMARY_STATUS_RE.test(rawSt) || rawSt === '0' || rawSt === '1') {
+          terminalChildIds.add(cid);
+        } else if (RUNNING_SUMMARY_STATUS_RE.test(rawSt) || rawSt === '2') {
+          runningChildIds.add(cid);
+        }
+      };
+      if (cleanParents.length > 0 && childCol && parentCol) {
         const stmt = db.prepare(`SELECT ${childCol} AS cid${selectStatusSql} FROM conversation_summaries WHERE lower(${parentCol}) = ?`);
         for (const pid of cleanParents) {
           for (const r of stmt.all(pid) as Array<{ cid?: unknown; status?: unknown }>) {
             const cid = String(r.cid ?? '').trim().toLowerCase();
             if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(cid)) {
               childIds.add(cid);
-              if (hasStatus && r.status !== null && r.status !== undefined) {
-                const rawSt = String(r.status).trim();
-                if (NON_RUNNING_SUMMARY_STATUS_RE.test(rawSt) || rawSt === '0' || rawSt === '1') {
-                  terminalChildIds.add(cid);
-                }
-              }
+              classifySummaryStatus(cid, r.status);
             }
           }
         }
-      } else if (childCol && hasStatus && childIds.size > 0) {
+      } else if (cleanParents.length > 0 && childCol && hasStatus && childIds.size > 0) {
         const byIdStmt = db.prepare(`SELECT status FROM conversation_summaries WHERE lower(${childCol}) = ?`);
         for (const cid of childIds) {
           const row = byIdStmt.get(cid) as { status?: unknown } | undefined;
-          if (row && row.status !== null && row.status !== undefined) {
-            const rawSt = String(row.status).trim();
-            if (NON_RUNNING_SUMMARY_STATUS_RE.test(rawSt) || rawSt === '0' || rawSt === '1') {
-              terminalChildIds.add(cid);
+          if (row) classifySummaryStatus(cid, row.status);
+        }
+      }
+      if (cleanSelfIds.length > 0 && childCol && hasStatus) {
+        const selfStmt = db.prepare(`SELECT status FROM conversation_summaries WHERE lower(${childCol}) = ?`);
+        for (const sid of cleanSelfIds) {
+          const rows = selfStmt.all(sid) as Array<{ status?: unknown }>;
+          for (const row of rows) {
+            if (row && row.status !== null && row.status !== undefined) {
+              const rawSt = String(row.status).trim();
+              if (RUNNING_SUMMARY_STATUS_RE.test(rawSt) || rawSt === '2') {
+                selfRunning = true;
+                break;
+              }
             }
           }
+          if (selfRunning) break;
         }
       }
     }
-    return { foundTable: true, childIds: [...childIds], terminalChildIds: [...terminalChildIds] };
+    return {
+      foundTable: true,
+      childIds: [...childIds],
+      terminalChildIds: [...terminalChildIds],
+      runningChildIds: [...runningChildIds],
+      selfRunning,
+    };
   } finally {
     try { db.close(); } catch {}
   }

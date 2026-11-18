@@ -23,9 +23,9 @@ enum ModelIcons {
     static func brands(for title:String) -> [String] {
         let lower=title.lowercased()
         if lower.contains("claude") && (lower.contains("gpt") || lower.contains("openai")) { return ["claude","openai"] }
-        if lower.contains("gemini") || lower.contains("orchestrator") || lower.contains("argon") || lower.contains("carbon") { return ["gemini"] }
+        if lower.contains("gemini") || lower.contains("orchestrator") || lower.contains("argon") || lower.contains("carbon") || lower.contains("hydrogen") || lower.contains("neon") { return ["gemini"] }
         if lower.contains("claude") { return ["claude"] }
-        if lower.contains("gpt") || lower.contains("openai") { return ["openai"] }
+        if lower.contains("gpt") || lower.contains("openai") || lower.range(of: "(?:^|\\b)o[1-9](?:$|[-_\\s])", options: .regularExpression) != nil { return ["openai"] }
         return []
     }
 }

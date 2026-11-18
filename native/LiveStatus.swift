@@ -97,6 +97,11 @@ struct LiveStatus {
         if !dictionaryError.isEmpty { return .systemOrange }
         switch mode {
         case "connected": return languageMode == "zh" ? .systemGreen : .systemBlue
+        case "paused":
+            if (L10n.shared.currentLocale == "en" || locale == "en") && windows > 0 {
+                return .systemBlue
+            }
+            return .secondaryLabelColor
         case "adaptive", "unsupported", "legacy-blocked": return .systemOrange
         case "error": return .systemRed
         default: return .secondaryLabelColor

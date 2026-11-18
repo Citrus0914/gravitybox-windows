@@ -133,6 +133,9 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
             const unpriced = !lock || zeroSentinel || lockedMissingCw;
             if (options.mode !== 'unpriced_only' || unpriced) {
                 candidateLocks.delete(eventKey);
+                if (typeof event.legacy_event_key === 'string' && event.legacy_event_key) {
+                    candidateLocks.delete(event.legacy_event_key);
+                }
             }
         }
         const after = aggregateLedger(db, {

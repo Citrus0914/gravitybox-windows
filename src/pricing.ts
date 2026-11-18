@@ -557,7 +557,6 @@ function isUserVisiblePreviewChatModel(
   rawDisplayName: string,
   feedModelSet: Set<string>
 ): boolean {
-  if (sourceKind === 'account_cloud') return false;
   if (!normBase || feedModelSet.has(normBase) || LEGACY_INTERNAL_TRIAL_LITE_IDS.has(normBase)) {
     return false;
   }
@@ -571,6 +570,9 @@ function isUserVisiblePreviewChatModel(
   }
   const label = rawDisplayName.trim();
   if (!label || /^model_placeholder_/i.test(label) || label.toLowerCase() === id.toLowerCase()) {
+    return false;
+  }
+  if (sourceKind === 'account_cloud' && !/\s/.test(label)) {
     return false;
   }
   return /(?:^|[-_])(?:flash[-_]lite|trial)(?:$|[-_])/i.test(id);
@@ -628,7 +630,7 @@ function extractCatalogModels(
   }
 
   const isOpenAiFamily = (key: string): boolean =>
-    key.startsWith('gpt-') || /^o[134](?:$|[-_])/.test(key);
+    key.startsWith('gpt-') || /^o[1-9](?:$|[-_])/.test(key);
   const hasEnabledActiveClaude = parsed.some(
     (c) => !c.disabled && c.canonicalKey.startsWith('claude-') && effectiveActiveSet.has(c.canonicalKey)
   );

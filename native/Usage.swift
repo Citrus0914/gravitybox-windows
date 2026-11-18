@@ -328,7 +328,8 @@ final class UsagePage: NSObject {
         let pricedCount = (summary["pricedModels"] as? Int) ?? (summary["priced_models"] as? Int) ?? (value["pricedModels"] as? Int) ?? 0
         let unpricedCount = (summary["unpricedModels"] as? Int) ?? (summary["unpriced_models"] as? Int) ?? (value["unpricedModels"] as? Int) ?? 0
         self.costTitle.stringValue = L10n.t("usage.section.cost")
-        self.usdMetric.stringValue = unpricedCount > 0 && pricedCount == 0 && usd == 0 ? L10n.t("menu_panel.usage.unpriced") : self.formatUsd(usd)
+        let partialPrefix = (unpricedCount > 0 && (pricedCount > 0 || usd > 0)) ? L10n.t("usage.models.partial_prefix") : ""
+        self.usdMetric.stringValue = unpricedCount > 0 && pricedCount == 0 && usd == 0 ? L10n.t("menu_panel.usage.unpriced") : partialPrefix + self.formatUsd(usd)
         self.usdDetail.stringValue = ""
         self.usdDetail.isHidden = true
 
@@ -561,6 +562,7 @@ final class UsagePage: NSObject {
 
         for item in modelRows {
             let name = InterfaceText.localizedModelLabel(item["model"] as? String)
+            let rawModelId = (item["modelId"] as? String) ?? (item["model_id"] as? String)
             let mTokens = intVal(item, "totalTokens", fallback: intVal(item, "total_tokens"))
             let mIn = intVal(item, "promptTokens", fallback: intVal(item, "input_tokens"))
             let mOut = intVal(item, "candidatesTokens", fallback: intVal(item, "output_tokens"))
@@ -573,20 +575,12 @@ final class UsagePage: NSObject {
             var usdStr: String
             let isItemUnpriced = !(isItemPriced || (item["partiallyPriced"] as? Bool == true)) && mTokens > 0
             if isItemPriced || (item["partiallyPriced"] as? Bool == true) {
-                if mUsd > 0 && mUsd < 0.001 {
-                    usdStr = "<$0.001"
-                } else if mUsd < 0.01 && mUsd > 0 {
-                    usdStr = String(format: "$%.3f", locale: Locale(identifier: "en_US_POSIX"), mUsd)
-                } else if mUsd == 0 {
-                    usdStr = "$0.00"
-                } else {
-                    usdStr = String(format: "$%.2f", locale: Locale(identifier: "en_US_POSIX"), mUsd)
-                }
+                usdStr = self.formatUsd(mUsd)
             } else {
                 usdStr = mTokens > 0 ? L10n.t("menu_panel.usage.unpriced") : "$0.00"
             }
             if item["partiallyPriced"] as? Bool == true { usdStr = L10n.t("usage.models.partial_prefix") + usdStr }
-            let row = ModelUsageRow(name: name, tokens: formatCompactTokens(mTokens), input: formatCompactTokens(mIn), output: formatCompactTokens(mOut), requests: mReq, cost: usdStr, share: sharePct, shareText: shareText, isUnpriced: isItemUnpriced)
+            let row = ModelUsageRow(name: name, rawModelId: rawModelId, tokens: formatCompactTokens(mTokens), input: formatCompactTokens(mIn), output: formatCompactTokens(mOut), requests: mReq, cost: usdStr, share: sharePct, shareText: shareText, isUnpriced: isItemUnpriced)
             if !modelsBreakdownStack.arrangedSubviews.isEmpty {
                 let line = divider(); modelsBreakdownStack.addArrangedSubview(line); fillWidth(line, in: modelsBreakdownStack)
             }

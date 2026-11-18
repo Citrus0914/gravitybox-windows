@@ -1452,7 +1452,12 @@ export function buildAccountQuotaOverview(account: Account | AccountSummary | { 
     carbonResetCountdown: legacySnapshot.carbonWeeklyResetCountdown,
     resetTime,
     resetCountdown,
-    subscriptionTier: quota.subscription_tier && /\b(?:free|starter|trial)\b/i.test(quota.subscription_tier) ? 'FREE' : quota.subscription_tier || bt('quota.tier.pending'),
+    subscriptionTier: !quota.subscription_tier
+      ? bt('quota.tier.pending')
+      : !/\b(?:ultra|enterprise|teams?|business|workspace|plus|pro|ai\s+premium)\b/i.test(quota.subscription_tier) &&
+        /\b(?:free|starter|trial)\b/i.test(quota.subscription_tier)
+      ? 'FREE'
+      : quota.subscription_tier,
     quotaGroups: outGroups,
     staleGroups,
     unknownBuckets,

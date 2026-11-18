@@ -380,6 +380,7 @@ final class DashboardPage: NSObject {
 
     private static func makeBentoSubRow(
         title: String,
+        copyModelId: String? = nil,
         badgeText: String,
         badgeTint: NSColor,
         subtitle: String,
@@ -391,7 +392,9 @@ final class DashboardPage: NSObject {
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         nameLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        enableTextCopy(nameLabel, value: title, title: L10n.t("overview.copy_model_id"))
+        if let copyModelId, !copyModelId.isEmpty {
+            enableTextCopy(nameLabel, value: copyModelId, title: L10n.t("overview.copy_model_id"))
+        }
 
         let pill = pillBadge(badgeText, color: badgeTint)
         pill.isHidden = badgeText.isEmpty
@@ -560,6 +563,7 @@ final class DashboardPage: NSObject {
             rightBentoCountBadge.tint = Design.blue
             for item in models.prefix(shown) {
                 let displayModel = InterfaceText.localizedModelLabel(item["model"] as? String)
+                let rawModelId = (item["modelId"] as? String) ?? (item["model_id"] as? String) ?? displayModel
                 let mTokens = intVal(item, "totalTokens", fallback: intVal(item, "total_tokens"))
                 let mReqs = intVal(item, "requestCount", fallback: intVal(item, "request_count"))
                 let mUsd = doubleVal(item, "estimatedUsd", fallback: doubleVal(item, "estimated_usd"))
@@ -576,6 +580,7 @@ final class DashboardPage: NSObject {
                 let costNote = mUsd > 0 ? " · \(InterfaceText.formatUsd(mUsd))" : ""
                 let row = Self.makeBentoSubRow(
                     title: displayModel,
+                    copyModelId: rawModelId,
                     badgeText: "",
                     badgeTint: Design.blue,
                     subtitle: L10n.t("overview.bento.model_sub_multi", ["reqs": InterfaceText.formatInteger(mReqs), "share": shareNote, "cost": costNote]),
@@ -591,12 +596,14 @@ final class DashboardPage: NSObject {
             rightBentoCountBadge.tint = Design.blue
             let topModel = models[0]
             let displayModel = InterfaceText.localizedModelLabel(topModel["model"] as? String)
+            let rawModelId = (topModel["modelId"] as? String) ?? (topModel["model_id"] as? String) ?? displayModel
             let mTokens = intVal(topModel, "totalTokens", fallback: intVal(topModel, "total_tokens"))
             let mReqs = intVal(topModel, "requestCount", fallback: intVal(topModel, "request_count"))
             let mUsd = doubleVal(topModel, "estimatedUsd", fallback: doubleVal(topModel, "estimated_usd"))
             let costNote = mUsd > 0 ? " · \(InterfaceText.formatUsd(mUsd))" : ""
             let row1 = Self.makeBentoSubRow(
                 title: displayModel,
+                copyModelId: rawModelId,
                 badgeText: "",
                 badgeTint: Design.blue,
                 subtitle: L10n.t("overview.bento.model_sub_single", ["reqs": InterfaceText.formatInteger(mReqs), "cost": costNote]),

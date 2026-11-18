@@ -758,11 +758,14 @@ final class UsageTrendChartView: NSView {
 
 // MARK: - ModelDonutChartView (CoreGraphics Multi-Segment Donut Chart for Model Cost Share)
 final class ModelDonutChartView: NSView {
-    struct Slice {
+    struct Slice: Equatable {
         let model: String
         let usd: Double
         let tokens: Int
         let color: NSColor
+        static func == (lhs: Slice, rhs: Slice) -> Bool {
+            lhs.model == rhs.model && lhs.tokens == rhs.tokens && abs(lhs.usd - rhs.usd) < 1e-9
+        }
     }
     private var revealProgress: CGFloat = 1.0
     private let revealMotion = DesignMotion()
@@ -774,9 +777,7 @@ final class ModelDonutChartView: NSView {
         didSet {
             hoveredSliceIndex = nil
             hoverEmphasis = 0.0
-            let oldKey = oldValue.map { "\($0.model):\($0.usd):\($0.tokens)" }.joined(separator: "|")
-            let newKey = slices.map { "\($0.model):\($0.usd):\($0.tokens)" }.joined(separator: "|")
-            guard oldKey != newKey else {
+            guard oldValue != slices else {
                 needsDisplay = true
                 return
             }
@@ -980,12 +981,8 @@ final class ModelDonutChartView: NSView {
         let usdText: NSString
         if totalUsd > 0 && totalUsd < 0.001 {
             usdText = "<$0.001" as NSString
-        } else if activeUsd > 0 && activeUsd < 0.001 {
-            usdText = "<$0.001" as NSString
-        } else if activeUsd < 0.01 && activeUsd > 0 {
-            usdText = String(format: "$%.3f", locale: Locale(identifier: "en_US_POSIX"), activeUsd) as NSString
         } else {
-            usdText = String(format: "$%.2f", locale: Locale(identifier: "en_US_POSIX"), activeUsd) as NSString
+            usdText = InterfaceText.formatUsd(activeUsd) as NSString
         }
         let mainAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 15, weight: .bold),

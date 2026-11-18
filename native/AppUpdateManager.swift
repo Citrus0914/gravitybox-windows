@@ -301,6 +301,7 @@ final class AppUpdateManager {
         }
     }
 
+    /// @testonly 供 native-ui 单测验证更新日志清洗规则（生产关于页直接打开 GitHub Release 页面）。
     static func formatReleaseNotes(_ raw: String) -> String {
         let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")

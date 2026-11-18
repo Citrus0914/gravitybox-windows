@@ -743,7 +743,10 @@ async function run() {
         const counts = store.layerCounts;
         const dictTotal = (counts?.builtin ?? 0) + (counts?.incremental ?? 0) + (counts?.personal ?? 0);
         const livePromise = probeLiveCached().catch(() => null);
-        const pricingSyncPromise = syncActiveOfficialModelsToUsageManager();
+        const pricingSyncPromise = Promise.all([
+          syncActiveOfficialModelsToUsageManager(),
+          syncActiveAccountToUsageManager().catch(() => {}),
+        ]);
         const [report, aggregate] = await Promise.all([
           controller.coverageReport(),
           buildDashboardAggregate({
@@ -905,8 +908,20 @@ async function run() {
               const entries = await readdir(geminiDir, { withFileTypes: true }).catch(() => [] as any[]);
               for (const entry of entries) {
                 if (!entry.isDirectory() || !allowedDataDirs.has(entry.name)) continue;
+                const summariesDb = join(geminiDir, entry.name, 'conversation_summaries.db');
+                const [sumSt, sumWalSt] = await Promise.all([
+                  lstat(summariesDb).catch(() => null),
+                  lstat(`${summariesDb}-wal`).catch(() => null),
+                ]);
+                if ((sumSt && nowMs - sumSt.mtimeMs < 15000) || (sumWalSt && nowMs - sumWalSt.mtimeMs < 15000)) {
+                  hasRunningTask = true;
+                  taskReason = bt('main.task.active_session');
+                  break;
+                }
                 for (const sub of ['conversations', 'brain']) {
                   const subDir = join(geminiDir, entry.name, sub);
+                  const dirSt = await lstat(subDir).catch(() => null);
+                  if (!dirSt) continue;
                   const files = await readdir(subDir).catch(() => [] as string[]);
                   for (let i = 0; i < files.length; i += 32) {
                     const stats = await Promise.all(files.slice(i, i + 32).map(f => lstat(join(subDir, f)).catch(() => null)));
@@ -993,14 +1008,14 @@ async function run() {
           if (command === 'usage_events') {
             const period = ['today', '7d', '30d', 'all'].includes(String(parsed.period)) ? String(parsed.period) : 'today';
             const targetAccountId = typeof parsed.accountId === 'string' && parsed.accountId ? parsed.accountId : undefined;
-            if (targetAccountId) await syncActiveAccountToUsageManager().catch(() => {});
+            await syncActiveAccountToUsageManager().catch(() => {});
             reply({ ok: true, ...await usageManager.getUsageEvents(period, String(parsed.query ?? ''), Number(parsed.offset), Number(parsed.limit), typeof parsed.snapshotId === 'string' ? parsed.snapshotId : undefined, parsed.pinSnapshot === true, Boolean(parsed.force), targetAccountId) });
             return;
           }
           if (command === 'usage_summary') {
             const force = Boolean(parsed.force);
             const targetAccountId = typeof parsed.accountId === 'string' && parsed.accountId ? parsed.accountId : undefined;
-            if (targetAccountId) await syncActiveAccountToUsageManager().catch(() => {});
+            await syncActiveAccountToUsageManager().catch(() => {});
             const usage = await usageManager.getUsageSummary(force, targetAccountId);
             reply(projectUsagePeriodSummary(usage, parsed.period, { includeAllPeriods: !targetAccountId || targetAccountId === 'all' }));
             return;

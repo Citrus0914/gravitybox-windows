@@ -163,7 +163,14 @@ jobs:
             const fs = require('fs');
             const report = JSON.parse(fs.readFileSync('pricing-watch-alert.json', 'utf8'));
             const title = '[Pricing Watch] Upstream model rate drift or promotional expiry detected';
-            const needsIssue = process.env.DECISION === 'yellow_needs_review' || process.env.GATE_PASSED !== 'true';
+            const hasPendingReviewItems =
+              (Array.isArray(report.yellowItems) && report.yellowItems.length > 0) ||
+              (Array.isArray(report.expiring) && report.expiring.length > 0) ||
+              (Array.isArray(report.newModelsRadar) && report.newModelsRadar.length > 0);
+            const needsIssue =
+              process.env.DECISION === 'yellow_needs_review' ||
+              hasPendingReviewItems ||
+              process.env.GATE_PASSED !== 'true';
 
             const existing = await github.rest.issues.listForRepo({
               owner: context.repo.owner,

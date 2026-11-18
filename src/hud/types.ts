@@ -88,6 +88,8 @@ export interface ConversationHudMetrics {
     awaitingFirstTurnStep?: boolean;
     /** 当前轮次末步是否因用户停止或异常而终止 */
     turnAborted?: boolean;
+    /** 当前轮次末步因停止/异常终止且底层尚未写入完成时间戳（供前端在多步轮次中保留中止时刻高水位） */
+    turnAbortedMissingEnd?: boolean;
     /** 模型累计总用时 (秒) */
     modelDurationSeconds: number;
     /** 模型用时中文格式化展示 (如 "22 分 28 秒") */
