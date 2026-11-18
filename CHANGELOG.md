@@ -11,6 +11,7 @@
 ### Added
 - **Full App Localization (`简体中文` / `English`)**：新增 GravityBox 自身原生 Swift AppKit 界面（`native/L10n.swift`）、Node 后端（`src/i18n.ts`）与 IDE 会话状态栏（`runtime/hud-i18n.js`）完整中英双语支持，基于外置语言包 `assets/i18n/en.json` 与 `assets/i18n/zh-Hans.json` 实现零重启实时切换。
 - **System Language Following & Packaging**：设置页新增「显示语言 / Display Language」选择器（支持「跟随系统 / Follow System」「简体中文」「English」）；`tools/package-mac.mjs` 依据语言包自动写入 `Info.plist` `CFBundleLocalizations` 并随包同步双端语言资产；新增 `test/i18n-foundation.test.mjs` 与 `test/native-i18n.test.mjs`。
+- **Antigravity `2.32.2` Support**：登记并验证 Google Antigravity `2.32.2` 官方包指纹与界面串提取快照（`ui-strings/2.32.2.json`），现已覆盖 `2.23.0` ~ `2.32.2` 全系列受支持正式版。
 
 ### Changed
 - **Unified Language Lifecycle**：融合 Antigravity 界面汉化开关与全局语言偏好，语言切换实时联动原生窗口、菜单栏面板、后端状态消息与嵌入式 Telemetry HUD，并同步更新版本标识、截图脚本与发布文档至 `1.1.1`。

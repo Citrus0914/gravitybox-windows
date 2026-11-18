@@ -53,7 +53,7 @@ body:
       label: Google Antigravity 版本通道
       description: 你正在使用的目标应用通道及版本。
       options:
-        - 正式版 (Stable - 2.31.0 ~ 2.32.1)
+        - 正式版 (Stable - 2.31.0 ~ 2.32.2)
         - 正式版 (Stable - 2.23.0 ~ 2.30.0)
         - 正式版 (Stable - 其他版本)
     validations:
