@@ -579,7 +579,7 @@ try {
     await until(async () => (await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.state().pending', context.executionContextId)) === 0);
     assert.equal(await text(main, '#time-title'), '5d'); assert.equal(await text(main, '#time-body'), '5d');
     const before = await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.state().scanCount', context.executionContextId);
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise(r => setTimeout(r, 450));
     assert.equal(await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.state().scanCount', context.executionContextId), before);
   });
   await check('采集候选重新检查保护状态，排除句中的路径与邮箱', async () => {
@@ -601,7 +601,7 @@ try {
     await main.evaluate('document.getElementById("remove-probe").remove()');
     await until(async () => (await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.state().translatedNodes', context.executionContextId)) <= baseline);
   });
-  await new Promise(resolve => setTimeout(resolve, 3000));
+  await new Promise(resolve => setTimeout(resolve, 300));
 
   await check('场景词典按角色应用，界面候选包含语境而不收集隐藏或受保护内容',async()=>{
     const tree=await main.send('Page.getFrameTree'),ctx=await main.send('Page.createIsolatedWorld',{frameId:tree.frameTree.frame.id,worldName:'GRAVITYBOX-localization-v1'});
@@ -715,7 +715,7 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     try { await main.send('Page.bringToFront'); } catch {
       main.close();const same=await until(async()=>(await(await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find(t=>t.id===page.id));main=new CDP(same.webSocketDebuggerUrl);await main.connect();await main.send('Page.enable');await main.send('Page.bringToFront');
     }
-    await new Promise(r=>setTimeout(r,3000));
+    await new Promise(r=>setTimeout(r,2600));
     try { await main.send('Page.enable'); } catch {
       main.close();const same=await until(async()=>(await(await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find(t=>t.id===page.id));main=new CDP(same.webSocketDebuggerUrl);await main.connect();await main.send('Page.enable');
     }
@@ -1609,6 +1609,6 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
   if (backend?.exitCode === null) { try { await command('stop'); } catch { backend.kill('SIGTERM'); } }
   main?.close(); second?.close(); chrome?.kill('SIGTERM');
   await new Promise(resolve => server.close(resolve));
-  await new Promise(resolve => setTimeout(resolve, 500));
+  await new Promise(resolve => setTimeout(resolve, 150));
   await rm(temp, { recursive: true, force: true });
 }

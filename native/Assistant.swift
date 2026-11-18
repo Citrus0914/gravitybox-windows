@@ -1247,13 +1247,17 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopo
             showPanel()
         }
         guard let rootWindow = self.window else {
+            #if !NATIVE_UI_TEST
             NSApp.activate(ignoringOtherApps: true)
+            #endif
             completion(alert.runModal())
             return
         }
         var parent = rootWindow
         while let sheet = parent.activeSheetWindow { parent = sheet }
+        #if !NATIVE_UI_TEST
         NSApp.activate(ignoringOtherApps: true)
+        #endif
         alert.beginSheetModal(for: parent, completionHandler: completion)
     }
 }

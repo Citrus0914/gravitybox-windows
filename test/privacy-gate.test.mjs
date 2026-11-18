@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { runPrivacyCheck, scanContentForPrivacy } from '../tools/check-privacy.mjs';
+import { runPrivacyCheck, scanContentForPrivacy, scanDirectoryForPrivacy } from '../tools/check-privacy.mjs';
 
 const execFileAsync = promisify(execFile);
 const repoRoot = fileURLToPath(new URL('../', import.meta.url));
@@ -36,6 +36,60 @@ test('隐私门禁扫描器：放行占位域名与 Retina 资源后缀，拦截
   assert.equal(issues[0].code, 'DISALLOWED_EMAIL_DOMAIN');
   assert.equal(issues[1].code, 'DISALLOWED_EMAIL_DOMAIN');
   assert.ok(!issues[0].detail.includes('someone@'), '告警信息不得回显完整邮箱前缀');
+});
+
+test('隐私门禁扫描器：放行占位用户目录，拦截真实 /Users /home 与 Windows 用户路径', () => {
+  const safePaths = `
+    const a = '/Users/alice/Library/Application Support/Antigravity';
+    const b = '/Users/demo/Private.txt';
+    const c = '/Users/private/bad';
+    const d = '/Users/Shared/cache';
+    const e = 'C:\\\\Users\\\\demo\\\\AppData';
+    const f = '/home/alice/.config';
+  `;
+  assert.deepEqual(scanContentForPrivacy(safePaths, 'test/sample.test.mjs'), []);
+
+  const realMacPath = ['/Users', 'realdeveloper', 'Developer', 'gravitybox'].join('/');
+  const realWinPath = ['C:', 'Users', 'realdeveloper', 'Desktop'].join('\\');
+  const realLinuxPath = ['/home', 'realdeveloper', 'work'].join('/');
+  const issues = scanContentForPrivacy(
+    `const a = '${realMacPath}';\nconst b = '${realWinPath}';\nconst c = '${realLinuxPath}';\n`,
+    'docs/report.md'
+  );
+  assert.equal(issues.length, 3);
+  assert.deepEqual(issues.map(i => i.code), ['DISALLOWED_LOCAL_HOME_PATH', 'DISALLOWED_LOCAL_HOME_PATH', 'DISALLOWED_LOCAL_HOME_PATH']);
+  assert.deepEqual(issues.map(i => i.line), [1, 2, 3]);
+  assert.ok(issues.every(i => !i.detail.includes('realdeveloper')), '告警信息不得回显完整本机用户名');
+});
+
+test('隐私门禁扫描器：拦截真实私钥与密钥前缀，豁免显式测试占位凭据，并支持目录打包扫描', async () => {
+  const safeCreds = `
+    const testAt = 'ya29.' + 'abcdefghijklmnop';
+    const secretAt = 'ya29.superSecretAccessToken123456';
+    const testSk = 'sk-live-abcdefghijklmnop';
+  `;
+  assert.deepEqual(scanContentForPrivacy(safeCreds, 'test/sample.test.mjs'), []);
+
+  const fakePem = ['-----BEGIN RSA', 'PRIVATE KEY-----'].join(' ');
+  const fakeGoogleKey = 'AIza' + 'SyD9x8y7z6A5B4C3D2E1F0G9H8I7J6K5L4M';
+  const fakeGhToken = 'ghp_' + 'Z9y8X7w6V5u4T3s2R1q0P9o8N7m6';
+  const issues = scanContentForPrivacy(`${fakePem}\n${fakeGoogleKey}\n${fakeGhToken}\n`, 'src/leaked.ts');
+  assert.equal(issues.length, 3);
+  assert.deepEqual(issues.map(i => i.code), ['DISALLOWED_SECRET_LITERAL', 'DISALLOWED_SECRET_LITERAL', 'DISALLOWED_SECRET_LITERAL']);
+
+  const tempDir = await mkdtemp(join(tmpdir(), 'gb-privacy-dir-'));
+  try {
+    await mkdir(join(tempDir, 'Resources', 'core'), { recursive: true });
+    await mkdir(join(tempDir, 'MacOS'), { recursive: true });
+    await writeFile(join(tempDir, 'MacOS', 'bin'), `${fakeGhToken}\n`);
+    await writeFile(join(tempDir, 'Resources', 'core', 'app.js'), `console.log('${fakeGoogleKey}');\n`);
+    const dirResult = await scanDirectoryForPrivacy(tempDir, { excludePrefixes: ['MacOS/'] });
+    assert.equal(dirResult.scannedCount, 1);
+    assert.equal(dirResult.issues.length, 1);
+    assert.equal(dirResult.issues[0].file, 'Resources/core/app.js');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
 });
 
 test('隐私门禁扫描器：支持指纹匹配拦截敏感标识、姓名与引号别名，并豁免词典中正常词条', () => {

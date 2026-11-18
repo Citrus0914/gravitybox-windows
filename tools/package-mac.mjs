@@ -6,6 +6,7 @@ import { join, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { sourceDigest, includeDictionaryPath, assertReleaseArtifacts, listCompiledScripts, writeSha256Sidecar, verifySha256Sidecar } from './release-integrity.mjs';
 import { buildInfoPayload, describeValidationScope, resolvePackagingScope } from './release-scope.mjs';
+import { scanDirectoryForPrivacy } from './check-privacy.mjs';
 const run = promisify(execFile), root = fileURLToPath(new URL('../', import.meta.url));
 
 /** Filters Finder metadata and asset attribution manifests out of packaged app resources. */
@@ -118,6 +119,13 @@ async function main() {
   if (!verification.nativeBinarySha256 || createHash('sha256').update(await readFile(nativeBinary)).digest('hex') !== verification.nativeBinarySha256) throw new Error('发行编译产物未通过校验，请先运行完整验证');
   await copyFile(nativeBinary, join(app, 'Contents/MacOS/GravityBox'));
   await writeFile(join(resources, 'build-info.json'), JSON.stringify(buildInfoPayload({ version, build, verification, scope, node: process.versions.node }), null, 2));
+  const bundlePrivacy = await scanDirectoryForPrivacy(join(app, 'Contents'), {
+    excludePrefixes: ['MacOS/', 'Resources/runtime/'],
+  });
+  if (bundlePrivacy.issues.length > 0) {
+    const summary = bundlePrivacy.issues.map(i => `${i.file}:${i.line} [${i.code}] ${i.detail}`).join('\n');
+    throw new Error(`应用包隐私检查未通过，已中止打包:\n${summary}`);
+  }
   await run('/usr/bin/codesign', ['--force', '--deep', '--sign', '-', '--timestamp=none', app]); await run('/usr/bin/codesign', ['--verify', '--deep', '--strict', app]);
   await run('/bin/ln', ['-s', '/Applications', join(stage, 'Applications')]);
   const dmg = join(output, `GravityBox-${version}-arm64.dmg`); await run('/usr/bin/hdiutil', ['create', '-ov', '-volname', 'GravityBox', '-srcfolder', stage, '-format', 'ULFO', dmg], { maxBuffer: 2e6 }); await run('/usr/bin/hdiutil', ['verify', dmg], { maxBuffer: 2e6 });

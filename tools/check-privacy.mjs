@@ -23,6 +23,23 @@ export const ALLOWED_EMAIL_DOMAINS = new Set([
   'users.noreply.github.com',
 ]);
 
+/** 测试与系统公共目录允许使用的 /Users/<name> 占位用户名白名单。 */
+export const ALLOWED_HOME_USERS = new Set([
+  'alice',
+  'bob',
+  'charlie',
+  'demo',
+  'example',
+  'fixture',
+  'private',
+  'sandbox',
+  'shared',
+  'temp',
+  'test',
+  'user',
+]);
+export const ALLOWED_MACOS_HOME_USERS = ALLOWED_HOME_USERS;
+
 /** 敏感账号本地标识与全名 SHA-256 指纹（避免源码中明文出现）。 */
 export const BANNED_TOKEN_HASHES = new Set([
   '654a64a2b7a73dff84d0077181edaf215876848c834b8af2ca0f146f8b3a93d3',
@@ -52,6 +69,19 @@ const SKIPPED_DIRS = new Set([
 
 const EMAIL_RE = /([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
 const RETINA_ASSET_RE = /^(?:1|2|3)x\.(?:png|jpe?g|webp|gif|svg)$/i;
+const LOCAL_HOME_PATH_PATTERNS = [
+  { label: '/Users', re: /(?:^|[^A-Za-z0-9_])\/Users\/([A-Za-z0-9._-]+)(?=\/|[^A-Za-z0-9._-]|$)/g, marker: '/Users/' },
+  { label: '/home', re: /(?:^|[^A-Za-z0-9_])\/home\/([A-Za-z0-9._-]+)(?=\/|[^A-Za-z0-9._-]|$)/g, marker: '/home/' },
+  { label: 'C:\\Users', re: /(?:^|[^A-Za-z0-9_])[A-Za-z]:(?:\\{1,2}|\/)Users(?:\\{1,2}|\/)([A-Za-z0-9._-]+)(?=\\|\/|[^A-Za-z0-9._-]|$)/gi, marker: 'Users' },
+];
+const SECRET_SYNTHETIC_EXEMPT_RE = /(?:abcde|secret|dummy|fake|example|test|placeholder|fixture)/i;
+const SECRET_PATTERNS = [
+  { name: '私钥头', re: /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/g, allowSynthetic: false },
+  { name: 'Google API Key', re: /\bAIza[0-9A-Za-z\-_]{35}\b/g, allowSynthetic: true },
+  { name: 'Google OAuth Token', re: /\bya29\.[0-9A-Za-z\-_.]{24,}\b/g, allowSynthetic: true },
+  { name: 'GitHub Token', re: /\b(?:gh[pousr]_[0-9A-Za-z]{20,}|github_pat_[0-9A-Za-z_]{30,})\b/g, allowSynthetic: true },
+  { name: 'API/Webhook Token', re: /\b(?:(?:sk-proj-|sk-ant-|sk-live-)[0-9A-Za-z\-_]{16,}|xox[baprs]-[0-9A-Za-z-]{16,}|AKIA[0-9A-Z]{16})\b/g, allowSynthetic: true },
+];
 const ASCII_TOKEN_RE = /[A-Za-z0-9]+/g;
 const CJK_RUN_RE = /[\u4e00-\u9fff]{2,}/g;
 const QUOTED_LITERAL_RE = /(["'`])([^"'`\r\n]{1,64})\1/g;
@@ -63,7 +93,7 @@ function sha256Hex(text) {
 export function isExcludedPrivacyPath(filePath) {
   const rel = filePath.replaceAll('\\', '/').replace(/^\.\//, '');
   if (!rel) return true;
-  if (rel.startsWith('licenses/')) return true;
+  if (rel === 'AGENTS.md' || rel.startsWith('licenses/')) return true;
   const segments = rel.split('/');
   if (segments.some(seg => SKIPPED_DIRS.has(seg))) return true;
   if (BINARY_EXTENSIONS.has(extname(rel).toLowerCase())) return true;
@@ -91,6 +121,7 @@ export function scanContentForPrivacy(content, filePath, options = {}) {
   if (isExcludedPrivacyPath(rel) || !content || content.includes('\0')) return [];
 
   const allowedDomains = options.allowedDomains ?? ALLOWED_EMAIL_DOMAINS;
+  const allowedHomeUsers = options.allowedHomeUsers ?? ALLOWED_MACOS_HOME_USERS;
   const tokenHashes = options.tokenHashes ?? BANNED_TOKEN_HASHES;
   const cjkBigramHashes = options.cjkBigramHashes ?? BANNED_CJK_BIGRAM_HASHES;
   const quotedAliasHashes = options.quotedAliasHashes ?? BANNED_QUOTED_ALIAS_HASHES;
@@ -106,6 +137,35 @@ export function scanContentForPrivacy(content, filePath, options = {}) {
         file: rel,
         line: lineNumberAt(content, match.index ?? 0),
         detail: `发现非测试占位邮箱 ${redactLocalPart(localPart)}@${normalizedDomain}（请改用 *.example.invalid 或 *.example.test）`,
+      });
+    }
+  }
+
+  for (const { label, re, marker } of LOCAL_HOME_PATH_PATTERNS) {
+    for (const match of content.matchAll(re)) {
+      const username = match[1];
+      if (!allowedHomeUsers.has(username.toLowerCase())) {
+        const markerOffset = match[0].toLowerCase().indexOf(marker.toLowerCase());
+        const pos = (match.index ?? 0) + Math.max(0, markerOffset);
+        issues.push({
+          code: 'DISALLOWED_LOCAL_HOME_PATH',
+          file: rel,
+          line: lineNumberAt(content, pos),
+          detail: `发现疑似本机用户目录路径 ${label}/${redactLocalPart(username)}（请改用相对路径或 /Users/demo、/Users/alice 等占位路径）`,
+        });
+      }
+    }
+  }
+
+  for (const { name, re, allowSynthetic } of SECRET_PATTERNS) {
+    for (const match of content.matchAll(re)) {
+      const raw = match[0];
+      if (allowSynthetic && SECRET_SYNTHETIC_EXEMPT_RE.test(raw)) continue;
+      issues.push({
+        code: 'DISALLOWED_SECRET_LITERAL',
+        file: rel,
+        line: lineNumberAt(content, match.index ?? 0),
+        detail: `发现疑似明文 ${name} 凭据（请改用环境变量或显式测试占位串）`,
       });
     }
   }
@@ -168,6 +228,7 @@ export function scanContentForPrivacy(content, filePath, options = {}) {
     }
   }
 
+  issues.sort((a, b) => a.line - b.line);
   return issues;
 }
 
@@ -235,6 +296,27 @@ export async function runPrivacyCheck({ repoRoot = root, staged = false } = {}) 
     issues.push(...scanContentForPrivacy(content, rel));
   }
 
+  return { scannedCount, issues };
+}
+
+/**
+ * 扫描指定目录（如已打包的 GravityBox.app/Contents）内的非二进制文件是否存在隐私或凭据泄露。
+ */
+export async function scanDirectoryForPrivacy(targetDir, { excludePrefixes = [], options = {} } = {}) {
+  const issues = [];
+  let scannedCount = 0;
+  const files = await walkDirectory(targetDir, targetDir);
+  for (const rel of files) {
+    if (excludePrefixes.some(prefix => rel.startsWith(prefix))) continue;
+    let content;
+    try {
+      content = await readFile(join(targetDir, rel), 'utf8');
+    } catch {
+      continue;
+    }
+    scannedCount++;
+    issues.push(...scanContentForPrivacy(content, rel, options));
+  }
   return { scannedCount, issues };
 }
 

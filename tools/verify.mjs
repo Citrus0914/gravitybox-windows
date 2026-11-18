@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { sourceDigest, collectReleaseArtifacts, checkReleaseConsistency, renderReleaseConsistency } from './release-integrity.mjs';
 import { describeValidationScope, parseTargetAppVersionArg, recordedScopeFields, resolveValidationScope, VALIDATION_SCOPE_TARGETED } from './release-scope.mjs';
-import { nativeBuildArgs } from './native-build.mjs';
+import { computeSwiftInputsDigest, nativeBuildArgs } from './native-build.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url)), run = promisify(execFile);
 const argv = process.argv.slice(2);
@@ -146,12 +146,39 @@ async function main() {
     }
   }
 
-  await step('隐私门禁', process.execPath, [join(root, 'tools/check-privacy.mjs')]);
+  const privacyPromise = step('隐私门禁', process.execPath, [join(root, 'tools/check-privacy.mjs')]);
 
   let swiftPromise = null;
   if (!dictOnly) {
     await mkdir(join(root, '.cache'), { recursive: true });
-    swiftPromise = step('Swift检查', '/usr/bin/swiftc', await nativeBuildArgs(root, join(root, '.cache/GravityBox-native-verified')));
+    const swiftBinaryPath = join(root, '.cache/GravityBox-native-verified');
+    const swiftMetaPath = join(root, '.cache/GravityBox-native-verified.meta.json');
+    const forceSwift = argv.includes('--force-swift') || process.env.GRAVITYBOX_FORCE_SWIFT === '1';
+    const swiftInputsDigest = await computeSwiftInputsDigest(root);
+    let swiftCacheHit = false;
+    if (!forceSwift && existsSync(swiftBinaryPath) && existsSync(swiftMetaPath)) {
+      try {
+        const meta = JSON.parse(await readFile(swiftMetaPath, 'utf8'));
+        if (meta?.swiftInputsDigest === swiftInputsDigest && typeof meta?.binarySha256 === 'string') {
+          const actualBinSha = createHash('sha256').update(await readFile(swiftBinaryPath)).digest('hex');
+          swiftCacheHit = actualBinSha === meta.binarySha256;
+        }
+      } catch {
+        swiftCacheHit = false;
+      }
+    }
+    if (swiftCacheHit) {
+      completedSteps.push('Swift检查');
+      timings.push({ name: 'Swift检查', durationMs: 0 });
+      process.stdout.write('通过：Swift检查（源码未变更，复用已校验产物）\n');
+      swiftPromise = Promise.resolve();
+    } else {
+      const swiftArgs = await nativeBuildArgs(root, swiftBinaryPath);
+      swiftPromise = step('Swift检查', '/usr/bin/swiftc', swiftArgs).then(async () => {
+        const binarySha256 = createHash('sha256').update(await readFile(swiftBinaryPath)).digest('hex');
+        await writeFile(swiftMetaPath, JSON.stringify({ swiftInputsDigest, binarySha256, at: new Date().toISOString() }, null, 2) + '\n');
+      });
+    }
   }
 
   await step('清理孤儿构建产物', process.execPath, [join(root, 'tools/clean-dist.mjs')]);
@@ -201,9 +228,10 @@ async function main() {
   }
 
   if (dictOnly) {
-    await runDictionaryGates();
+    await Promise.all([privacyPromise, runDictionaryGates()]);
   } else {
     const settled = await Promise.allSettled([
+      privacyPromise,
       swiftPromise,
       step('单元与集成', process.execPath, [join(root, 'tools/run-tests.mjs')]),
       step('浏览器回归', process.execPath, [join(root, 'test/browser.mjs')]),

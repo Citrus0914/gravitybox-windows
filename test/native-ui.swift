@@ -50,7 +50,7 @@ import Cocoa
     static func main() throws {
         let application = NSApplication.shared
         let interactive = CommandLine.arguments.contains("--interactive")
-        application.setActivationPolicy(interactive ? .regular : .accessory)
+        application.setActivationPolicy(interactive ? .regular : .prohibited)
         let state = URL(fileURLWithPath:CommandLine.arguments[1]), output = URL(fileURLWithPath:CommandLine.arguments[2])
         try FileManager.default.createDirectory(at:output,withIntermediateDirectories:true)
         L10n.shared.setLanguage("zh-Hans", notify: false)
@@ -191,6 +191,8 @@ import Cocoa
             withExtendedLifetime(assistant) { application.run() }
             return
         }
+        // 非交互测试模式将窗口锚定在离屏坐标且不激活前台，避免测试期间在桌面闪现并切换页面
+        window.setFrameOrigin(NSPoint(x: -24000, y: -24000))
         var captures:[String] = []
         for (theme, appearance) in [("light",NSAppearance.Name.aqua),("dark",NSAppearance.Name.darkAqua)] {
             window.appearance = NSAppearance(named:appearance)
@@ -1311,7 +1313,7 @@ import Cocoa
             let pricingSheet = PricingSyncSheetController(app: isolated)
 
             // Package A: Modal sheet lifecycle, healed count, badge varieties, empty state and recheck
-            let testParentWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
+            let testParentWindow = NSWindow(contentRect: NSRect(x: -24000, y: -24000, width: 800, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
             pricingSheet.show(in: testParentWindow, payload: [
                 "synced": true,
                 "count": 3,
@@ -1723,7 +1725,7 @@ import Cocoa
             check(allTextValues(reopenedPanel.accountsCardsStack).contains("Recommended") && !allTextValues(reopenedPanel.accountsCardsStack).contains("推荐备用"), "P0-07: Recreated MenuPanel must preserve recommendation badge in English")
 
             // P1-28: UsageLog jumpToPage single fetch on blurred Enter
-            let sheetHostWin = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 620), styleMask: [.titled], backing: .buffered, defer: false)
+            let sheetHostWin = NSWindow(contentRect: NSRect(x: -24000, y: -24000, width: 820, height: 620), styleMask: [.titled], backing: .buffered, defer: false)
             let logCtrl = UsageLogController(app: p1Host, period: "today")
             logCtrl.show(in: sheetHostWin) {}
             pump()
