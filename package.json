@@ -3,17 +3,17 @@
   "version": "1.1.1",
   "private": true,
   "type": "module",
-  "description": "GravityBox: Native macOS Antigravity Companion · 原生 macOS Antigravity 全功能增强伴侣",
+  "description": "GravityBox Windows: Antigravity Companion Desktop Edition (based on Enzoo404/gravitybox)",
   "license": "MIT",
-  "author": "Enzoo404 <enzoo404@users.noreply.github.com>",
+  "author": "Enzoo404 (Original macOS) / Citrus0914 (Windows Port)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Enzoo404/gravitybox.git"
+    "url": "git+https://github.com/Citrus0914/gravitybox-windows.git"
   },
   "bugs": {
-    "url": "https://github.com/Enzoo404/gravitybox/issues"
+    "url": "https://github.com/Citrus0914/gravitybox-windows/issues"
   },
-  "homepage": "https://github.com/Enzoo404/gravitybox#readme",
+  "homepage": "https://github.com/Citrus0914/gravitybox-windows#readme",
   "scripts": {
     "build": "node tools/clean-dist.mjs && tsc && node tools/copy-runtime.mjs",
     "test": "npm run build && node tools/sync-pricing-feed.mjs && node tools/run-tests.mjs",

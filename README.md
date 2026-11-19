@@ -1,19 +1,20 @@
 <div align="center">
-  <a href="https://github.com/Enzoo404/gravitybox">
+  <a href="https://github.com/Citrus0914/gravitybox-windows">
     <img src="assets/master-1024.png" alt="GravityBox Logo" width="84" height="84" />
   </a>
 
-  <h1>GravityBox</h1>
+  <h1>GravityBox Windows</h1>
 
   <p>
-    <strong>专为 Apple Silicon Mac 打造的 Google Antigravity 原生增强工具箱</strong><br />
-    不改官方安装包、不破系统签名 —— 一键切换中文界面 · 输入框下实时看 Token 与上下文 · 看清 5 小时/每周真实配额 · 多账号安全切换 · 无损清理缓存
+    <strong>面向 Windows 10/11 (`x64`) 的 Google Antigravity 轻量级桌面伴侣工具箱</strong><br />
+    基于 <a href="https://github.com/Enzoo404/gravitybox">Enzoo404/gravitybox</a> 移植 · 不改官方安装包 —— 独立汉化开关 · 输入框下实时看 Token 与上下文 · 看清 5 小时/每周真实配额 · 多账号安全切换 · 回收站无损清理
   </p>
 
   <p>
-    <a href="https://github.com/Enzoo404/gravitybox/releases/latest"><img src="https://img.shields.io/github/v/release/Enzoo404/gravitybox?style=flat-square&color=2563EB" alt="Latest Release"></a>
-    <a href="https://github.com/Enzoo404/gravitybox/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Enzoo404/gravitybox/ci.yml?branch=main&style=flat-square&logo=github" alt="CI Status"></a>
-    <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20Silicon-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+ Apple Silicon">
+    <a href="https://github.com/Citrus0914/gravitybox-windows/releases/latest"><img src="https://img.shields.io/github/v/release/Citrus0914/gravitybox-windows?style=flat-square&color=2563EB" alt="Latest Release"></a>
+    <a href="https://github.com/Citrus0914/gravitybox-windows/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Citrus0914/gravitybox-windows/ci.yml?branch=main&style=flat-square&logo=github" alt="CI Status"></a>
+    <img src="https://img.shields.io/badge/Windows-10%2F11%20%C2%B7%20x64-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows 10/11 x64">
+    <img src="https://img.shields.io/badge/Upstream-Enzoo404%2Fgravitybox-111827?style=flat-square&logo=apple&logoColor=white" alt="Upstream macOS Project">
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-10B981?style=flat-square" alt="MIT License"></a>
   </p>
 
@@ -47,40 +48,39 @@
 
 ## ✨ GravityBox 是干什么的？
 
-如果你日常在 Mac 上使用 Google **Antigravity** 写代码，大概率遇到过这些烦恼：全英文界面不够顺手、聊着聊着突然限流却分不清是 5 小时还是周额度用完了、完全不知道当前对话烧了多少 Token 或上下文快满了没、切换多个 Google 账号既麻烦又怕把本地状态搞坏。
+> **致谢与上游说明**：本仓库（[`Citrus0914/gravitybox-windows`](https://github.com/Citrus0914/gravitybox-windows)）是基于原作者 **Enzoo404** 开源的 macOS 原版 [**`Enzoo404/gravitybox`**](https://github.com/Enzoo404/gravitybox)（MIT License）移植开发的 **Windows 桌面版**。衷心感谢原作者构建的核心架构、运行期汉化引擎、Telemetry HUD、双周期配额聚合、只读 SQLite 用量账本与安全切号事务。
 
-**GravityBox**（当前版本 `GravityBox v1.1.1`）就是为了解决这些问题而生的**轻量级原生桌面伴侣**。它不修改 `/Applications/Antigravity.app` 里的任何一行官方文件，打开即用：
+如果你日常在 Windows 上使用 Google **Antigravity** 写代码，大概率遇到过这些烦恼：全英文界面不够顺手、聊着聊着突然限流却分不清是 5 小时还是周额度用完了、完全不知道当前对话烧了多少 Token 或上下文快满了没、切换多个 Google 账号既麻烦又怕把本地状态搞坏。
+
+**GravityBox**（当前版本 `GravityBox v1.1.1`）就是为了解决这些问题而生的**轻量级桌面伴侣**。它不修改官方 `%LocalAppData%\Programs\Antigravity` 里的任何文件，开箱即用：
 
 | 日常痛点 | GravityBox 帮你做什么 |
 | :--- | :--- |
-| **全英文界面阅读费力，打汉化补丁又会破坏官方签名、每次更新都失效** | **零改包实时中英切换**：在运行期动态把 Antigravity 菜单、设置、侧栏变成地道中文（已覆盖 `2.23.0` ~ `2.32.2`），不碰代码、聊天记录与终端输出；GravityBox 自身也支持 **跟随系统 / 简体中文 / English** 无感热切换。 |
+| **全英文界面阅读费力，打静态补丁每次更新又要重打** | **零改包实时中英切换 + 独立汉化开关**：在运行期动态把 Antigravity 菜单、设置、侧栏变成中文（基准覆盖 `2.23.0` ~ `2.32.2`，新版自动兼容适配），不碰代码、聊天记录与终端输出；并支持通过「Antigravity 界面汉化」持久化独立开关随时关闭，保留中文 HUD 与其他静态补丁和平共存。 |
 | **盲聊盲跑，不知道这轮跑了多久、生成多快、上下文还剩多少空间** | **输入框下嵌对话状态栏 (HUD)**：直接在每个聊天框正下方显示轮次、耗时、吐字速度、累计 Token、缓存省钱比例与上下文水位，悬停或点击即可向上弹出完整账单。 |
 | **配额显示笼统，常把“每周总额度”误当成“5 小时滚动额度”** | **双周期配额拆开看**：把 Gemini、Claude/GPT 的 **5 小时窗口** 与 **每周窗口**（以及 Pro 独立计算的 `Gemini 4 Argon` 等子模型）逐条列清，精确显示几小时几分钟后重置。 |
-| **手里有多个账号，反复退出重登太折腾，还怕切坏工作区** | **多账号管家与安全切换**：支持保存多个账号、额度见底时智能推荐备用号；退出 Antigravity 后一键安全切换，万一中途异常自动原位回滚，绝不后台强杀进程。 |
-| **用久了占用好几个 GB 磁盘空间，手动删缓存怕误删聊天记录和登录态** | **可撤回的无损存储瘦身**：自动锁死登录凭据与聊天正文，只清理无用运行缓存与超期后台日志；清理文件统一移入**系统废纸篓**并保留快照，随时可一键还原。 |
+| **手里有多个账号，反复退出重登太折腾，还怕切坏工作区** | **多账号管家与安全切换**：支持保存多个账号、额度见底时智能推荐备用号；退出 Antigravity 后一键安全切换（含 Windows Credential Manager 原生 JSON 凭据同步），万一中途异常自动原位回滚，绝不后台强杀进程。 |
+| **用久了占用好几个 GB 磁盘空间，手动删缓存怕误删聊天记录和登录态** | **可撤回的无损存储瘦身**：自动锁死登录凭据与聊天正文，只清理无用运行缓存与超期后台日志；清理文件统一移入 **Windows 回收站**并保留快照，随时可一键还原。 |
 
 ---
 
 ## 🚀 3 分钟快速上手
 
-### 第一步：下载并安装
-1. 前往 [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases/latest) 下载最新的 `GravityBox-<version>-arm64.dmg`（安装包已内置全部运行环境，**无需安装 Node.js 或任何外部依赖**）。
-2. 双击打开 DMG，将 **GravityBox.app** 拖入 **Applications（应用程序）** 文件夹。
-3. 由于开源免费软件未经过 Apple 付费公证，首次打开前请在终端执行一行放行命令（只需执行一次）：
-   ```bash
-   xattr -cr /Applications/GravityBox.app
-   ```
-   *(不想用终端也可以：首次双击若弹出拦截提示，前往「系统设置 → 隐私与安全性」点击底部的 **「仍要打开」** 即可。)*
+### 第一步：下载并解压
+1. 前往 [GitHub Releases](https://github.com/Citrus0914/gravitybox-windows/releases/latest) 下载最新的 `GravityBox-<version>-win-x64.zip`（便携包已内置完整 Node 22 运行时、Win32 原生辅助程序 `gb-win-helper.exe` 与 WebView2 依赖，**无需单独安装 Node.js**）。
+2. 将压缩包解压到常规用户目录（例如 `%LocalAppData%\Programs\GravityBox`）。*注：请勿直接从高受限/低完整性目录启动。*
+3. 双击运行 **`GravityBox.exe`**，启动后将常驻系统托盘。
 
-### 第二步：启动即自动连接
-打开 **GravityBox**，再打开官方正式版 **Antigravity**。无需任何配置，GravityBox 会自动识别并连接 Antigravity 窗口：
-- 若你的系统是中文，Antigravity 界面会自动切换为中文；
-- 每个对话输入框的正下方，会自动出现一条精致的三联状态栏（HUD）。
+### 第二步：通过 GravityBox 启动或连接 Antigravity
+- Windows 下官方默认快捷方式不开启本机 CDP 调试端口。首次使用时，建议在 GravityBox 托盘菜单或界面中点击 **「打开 Antigravity」**（会自动附带 `--remote-debugging-port=0` 仅本机回环参数）；若此前已无参打开了 Antigravity，先退出后再通过 GravityBox 拉起即可。
+- 连接成功后：
+  - 若开启了界面汉化，Antigravity 界面会自动切换为中文；
+  - 每个对话输入框的正下方，会自动出现一条三联状态栏（HUD）。
 
 ### 第三步：日常怎么配合最顺手？
 - **写代码时 → 低头看输入框下方 HUD**：随时掌握当前对话速度和上下文水位；鼠标悬停查看详情，**点击任意胶囊可固定弹窗**（按 `Esc` 或点击空白处收起）。
-- **随手查额度 → 点屏幕右上角菜单栏图标**：不用切出全屏窗口，点一下菜单栏里的 GravityBox 图标就能看今日用量、剩余配额和快速切号。
-- **细管账号与空间 → 打开主控制台**：点击菜单栏面板右下角「打开主界面 ↗」，使用完整的 **总览 · 账号 · 用量 · 设置 · 关于** 五页工作台。
+- **随手查额度 → 点右下角系统托盘图标**：不用切出全屏窗口，点一下托盘里的 GravityBox 图标就能看今日用量、剩余配额和快速切号。
+- **细管账号与空间 → 打开主控制台**：点击托盘面板顶部或右键菜单打开主界面，使用完整的 **总览 · 账号 · 用量 · 设置 · 关于** 五页工作台。
 
 ---
 
@@ -192,15 +192,16 @@ HUD 静静挂载在每一个 Antigravity 对话输入框正下方（支持分栏
 
 除了输入框下方的 HUD，GravityBox 还提供**主控制台（5 个页面）**与**顶部菜单栏快捷面板**。下面是每一个开关、按钮和配置项的具体作用：
 
-### 1. 设置页（`设置`）—— 7 个核心选项逐一说明
+### 1. 设置页（`设置`）—— 核心选项逐一说明
 
 | 分组 | 选项名称 | 可选值 / 控件 | 它是干什么的？怎么选最合适？ |
 | :--- | :--- | :--- | :--- |
-| **Antigravity 增强** | **显示语言** | `跟随系统`（默认）<br>`简体中文`<br>`English` | **一键统管两边语言**：既切换 GravityBox 自己的界面语言，也同时控制是否把 Antigravity 界面翻译为中文。选 `English` 时，GravityBox 变为英文，同时 Antigravity 立即恢复官方原版英文界面，全程无需重启。 |
-| **Antigravity 增强** | **对话状态栏** | 开关（默认 `开`） | 控制是否在 Antigravity 输入框下方挂载 HUD 状态栏。**它与语言相互独立**——即使你把语言设为 `English` 使用原版英文界面，也可以单独开着英文 HUD 查看实时速率与上下文。 |
+| **Antigravity 增强** | **显示语言** | `跟随系统`（默认）<br>`简体中文`<br>`English` | **切换面板与 HUD 语言**：选 `English` 时 GravityBox 与 HUD 变为英文，Antigravity 同时恢复原版英文界面，全程无需重启。 |
+| **Antigravity 增强** | **Antigravity 界面汉化** | 开关（默认 `开`） | **持久化独立汉化开关**：控制是否在运行期翻译 Antigravity 界面。若你已使用其他静态汉化补丁或只想用原版英文界面，可关闭此项并永久生效，同时 GravityBox 自身与 HUD 仍可保持中文。 |
+| **Antigravity 增强** | **对话状态栏** | 开关（默认 `开`） | 控制是否在 Antigravity 输入框下方挂载 HUD 状态栏。**与汉化相互独立**——即使关闭汉化或设为 `English`，仍可单独使用 HUD 查看实时速率与上下文。 |
 | **配额与计价** | **配额刷新间隔** | `手动刷新`（默认）<br>`每 5 / 10 / 15 / 30 / 60 分钟` | 控制后台每隔多久自动拉取一次已保存账号的剩余配额。单账号用户保持 `手动刷新` 即可；多账号高频轮换建议设为 `每 10 分钟` 或 `每 15 分钟`。 |
-| **配额与计价** | **自动更新价格基准** | `立即检查` 按钮 + 开关（默认 `关`） | 开启后每 24 小时自动从 GitHub / jsDelivr 同步一次最新公开模型单价表，无需等软件发版就能给新模型算准费用。<br>点击 **「立即检查」** 会弹出 **价格基准明细表**，可查看所有在用/已下架模型的输入、缓存读/写、输出费率与官方来源链接，并自动补齐历史未计价记录。 |
-| **系统与存储** | **登录时启动** | 开关（默认 `关`） | 开启后，每次登录 macOS 时自动启动 GravityBox 并在右上角菜单栏静默待命。 |
+| **配额与计价** | **自动更新价格基准** | `立即检查` 按钮 + 开关（默认 `关`） | 开启后每 24 小时自动同步一次最新公开模型单价表，无需等软件发版就能给新模型算准费用。<br>点击 **「立即检查」** 会弹出 **价格基准明细表**，可查看所有在用/已下架模型的输入、缓存读/写、输出费率与官方来源链接，并自动补齐历史未计价记录。 |
+| **系统与存储** | **登录时启动** | 开关（默认 `关`） | 开启后，每次登录 Windows 时自动启动 GravityBox 并在系统托盘静默待命。 |
 | **系统与存储** | **跟随 Antigravity 启停** | 开关（默认 `关`） | 开启后，打开 Antigravity 时自动拉起 GravityBox，关闭 Antigravity 时自动一并退出——适合不喜欢后台常驻图标的用户。 |
 | **系统与存储** | **存储与维护** | 状态徽章 + `管理存储…` 按钮 | 自动评估本机缓存体积（显示 `可释放 XX MB` 或 `状态良好`），点击打开安全清理面板（详见下方第 5 节）。 |
 
@@ -362,28 +363,24 @@ HUD 静静挂载在每一个 Antigravity 对话输入框正下方（支持分栏
 ## 📦 安装与无损升级
 
 ### 运行环境要求
-- **操作系统**：macOS 14 (Sonoma) 或 macOS 15+ (Sequoia)
-- **芯片架构**：Apple Silicon (`arm64`，M 系列全系芯片支持)
-- **目标应用**：官方正式版 `/Applications/Antigravity.app`（已完整验证适配 `2.23.0` ~ `2.32.2`，*不支持也不干扰 Insiders 预览版*）
-- **外部依赖**：**零依赖** —— `.app` 内已自带独立 Node 22 运行时与原生宿主程序
+- **操作系统**：Windows 10 / Windows 11 (`x64`)（macOS 请使用原版上游仓库 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)）
+- **目标应用**：官方正式版 `%LocalAppData%\Programs\Antigravity`（兼容打包 `resources\app.asar` 与解包 `resources\app\` 布局；基准词典覆盖 `2.23.0` ~ `2.32.2`，更高版本自动兼容）
+- **外部依赖**：**零依赖** —— 便携包已自带独立 Node 22 运行时与 `gb-win-helper.exe`（需要系统已安装 WebView2 Runtime，Windows 11 默认自带）
 
-### 校验与安装完整步骤
+### 安装步骤
 
-1. 从 [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases/latest) 下载 `GravityBox-<version>-arm64.dmg` 及同名 `.sha256` 校验文件。
-2. *(可选)* 在终端核对安装包 SHA-256 指纹：
-   ```bash
-   shasum -a 256 -c GravityBox-<version>-arm64.dmg.sha256
+1. 从 [GitHub Releases](https://github.com/Citrus0914/gravitybox-windows/releases/latest) 下载 `GravityBox-<version>-win-x64.zip` 及同名 `.sha256` 校验文件。
+2. *(可选)* 在 PowerShell 核对压缩包 SHA-256 指纹：
+   ```powershell
+   Get-FileHash .\GravityBox-<version>-win-x64.zip -Algorithm SHA256
    ```
-3. 双击挂载 DMG，将 **GravityBox.app** 拖入 `/Applications`。
-4. 首次启动前清除 macOS 隔离标记：
-   ```bash
-   xattr -cr /Applications/GravityBox.app
-   ```
+3. 将压缩包解压至常规用户目录（推荐 `%LocalAppData%\Programs\GravityBox`），双击运行 `GravityBox.exe`。
+4. 如需自动挂载 HUD / 汉化，请退出已运行的 Antigravity 后，通过 GravityBox 界面或托盘菜单中的 **「打开 Antigravity」** 启动（会自动附加 `--remote-debugging-port=0`）。
 
 ### 如何从旧版本升级？
-- **直接拖入覆盖即可**：退出旧版 GravityBox，将新版拖进 `/Applications` 替换原应用（或在「关于」页直接点击检查更新一键升级）。
-- **数据 100% 保留**：你保存的所有账号、自定义词典、历史用量总账和清理恢复点均独立存放在 `~/Library/Application Support/GravityBox`，覆盖升级不会丢失任何个人数据。
-- **旧配置自动迁移**：若 `v1.0.5` 及更早版本曾配置过 `applicationChannel=insiders`，首次启动新版时会自动先备份原配置并平滑切换至正式版模式。
+- **直接解压覆盖即可**：退出旧版 `GravityBox.exe`，将新版覆盖至原目录。
+- **数据 100% 保留**：你保存的所有账号、自定义词典、历史用量总账和清理恢复点均独立存放在 `%LocalAppData%\GravityBox`，覆盖升级不会丢失任何个人数据。
+- **Windows 凭据与配置自动兼容**：自动同步 Windows Credential Manager (`gemini:antigravity`) 与既有 `config.json` 配置。
 
 <details>
 <summary><b>进阶可选：为备用账号配置 Google OAuth 浏览器登录凭据</b></summary>
@@ -391,7 +388,7 @@ HUD 静静挂载在每一个 Antigravity 对话输入框正下方（支持分栏
 
 如果你只需要「保存当前账号」、查看当前账号配额、使用 HUD 状态栏、统计历史费用与界面汉化，**完全不需要配置这一项**。
 
-只有当你希望通过「Google 授权登录…」在浏览器直接登录新账号，或让后台自动静默刷新多个备用账号的过期 Token 时，才需要把你自己创建的 Google OAuth Desktop 客户端凭据写入 `~/Library/Application Support/GravityBox/.env`：
+只有当你希望通过「Google 授权登录…」在浏览器直接登录新账号，或让后台自动静默刷新多个备用账号的过期 Token 时，才需要把你自己创建的 Google OAuth Desktop 客户端凭据写入 `%LocalAppData%\GravityBox\.env`：
 
 ```bash
 GRAVITYBOX_GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
@@ -407,9 +404,9 @@ GRAVITYBOX_GOOGLE_CLIENT_SECRET="your-client-secret"
 | 安全承诺 | 实际工程机制 |
 | :--- | :--- |
 | **零隐私收割、零遥测** | 无任何第三方统计 SDK、无崩溃上报、无暗中联网行为；自动检查更新与自动同步价格默认均为关闭状态。 |
-| **绝不触碰官方安装包** | 通过本机回环（`127.0.0.1`）CDP 隔离世界运行，绝不解包、不改写 `app.asar`、不重签名 `/Applications/Antigravity.app`。 |
+| **绝不触碰官方安装包** | 通过本机回环（`127.0.0.1`）CDP 隔离世界运行，绝不改写 Antigravity 安装目录文件。 |
 | **聊天与代码绝对隔离** | 编辑器草稿、历史对话正文、代码块、终端输出、文件名与工作区路径均受严格选择器白名单保护，绝不篡改或上传。 |
-| **纯本地权限隔离存储** | 所有配置、钥匙串凭据索引、SQLite 账本与快照均仅保存在本机 `~/Library/Application Support/GravityBox`（严格 `0700` / `0600` 权限）。 |
+| **纯本地权限隔离存储** | 所有配置、凭据索引、SQLite 账本与快照均仅保存在本机 `%LocalAppData%\GravityBox`（macOS 下为 `~/Library/Application Support/GravityBox`）。 |
 
 ---
 
@@ -417,45 +414,42 @@ GRAVITYBOX_GOOGLE_CLIENT_SECRET="your-client-secret"
 
 ```mermaid
 flowchart LR
-  UI["原生桌面前端 (Swift 6 / AppKit)<br/>主控制台 · 常驻菜单栏 · 自更新器"] <-->|"Unix Domain Socket IPC"| Core["核心后端引擎 (Node 22 / TypeScript)<br/>四阶段切号 · 只读 SQLite 账本 · 配额融合"]
-  Core -->|"本机回环 CDP (零改包)"| IDE["/Applications/Antigravity.app<br/>界面中英热适配 · 输入框 HUD 状态栏"]
-  Core -->|"只读快照 + 废纸篓回收"| Local["~/Library/Application Support/GravityBox<br/>账号与配置 · 用量总账 · 个人词典 · 恢复点"]
+  UI["Windows 桌面前端 (Tauri 2 + React / TypeScript)<br/>主控制台 · 系统托盘面板"] <-->|"Named Pipe IPC"| Core["核心后端引擎 (Node 22 / TypeScript + Win32 Helper)<br/>四阶段切号 · 只读 SQLite 账本 · 配额融合"]
+  Core -->|"本机回环 CDP (零改包)"| IDE["Antigravity.exe<br/>界面中英热适配 · 输入框 HUD 状态栏"]
+  Core -->|"只读快照 + 回收站安全移除"| Local["%LocalAppData%\\GravityBox<br/>账号与配置 · 用量总账 · 个人词典 · 恢复点"]
 ```
 
 ### 从源码编译与运行开发门禁
 
-> 源码构建需本机安装 Xcode Command Line Tools 与 Node.js `>=22.15.0 <23`。
+> Windows 源码构建需安装 Node.js `>=22.15.0 <23`、`pnpm` 以及 Rust 工具链（支持 `x86_64-pc-windows-gnu` 或 MSVC）。
 
-```bash
-git clone https://github.com/Enzoo404/gravitybox.git
-cd gravitybox
+```powershell
+git clone https://github.com/Citrus0914/gravitybox-windows.git
+cd gravitybox-windows
 npm ci
+pnpm --dir desktop install
 
-# 日常构建、同步价格表并运行核心单元/集成测试
-npm test
+# 运行后端构建与全量 Windows 门禁（隐私检查 + 文档检查 + Rust 单测 + 前端/Tauri 构建 + 单元集成测试 + 词典门禁）
+npm run verify:win
 
-# 运行原生 Swift AppKit 编译与界面排版检查
-npm run check:swift
-
-# 运行完整发版门禁（TS 编译 + 全量单测 + 无头浏览器回归 + Swift 编译 + 多版本词典门禁）
-npm run verify
-
-# 本地打包 Apple Silicon 原生 .app 与 .dmg 安装镜像
-npm run package:mac
+# 打包 Windows 便携目录与 .zip 分发包（输出至 build/）
+npm run package:win
 ```
 
 <details>
 <summary><b>查看仓库目录结构说明</b></summary>
 
 ```text
-gravitybox/
-├── native/          # Swift 6 / AppKit 原生主控制台、菜单栏面板、L10n 双语运行时与自更新校验
-├── src/             # TypeScript 核心后端（IPC 通信、双语引擎、四阶段切号、配额聚合、只读 SQLite 账本、HUD 计算）
+gravitybox-windows/
+├── desktop/         # Windows 桌面端（Tauri 2 Rust 宿主 + React/TypeScript 5 页主控制台与托盘面板）
+├── native-win/      # 零外部依赖 Win32 Rust 原生辅助程序（gb-win-helper.exe）
+├── native/          # 原生 macOS Swift 6 / AppKit 前端（源自上游 Enzoo404/gravitybox）
+├── src/             # 跨平台 TypeScript 核心后端（含 src/platform/ Windows 抽象层）
 ├── runtime/         # CDP 隔离世界脚本（零侵入增量翻译引擎、DOM 边界保护、双语会话状态栏 HUD）
 ├── dict/ & ui-strings/ # 多版本双语词典与官方界面文案快照基准（覆盖 2.23.0 ~ 2.32.2）
-├── assets/          # 应用图标、中英语言包 (i18n/)、2x Retina 实机截图、时序价格基准 (pricing-feed.json) 与模型目录
-├── test/            # 单元/集成测试、双语测试、无头 Chromium 浏览器回归与原生 Swift UI 自动化断言
-└── tools/           # 门禁校验、隐私扫描、文档一致性核对与 macOS DMG 打包脚本
+├── assets/          # 应用图标、中英语言包 (i18n/)、实机截图、时序价格基准 (pricing-feed.json) 与模型目录
+├── test/            # 单元/集成测试、Windows Named Pipe 契约测试、双语测试与浏览器回归
+└── tools/           # Windows/macOS 构建、验证门禁、隐私扫描、文档一致性核对与打包脚本
 ```
 
 </details>
@@ -496,14 +490,15 @@ Antigravity 运行时会持续持有本地 SQLite 数据库与认证缓存的文
 
 ---
 
-## 🤝 参与贡献与开源协议
+## 🤝 致谢、参与贡献与开源协议
 
-- 提交问题或代码前，欢迎阅读 [贡献指南 (CONTRIBUTING.md)](./CONTRIBUTING.md)、[行为准则 (CODE_OF_CONDUCT.md)](./CODE_OF_CONDUCT.md) 与 [安全政策 (SECURITY.md)](./SECURITY.md)，并通过 [GitHub Issues](https://github.com/Enzoo404/gravitybox/issues) 交流反馈。
-- 完整版本演进记录请查阅 [CHANGELOG.md](./CHANGELOG.md) 与 [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases)。
+- **致谢原作者**：本项目的核心架构、运行期翻译引擎、HUD 遥测、配额与账本等全部原始设计均来自 [**Enzoo404**](https://github.com/Enzoo404) 开源的 macOS 原版仓库 [**Enzoo404/gravitybox**](https://github.com/Enzoo404/gravitybox)，在此向原作者致以诚挚感谢。
+- 提交问题或代码前，欢迎阅读 [贡献指南 (CONTRIBUTING.md)](./CONTRIBUTING.md)、[行为准则 (CODE_OF_CONDUCT.md)](./CODE_OF_CONDUCT.md) 与 [安全政策 (SECURITY.md)](./SECURITY.md)，并通过 [GitHub Issues](https://github.com/Citrus0914/gravitybox-windows/issues) 交流反馈。
+- 完整版本演进记录请查阅 [CHANGELOG.md](./CHANGELOG.md) 与 [GitHub Releases](https://github.com/Citrus0914/gravitybox-windows/releases)。
 
 <div align="center">
-  <a href="https://star-history.com/#Enzoo404/gravitybox&Date">
-    <img src="https://api.star-history.com/svg?repos=Enzoo404/gravitybox&type=Date" alt="Star History Chart" width="720" />
+  <a href="https://star-history.com/#Citrus0914/gravitybox-windows&Date">
+    <img src="https://api.star-history.com/svg?repos=Citrus0914/gravitybox-windows&type=Date" alt="Star History Chart" width="720" />
   </a>
 </div>
 
