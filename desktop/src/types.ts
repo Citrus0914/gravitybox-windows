@@ -66,9 +66,11 @@ export interface TaskItem {
 }
 
 export interface QuotaGroupWindow {
+  id?: string;
   key?: string;
   label?: string;
   period?: '5h' | 'weekly' | 'daily' | string;
+  remaining?: number | null;
   percentage?: number | null;
   known?: boolean;
   resetTime?: number | null;
@@ -79,14 +81,23 @@ export interface QuotaGroupWindow {
 export interface QuotaGroup {
   key?: string;
   id?: string;
+  displayName?: string;
+  summaryLabel?: string;
   title?: string;
   label?: string;
   family?: string;
+  brands?: string[];
+  isStandalone?: boolean;
+  availability?: string;
+  quotaState?: string;
+  message?: string;
   windows?: QuotaGroupWindow[];
   percentage?: number | null;
   resetCountdown?: string;
   stale?: boolean;
 }
+
+export type StaleGroupEntry = string | { name?: string; observed_at?: number };
 
 export interface AccountItem {
   id: string;
@@ -112,8 +123,8 @@ export interface AccountItem {
   argonWeeklyResetCountdown?: string;
   carbonWeeklyRemaining?: number | null;
   carbonWeeklyResetCountdown?: string;
-  staleGroups?: string[];
-  stale_groups?: string[];
+  staleGroups?: StaleGroupEntry[];
+  stale_groups?: StaleGroupEntry[];
   quotaGroups?: QuotaGroup[];
   quotaWarnings?: string[];
   credentialReadiness?: { state?: string; message?: string };
@@ -222,7 +233,7 @@ export interface DashboardSummary {
     argonWeeklyResetCountdown?: string;
     carbonWeeklyRemaining?: number | null;
     carbonWeeklyResetCountdown?: string;
-    staleGroups?: string[];
+    staleGroups?: StaleGroupEntry[];
     quotaGroups?: QuotaGroup[];
     quotaRefreshError?: string;
     quotaWarnings?: string[];
@@ -250,9 +261,16 @@ export interface DashboardSummary {
 export interface AutoSwitchConfig {
   enabled: boolean;
   strategy?: 'priority' | 'round_robin' | string;
+  monitored_model?: string;
   monitoredGroup?: string;
+  reserve_percentage?: number;
+  reservePercentage?: number;
   reserveThresholdPct?: number;
+  candidate_min_percentage?: number;
+  candidateMinPercentage?: number;
   candidateMinPct?: number;
+  candidate_account_ids?: string[];
+  last_switched_id?: string;
   [key: string]: unknown;
 }
 

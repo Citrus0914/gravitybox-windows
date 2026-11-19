@@ -48,8 +48,17 @@ export const SettingsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
   const handleCheckPricingNow = async () => {
     setCheckingPricing(true);
     try {
-      const res = await ipcRequest<{ appliedCount?: number }>('pricing_sync_check');
-      store.showToast(t('settings.pricing_sync.synced', { count: res.appliedCount ?? 0 }));
+      const res = await ipcRequest<{
+        synced?: boolean;
+        error?: string;
+        count?: number;
+        appliedCount?: number;
+      }>('pricing_sync_check');
+      if (res.synced === false) {
+        store.showToast(res.error || t('settings.pricing_sync.update_failed'), true);
+      } else {
+        store.showToast(t('settings.pricing_sync.synced', { count: res.count ?? res.appliedCount ?? 0 }));
+      }
     } catch (err) {
       store.showToast(t('settings.pricing_sync.sync_failed', { error: String(err) }), true);
     } finally {

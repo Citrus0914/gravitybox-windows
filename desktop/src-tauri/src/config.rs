@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,9 +120,27 @@ pub fn save_config(state_dir: &Path, mut cfg: AppConfig) -> Result<AppConfig, St
     let path = state_dir.join("config.json");
     let existing = fs::read_to_string(&path).ok();
     let serialized = merge_config_document(existing.as_deref(), &cfg)?;
-    let tmp = state_dir.join(format!("config-{}.tmp", std::process::id()));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = state_dir.join(format!("config-{}-{}.tmp", std::process::id(), seq));
     fs::write(&tmp, serialized.as_bytes()).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match fs::rename(&tmp, &path) {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    thread::sleep(Duration::from_millis(15));
+                }
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        return Err(err.to_string());
+    }
     Ok(cfg)
 }
 

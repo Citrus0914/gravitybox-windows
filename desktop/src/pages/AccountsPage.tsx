@@ -33,9 +33,9 @@ export const AccountsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
   const [autoSwitch, setAutoSwitch] = useState<AutoSwitchConfig>({
     enabled: false,
     strategy: 'priority',
-    monitoredGroup: 'gemini_all',
-    reserveThresholdPct: 10,
-    candidateMinPct: 30,
+    monitored_model: 'all',
+    reserve_percentage: 10,
+    candidate_min_percentage: 30,
   });
   const [recommendation, setRecommendation] = useState<{
     shouldSwitch?: boolean;
@@ -48,6 +48,14 @@ export const AccountsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
   const [showAddModal, setShowAddModal] = useState(false);
   const [showPolicyModal, setShowPolicyModal] = useState(false);
   const [renameTarget, setRenameTarget] = useState<{ id: string; name: string } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<AccountItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  useEffect(() => {
+    if (typeof store.config?.accountsCollapsed === 'boolean') {
+      setCollapsedAll(store.config.accountsCollapsed);
+    }
+  }, [store.config?.accountsCollapsed]);
 
   const loadAccounts = useCallback(async () => {
     try {
@@ -108,10 +116,18 @@ export const AccountsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
     if (refreshingAll) return;
     setRefreshingAll(true);
     try {
-      await ipcRequest('quota_refresh_all');
+      const res = await ipcRequest<{
+        partial?: boolean;
+        failures?: Array<{ email?: string; error?: string }>;
+      }>('quota_refresh_all');
       await loadAccounts();
-      store.showToast(t('main.quota.read_ok', undefined, 'Quota refreshed'));
+      if (res.failures?.length) {
+        store.showToast(res.failures[0]?.error || t('main.quota.read_partial'), true);
+      } else {
+        store.showToast(t('main.quota.read_ok', undefined, 'Quota refreshed'));
+      }
     } catch (err) {
+      await loadAccounts().catch(() => {});
       store.showToast(String(err), true);
     } finally {
       setRefreshingAll(false);
@@ -161,12 +177,17 @@ export const AccountsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
     }
   };
 
-  const handleDelete = async (acc: AccountItem) => {
+  const handleDeleteConfirm = async () => {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
     try {
-      await ipcRequest('account_delete', { id: acc.id });
+      await ipcRequest('account_delete', { id: deleteTarget.id });
+      setDeleteTarget(null);
       await loadAccounts();
     } catch (err) {
       store.showToast(String(err), true);
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -180,14 +201,31 @@ export const AccountsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
     }
   };
 
-  const monitoredKey = autoSwitch.monitoredGroup || 'gemini_all';
-  const monitoredLabel = t(
-    `accounts.smart_switch.monitored.${monitoredKey}`,
-    undefined,
-    monitoredKey,
-  );
-  const reservePct = autoSwitch.reserveThresholdPct ?? 10;
-  const minPct = autoSwitch.candidateMinPct ?? 30;
+  const monitoredKey = autoSwitch.monitored_model || autoSwitch.monitoredGroup || 'all';
+  const monitoredLabel =
+    monitoredKey === 'all'
+      ? t('accounts.smart_switch.monitored.all_available')
+      : monitoredKey === 'gemini_all'
+        ? t('accounts.smart_switch.monitored.gemini_all')
+        : monitoredKey === 'gemini' || monitoredKey === 'gemini_base'
+          ? t('accounts.smart_switch.monitored.gemini_base')
+          : monitoredKey === 'claude'
+            ? 'Claude/GPT'
+            : monitoredKey === 'argon'
+              ? 'Gemini 4 Argon'
+              : monitoredKey === 'carbon'
+                ? 'Gemini 4 Carbon'
+                : monitoredKey;
+  const reservePct =
+    autoSwitch.reserve_percentage ??
+    autoSwitch.reservePercentage ??
+    autoSwitch.reserveThresholdPct ??
+    10;
+  const minPct =
+    autoSwitch.candidate_min_percentage ??
+    autoSwitch.candidateMinPercentage ??
+    autoSwitch.candidateMinPct ??
+    30;
 
   return (
     <>
@@ -199,7 +237,7 @@ export const AccountsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
             {collapsedAll ? t('accounts.expand_all') : t('accounts.collapse_all')}
           </button>
           <button className="btn" onClick={() => void handleRefreshAll()} disabled={!reachable || refreshingAll}>
-            <RefreshCw size={13} />
+            <RefreshCw size={13} className={refreshingAll ? 'spin' : ''} />
             {t('common.refresh_quota')}
           </button>
           <button className="btn btn-primary" onClick={() => setShowAddModal(true)} disabled={!reachable}>
@@ -335,7 +373,7 @@ export const AccountsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
                       disabled={refreshingId === acc.id}
                       onClick={() => void handleRefreshSingle(acc.id)}
                     >
-                      <RefreshCw size={14} />
+                      <RefreshCw size={14} className={refreshingId === acc.id ? 'spin' : ''} />
                     </button>
 
                     <div className="dropdown-wrap" onClick={(e) => e.stopPropagation()}>
@@ -390,7 +428,7 @@ export const AccountsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
                           <div className="dropdown-sep" />
                           <button
                             className="dropdown-item danger"
-                            onClick={() => { setMenuOpenId(null); void handleDelete(acc); }}
+                            onClick={() => { setMenuOpenId(null); setDeleteTarget(acc); }}
                           >
                             <span>{store.locale === 'en' ? 'Remove Account' : '删除账号'}</span>
                             <Trash2 size={13} />
@@ -491,6 +529,35 @@ export const AccountsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
           />
         </Modal>
       )}
+
+      {deleteTarget && (
+        <Modal
+          title={store.locale === 'en' ? 'Remove Account' : '移除账号'}
+          onClose={() => { if (!deleting) setDeleteTarget(null); }}
+          footer={
+            <>
+              <button className="btn" disabled={deleting} onClick={() => setDeleteTarget(null)}>
+                {t('common.cancel')}
+              </button>
+              <button
+                className="btn btn-danger"
+                disabled={deleting}
+                onClick={() => void handleDeleteConfirm()}
+              >
+                {deleting
+                  ? t('status.running_tasks')
+                  : (store.locale === 'en' ? 'Remove' : '确认移除')}
+              </button>
+            </>
+          }
+        >
+          <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+            {store.locale === 'en'
+              ? `Remove saved account "${deleteTarget.name || deleteTarget.email}" (${deleteTarget.email}) from GravityBox?`
+              : `确定从 GravityBox 号池中移除账号「${deleteTarget.name || deleteTarget.email}」（${deleteTarget.email}）吗？`}
+          </div>
+        </Modal>
+      )}
     </>
   );
 };
@@ -512,21 +579,27 @@ const AddAccountModal: React.FC<{
     const timer = window.setInterval(async () => {
       try {
         const res = await ipcRequest<{
+          phase?: string;
           status?: string;
+          message?: string;
           error?: string;
           account?: AccountItem;
         }>('account_oauth_status', { id: oauthId });
-        if (res.status === 'completed' || res.account) {
+        const phase = res.phase || res.status;
+        if (phase === 'succeeded' || phase === 'completed' || res.account) {
           window.clearInterval(timer);
           setOauthId(null);
           setBusy(false);
           onAdded();
           onClose();
-        } else if (res.status === 'failed' || res.status === 'cancelled' || res.error) {
+        } else if (phase === 'exchanging' || phase === 'saving') {
+          setStatusText(t('add_account.status.saving'));
+        } else if (phase === 'failed' || phase === 'cancelled' || phase === 'expired' || res.error) {
           window.clearInterval(timer);
           setOauthId(null);
           setBusy(false);
-          setErrorText(res.error || t('add_account.error.incomplete'));
+          setStatusText('');
+          setErrorText(res.message || res.error || t('add_account.error.incomplete'));
         }
       } catch {
         // keep polling
@@ -674,9 +747,21 @@ const AutoSwitchPolicyModal: React.FC<{
 }> = ({ store, initial, onClose, onSaved }) => {
   const { t } = store;
   const [strategy, setStrategy] = useState(initial.strategy || 'priority');
-  const [monitoredGroup, setMonitoredGroup] = useState(initial.monitoredGroup || 'gemini_all');
-  const [reservePct, setReservePct] = useState(String(initial.reserveThresholdPct ?? 10));
-  const [candidatePct, setCandidatePct] = useState(String(initial.candidateMinPct ?? 30));
+  const [monitoredModel, setMonitoredModel] = useState(() => {
+    const raw = initial.monitored_model || initial.monitoredGroup || 'all';
+    return raw === 'gemini_base' ? 'gemini' : raw;
+  });
+  const [reservePct, setReservePct] = useState(
+    String(initial.reserve_percentage ?? initial.reservePercentage ?? initial.reserveThresholdPct ?? 10),
+  );
+  const [candidatePct, setCandidatePct] = useState(
+    String(
+      initial.candidate_min_percentage ??
+        initial.candidateMinPercentage ??
+        initial.candidateMinPct ??
+        30,
+    ),
+  );
   const [err, setErr] = useState('');
 
   const handleSave = async () => {
@@ -694,17 +779,20 @@ const AutoSwitchPolicyModal: React.FC<{
       setErr(t('policy.error.candidate_le_reserve'));
       return;
     }
+    const payload: AutoSwitchConfig = {
+      ...initial,
+      strategy,
+      monitored_model: monitoredModel,
+      reserve_percentage: r,
+      reservePercentage: r,
+      candidate_min_percentage: c,
+      candidateMinPercentage: c,
+    };
     try {
       const res = await ipcRequest<{ config?: AutoSwitchConfig }>('auto_switch_set', {
-        config: {
-          ...initial,
-          strategy,
-          monitoredGroup,
-          reserveThresholdPct: r,
-          candidateMinPct: c,
-        },
+        config: payload,
       });
-      onSaved(res.config ?? { ...initial, strategy, monitoredGroup, reserveThresholdPct: r, candidateMinPct: c });
+      onSaved(res.config ?? payload);
       onClose();
     } catch (e) {
       setErr(String(e));
@@ -737,12 +825,13 @@ const AutoSwitchPolicyModal: React.FC<{
         <div>
           <div style={{ fontWeight: 600 }}>{t('policy.row.monitored.title')}</div>
         </div>
-        <select className="select" value={monitoredGroup} onChange={(e) => setMonitoredGroup(e.target.value)}>
+        <select className="select" value={monitoredModel} onChange={(e) => setMonitoredModel(e.target.value)}>
+          <option value="all">{t('accounts.smart_switch.monitored.all_available')}</option>
           <option value="gemini_all">{t('accounts.smart_switch.monitored.gemini_all')}</option>
-          <option value="all_available">{t('accounts.smart_switch.monitored.all_available')}</option>
-          <option value="all_core">{t('accounts.smart_switch.monitored.all_core')}</option>
-          <option value="gemini_all_argon">{t('accounts.smart_switch.monitored.gemini_all_argon')}</option>
-          <option value="gemini_base">{t('accounts.smart_switch.monitored.gemini_base')}</option>
+          <option value="gemini">{t('accounts.smart_switch.monitored.gemini_base')}</option>
+          <option value="claude">Claude/GPT</option>
+          <option value="argon">Gemini 4 Argon</option>
+          <option value="carbon">Gemini 4 Carbon</option>
         </select>
       </div>
 

@@ -125,7 +125,7 @@ export async function winPsList(): Promise<WinProcessEntry[]> {
   try {
     const { stdout } = await runHelper(['ps-list'], 5000);
     const parsed = JSON.parse(stdout || '[]') as WinProcessEntry[];
-    if (parsed.some(entry => entry.pid === process.pid)) {
+    if (parsed.length >= 10 && parsed.some(entry => entry.pid === process.pid)) {
       return parsed;
     }
   } catch {}

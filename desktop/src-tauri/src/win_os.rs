@@ -1,3 +1,4 @@
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -5,15 +6,41 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const ERROR_ALREADY_EXISTS: u32 = 183;
+#[cfg(windows)]
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+#[cfg(windows)]
+const INFINITE: u32 = 0xFFFF_FFFF;
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
     fn GetUserDefaultLocaleName(lpLocaleName: *mut u16, cchLocaleName: i32) -> i32;
+    fn CreateMutexW(
+        lpMutexAttributes: *const c_void,
+        bInitialOwner: i32,
+        lpName: *const u16,
+    ) -> *mut c_void;
+    fn CreateEventW(
+        lpEventAttributes: *const c_void,
+        bManualReset: i32,
+        bInitialState: i32,
+        lpName: *const u16,
+    ) -> *mut c_void;
+    fn OpenEventW(dwDesiredAccess: u32, bInheritHandle: i32, lpName: *const u16) -> *mut c_void;
+    fn SetEvent(hEvent: *mut c_void) -> i32;
+    fn WaitForSingleObject(hHandle: *mut c_void, dwMilliseconds: u32) -> u32;
+    fn CloseHandle(hObject: *mut c_void) -> i32;
+    fn GetLastError() -> u32;
 }
 
 pub fn new_hidden_command(program: &str) -> Command {
@@ -79,12 +106,124 @@ fn normalize_path_for_node_resolve(path: &Path) -> String {
     trimmed.to_lowercase()
 }
 
-pub fn control_endpoint_for_state_dir(state_dir: &Path) -> String {
+pub fn state_dir_hash16(state_dir: &Path) -> String {
     let normalized = normalize_path_for_node_resolve(state_dir);
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
-    format!("\\\\.\\pipe\\gravitybox-{}", &digest[..16])
+    digest[..16].to_string()
+}
+
+pub fn control_endpoint_for_state_dir(state_dir: &Path) -> String {
+    format!("\\\\.\\pipe\\gravitybox-{}", state_dir_hash16(state_dir))
+}
+
+#[cfg(windows)]
+fn to_wide_null(s: &str) -> Vec<u16> {
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+struct SendHandle(*mut c_void);
+
+#[cfg(windows)]
+unsafe impl Send for SendHandle {}
+#[cfg(windows)]
+unsafe impl Sync for SendHandle {}
+
+pub struct SingleInstanceGuard {
+    #[cfg(windows)]
+    mutex_handle: SendHandle,
+    #[cfg(windows)]
+    wake_handle: SendHandle,
+}
+
+impl SingleInstanceGuard {
+    pub fn acquire(state_dir: &Path, signal_existing: bool) -> Option<Self> {
+        #[cfg(windows)]
+        {
+            let hash = state_dir_hash16(state_dir);
+            let mutex_name = to_wide_null(&format!("Local\\GravityBox-Desktop-Mutex-{}", hash));
+            let wake_name = to_wide_null(&format!("Local\\GravityBox-Desktop-Wake-{}", hash));
+
+            unsafe {
+                let mutex_handle = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
+                if !mutex_handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+                    CloseHandle(mutex_handle);
+                    if signal_existing {
+                        let ev = OpenEventW(EVENT_MODIFY_STATE, 0, wake_name.as_ptr());
+                        if !ev.is_null() {
+                            let _ = SetEvent(ev);
+                            CloseHandle(ev);
+                        }
+                    }
+                    return None;
+                }
+                let wake_handle = CreateEventW(std::ptr::null(), 0, 0, wake_name.as_ptr());
+                Some(Self {
+                    mutex_handle: SendHandle(mutex_handle),
+                    wake_handle: SendHandle(wake_handle),
+                })
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (state_dir, signal_existing);
+            Some(Self {})
+        }
+    }
+
+    pub fn wait_for_wake(&self) -> bool {
+        #[cfg(windows)]
+        {
+            if self.wake_handle.0.is_null() {
+                return false;
+            }
+            unsafe { WaitForSingleObject(self.wake_handle.0, INFINITE) == 0 }
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    pub fn signal_wake(&self) {
+        #[cfg(windows)]
+        {
+            if !self.wake_handle.0.is_null() {
+                unsafe {
+                    let _ = SetEvent(self.wake_handle.0);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            if !self.wake_handle.0.is_null() {
+                CloseHandle(self.wake_handle.0);
+            }
+            if !self.mutex_handle.0.is_null() {
+                CloseHandle(self.mutex_handle.0);
+            }
+        }
+    }
+}
+
+pub fn matches_antigravity_process_row(row: &Value, root_lower: &str) -> bool {
+    let exe = row["exe"].as_str().unwrap_or("").to_lowercase();
+    let cmd = row["cmd"]
+        .as_str()
+        .or_else(|| row["command"].as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    exe.starts_with(root_lower) || cmd.contains(root_lower)
 }
 
 pub fn get_system_locales() -> Vec<String> {
@@ -114,14 +253,14 @@ pub fn is_antigravity_running(helper_exe: Option<&Path>) -> bool {
                 if output.status.success() {
                     if let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
                         let root = default_antigravity_dir().to_string_lossy().to_lowercase();
-                        for row in rows {
-                            let exe = row["exe"].as_str().unwrap_or("").to_lowercase();
-                            let cmd = row["command"].as_str().unwrap_or("").to_lowercase();
-                            if exe.starts_with(&root) || cmd.contains(&root) {
+                        for row in &rows {
+                            if matches_antigravity_process_row(row, &root) {
                                 return true;
                             }
                         }
-                        return false;
+                        if rows.len() >= 10 {
+                            return false;
+                        }
                     }
                 }
             }
@@ -265,5 +404,55 @@ mod tests {
         let a = control_endpoint_for_state_dir(Path::new(r"C:\Users\demo\AppData\Local\GravityBox\"));
         let b = control_endpoint_for_state_dir(Path::new(r"c:\users\demo\appdata\local\gravitybox"));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn matches_antigravity_process_row_reads_cmd_and_command() {
+        let root = r"c:\users\demo\appdata\local\programs\antigravity";
+        let row_cmd = serde_json::json!({
+            "pid": 100,
+            "exe": r"C:\Windows\System32\cmd.exe",
+            "cmd": r"C:\Users\demo\AppData\Local\Programs\Antigravity\Antigravity.exe --type=renderer"
+        });
+        assert!(matches_antigravity_process_row(&row_cmd, root));
+
+        let row_exe = serde_json::json!({
+            "pid": 101,
+            "exe": r"C:\Users\demo\AppData\Local\Programs\Antigravity\Antigravity.exe",
+            "cmd": ""
+        });
+        assert!(matches_antigravity_process_row(&row_exe, root));
+
+        let row_other = serde_json::json!({
+            "pid": 102,
+            "exe": r"C:\Windows\notepad.exe",
+            "cmd": "notepad.exe"
+        });
+        assert!(!matches_antigravity_process_row(&row_other, root));
+    }
+
+    #[test]
+    fn single_instance_guard_blocks_duplicate_and_signals_wake() {
+        let dir1 = PathBuf::from(format!(
+            r"C:\Users\demo\AppData\Local\GravityBox-UnitTest-{}-1",
+            std::process::id()
+        ));
+        let dir2 = PathBuf::from(format!(
+            r"C:\Users\demo\AppData\Local\GravityBox-UnitTest-{}-2",
+            std::process::id()
+        ));
+
+        let guard1 = SingleInstanceGuard::acquire(&dir1, false).expect("first guard should succeed");
+        assert!(SingleInstanceGuard::acquire(&dir1, true).is_none());
+        assert!(guard1.wait_for_wake());
+
+        let guard2 = SingleInstanceGuard::acquire(&dir2, false);
+        assert!(guard2.is_some());
+
+        drop(guard2);
+        drop(guard1);
+
+        let reacquired = SingleInstanceGuard::acquire(&dir1, false);
+        assert!(reacquired.is_some());
     }
 }
