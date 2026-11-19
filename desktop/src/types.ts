@@ -4,6 +4,7 @@ export interface AppConfig {
   navigationVersion?: number;
   quotaRefreshMinutes: number;
   hudEnabled: boolean;
+  translationEnabled?: boolean;
   autoPricingSyncEnabled: boolean;
   syncAntigravityLifecycle: boolean;
   autoUpdateEnabled: boolean;

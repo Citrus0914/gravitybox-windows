@@ -657,7 +657,7 @@ export class Controller {
   setLocale(
     nextLocale: string,
     configuredLanguage?: string,
-    options?: { dictionary?: Dictionary; hasTargetDictionary?: boolean }
+    options?: { dictionary?: Dictionary; hasTargetDictionary?: boolean; translationEnabled?: boolean }
   ): Promise<void> {
     return this.enqueueControl(async () => {
       const resolved = normalizeLocale(nextLocale) ?? 'en';
@@ -676,7 +676,7 @@ export class Controller {
         for (const s of this.pages.values()) s.languageMode = undefined;
       }
       this.bootCache.clear();
-      const shouldTranslateDom = resolved !== 'en' && this.hasTargetDictionary;
+      const shouldTranslateDom = (options?.translationEnabled ?? true) && resolved !== 'en' && this.hasTargetDictionary;
       if (!shouldTranslateDom) {
         this.paused = true;
         if (!previousPaused || previousLocale !== resolved) {
