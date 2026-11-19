@@ -60,6 +60,7 @@ const BINARY_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.icns', '.ico',
   '.dmg', '.zip', '.tar', '.gz', '.pdf', '.woff', '.woff2',
   '.ttf', '.otf', '.node', '.sqlite', '.db', '.bin',
+  '.exe', '.dll', '.msi', '.pdb', '.lib',
 ]);
 
 const SKIPPED_DIRS = new Set([
