@@ -540,7 +540,14 @@ async function run() {
         })
       : { configuredLanguage: 'zh-Hans', resolvedLocale: 'zh-Hans' };
   setActiveLocale(initialLang.resolvedLocale);
-  const initialDictInfo = await resolveDictionaryForLocale(baseDir, initialLang.resolvedLocale);
+  let translationSettingEnabled =
+    typeof configuredTranslationEnabled === 'boolean'
+      ? configuredTranslationEnabled
+      : preferredConfiguredLanguage === undefined && typeof runtimePrefs?.translationEnabled === 'boolean'
+      ? runtimePrefs.translationEnabled
+      : initialLang.resolvedLocale !== 'en';
+  const initialDictLocale = translationSettingEnabled ? 'zh-Hans' : initialLang.resolvedLocale;
+  const initialDictInfo = await resolveDictionaryForLocale(baseDir, initialDictLocale);
   const store = new DictionaryStore(initialDictInfo.baseDir, userDir);
   let fallback;
   try {
@@ -572,13 +579,7 @@ async function run() {
   }
   let applyChain = Promise.resolve();
   const shortcutEnabled = !!fixture;
-  let translationSettingEnabled =
-    typeof configuredTranslationEnabled === 'boolean'
-      ? configuredTranslationEnabled
-      : preferredConfiguredLanguage === undefined && typeof runtimePrefs?.translationEnabled === 'boolean'
-      ? runtimePrefs.translationEnabled
-      : true;
-  let initiallyPaused = !translationSettingEnabled || initialLang.resolvedLocale === 'en' || !initialDictInfo.hasTargetDictionary;
+  let initiallyPaused = !translationSettingEnabled || !initialDictInfo.hasTargetDictionary;
   let hudEnabled = typeof configuredHudEnabled === 'boolean' ? configuredHudEnabled : true;
   if (runtimePrefs && typeof configuredHudEnabled !== 'boolean' && typeof runtimePrefs.hudEnabled === 'boolean') {
     hudEnabled = runtimePrefs.hudEnabled;
@@ -633,21 +634,23 @@ async function run() {
   ) => {
     setActiveLocale(resolved);
     usageManager.invalidateCache();
-    const nextDictInfo = await resolveDictionaryForLocale(baseDir, resolved);
+    const shouldTranslate = translationSettingEnabled;
+    const nextDictLocale = shouldTranslate ? 'zh-Hans' : resolved;
+    const nextDictInfo = await resolveDictionaryForLocale(baseDir, nextDictLocale);
     await store.setBaseDir(nextDictInfo.baseDir);
-    const shouldTranslate = translationSettingEnabled && resolved !== 'en' && nextDictInfo.hasTargetDictionary;
+    const effectiveTranslate = shouldTranslate && nextDictInfo.hasTargetDictionary;
     await saveRuntimePreferences({
       language: requested,
-      translationEnabled: shouldTranslate,
+      translationEnabled: effectiveTranslate,
       persistTranslation: options.persistTranslation,
     });
-    if (!shouldTranslate) cancelRunningDeepScan();
+    if (!effectiveTranslate) cancelRunningDeepScan();
     await controller.setLocale(resolved, requested, {
       dictionary: store.current,
       hasTargetDictionary: nextDictInfo.hasTargetDictionary,
-      translationEnabled: shouldTranslate,
+      translationEnabled: effectiveTranslate,
     });
-    return shouldTranslate;
+    return effectiveTranslate;
   };
   let cacheChain = Promise.resolve();
   const cache = () => { const value = store.current; cacheChain = cacheChain.catch(() => {}).then(() => atomicJson(join(channelStateDir, 'last-valid-dictionary.json'), value)); cacheChain.catch(() => {}); };
@@ -1094,7 +1097,7 @@ async function run() {
             return;
           }
           if(command==='hud_set'){const nextHud=parsed.enabled!==false;await saveRuntimePreferences({hudEnabled:nextHud});await controller.configureHud(nextHud);await writeChain;reply({ok:true,status:controller.snapshot()});return;}
-          if(command==='translation_set'){const nextTranslation=parsed.enabled!==false;translationSettingEnabled=nextTranslation;await saveRuntimePreferences({translationEnabled:nextTranslation,persistTranslation:true});if(nextTranslation){if(getActiveLocale()==='en'){await applyLocalePreference('zh-Hans','zh-Hans',{persistTranslation:true});}else{await controller.resume();}}else{cancelRunningDeepScan();await controller.pause();}await writeChain;reply({ok:true,status:controller.snapshot()});return;}
+          if(command==='translation_set'){const nextTranslation=parsed.enabled!==false;translationSettingEnabled=nextTranslation;const nextDictLocale=nextTranslation?'zh-Hans':getActiveLocale();const nextDictInfo=await resolveDictionaryForLocale(baseDir,nextDictLocale);await store.setBaseDir(nextDictInfo.baseDir);const effectiveTranslate=nextTranslation&&nextDictInfo.hasTargetDictionary;await saveRuntimePreferences({translationEnabled:effectiveTranslate,persistTranslation:true});if(effectiveTranslate){await controller.setLocale(getActiveLocale(),undefined,{dictionary:store.current,hasTargetDictionary:nextDictInfo.hasTargetDictionary,translationEnabled:true});}else{cancelRunningDeepScan();await controller.pause();}await writeChain;reply({ok:true,status:controller.snapshot()});return;}
           if(command==='maintenance_smart_clear'){reply(await cacheMaintenance.smartClear({scopes:parsed.scopes,retentionDays:parsed.retentionDays,keepLocalSnapshots:parsed.keepLocalSnapshots}));return;}
           if(command==='maintenance_clear'){reply(await cacheMaintenance.clear(parsed.token, parsed.selectedNames));return;}
           if(command==='maintenance_restore'){reply(await cacheMaintenance.restore(parsed.snapshotId ?? parsed.id));return;}
