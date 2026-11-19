@@ -119,15 +119,14 @@ export const SettingsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
                 <div>
                   <div style={{ fontWeight: 600 }}>{t('settings.translation.title')}</div>
                   <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                    {store.locale === 'en' ? t('settings.translation.english_hint') : t('settings.translation.subtitle')}
+                    {t('settings.translation.subtitle')}
                   </div>
                 </div>
               </div>
               <label className="switch">
                 <input
                   type="checkbox"
-                  disabled={store.locale === 'en'}
-                  checked={store.locale !== 'en' && Boolean(translationSettingEnabled)}
+                  checked={Boolean(translationSettingEnabled)}
                   onChange={(e) => void store.setTranslationEnabled(e.target.checked)}
                 />
                 <span className="switch-slider" />

@@ -9,11 +9,13 @@ const enApp: Record<string, string> = en.app as Record<string, string>;
 const WINDOWS_OVERRIDES: Record<ResolvedLocale, Record<string, string>> = {
   'zh-Hans': {
     'about.reveal_data': '在资源管理器中显示',
+    'settings.language.subtitle': '仅控制 GravityBox 控制台与对话状态栏 (HUD) 的显示语言，不改动 Antigravity 界面',
     'settings.login.subtitle': '登录 Windows 时自动在系统托盘驻留',
     'maintenance.reveal_btn': '在资源管理器中查看',
   },
   en: {
     'about.reveal_data': 'Show in Explorer',
+    'settings.language.subtitle': 'Sets display language for GravityBox and Session HUD only without affecting Antigravity',
     'settings.login.subtitle': 'Launch automatically in the system tray at Windows sign-in',
     'maintenance.reveal_btn': 'Show in Explorer',
   },

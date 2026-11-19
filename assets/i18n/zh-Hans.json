@@ -90,7 +90,7 @@
     "settings.section.quota_pricing": "配额与计价",
     "settings.section.system_storage": "系统与存储",
     "settings.translation.title": "Antigravity 界面汉化",
-    "settings.translation.subtitle": "实时翻译 Antigravity 界面；关闭后永久保持禁用，仍可正常使用中文 HUD 与面板",
+    "settings.translation.subtitle": "实时将 Antigravity 界面翻译为中文；与上方软件显示语言相互独立，关闭后永久保留原版或外部补丁",
     "settings.translation.english_hint": "当前显示语言为 English，Antigravity 将保持原版英文",
     "settings.hud.subtitle": "在 Antigravity 输入框下方显示轮次、Token 与上下文",
     "settings.refresh.title": "配额刷新间隔",

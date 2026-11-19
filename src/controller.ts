@@ -119,7 +119,9 @@ export class Controller {
     this.locale = initialLocale;
     this.configuredLanguage = options.configuredLanguage ?? initialLocale;
     this.hasTargetDictionary = options.hasTargetDictionary ?? (initialLocale !== 'en');
-    this.paused = options.initiallyPaused === true || initialLocale === 'en' || !this.hasTargetDictionary;
+    this.paused = typeof options.initiallyPaused === 'boolean'
+      ? (options.initiallyPaused || !this.hasTargetDictionary)
+      : (initialLocale === 'en' || !this.hasTargetDictionary);
     this.hudEnabled = options.hudEnabled !== false;
     this.hudBridge = new CdpHudBridge({
       geminiDir: options.geminiDir || process.env.GRAVITYBOX_GEMINI_DIR || process.env.GEMINI_DIR,
@@ -247,7 +249,7 @@ export class Controller {
   private boot(url: string) {
     const page = new URL(url);
     const effectiveHudLocale = this.effectiveHudLocale();
-    const languageMode = this.paused ? 'en' : (this.locale === 'zh-Hans' ? 'zh' : this.locale);
+    const languageMode = this.paused ? 'en' : 'zh';
     const key = `${page.origin}${page.pathname}:${this.options.dictionary.version}:${this.verifiedBundle()}:${this.hudEnabled}:${this.paused}:${effectiveHudLocale}`;
     const cached = this.bootCache.get(key);
     if (cached) return cached;
@@ -402,7 +404,7 @@ export class Controller {
       if (previous?.active&&previous.runtimeId===this.runtimeId) {
         if (previous.version === this.options.dictionary.version) await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.refresh()', session.contextId);
         else await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__.update(${JSON.stringify(this.options.dictionary)})`, session.contextId);
-        const desiredLanguageMode = this.paused ? 'en' : preservedManualEn ? 'en' : (this.locale === 'zh-Hans' ? 'zh' : 'en');
+        const desiredLanguageMode = this.paused ? 'en' : preservedManualEn ? 'en' : 'zh';
         if (!this.paused && !this.options.fixture && previous.languageMode && previous.languageMode !== desiredLanguageMode) {
           await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage?.(${JSON.stringify(desiredLanguageMode)})`, session.contextId);
         }
@@ -416,7 +418,7 @@ export class Controller {
       }
       if (state?.version !== this.options.dictionary.version) throw new Error(this.t('controller.err.dict_version_unconfirmed'));
       session.languageMode=state.languageMode??'zh';
-      const effectiveHudLocale = !this.paused && session.languageMode === 'en' ? 'en' : this.effectiveHudLocale();
+      const effectiveHudLocale = this.options.fixture && !this.paused && session.languageMode === 'en' ? 'en' : this.effectiveHudLocale();
       if (this.hudEnabled) {
         await session.cdp.evaluate(`(globalThis.__GRAVITYBOX_ATTACH_HUD__?.(), globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(${JSON.stringify(effectiveHudLocale)}), globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true), globalThis.__GRAVITYBOX_HUD_V1__?.syncAllSessions?.())`, session.contextId).catch(() => {});
       } else {
@@ -605,14 +607,14 @@ export class Controller {
   private async resumeHudOnly() {
     if (this.browser) await this.sync(); else await this.tryConnect();
   }
-  private async resumeInternal() {
+  private async resumeInternal(keepLocale = false) {
     const prevHudLocale = this.effectiveHudLocale();
     // Recreate the isolated runtime so translation starts from the chosen mode.
-    if (this.locale === 'en') {
+    if (!keepLocale && this.locale === 'en') {
       this.locale = 'zh-Hans';
       this.configuredLanguage = 'zh-Hans';
-      this.hasTargetDictionary = true;
     }
+    this.hasTargetDictionary = true;
     const wasPaused = this.paused;
     if (wasPaused && this.pages.size && !this.hudEnabled) await this.disconnectPages();
     this.paused = false;
@@ -651,8 +653,8 @@ export class Controller {
       await this.hudBridge.refreshAllForLocaleChange();
     }
   }
-  resume(): Promise<void> {
-    return this.enqueueControl(() => this.resumeInternal());
+  resume(options?: { keepLocale?: boolean }): Promise<void> {
+    return this.enqueueControl(() => this.resumeInternal(options?.keepLocale === true));
   }
   setLocale(
     nextLocale: string,
@@ -664,8 +666,10 @@ export class Controller {
       const previousLocale = this.locale;
       const previousPaused = this.paused;
       this.locale = resolved;
-      this.configuredLanguage = configuredLanguage ?? resolved;
-      this.hasTargetDictionary = options?.hasTargetDictionary ?? (resolved !== 'en');
+      if (configuredLanguage !== undefined) {
+        this.configuredLanguage = configuredLanguage;
+      }
+      this.hasTargetDictionary = options?.hasTargetDictionary ?? !this.paused;
       this.status.errors = [];
       if (options?.dictionary) {
         this.options.dictionary = options.dictionary;
@@ -676,7 +680,7 @@ export class Controller {
         for (const s of this.pages.values()) s.languageMode = undefined;
       }
       this.bootCache.clear();
-      const shouldTranslateDom = (options?.translationEnabled ?? true) && resolved !== 'en' && this.hasTargetDictionary;
+      const shouldTranslateDom = (options?.translationEnabled ?? !this.paused) && this.hasTargetDictionary;
       if (!shouldTranslateDom) {
         this.paused = true;
         if (!previousPaused || previousLocale !== resolved) {
@@ -697,7 +701,7 @@ export class Controller {
         return;
       }
       if (previousPaused) {
-        await this.resumeInternal();
+        await this.resumeInternal(true);
         if (this.hudEnabled) {
           await this.hudBridge.refreshAllForLocaleChange();
         }

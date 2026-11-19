@@ -272,7 +272,7 @@ test('macOS 无 LANG 环境或遵循 AppleLanguages 时 system 语言解析与�
     const switchEn = await rpc(directory, { command: 'language_set', language: 'en' });
     assert.equal(switchEn.ok, true);
     assert.equal(switchEn.status.locale, 'en');
-    assert.equal(switchEn.status.translationEnabled, false);
+    assert.equal(switchEn.status.translationEnabled, true);
 
     const switchSys = await rpc(directory, {
       command: 'language_set',
