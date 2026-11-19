@@ -22,8 +22,10 @@ pub struct BackendSupervisor {
 
 impl BackendSupervisor {
     pub fn discover(state_dir: PathBuf, resource_dir: Option<&Path>) -> Self {
+        let state_dir = strip_verbatim_prefix(state_dir);
         let pipe_endpoint = control_endpoint_for_state_dir(&state_dir);
-        let (node_exe, core_entry, helper_exe) = locate_runtime(resource_dir);
+        let clean_res = resource_dir.map(|p| strip_verbatim_prefix(p.to_path_buf()));
+        let (node_exe, core_entry, helper_exe) = locate_runtime(clean_res.as_deref());
         Self {
             state_dir,
             pipe_endpoint,
@@ -228,14 +230,28 @@ impl BackendSupervisor {
     }
 }
 
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 fn locate_runtime(resource_dir: Option<&Path>) -> (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
     let mut candidate_roots: Vec<PathBuf> = Vec::new();
     if let Some(res) = resource_dir {
-        candidate_roots.push(res.to_path_buf());
+        candidate_roots.push(strip_verbatim_prefix(res.to_path_buf()));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            candidate_roots.push(parent.to_path_buf());
+            candidate_roots.push(strip_verbatim_prefix(parent.to_path_buf()));
         }
     }
     if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
@@ -295,7 +311,11 @@ fn locate_runtime(resource_dir: Option<&Path>) -> (Option<PathBuf>, Option<PathB
         node_exe = find_in_path("node.exe");
     }
 
-    (node_exe, core_entry, helper_exe)
+    (
+        node_exe.map(strip_verbatim_prefix),
+        core_entry.map(strip_verbatim_prefix),
+        helper_exe.map(strip_verbatim_prefix),
+    )
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
@@ -307,4 +327,27 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_verbatim_prefix;
+    use std::path::PathBuf;
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_handles_drive_and_unc_paths() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\Demo\GravityBox")),
+            PathBuf::from(r"C:\Users\Demo\GravityBox")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\dir")),
+            PathBuf::from(r"\\server\share\dir")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"C:\Normal\Path")),
+            PathBuf::from(r"C:\Normal\Path")
+        );
+    }
 }

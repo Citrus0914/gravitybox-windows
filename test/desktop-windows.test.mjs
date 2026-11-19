@@ -328,3 +328,57 @@ test('Windows Named Pipe 后端 IPC 实机契约闭环', { skip: !isWindows }, a
   const exitCode = await exitPromise;
   assert.equal(exitCode, 0);
 });
+
+test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为主入口', { skip: !isWindows }, async (t) => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'gb-verbatim-entry-'));
+  const stateDir = join(sandbox, 'state');
+  const geminiDir = join(sandbox, 'gemini');
+  const homeDir = join(sandbox, 'home');
+  const appSupportDir = join(sandbox, 'app-support');
+  const profileDir = join(sandbox, 'ag-profile');
+  const appDir = join(sandbox, 'ag-app-missing');
+  for (const d of [stateDir, geminiDir, homeDir, appSupportDir, profileDir]) {
+    mkdirSync(d, { recursive: true });
+  }
+  const pipePath = controlEndpointForStateDir(stateDir);
+  const verbatimEntry = `\\\\?\\${join(root, 'dist', 'main.js')}`;
+  const child = spawn(
+    process.execPath,
+    [
+      verbatimEntry,
+      '--state-dir',
+      stateDir,
+      '--gemini-dir',
+      geminiDir,
+      '--home-dir',
+      homeDir,
+      '--app-support-dir',
+      appSupportDir,
+      '--profile',
+      profileDir,
+      '--app',
+      appDir,
+    ],
+    {
+      cwd: root,
+      env: { ...process.env, GRAVITYBOX_CONTROL_ENDPOINT: pipePath },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    },
+  );
+
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill(); } catch {}
+    }
+  });
+
+  const pingRes = await waitForPipePing(pipePath);
+  assert.equal(pingRes.ok, true);
+  const exitPromise = new Promise((resolveExit) => {
+    child.once('exit', (code) => resolveExit(code));
+  });
+  const stopRes = await sendPipeCommand(pipePath, { command: 'stop' });
+  assert.equal(stopRes.ok, true);
+  assert.equal(await exitPromise, 0);
+});
