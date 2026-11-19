@@ -53,6 +53,13 @@ test('tools/build-desktop: resolveAsciiCargoTargetDir 始终返回纯 ASCII 路�
   assert.equal(/[^\x00-\x7F]/.test(dir), false, `CARGO_TARGET_DIR 不应包含非 ASCII 字符: ${dir}`);
 });
 
+test('desktop 生产构建启用 custom-protocol 嵌入 frontendDist', () => {
+  const cargoToml = readFileSync(join(root, 'desktop', 'src-tauri', 'Cargo.toml'), 'utf8');
+  assert.match(cargoToml, /custom-protocol\s*=\s*\[\s*"tauri\/custom-protocol"\s*\]/);
+  const buildDesktopSrc = readFileSync(join(root, 'tools', 'build-desktop.mjs'), 'utf8');
+  assert.match(buildDesktopSrc, /custom-protocol/);
+});
+
 test('desktop 前端构建产物与 Tauri 图标齐备', { skip: !isWindows }, () => {
   assert.equal(existsSync(join(root, 'desktop', 'dist', 'index.html')), true, '应先生成 desktop/dist/index.html');
   for (const iconName of ['32x32.png', '128x128.png', '128x128@2x.png', 'icon.ico']) {
