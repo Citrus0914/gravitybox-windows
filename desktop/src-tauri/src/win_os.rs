@@ -278,15 +278,21 @@ pub fn is_antigravity_running(helper_exe: Option<&Path>) -> bool {
     false
 }
 
+pub fn build_antigravity_launch_command(exe: &Path) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.arg("--remote-debugging-port=0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
 pub fn launch_antigravity() -> Result<(), String> {
     let exe = default_antigravity_exe();
     if !exe.exists() {
         return Err(format!("Antigravity executable not found at {}", exe.display()));
     }
-    Command::new(&exe)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    build_antigravity_launch_command(&exe)
         .spawn()
         .map_err(|e| format!("Failed to launch Antigravity: {}", e))?;
     Ok(())
@@ -454,5 +460,15 @@ mod tests {
 
         let reacquired = SingleInstanceGuard::acquire(&dir1, false);
         assert!(reacquired.is_some());
+    }
+
+    #[test]
+    fn antigravity_launch_command_enables_ephemeral_cdp_port() {
+        let cmd = build_antigravity_launch_command(Path::new(r"C:\Demo\Antigravity.exe"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["--remote-debugging-port=0"]);
     }
 }
