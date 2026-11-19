@@ -1,0 +1,22 @@
+[package]
+name = "gravitybox-desktop"
+version = "1.1.1"
+description = "GravityBox Windows Desktop Companion"
+authors = ["Enzoo404"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

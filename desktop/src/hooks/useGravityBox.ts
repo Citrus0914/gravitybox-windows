@@ -1,0 +1,215 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import {
+  getAppRuntimeInfo,
+  ipcRequest,
+  loadAppConfig,
+  saveAppConfig,
+} from '../ipc';
+import { resolveLocaleFromPreference, translate, type ResolvedLocale } from '../i18n';
+import type { AppConfig, AppRuntimeInfo, StatusSnapshot, TaskItem } from '../types';
+
+export interface ToastState {
+  id: number;
+  message: string;
+  error?: boolean;
+}
+
+export function useGravityBox() {
+  const [config, setConfig] = useState<AppConfig | null>(null);
+  const [runtime, setRuntime] = useState<AppRuntimeInfo | null>(null);
+  const [status, setStatus] = useState<StatusSnapshot | null>(null);
+  const [tasks, setTasks] = useState<TaskItem[]>([]);
+  const [reachable, setReachable] = useState<boolean>(false);
+  const [toast, setToast] = useState<ToastState | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+  const lastTaskRevisionRef = useRef<number>(-1);
+
+  const showToast = useCallback((message: string, error = false) => {
+    const id = Date.now();
+    setToast({ id, message, error });
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast((prev) => (prev?.id === id ? null : prev));
+    }, error ? 5500 : 3500);
+  }, []);
+
+  const refreshRuntime = useCallback(async () => {
+    try {
+      const info = await getAppRuntimeInfo();
+      setRuntime(info);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const refreshStatus = useCallback(async (forceTasks = false) => {
+    try {
+      const res = await ipcRequest<{
+        ok: boolean;
+        status?: StatusSnapshot;
+        taskRevision?: number;
+        tasks?: TaskItem[];
+      }>('status', {
+        includeTasks: true,
+        tasksSince: forceTasks ? -1 : lastTaskRevisionRef.current,
+        includeAccounts: true,
+      });
+      setReachable(true);
+      if (res.status) setStatus(res.status);
+      if (typeof res.taskRevision === 'number') {
+        lastTaskRevisionRef.current = res.taskRevision;
+      }
+      if (Array.isArray(res.tasks)) {
+        setTasks(res.tasks);
+      }
+      return true;
+    } catch {
+      setReachable(false);
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAppConfig().then(setConfig).catch(() => {});
+    void refreshRuntime();
+    void refreshStatus(true);
+
+    const statusTimer = window.setInterval(() => {
+      void refreshStatus(false);
+      void refreshRuntime();
+    }, 4000);
+
+    const unlistenPromise = listen<AppConfig>('config-changed', (ev) => {
+      setConfig(ev.payload);
+    });
+
+    return () => {
+      window.clearInterval(statusTimer);
+      void unlistenPromise.then((fn) => fn());
+    };
+  }, [refreshRuntime, refreshStatus]);
+
+  useEffect(() => {
+    const minutes = config?.quotaRefreshMinutes ?? 0;
+    const isMainView = new URLSearchParams(window.location.search).get('view') !== 'tray';
+    if (!isMainView || !reachable || minutes <= 0) return;
+    const timer = window.setInterval(() => {
+      void ipcRequest('quota_refresh_start').catch(() => {});
+    }, minutes * 60_000);
+    return () => window.clearInterval(timer);
+  }, [config?.quotaRefreshMinutes, reachable]);
+
+  const configuredLanguage = useMemo(() => {
+    return (
+      status?.configuredLanguage ||
+      config?.appLanguage ||
+      'system'
+    );
+  }, [config?.appLanguage, status?.configuredLanguage]);
+
+  const locale: ResolvedLocale = useMemo(() => {
+    if (status?.locale === 'en' || status?.locale === 'zh-Hans') {
+      return status.locale;
+    }
+    return resolveLocaleFromPreference(configuredLanguage, runtime?.systemLocales);
+  }, [configuredLanguage, runtime?.systemLocales, status?.locale]);
+
+  const t = useCallback(
+    (key: string, params?: Record<string, string | number>, fallback?: string) =>
+      translate(locale, key, params, fallback),
+    [locale],
+  );
+
+  const updateConfig = useCallback(async (patch: Partial<AppConfig>) => {
+    const saved = await saveAppConfig(patch);
+    setConfig(saved);
+    return saved;
+  }, []);
+
+  const setLanguage = useCallback(
+    async (lang: string) => {
+      const target = lang.trim() || 'system';
+      await updateConfig({ appLanguage: target });
+      try {
+        const res = await ipcRequest<{ status?: StatusSnapshot }>('language_set', {
+          language: target,
+          systemLocales: runtime?.systemLocales ?? [navigator.language || 'zh-CN'],
+        });
+        if (res.status) setStatus(res.status);
+        void refreshStatus(true);
+      } catch (err) {
+        showToast(String(err), true);
+      }
+    },
+    [refreshStatus, runtime?.systemLocales, showToast, updateConfig],
+  );
+
+  const setHudEnabled = useCallback(
+    async (enabled: boolean) => {
+      await updateConfig({ hudEnabled: enabled });
+      try {
+        const res = await ipcRequest<{ status?: StatusSnapshot }>('hud_set', { enabled });
+        if (res.status) setStatus(res.status);
+      } catch (err) {
+        showToast(String(err), true);
+      }
+    },
+    [showToast, updateConfig],
+  );
+
+  const setTranslationPaused = useCallback(
+    async (paused: boolean) => {
+      try {
+        const res = await ipcRequest<{ status?: StatusSnapshot }>(paused ? 'pause' : 'resume');
+        if (res.status) setStatus(res.status);
+        void refreshStatus(false);
+      } catch (err) {
+        showToast(String(err), true);
+      }
+    },
+    [refreshStatus, showToast],
+  );
+
+  const statusLabel = useMemo(() => {
+    if (!reachable) return t('status.disconnected');
+    const mode = status?.mode ?? '';
+    if (mode === 'connected' || mode === 'active') {
+      return locale === 'en' || status?.translationEnabled === false
+        ? t('status.connected_english')
+        : t('status.connected');
+    }
+    if (mode === 'paused') return t('status.paused');
+    if (mode === 'waiting_window') return t('status.waiting_window');
+    if (mode === 'waiting_app') return t('status.waiting_app');
+    if (mode === 'waiting' || mode === 'starting') return t('status.waiting');
+    if (mode === 'unsupported') return t('status.unsupported');
+    if (mode === 'legacy_blocked') return t('status.legacy_blocked');
+    if (mode === 'error') return t('status.error');
+    if (mode === 'stopped') return t('status.stopped');
+    return t('status.waiting_app');
+  }, [locale, reachable, status?.mode, status?.translationEnabled, t]);
+
+  return {
+    config,
+    runtime,
+    status,
+    tasks,
+    reachable,
+    locale,
+    configuredLanguage,
+    statusLabel,
+    toast,
+    showToast,
+    clearToast: () => setToast(null),
+    refreshStatus,
+    refreshRuntime,
+    updateConfig,
+    setLanguage,
+    setHudEnabled,
+    setTranslationPaused,
+    t,
+  };
+}
+
+export type GravityBoxStore = ReturnType<typeof useGravityBox>;
