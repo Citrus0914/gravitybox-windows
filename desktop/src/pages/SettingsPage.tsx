@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   Globe,
+  Languages,
   Activity,
   RefreshCw,
   DollarSign,
@@ -78,6 +79,7 @@ export const SettingsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
   const safeBytes = scan?.buckets?.runtimeCache?.clearableBytes ?? scan?.safeBytes ?? 0;
   const statefulBytes = scan?.buckets?.historyLogs?.clearableBytes ?? scan?.statefulBytes ?? 0;
   const hudEnabled = status?.hudEnabled ?? config?.hudEnabled ?? true;
+  const translationSettingEnabled = config?.translationEnabled ?? status?.translationEnabled ?? true;
 
   return (
     <>
@@ -109,6 +111,27 @@ export const SettingsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
                 <option value="zh-Hans">简体中文</option>
                 <option value="en">English</option>
               </select>
+            </div>
+
+            <div className="list-row">
+              <div className="list-row-left">
+                <span className="icon-tile"><Languages size={16} /></span>
+                <div>
+                  <div style={{ fontWeight: 600 }}>{t('settings.translation.title')}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    {store.locale === 'en' ? t('settings.translation.english_hint') : t('settings.translation.subtitle')}
+                  </div>
+                </div>
+              </div>
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  disabled={store.locale === 'en'}
+                  checked={store.locale !== 'en' && Boolean(translationSettingEnabled)}
+                  onChange={(e) => void store.setTranslationEnabled(e.target.checked)}
+                />
+                <span className="switch-slider" />
+              </label>
             </div>
 
             <div className="list-row">

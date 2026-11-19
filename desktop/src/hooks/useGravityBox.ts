@@ -162,17 +162,25 @@ export function useGravityBox() {
     [showToast, updateConfig],
   );
 
-  const setTranslationPaused = useCallback(
-    async (paused: boolean) => {
+  const setTranslationEnabled = useCallback(
+    async (enabled: boolean) => {
+      await updateConfig({ translationEnabled: enabled });
       try {
-        const res = await ipcRequest<{ status?: StatusSnapshot }>(paused ? 'pause' : 'resume');
+        const res = await ipcRequest<{ status?: StatusSnapshot }>('translation_set', { enabled });
         if (res.status) setStatus(res.status);
         void refreshStatus(false);
       } catch (err) {
         showToast(String(err), true);
       }
     },
-    [refreshStatus, showToast],
+    [refreshStatus, showToast, updateConfig],
+  );
+
+  const setTranslationPaused = useCallback(
+    async (paused: boolean) => {
+      await setTranslationEnabled(!paused);
+    },
+    [setTranslationEnabled],
   );
 
   const statusLabel = useMemo(
@@ -197,6 +205,7 @@ export function useGravityBox() {
     updateConfig,
     setLanguage,
     setHudEnabled,
+    setTranslationEnabled,
     setTranslationPaused,
     t,
   };

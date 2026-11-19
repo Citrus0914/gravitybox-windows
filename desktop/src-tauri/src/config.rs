@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub quota_refresh_minutes: u32,
     #[serde(default = "default_true")]
     pub hud_enabled: bool,
+    #[serde(default = "default_true")]
+    pub translation_enabled: bool,
     #[serde(default)]
     pub auto_pricing_sync_enabled: bool,
     #[serde(default)]
@@ -67,6 +69,7 @@ impl Default for AppConfig {
             navigation_version: Some(5),
             quota_refresh_minutes: 0,
             hud_enabled: true,
+            translation_enabled: true,
             auto_pricing_sync_enabled: false,
             sync_antigravity_lifecycle: false,
             auto_update_enabled: false,
@@ -158,5 +161,17 @@ mod tests {
         assert_eq!(raw["customExternalFlag"], Value::Bool(true));
         assert_eq!(raw["lastPage"], serde_json::json!(2));
         assert_eq!(raw["quotaRefreshMinutes"], serde_json::json!(15));
+    }
+
+    #[test]
+    fn translation_enabled_defaults_to_true_and_roundtrips_false() {
+        let legacy: AppConfig = serde_json::from_str(r#"{"schema":2,"hudEnabled":true}"#).unwrap();
+        assert!(legacy.translation_enabled);
+
+        let mut cfg = AppConfig::default();
+        cfg.translation_enabled = false;
+        let out = merge_config_document(None, &cfg).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&out).unwrap();
+        assert!(!parsed.translation_enabled);
     }
 }

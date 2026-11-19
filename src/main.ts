@@ -335,12 +335,14 @@ async function run() {
   const socketPath = process.env[CONTROL_ENDPOINT_ENV_KEY] || controlEndpointForStateDir(stateDir);
   let configuredChannel: unknown;
   let configuredHudEnabled: unknown;
+  let configuredTranslationEnabled: unknown;
   let configuredAppLanguage: unknown;
   let configuredAutoPricingSync: unknown;
   try {
     const parsedCfg = JSON.parse(readFileSync(join(stateDir, 'config.json'), 'utf8'));
     configuredChannel = parsedCfg.applicationChannel;
     configuredHudEnabled = parsedCfg.hudEnabled;
+    configuredTranslationEnabled = parsedCfg.translationEnabled;
     configuredAppLanguage = parsedCfg.appLanguage;
     configuredAutoPricingSync = parsedCfg.autoPricingSyncEnabled;
   }
@@ -570,15 +572,22 @@ async function run() {
   }
   let applyChain = Promise.resolve();
   const shortcutEnabled = !!fixture;
-  let initiallyPaused = initialLang.resolvedLocale === 'en' || !initialDictInfo.hasTargetDictionary;
+  let translationSettingEnabled =
+    typeof configuredTranslationEnabled === 'boolean'
+      ? configuredTranslationEnabled
+      : preferredConfiguredLanguage === undefined && typeof runtimePrefs?.translationEnabled === 'boolean'
+      ? runtimePrefs.translationEnabled
+      : true;
+  let initiallyPaused = !translationSettingEnabled || initialLang.resolvedLocale === 'en' || !initialDictInfo.hasTargetDictionary;
   let hudEnabled = typeof configuredHudEnabled === 'boolean' ? configuredHudEnabled : true;
   if (runtimePrefs && typeof configuredHudEnabled !== 'boolean' && typeof runtimePrefs.hudEnabled === 'boolean') {
     hudEnabled = runtimePrefs.hudEnabled;
   }
-  const saveRuntimePreferences = async (patch: { language?: string; translationEnabled?: boolean; hudEnabled?: boolean }) => {
+  const saveRuntimePreferences = async (patch: { language?: string; translationEnabled?: boolean; hudEnabled?: boolean; persistTranslation?: boolean }) => {
+    const { persistTranslation, ...prefPatch } = patch;
     const currentPrefs = (await readOptionalJson<Record<string, unknown>>(join(stateDir, 'runtime-preferences.json'), 'runtime-preferences.json')) ?? {};
-    const nextPrefs = { ...currentPrefs, translationEnabled: controller.snapshot().translationEnabled !== false, hudEnabled, ...patch };
-    if (typeof patch.hudEnabled === 'boolean' || typeof patch.language === 'string') {
+    const nextPrefs = { ...currentPrefs, translationEnabled: controller.snapshot().translationEnabled !== false, hudEnabled, ...prefPatch };
+    if (typeof patch.hudEnabled === 'boolean' || typeof patch.language === 'string' || persistTranslation) {
       if (typeof patch.hudEnabled === 'boolean') hudEnabled = patch.hudEnabled;
       const configPath = join(stateDir, 'config.json');
       try {
@@ -587,6 +596,7 @@ async function run() {
           await atomicJson(configPath, {
             ...cfg,
             ...(typeof patch.hudEnabled === 'boolean' ? { hudEnabled } : {}),
+            ...(persistTranslation && typeof patch.translationEnabled === 'boolean' ? { translationEnabled: patch.translationEnabled } : {}),
             ...(typeof patch.language === 'string' ? { appLanguage: patch.language } : {}),
           });
         }
@@ -616,17 +626,26 @@ async function run() {
     const deepScan = tasks.list().find(t => t.kind === 'deep-scan' && t.state === 'running');
     if (deepScan) tasks.cancel(deepScan.id);
   };
-  const applyLocalePreference = async (requested: string, resolved: ReturnType<typeof resolveLocale>) => {
+  const applyLocalePreference = async (
+    requested: string,
+    resolved: ReturnType<typeof resolveLocale>,
+    options: { persistTranslation?: boolean } = {},
+  ) => {
     setActiveLocale(resolved);
     usageManager.invalidateCache();
     const nextDictInfo = await resolveDictionaryForLocale(baseDir, resolved);
     await store.setBaseDir(nextDictInfo.baseDir);
-    const shouldTranslate = resolved !== 'en' && nextDictInfo.hasTargetDictionary;
-    await saveRuntimePreferences({ language: requested, translationEnabled: shouldTranslate });
+    const shouldTranslate = translationSettingEnabled && resolved !== 'en' && nextDictInfo.hasTargetDictionary;
+    await saveRuntimePreferences({
+      language: requested,
+      translationEnabled: shouldTranslate,
+      persistTranslation: options.persistTranslation,
+    });
     if (!shouldTranslate) cancelRunningDeepScan();
     await controller.setLocale(resolved, requested, {
       dictionary: store.current,
       hasTargetDictionary: nextDictInfo.hasTargetDictionary,
+      translationEnabled: shouldTranslate,
     });
     return shouldTranslate;
   };
@@ -1075,6 +1094,7 @@ async function run() {
             return;
           }
           if(command==='hud_set'){const nextHud=parsed.enabled!==false;await saveRuntimePreferences({hudEnabled:nextHud});await controller.configureHud(nextHud);await writeChain;reply({ok:true,status:controller.snapshot()});return;}
+          if(command==='translation_set'){const nextTranslation=parsed.enabled!==false;translationSettingEnabled=nextTranslation;await saveRuntimePreferences({translationEnabled:nextTranslation,persistTranslation:true});if(nextTranslation){if(getActiveLocale()==='en'){await applyLocalePreference('zh-Hans','zh-Hans',{persistTranslation:true});}else{await controller.resume();}}else{cancelRunningDeepScan();await controller.pause();}await writeChain;reply({ok:true,status:controller.snapshot()});return;}
           if(command==='maintenance_smart_clear'){reply(await cacheMaintenance.smartClear({scopes:parsed.scopes,retentionDays:parsed.retentionDays,keepLocalSnapshots:parsed.keepLocalSnapshots}));return;}
           if(command==='maintenance_clear'){reply(await cacheMaintenance.clear(parsed.token, parsed.selectedNames));return;}
           if(command==='maintenance_restore'){reply(await cacheMaintenance.restore(parsed.snapshotId ?? parsed.id));return;}
@@ -1195,12 +1215,13 @@ async function run() {
             const resolved = resolveLocale(requested, systemLocales?.length ? systemLocales : undefined);
             await applyLocalePreference(requested, resolved);
           }
-          else if (command === 'pause' || command === 'restore') { await saveRuntimePreferences({ translationEnabled: false }); cancelRunningDeepScan(); await controller.pause(); }
+          else if (command === 'pause' || command === 'restore') { translationSettingEnabled = false; await saveRuntimePreferences({ translationEnabled: false, persistTranslation: true }); cancelRunningDeepScan(); await controller.pause(); }
           else if (command === 'resume' || command === 'reapply') {
+            translationSettingEnabled = true;
             if (getActiveLocale() === 'en') {
-              await applyLocalePreference('zh-Hans', 'zh-Hans');
+              await applyLocalePreference('zh-Hans', 'zh-Hans', { persistTranslation: true });
             } else {
-              await saveRuntimePreferences({ translationEnabled: true });
+              await saveRuntimePreferences({ translationEnabled: true, persistTranslation: true });
               await controller.resume();
             }
           }

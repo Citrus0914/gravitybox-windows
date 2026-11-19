@@ -554,4 +554,105 @@ test('P0-02/P1-15/P1-17/P1-19/P1-20: 维护目录动态双语、resume切回中�
     await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
+
+test('translation_set 独立汉化开关写入 config.json 并在重启及切换语言时持久保留', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-translation-toggle-'));
+  const endpoint = controlEndpointForStateDir(dir);
+  await writeFile(
+    join(dir, 'config.json'),
+    JSON.stringify({ schema: 2, hudEnabled: true, translationEnabled: true, appLanguage: 'system' }),
+    'utf8',
+  );
+  const spawnBackend = () =>
+    spawn(
+      process.execPath,
+      [
+        'dist/main.js',
+        '--state-dir',
+        dir,
+        '--app',
+        '/nonexistent',
+        '--profile',
+        dir,
+        '--home-dir',
+        dir,
+        '--app-support-dir',
+        dir,
+        '--gemini-dir',
+        join(dir, 'gemini'),
+        '--locale',
+        'system',
+        '--system-locales',
+        'zh-CN',
+      ],
+      {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: {
+          ...process.env,
+          GRAVITYBOX_PROBE_LS: 'false',
+          GRAVITYBOX_CONTROL_ENDPOINT: endpoint,
+        },
+      },
+    );
+
+  let child = spawnBackend();
+  try {
+    await until(async () => {
+      try {
+        return (await rpc(dir, { command: 'status', includeTasks: false })).ok;
+      } catch {
+        return false;
+      }
+    }, 15000);
+
+    const disabled = await rpc(dir, { command: 'translation_set', enabled: false });
+    assert.equal(disabled.ok, true);
+    assert.equal(disabled.status.translationEnabled, false);
+    assert.equal(disabled.status.locale, 'zh-Hans');
+    assert.equal(disabled.status.hudEnabled, true);
+
+    const cfgAfterDisable = JSON.parse(await readFile(join(dir, 'config.json'), 'utf8'));
+    assert.equal(cfgAfterDisable.translationEnabled, false);
+    assert.equal(cfgAfterDisable.appLanguage, 'system');
+
+    const langWhileDisabled = await rpc(dir, { command: 'language_set', language: 'zh-Hans' });
+    assert.equal(langWhileDisabled.ok, true);
+    assert.equal(langWhileDisabled.status.locale, 'zh-Hans');
+    assert.equal(langWhileDisabled.status.translationEnabled, false);
+
+    await rpc(dir, { command: 'stop' });
+    await until(async () => child.exitCode === 0, 10000);
+    await sleep(50);
+
+    // 重启后即使 appLanguage 为 zh-Hans，汉化仍保持禁用且界面/HUD 保持中文
+    child = spawnBackend();
+    await until(async () => {
+      try {
+        return (await rpc(dir, { command: 'status', includeTasks: false })).ok;
+      } catch {
+        return false;
+      }
+    }, 15000);
+
+    const afterRestart = await rpc(dir, { command: 'status', includeTasks: false });
+    assert.equal(afterRestart.ok, true);
+    assert.equal(afterRestart.status.translationEnabled, false);
+    assert.equal(afterRestart.status.locale, 'zh-Hans');
+    assert.equal(afterRestart.status.hudEnabled, true);
+
+    const reEnabled = await rpc(dir, { command: 'translation_set', enabled: true });
+    assert.equal(reEnabled.ok, true);
+    assert.equal(reEnabled.status.translationEnabled, true);
+    const cfgAfterEnable = JSON.parse(await readFile(join(dir, 'config.json'), 'utf8'));
+    assert.equal(cfgAfterEnable.translationEnabled, true);
+
+    await rpc(dir, { command: 'stop' });
+    await until(async () => child.exitCode === 0, 10000);
+    await sleep(50);
+  } finally {
+    if (child.exitCode === null) child.kill('SIGTERM');
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
 });
