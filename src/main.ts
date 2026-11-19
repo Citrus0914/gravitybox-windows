@@ -1256,12 +1256,23 @@ async function run() {
 }
 // 仅作为入口脚本直接运行时启动助手；被测试/工具 import 时只暴露纯函数，避免误启动真实 socket。
 // 同路径与 realpath 双判定：经由符号链接路径启动（npm start/打包安装目录）也必须正常运行。
+function normalizeEntryPath(pathValue: string): string {
+  let normalized = pathValue;
+  if (isWindows) {
+    if (normalized.startsWith('\\\\?\\UNC\\')) normalized = '\\\\' + normalized.slice(8);
+    else if (normalized.startsWith('\\\\?\\')) normalized = normalized.slice(4);
+    normalized = resolve(normalized).toLowerCase();
+  } else {
+    normalized = resolve(normalized);
+  }
+  return normalized;
+}
 function isDirectEntry(): boolean {
   const entry = process.argv[1];
   if (!entry) return false;
   const modulePath = fileURLToPath(import.meta.url);
-  if (resolve(entry) === modulePath) return true;
-  try { return realpathSync(entry) === realpathSync(modulePath); } catch { return false; }
+  if (normalizeEntryPath(entry) === normalizeEntryPath(modulePath)) return true;
+  try { return normalizeEntryPath(realpathSync(entry)) === normalizeEntryPath(realpathSync(modulePath)); } catch { return false; }
 }
 if (process.env.GRAVITYBOX_IMPORT_ONLY !== '1' && isDirectEntry()) {
   run().catch(error => { console.error(`[GravityBox] ${sanitizeError((error as Error)?.message ?? bt('main.startup_failed'))}`); process.exitCode = 1; });
