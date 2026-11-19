@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { RefreshCw, Download, ListFilter, Tags, Search } from 'lucide-react';
 import { ipcRequest } from '../ipc';
 import { formatCompactTokens, formatCount, formatTimestampShort, formatUsd } from '../format';
@@ -334,7 +334,11 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
       )}
 
       {showPricingModal && (
-        <PricingSyncModal store={store} onClose={() => setShowPricingModal(false)} />
+        <PricingSyncModal
+          store={store}
+          onClose={() => setShowPricingModal(false)}
+          onRevalued={() => void fetchUsage(true)}
+        />
       )}
     </>
   );
@@ -351,7 +355,7 @@ const UsageLogModal: React.FC<{
   const [events, setEvents] = useState<Array<Record<string, unknown>>>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
-  const [snapshotId, setSnapshotId] = useState<string | undefined>(undefined);
+  const snapshotIdRef = useRef<string | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const limit = 40;
 
@@ -361,22 +365,27 @@ const UsageLogModal: React.FC<{
       setLoading(true);
       try {
         const res = await ipcRequest<{
+          rows?: Array<Record<string, unknown>>;
           events?: Array<Record<string, unknown>>;
           total?: number;
+          snapshot_id?: string;
           snapshotId?: string;
         }>('usage_events', {
           period,
           query,
           offset,
           limit,
-          snapshotId,
-          pinSnapshot: !snapshotId,
+          snapshotId: snapshotIdRef.current,
+          pinSnapshot: !snapshotIdRef.current,
           ...(accountId && accountId !== 'all' ? { accountId } : {}),
         });
         if (!active) return;
-        setEvents(res.events ?? []);
+        setEvents(res.rows ?? res.events ?? []);
         setTotal(res.total ?? 0);
-        if (res.snapshotId && !snapshotId) setSnapshotId(res.snapshotId);
+        const sid = res.snapshot_id ?? res.snapshotId;
+        if (sid && !snapshotIdRef.current) {
+          snapshotIdRef.current = sid;
+        }
       } catch {
         // ignore
       } finally {
@@ -387,15 +396,16 @@ const UsageLogModal: React.FC<{
     return () => {
       active = false;
     };
-  }, [accountId, offset, period, query, snapshotId]);
+  }, [accountId, offset, period, query]);
 
   useEffect(() => {
     return () => {
-      if (snapshotId) {
-        void ipcRequest('usage_snapshot_release', { snapshotId }).catch(() => {});
+      if (snapshotIdRef.current) {
+        void ipcRequest('usage_snapshot_release', { snapshotId: snapshotIdRef.current }).catch(() => {});
+        snapshotIdRef.current = undefined;
       }
     };
-  }, [snapshotId]);
+  }, []);
 
   return (
     <Modal
@@ -468,26 +478,79 @@ const UsageLogModal: React.FC<{
   );
 };
 
+interface PricingRowItem {
+  id: string;
+  input?: number;
+  output?: number;
+  cached?: number;
+  cacheWrite?: number;
+  status?: string;
+}
+
 const PricingSyncModal: React.FC<{
   store: GravityBoxStore;
   onClose: () => void;
-}> = ({ store, onClose }) => {
+  onRevalued?: () => void;
+}> = ({ store, onClose, onRevalued }) => {
   const { t } = store;
-  const [models, setModels] = useState<Array<{ id: string; inputPerMillion?: number; outputPerMillion?: number; cachedPerMillion?: number; source?: string }>>([]);
+  const [models, setModels] = useState<PricingRowItem[]>([]);
   const [syncing, setSyncing] = useState(false);
-  const [preview, setPreview] = useState<{ previewId?: string; affectedCount?: number; oldUsd?: number; newUsd?: number } | null>(null);
+  const [preview, setPreview] = useState<{
+    previewId?: string;
+    changedCount?: number;
+    affectedCount?: number;
+    before?: number;
+    after?: number;
+    unverifiableCount?: number;
+  } | null>(null);
 
   const loadCatalog = useCallback(async () => {
     try {
       const res = await ipcRequest<{
-        models?: Array<{ id: string; inputPerMillion?: number; outputPerMillion?: number; cachedPerMillion?: number; source?: string }>;
+        prices?: Record<string, { model?: string; input?: number; output?: number; cached?: number; cacheWrite?: number }>;
+        pricingStatus?: Record<string, string>;
+        models?: Array<{
+          id: string;
+          input?: number;
+          output?: number;
+          cached?: number;
+          cacheWrite?: number;
+          inputPerMillion?: number;
+          outputPerMillion?: number;
+          cachedPerMillion?: number;
+        }>;
         pricing?: Record<string, { inputPerMillion?: number; outputPerMillion?: number; cachedPerMillion?: number }>;
       }>('api_pricing_get');
-      if (Array.isArray(res.models)) {
-        setModels(res.models);
+      if (res.prices && typeof res.prices === 'object') {
+        const statuses = res.pricingStatus ?? {};
+        setModels(
+          Object.entries(res.prices).map(([id, p]) => ({
+            id,
+            input: p.input,
+            output: p.output,
+            cached: p.cached,
+            cacheWrite: p.cacheWrite,
+            status: statuses[id],
+          })),
+        );
+      } else if (Array.isArray(res.models)) {
+        setModels(
+          res.models.map((m) => ({
+            id: m.id,
+            input: m.input ?? m.inputPerMillion,
+            output: m.output ?? m.outputPerMillion,
+            cached: m.cached ?? m.cachedPerMillion,
+            cacheWrite: m.cacheWrite,
+          })),
+        );
       } else if (res.pricing) {
         setModels(
-          Object.entries(res.pricing).map(([id, p]) => ({ id, ...p })),
+          Object.entries(res.pricing).map(([id, p]) => ({
+            id,
+            input: p.inputPerMillion,
+            output: p.outputPerMillion,
+            cached: p.cachedPerMillion,
+          })),
         );
       }
     } catch {
@@ -502,9 +565,20 @@ const PricingSyncModal: React.FC<{
   const handleSyncNow = async () => {
     setSyncing(true);
     try {
-      const res = await ipcRequest<{ appliedCount?: number }>('pricing_sync_check');
+      const res = await ipcRequest<{
+        synced?: boolean;
+        error?: string;
+        count?: number;
+        appliedCount?: number;
+      }>('pricing_sync_check');
       await loadCatalog();
-      store.showToast(t('settings.pricing_sync.synced', { count: res.appliedCount ?? models.length }));
+      if (res.synced === false) {
+        store.showToast(res.error || t('settings.pricing_sync.update_failed'), true);
+      } else {
+        store.showToast(
+          t('settings.pricing_sync.synced', { count: res.count ?? res.appliedCount ?? models.length }),
+        );
+      }
     } catch (err) {
       store.showToast(String(err), true);
     } finally {
@@ -514,7 +588,16 @@ const PricingSyncModal: React.FC<{
 
   const handleRevaluePreview = async () => {
     try {
-      const res = await ipcRequest<{ preview?: { previewId?: string; affectedCount?: number; oldUsd?: number; newUsd?: number } }>('api_pricing_revalue_preview', { mode: 'unpriced_only' });
+      const res = await ipcRequest<{
+        preview?: {
+          previewId?: string;
+          changedCount?: number;
+          affectedCount?: number;
+          before?: number;
+          after?: number;
+          unverifiableCount?: number;
+        };
+      }>('api_pricing_revalue_preview', { mode: 'unpriced_only' });
       if (res.preview) setPreview(res.preview);
     } catch (err) {
       store.showToast(String(err), true);
@@ -531,10 +614,13 @@ const PricingSyncModal: React.FC<{
       });
       setPreview(null);
       store.showToast(t('common.ok'));
+      onRevalued?.();
     } catch (err) {
       store.showToast(String(err), true);
     }
   };
+
+  const changedCount = preview?.changedCount ?? preview?.affectedCount ?? 0;
 
   return (
     <Modal
@@ -547,7 +633,7 @@ const PricingSyncModal: React.FC<{
             {t('pricing_sheet.revalue_btn', undefined, '重估未计价历史')}
           </button>
           <button className="btn" disabled={syncing} onClick={() => void handleSyncNow()}>
-            <RefreshCw size={12} />
+            <RefreshCw size={12} className={syncing ? 'spin' : ''} />
             {t('settings.pricing_sync.check_now')}
           </button>
           <button className="btn btn-primary" onClick={onClose}>{t('common.ok')}</button>
@@ -555,11 +641,11 @@ const PricingSyncModal: React.FC<{
       }
     >
       {preview && (
-        <div className="card-subtle" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div className="card-subtle" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
           <span style={{ fontSize: 12 }}>
             {store.locale === 'en'
-              ? `Will update ${preview.affectedCount ?? 0} records`
-              : `可更新 ${preview.affectedCount ?? 0} 条未计价记录`}
+              ? `Will update ${changedCount} records${typeof preview.before === 'number' && typeof preview.after === 'number' ? ` (${formatUsd(preview.before)} → ${formatUsd(preview.after)})` : ''}`
+              : `可更新 ${changedCount} 条未计价记录${typeof preview.before === 'number' && typeof preview.after === 'number' ? `（${formatUsd(preview.before)} → ${formatUsd(preview.after)}）` : ''}`}
           </span>
           <button className="btn btn-sm btn-primary" onClick={() => void handleRevalueExecute()}>
             {store.locale === 'en' ? 'Apply' : '确认应用'}
@@ -568,13 +654,14 @@ const PricingSyncModal: React.FC<{
       )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {models.map((m) => (
-          <div key={m.id} className="card-subtle" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div key={m.id} className="card-subtle" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 600 }}>
               <ModelIcon name={m.id} size={13} />
               {m.id}
             </span>
             <span className="tabular" style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
-              In ${m.inputPerMillion ?? '--'} · Cache ${m.cachedPerMillion ?? '--'} · Out ${m.outputPerMillion ?? '--'} / 1M
+              In ${m.input ?? '--'} · Cache ${m.cached ?? '--'}
+              {typeof m.cacheWrite === 'number' ? ` · Write $${m.cacheWrite}` : ''} · Out ${m.output ?? '--'} / 1M
             </span>
           </div>
         ))}

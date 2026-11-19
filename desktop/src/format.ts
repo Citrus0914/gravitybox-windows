@@ -78,13 +78,24 @@ export function extractQuotaBars(
   t: (key: string, params?: Record<string, string | number>, fallback?: string) => string,
 ): NormalizedQuotaBar[] {
   if (!source) return [];
-  const staleSet = new Set((source.staleGroups ?? []).map((s) => String(s).toLowerCase()));
+  const staleSet = new Set(
+    (source.staleGroups ?? [])
+      .map((s) => (typeof s === 'string' ? s : s?.name ?? ''))
+      .filter(Boolean)
+      .map((s) => s.toLowerCase()),
+  );
   const bars: NormalizedQuotaBar[] = [];
 
   if (Array.isArray(source.quotaGroups) && source.quotaGroups.length > 0) {
     for (const grp of source.quotaGroups as QuotaGroup[]) {
-      const grpKey = String(grp.key || grp.id || grp.title || grp.label || '');
-      const famLower = `${grp.family ?? ''} ${grpKey}`.toLowerCase();
+      const hasWindows = Array.isArray(grp.windows) && grp.windows.length > 0;
+      if (grp.availability === 'unavailable' && !hasWindows) {
+        continue;
+      }
+      const grpKey = String(
+        grp.key || grp.id || grp.displayName || grp.summaryLabel || grp.title || grp.label || '',
+      );
+      const famLower = `${(grp.brands ?? []).join(' ')} ${grp.family ?? ''} ${grpKey}`.toLowerCase();
       const family: NormalizedQuotaBar['family'] = famLower.includes('claude') || famLower.includes('gpt')
         ? 'claude'
         : famLower.includes('argon')
@@ -95,34 +106,46 @@ export function extractQuotaBars(
               ? 'gemini'
               : 'other';
 
-      if (Array.isArray(grp.windows) && grp.windows.length > 0) {
-        for (const win of grp.windows) {
+      const baseTitle = grp.displayName || grp.summaryLabel || grp.title || grp.label || grpKey;
+      if (hasWindows) {
+        for (const win of grp.windows!) {
           const periodLabel = win.period === '5h'
             ? t('common.period.5h', undefined, '5h')
             : win.period === 'weekly'
               ? t('common.period.weekly', undefined, 'Weekly')
               : win.period === 'daily'
                 ? t('common.period.daily', undefined, 'Daily')
-                : (win.label ?? '');
-          const baseTitle = grp.title || grp.label || grpKey;
+                : win.period === 'unspecified'
+                  ? ''
+                  : (win.label ?? '');
           const label = periodLabel && !baseTitle.includes(periodLabel) ? `${baseTitle} · ${periodLabel}` : baseTitle;
+          const rawPct = typeof win.remaining === 'number'
+            ? win.remaining
+            : (typeof win.percentage === 'number' ? win.percentage : null);
+          const percentage = win.known === false ? null : rawPct;
+          const winKey = win.id ?? win.key ?? win.period ?? label;
           bars.push({
-            key: `${grpKey}:${win.key ?? win.period ?? label}`,
+            key: `${grpKey}:${winKey}`,
             label,
             family,
-            percentage: typeof win.percentage === 'number' ? win.percentage : null,
+            percentage,
             resetCountdown: win.resetCountdown ?? '',
-            stale: Boolean(win.stale || grp.stale || staleSet.has(grpKey.toLowerCase())),
+            stale: Boolean(
+              win.stale ||
+                grp.stale ||
+                grp.quotaState === 'stale' ||
+                staleSet.has(grpKey.toLowerCase()),
+            ),
           });
         }
       } else {
         bars.push({
           key: grpKey || String(bars.length),
-          label: grp.title || grp.label || grpKey,
+          label: baseTitle,
           family,
           percentage: typeof grp.percentage === 'number' ? grp.percentage : null,
           resetCountdown: grp.resetCountdown ?? '',
-          stale: Boolean(grp.stale || staleSet.has(grpKey.toLowerCase())),
+          stale: Boolean(grp.stale || grp.quotaState === 'stale' || staleSet.has(grpKey.toLowerCase())),
         });
       }
     }

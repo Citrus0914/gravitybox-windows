@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import {
   MoreHorizontal,
@@ -49,6 +49,17 @@ export const TrayPanel: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
   const [showAllModels, setShowAllModels] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const hydratedRef = useRef(false);
+
+  useEffect(() => {
+    if (!config || hydratedRef.current) return;
+    hydratedRef.current = true;
+    if (typeof config.menuSelectedTab === 'number') setTab(config.menuSelectedTab);
+    if (typeof config.menuUsagePeriod === 'number') setPeriodIdx(config.menuUsagePeriod);
+    if (config.menuTrendMetric === 'requests' || config.menuTrendMetric === 'tokens') {
+      setMetric(config.menuTrendMetric);
+    }
+  }, [config]);
 
   const period = PERIODS[periodIdx] ?? 'today';
 
@@ -279,7 +290,7 @@ export const TrayPanel: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
               <div className="card" style={{ padding: '10px 12px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11.5, color: 'var(--text-secondary)', fontWeight: 600 }}>
                   <Send size={12} color="var(--text-secondary)" />
-                  {t('overview.metric.today_requests').replace('今日', '')}
+                  {t('usage.section.total_requests')}
                 </div>
                 <div className="tabular" style={{ fontSize: 20, fontWeight: 700, marginTop: 4 }}>
                   {usage ? formatCount(usage.summary.requestCount) : '--'}
@@ -402,10 +413,23 @@ export const TrayPanel: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
                 className="btn btn-sm"
                 disabled={!reachable}
                 onClick={async () => {
-                  const id = dashboard?.accounts?.currentAccountId;
-                  if (id) await ipcRequest('quota_refresh', { id }).catch(() => {});
-                  else await ipcRequest('quota_refresh_all').catch(() => {});
-                  void fetchTab(true);
+                  try {
+                    const id = dashboard?.accounts?.currentAccountId;
+                    if (id) {
+                      await ipcRequest('quota_refresh', { id });
+                    } else {
+                      const res = await ipcRequest<{
+                        partial?: boolean;
+                        failures?: Array<{ email?: string; error?: string }>;
+                      }>('quota_refresh_all');
+                      if (res.failures?.length) {
+                        store.showToast(res.failures[0]?.error || t('main.quota.read_partial'), true);
+                      }
+                    }
+                    await fetchTab(true);
+                  } catch (err) {
+                    store.showToast(String(err), true);
+                  }
                 }}
               >
                 {t('common.refresh_quota')}
@@ -497,8 +521,12 @@ export const TrayPanel: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
                           <button
                             className="btn btn-sm"
                             onClick={async () => {
-                              await ipcRequest('quota_refresh', { id: acc.id }).catch(() => {});
-                              void fetchTab(true);
+                              try {
+                                await ipcRequest('quota_refresh', { id: acc.id });
+                                await fetchTab(true);
+                              } catch (err) {
+                                store.showToast(String(err), true);
+                              }
                             }}
                           >
                             {t('common.refresh_quota')}

@@ -112,8 +112,8 @@ impl BackendSupervisor {
 
     pub fn send_request(&self, payload: Value) -> Result<Value, String> {
         let mut last_err = String::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        for attempt in 0..12 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for attempt in 0..24 {
             match self.perform_raw_request(&payload) {
                 Ok(val) => return Ok(val),
                 Err(err) => {
@@ -122,10 +122,11 @@ impl BackendSupervisor {
                         || err.contains("PIPE_NOT_READY")
                         || err.contains("os error 2)")
                         || err.contains("os error 231)");
-                    if !retryable || Instant::now() >= deadline || attempt == 11 {
+                    if !retryable || Instant::now() >= deadline || attempt == 23 {
                         break;
                     }
-                    thread::sleep(Duration::from_millis(80 + (attempt as u64) * 35));
+                    let delay_ms = (80 + (attempt as u64) * 35).min(300);
+                    thread::sleep(Duration::from_millis(delay_ms));
                 }
             }
         }
@@ -172,12 +173,34 @@ impl BackendSupervisor {
         let value: Value = serde_json::from_slice(&line)
             .map_err(|e| format!("Invalid JSON reply from backend: {}", e))?;
         if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            let is_partial_accounts = value.get("partial").and_then(|v| v.as_bool()) == Some(true)
+                && value.get("accounts").and_then(|v| v.as_array()).is_some();
+            if is_partial_accounts {
+                return Ok(value);
+            }
+            let failure_msg = value
+                .get("failures")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    if arr.is_empty() {
+                        None
+                    } else {
+                        arr[0]
+                            .get("error")
+                            .or_else(|| arr[0].get("message"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| Some(format!("{} account refresh failure(s)", arr.len())))
+                    }
+                });
             let msg = value
                 .get("error")
                 .or_else(|| value.get("message"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("Operation incomplete");
-            return Err(msg.to_string());
+                .map(|s| s.to_string())
+                .or(failure_msg)
+                .unwrap_or_else(|| "Operation incomplete".to_string());
+            return Err(msg);
         }
         Ok(value)
     }

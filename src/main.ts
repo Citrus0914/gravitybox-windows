@@ -67,7 +67,9 @@ function sanitizeErrorMessage(err: unknown): string {
   if (!(err instanceof Error)) return bt('common.action_incomplete');
   const msg = err.message || '';
   const redacted = sanitizeError(msg);
-  const sanitized = redacted.replace(/\/(?:Users|private|var|tmp|Volumes)\/[^\s'"]+/g, bt('common.path_token'));
+  const sanitized = redacted
+    .replace(/\/(?:Users|private|var|tmp|Volumes)\/[^\s'"]+/g, bt('common.path_token'))
+    .replace(/[A-Za-z]:\\Users\\[^\s'"]+/gi, bt('common.path_token'));
   return sanitized.slice(0, 200);
 }
 

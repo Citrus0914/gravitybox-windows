@@ -71,21 +71,24 @@ export function useGravityBox() {
   }, []);
 
   useEffect(() => {
+    const isTrayView = new URLSearchParams(window.location.search).get('view') === 'tray';
     void loadAppConfig().then(setConfig).catch(() => {});
     void refreshRuntime();
     void refreshStatus(true);
 
-    const statusTimer = window.setInterval(() => {
-      void refreshStatus(false);
-      void refreshRuntime();
-    }, 4000);
+    const statusTimer = isTrayView
+      ? null
+      : window.setInterval(() => {
+          void refreshStatus(false);
+          void refreshRuntime();
+        }, 4000);
 
     const unlistenPromise = listen<AppConfig>('config-changed', (ev) => {
       setConfig(ev.payload);
     });
 
     return () => {
-      window.clearInterval(statusTimer);
+      if (statusTimer !== null) window.clearInterval(statusTimer);
       void unlistenPromise.then((fn) => fn());
     };
   }, [refreshRuntime, refreshStatus]);
