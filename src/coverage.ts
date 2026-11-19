@@ -1,4 +1,5 @@
-import { join } from 'node:path';
+import { readdir, readFile, stat } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { openAsarArchive, parseAsarHeaderPrefix, resolveAsarEntryRange, type AsarFileEntry } from './asar.js';
 import { extractUiStrings, extractedKind, fetchBuffer, foldDictionaryKey, isEnglishSource, normalizeText as normalize } from './bundle.js';
@@ -6,6 +7,7 @@ import { decodeScopedKey } from './candidates.js';
 import type { Dictionary } from './dictionary.js';
 import type { DeepReport } from './deep-scan.js';
 import { bt, getActiveLocale } from './i18n.js';
+import { bundleLayoutPaths } from './platform/paths.js';
 
 export type CoverageSource = { id: string; scope: 'renderer' | 'native'; source: string };
 export type CoverageEntry = { key: string; translation?: string; status: string; sources: string[]; confidence: 'ui' | 'literal'; kind?: string; observed?: 'verified' | 'untranslated'; observations?: number; scoped?: boolean };
@@ -287,19 +289,61 @@ export function asarSources(buffer: Buffer): CoverageSource[] {
   return result;
 }
 
-export async function nativeSources(appPath: string): Promise<CoverageSource[]> {
-  const archive = await openAsarArchive(join(appPath, 'Contents/Resources/app.asar'), 8_000_000);
-  try {
-    const result: CoverageSource[] = [];
-    for (const { path, entry } of collectNativeAsarEntries(archive.header.files)) {
-      const bytes = await archive.readEntryBuffer(entry, 2_000_000);
-      if (!bytes) continue;
-      result.push({ id: `app.asar/${path}`, scope: 'native', source: bytes.toString() });
+async function readUnpackedNativeDistSources(distDir: string, prefix = 'dist/'): Promise<CoverageSource[]> {
+  const out: CoverageSource[] = [];
+  const entries = await readdir(distDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const rel = `${prefix}${entry.name}`;
+    const full = join(distDir, entry.name);
+    if (entry.isDirectory()) {
+      if (!/^(?:dist\/)?(?:node_modules|vendor)(?:\/|$)/.test(rel) && !/(?:^|\/)(?:__mocks__|test|tests)$/.test(rel)) {
+        out.push(...await readUnpackedNativeDistSources(full, `${rel}/`));
+      }
+      continue;
     }
-    return result;
-  } finally {
-    await archive.close();
+    if (!entry.isFile() || !/^dist\/.+\.(?:js|html)$/.test(rel) || /\.test\./.test(rel)) continue;
+    const info = await stat(full);
+    if (info.size > 2_000_000) continue;
+    out.push({ id: `app.asar/${rel}`, scope: 'native', source: await readFile(full, 'utf8') });
   }
+  return out;
+}
+
+export async function nativeSources(appPath: string): Promise<CoverageSource[]> {
+  const layout = bundleLayoutPaths(appPath);
+  const asarCandidates = [layout.asarPath];
+  const macAsar = join(appPath, 'Contents/Resources/app.asar');
+  if (layout.asarPath !== macAsar) asarCandidates.push(macAsar);
+
+  let lastEnoent: unknown;
+  for (const asarPath of asarCandidates) {
+    try {
+      const archive = await openAsarArchive(asarPath, 8_000_000);
+      try {
+        const result: CoverageSource[] = [];
+        for (const { path, entry } of collectNativeAsarEntries(archive.header.files)) {
+          const bytes = await archive.readEntryBuffer(entry, 2_000_000);
+          if (!bytes) continue;
+          result.push({ id: `app.asar/${path}`, scope: 'native', source: bytes.toString() });
+        }
+        return result;
+      } finally {
+        await archive.close();
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      lastEnoent = error;
+    }
+  }
+
+  const unpackedDist = join(dirname(layout.unpackedPackageJsonPath), 'dist');
+  try {
+    const info = await stat(unpackedDist);
+    if (info.isDirectory()) return await readUnpackedNativeDistSources(unpackedDist);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  throw lastEnoent ?? new Error(`ENOENT: app.asar not found under ${appPath}`);
 }
 
 export function createCoverage(sources: CoverageSource[], dictionary: Dictionary, appVersion: string, bundleSha256: string, skipped: CoverageReport['skipped'] = []): CoverageReport {
