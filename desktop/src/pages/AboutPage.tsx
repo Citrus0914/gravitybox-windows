@@ -1,10 +1,12 @@
 import React, { useState } from 'react';
-import { Cpu, FolderOpen, Box, ArrowUpRight, RefreshCw } from 'lucide-react';
+import { Cpu, FolderOpen, Box, ArrowUpRight, RefreshCw, Heart } from 'lucide-react';
 import { openExternalUrl, restartBackend, revealStateDir } from '../ipc';
 import { BrandLogo } from '../components/ModelIcon';
 import type { GravityBoxStore } from '../hooks/useGravityBox';
 
-const RELEASES_URL = 'https://github.com/Enzoo404/gravitybox/releases';
+const REPO_URL = 'https://github.com/Citrus0914/gravitybox-windows';
+const RELEASES_URL = 'https://github.com/Citrus0914/gravitybox-windows/releases';
+const UPSTREAM_URL = 'https://github.com/Enzoo404/gravitybox';
 
 export const AboutPage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
   const { t, config, runtime, status } = store;
@@ -130,15 +132,43 @@ export const AboutPage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
           </div>
         </div>
 
-        <div className="card list-card">
-          <div className="list-row">
-            <div className="list-row-left">
-              <span className="icon-tile"><Box size={16} /></span>
-              <span style={{ fontWeight: 600 }}>GitHub Releases</span>
+        <div>
+          <div className="section-label">{t('about.section.project')}</div>
+          <div className="card list-card">
+            <div className="list-row">
+              <div className="list-row-left">
+                <span className="icon-tile"><Box size={16} /></span>
+                <div>
+                  <div style={{ fontWeight: 600 }}>{t('about.repo')}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    {t('about.repo_subtitle')}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button className="btn btn-sm" onClick={() => void openExternalUrl(REPO_URL)}>
+                  GitHub <ArrowUpRight size={12} />
+                </button>
+                <button className="btn btn-sm" onClick={() => void openExternalUrl(RELEASES_URL)}>
+                  Releases <ArrowUpRight size={12} />
+                </button>
+              </div>
             </div>
-            <button className="btn btn-sm" onClick={() => void openExternalUrl(RELEASES_URL)}>
-              GitHub <ArrowUpRight size={12} />
-            </button>
+
+            <div className="list-row">
+              <div className="list-row-left">
+                <span className="icon-tile green"><Heart size={16} /></span>
+                <div>
+                  <div style={{ fontWeight: 600 }}>{t('about.upstream')}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    {t('about.upstream_subtitle')}
+                  </div>
+                </div>
+              </div>
+              <button className="btn btn-sm" onClick={() => void openExternalUrl(UPSTREAM_URL)}>
+                Enzoo404/gravitybox <ArrowUpRight size={12} />
+              </button>
+            </div>
           </div>
         </div>
       </div>

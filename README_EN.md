@@ -1,19 +1,20 @@
 <div align="center">
-  <a href="https://github.com/Enzoo404/gravitybox">
+  <a href="https://github.com/Citrus0914/gravitybox-windows">
     <img src="assets/master-1024.png" alt="GravityBox Logo" width="84" height="84" />
   </a>
 
-  <h1>GravityBox</h1>
+  <h1>GravityBox Windows</h1>
 
   <p>
-    <strong>Native macOS Companion for Google Antigravity on Apple Silicon</strong><br />
-    Zero App Modification · Bilingual UI (EN / 中文) · Live In-IDE Telemetry HUD · True 5h &amp; Weekly Quotas · Safe Multi-Account Switching · Reversible Cache Cleanup
+    <strong>Windows 10/11 (`x64`) Desktop Companion for Google Antigravity</strong><br />
+    Ported from <a href="https://github.com/Enzoo404/gravitybox">Enzoo404/gravitybox</a> · Zero App Modification · Persistent Translation Toggle · Live Telemetry HUD · True 5h &amp; Weekly Quotas · Safe Account Switching
   </p>
 
   <p>
-    <a href="https://github.com/Enzoo404/gravitybox/releases/latest"><img src="https://img.shields.io/github/v/release/Enzoo404/gravitybox?style=flat-square&color=2563EB" alt="Latest Release"></a>
-    <a href="https://github.com/Enzoo404/gravitybox/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Enzoo404/gravitybox/ci.yml?branch=main&style=flat-square&logo=github" alt="CI Status"></a>
-    <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20Silicon-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+ Apple Silicon">
+    <a href="https://github.com/Citrus0914/gravitybox-windows/releases/latest"><img src="https://img.shields.io/github/v/release/Citrus0914/gravitybox-windows?style=flat-square&color=2563EB" alt="Latest Release"></a>
+    <a href="https://github.com/Citrus0914/gravitybox-windows/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Citrus0914/gravitybox-windows/ci.yml?branch=main&style=flat-square&logo=github" alt="CI Status"></a>
+    <img src="https://img.shields.io/badge/Windows-10%2F11%20%C2%B7%20x64-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows 10/11 x64">
+    <img src="https://img.shields.io/badge/Upstream-Enzoo404%2Fgravitybox-111827?style=flat-square&logo=apple&logoColor=white" alt="Upstream macOS Project">
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-10B981?style=flat-square" alt="MIT License"></a>
   </p>
 
@@ -47,28 +48,30 @@
 
 ## ✨ What Is GravityBox?
 
-If you use Google **Antigravity** daily on macOS, you've probably hit a few blind spots: hitting rate limits without knowing whether your **5-hour rolling window** or **weekly cap** ran out, having zero visibility into live token burn or context compaction, juggling multiple Google accounts manually, or watching disk caches balloon over time.
+> **Attribution & Upstream**: This repository ([`Citrus0914/gravitybox-windows`](https://github.com/Citrus0914/gravitybox-windows)) is a **Windows desktop port** of the original macOS project [**`Enzoo404/gravitybox`**](https://github.com/Enzoo404/gravitybox) created by **Enzoo404** (MIT License). Thanks to the original author for the core architecture, runtime localization engine, Telemetry HUD, dual-window quota fusion, SQLite ledger, and safe account-switching design.
 
-**GravityBox** (latest `GravityBox v1.1.1`) is a lightweight, native macOS companion built to solve all of these **without modifying a single byte of `/Applications/Antigravity.app`**:
+If you use Google **Antigravity** daily on Windows, you've probably hit a few blind spots: hitting rate limits without knowing whether your **5-hour rolling window** or **weekly cap** ran out, having zero visibility into live token burn or context compaction, juggling multiple Google accounts manually, or watching disk caches balloon over time.
+
+**GravityBox** (latest `GravityBox v1.1.1`) is a lightweight desktop companion built to solve all of these **without modifying a single byte of `%LocalAppData%\Programs\Antigravity`**:
 
 | Everyday Pain Point | What GravityBox Does for You |
 | :--- | :--- |
 | **No live feedback on speed, token burn, cache savings, or context usage** | **In-IDE Telemetry HUD**: Mounts a sleek 3-capsule bar right below every chat input showing turns, speed, tokens, cache hit rate, and context fill—expanding upward on hover or click. |
 | **Confusing rate limits (mixing up 5-hour rolling windows vs. weekly caps)** | **True Dual-Window Quotas**: Separates **5-hour** and **Weekly** bars for Gemini, Claude/GPT, and standalone pools (like `Gemini 4 Argon`), with exact reset countdowns. |
-| **Tedious sign-out/sign-in loops across multiple accounts** | **Safe Multi-Account Manager**: Saves multiple accounts, recommends the best standby account when quota runs low, and switches atomically after Antigravity quits—with automatic rollback if anything fails. |
-| **Static language patches break official code signatures on every update** | **Zero-Patch Bilingual Adaptation**: Dynamically switches both GravityBox and Antigravity UI between **English** and **简体中文** (`2.23.0` ~ `2.32.2`) at runtime while leaving code, chats, and terminal output untouched. |
-| **Gigabytes of accumulated cache with fear of deleting chat history** | **Reversible Storage Trim**: Locks your credentials and conversations behind a strict allowlist, moves selected caches to **macOS Trash**, and lets you restore with one click. |
+| **Tedious sign-out/sign-in loops across multiple accounts** | **Safe Multi-Account Manager**: Saves multiple accounts, recommends the best standby account when quota runs low, and switches atomically after Antigravity quits (syncing Windows Credential Manager JSON)—with automatic rollback if anything fails. |
+| **Static language patches break on updates, or conflict with runtime translation** | **Zero-Patch Bilingual Adaptation + Independent Toggle**: Dynamically switches Antigravity UI (`2.23.0` ~ `2.32.2` verified, newer versions run in adaptive mode) while leaving code, chats, and terminal output untouched. Includes a persistent **Antigravity UI Translation** switch so you can disable runtime translation permanently while keeping the Chinese HUD alongside other patches. |
+| **Gigabytes of accumulated cache with fear of deleting chat history** | **Reversible Storage Trim**: Locks your credentials and conversations behind a strict allowlist, moves selected caches to **Windows Recycle Bin**, and lets you restore with one click. |
 
 ---
 
 ## 🚀 3-Minute Quick Start
 
-1. **Download & Install**: Grab the latest `GravityBox-<version>-arm64.dmg` from [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases/latest) (self-contained runtime included—**no Node.js or external dependencies needed**), drag **GravityBox.app** into **Applications**, and run the one-line Gatekeeper command in [First-Time Installation](#first-time-installation) below.
-2. **Launch & Auto-Connect**: Open **GravityBox** and official **Antigravity**. GravityBox automatically connects to Antigravity windows—attaching the live Telemetry HUD right below your chat composer and applying your chosen display language.
+1. **Download & Extract**: Grab the latest `GravityBox-<version>-win-x64.zip` from [GitHub Releases](https://github.com/Citrus0914/gravitybox-windows/releases/latest) (includes bundled Node 22 runtime, Win32 helper `gb-win-helper.exe`, and WebView2 loader—**no Node.js installation required**). Extract to a standard user directory such as `%LocalAppData%\Programs\GravityBox`, then launch **`GravityBox.exe`**.
+2. **Launch Antigravity via GravityBox**: On Windows, launching Antigravity from GravityBox automatically passes `--remote-debugging-port=0` (loopback-only) so GravityBox can attach the live Telemetry HUD and runtime localization.
 3. **Three Everyday Touchpoints**:
    - **While coding → Glance below the chat box**: Watch the live HUD capsules; hover for quick inspection or **click any capsule to pin its upward card** (press `Esc` or click outside to close).
-   - **Quick checks → Click the Menu Bar icon**: Check `Usage · Quota · Accounts` anytime without leaving fullscreen, or use the top-right `···` menu to toggle HUD or switch languages.
-   - **Full management → Open Main Console**: Click **Open Main Window ↗** from the menu bar footer to access **Overview · Accounts · Usage · Settings · About**.
+   - **Quick checks → Click the System Tray icon**: Check `Usage · Quota · Accounts` anytime, or use the top-right `···` menu to toggle HUD, pause/resume translation, or switch languages.
+   - **Full management → Open Main Console**: Open the main console for **Overview · Accounts · Usage · Settings · About**.
 
 ---
 
@@ -180,11 +183,12 @@ Hover over (or click to pin) any capsule to open its detailed breakdown card:
 
 | Section | Option | Choices / Control | What It Does & When to Use It |
 | :--- | :--- | :--- | :--- |
-| **Antigravity Enhancement** | **Display Language** | `Follow System` (default)<br>`简体中文`<br>`English` | **Unified language selector**: Controls both GravityBox's own UI language and whether Antigravity's UI is dynamically localized into Simplified Chinese. Selecting `English` keeps both GravityBox and Antigravity in clean English immediately—no restart needed. |
-| **Antigravity Enhancement** | **Conversation HUD** | Toggle (default `On`) | Shows or hides the 3-capsule Telemetry HUD below Antigravity's chat box. **Independent of language**—you can keep Antigravity in English while enjoying the English HUD. |
+| **Antigravity Enhancement** | **Display Language** | `Follow System` (default)<br>`简体中文`<br>`English` | **Panel & HUD language selector**: Controls GravityBox's UI and HUD language. Selecting `English` keeps GravityBox, HUD, and Antigravity in clean English immediately—no restart needed. |
+| **Antigravity Enhancement** | **Antigravity UI Translation** | Toggle (default `On`) | **Persistent independent translation switch**: Controls whether GravityBox translates Antigravity's UI at runtime. Turn it off to keep it persistently disabled (for example when using another static localization patch) while keeping GravityBox and the HUD in Chinese. |
+| **Antigravity Enhancement** | **Conversation HUD** | Toggle (default `On`) | Shows or hides the 3-capsule Telemetry HUD below Antigravity's chat box. **Independent of translation**—you can keep Antigravity untouched while using the HUD. |
 | **Quota & Pricing** | **Quota Refresh Interval** | `Manual Refresh` (default)<br>`Every 5 / 10 / 15 / 30 / 60 min` | How often GravityBox polls remaining quotas for saved accounts in the background. Leave on `Manual Refresh` for single-account use, or `10–15 min` when rotating accounts. |
-| **Quota & Pricing** | **Auto-Update Pricing Feed** | `Check Now` button + Toggle (default `Off`) | Syncs the public model pricing feed every 24 hours from GitHub / jsDelivr so newly launched models get accurate cost estimates without waiting for an app update.<br>Click **Check Now** to open the **Pricing Feed** sheet—inspect per-model input, cache read/write, and output rates with official source links, and automatically heal historical unpriced entries. |
-| **System & Storage** | **Launch at Login** | Toggle (default `Off`) | Starts GravityBox quietly in the macOS menu bar whenever you log in. |
+| **Quota & Pricing** | **Auto-Update Pricing Feed** | `Check Now` button + Toggle (default `Off`) | Syncs the public model pricing feed every 24 hours so newly launched models get accurate cost estimates without waiting for an app update.<br>Click **Check Now** to open the **Pricing Feed** dialog—inspect per-model input, cache read/write, and output rates with official source links, and automatically heal historical unpriced entries. |
+| **System & Storage** | **Launch at Login** | Toggle (default `Off`) | Starts GravityBox quietly in the Windows system tray whenever you sign in. |
 | **System & Storage** | **Sync with Antigravity** | Toggle (default `Off`) | Automatically launches GravityBox when Antigravity opens and quits when Antigravity closes. |
 | **System & Storage** | **Storage & Maintenance** | Status badge + `Manage Storage…` | Displays reclaimable cache size (`Reclaimable XX MB` or `Healthy`) and opens the safe cleanup sheet (see Section 5 below). |
 
@@ -332,35 +336,27 @@ Divides local disk usage into **Runtime Cache (Blue)**, **Background Logs (Orang
 ## 📦 Installation & Upgrades
 
 ### System Requirements
-- **OS**: macOS 14 (Sonoma) or macOS 15+ (Sequoia)
-- **Architecture**: Apple Silicon (`arm64` — all Apple M-series chips)
-- **Target App**: Official release `/Applications/Antigravity.app` (verified across `2.23.0` ~ `2.32.2`; *Insiders channel is neither supported nor modified*)
-- **Runtime**: **Zero dependencies** — self-contained Node 22 binary embedded inside the app bundle
+- **OS**: Windows 10 / Windows 11 (`x64`) *(for macOS Apple Silicon, see upstream [`Enzoo404/gravitybox`](https://github.com/Enzoo404/gravitybox))*
+- **Target App**: Official Antigravity under `%LocalAppData%\Programs\Antigravity` (supports both packed `resources\app.asar` and unpacked `resources\app\` layouts; dictionary baselines cover `2.23.0` ~ `2.32.2`, newer releases run in adaptive mode)
+- **Runtime**: **Zero external runtime required** — portable package bundles Node 22 and `gb-win-helper.exe` (uses Windows WebView2 Runtime, preinstalled on Windows 11)
 
 ### First-Time Installation
 
-1. Download the latest `GravityBox-<version>-arm64.dmg` and `.sha256` checksum from [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases/latest).
-2. *(Recommended)* Verify DMG integrity:
-   ```bash
-   shasum -a 256 -c GravityBox-<version>-arm64.dmg.sha256
+1. Download the latest `GravityBox-<version>-win-x64.zip` and `.sha256` checksum from [GitHub Releases](https://github.com/Citrus0914/gravitybox-windows/releases/latest).
+2. *(Recommended)* Verify integrity in PowerShell:
+   ```powershell
+   Get-FileHash .\GravityBox-<version>-win-x64.zip -Algorithm SHA256
    ```
-3. Mount the DMG and drag **GravityBox.app** into **Applications**.
-4. Because open-source builds are not Apple-notarized, clear Gatekeeper quarantine once before launching:
-   - **Terminal (Recommended)**:
-     ```bash
-     xattr -cr /Applications/GravityBox.app
-     ```
-   - **System Settings**: If blocked on first launch, open **System Settings → Privacy & Security** and click **Open Anyway**.
+3. Extract the archive to a standard user directory (e.g., `%LocalAppData%\Programs\GravityBox`) and run `GravityBox.exe`.
+4. To attach HUD / runtime localization, quit any existing Antigravity instance and launch Antigravity from GravityBox (passes `--remote-debugging-port=0`).
 
 ### Non-Destructive Upgrades
-- **Drop-In Replacement**: Quit GravityBox and drag the new app bundle over `/Applications/GravityBox.app`. All saved accounts, custom dictionary overrides, usage ledgers, and recovery snapshots under `~/Library/Application Support/GravityBox` are preserved intact.
-- **Legacy Channel Migration**: Configurations from `v1.0.5` or earlier with `applicationChannel=insiders` are automatically backed up and migrated to official `stable` mode on first launch.
-- **In-App Updates**: Background update checks remain off by default; check manually or opt in anytime from the **About** tab.
+- **Drop-In Replacement**: Quit `GravityBox.exe` and extract the new archive over your existing directory. All saved accounts, custom dictionary overrides, usage ledgers, and recovery snapshots under `%LocalAppData%\GravityBox` are preserved intact.
 
 <details>
 <summary>Optional: Custom Google OAuth credentials</summary>
 
-Importing the active account ("Save Current Account"), local quota inspection, the Telemetry HUD, SQLite cost tracking, and runtime localization require **no OAuth setup**. To enable browser OAuth sign-in or background token refreshes for standby accounts, place your own OAuth client credentials in `~/Library/Application Support/GravityBox/.env` (works for packaged `.app` builds launched from Finder) or set them in your shell environment when running from source:
+Importing the active account ("Save Current Account"), local quota inspection, the Telemetry HUD, SQLite cost tracking, and runtime localization require **no OAuth setup**. To enable browser OAuth sign-in or background token refreshes for standby accounts, place your own OAuth client credentials in `%LocalAppData%\GravityBox\.env`:
 
 ```bash
 GRAVITYBOX_GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
@@ -376,8 +372,8 @@ GRAVITYBOX_GOOGLE_CLIENT_SECRET="your-client-secret"
 | Principle | Implementation |
 | :--- | :--- |
 | **Zero Telemetry** | No analytics SDKs, crash telemetry, or unprompted outbound requests; update polling is off by default |
-| **Untouched Official Binary** | Never patches, unpacks, or re-signs `/Applications/Antigravity.app` |
-| **Local-Only State** | Accounts, keychain references, ledgers, and snapshots live exclusively in `~/Library/Application Support/GravityBox` |
+| **Untouched Official Binary** | Never patches, unpacks, or modifies files in `%LocalAppData%\Programs\Antigravity` |
+| **Local-Only State** | Accounts, ledger databases, config, and snapshots live exclusively in `%LocalAppData%\GravityBox` |
 | **Protected User Content** | Input drafts, messages, code blocks, terminal logs, and project names are excluded from DOM mutation |
 
 ---
@@ -386,45 +382,42 @@ GRAVITYBOX_GOOGLE_CLIENT_SECRET="your-client-secret"
 
 ```mermaid
 flowchart LR
-  UI["Native UI (Swift / AppKit)<br/>Main Console · Menu Bar · Updater"] <-->|"Unix Domain Socket IPC"| Core["Core Engine (Node 22 / TypeScript)<br/>4-Phase Switch · SQLite Ledger · Quota Fusion"]
-  Core -->|"CDP (Zero Binary Mod)"| IDE["/Applications/Antigravity.app<br/>Runtime Localization · Telemetry HUD"]
-  Core -->|"Read-Only SQLite + Trash Snapshots"| Local["~/Library/Application Support/GravityBox<br/>State · Ledger · Dict Overrides · Snapshots"]
+  UI["Windows Desktop UI (Tauri 2 + React / TypeScript)<br/>Main Console · System Tray Panel"] <-->|"Named Pipe IPC"| Core["Core Engine (Node 22 / TypeScript + Win32 Helper)<br/>4-Phase Switch · SQLite Ledger · Quota Fusion"]
+  Core -->|"CDP (Zero Binary Mod)"| IDE["Antigravity.exe<br/>Runtime Localization · Telemetry HUD"]
+  Core -->|"Read-Only SQLite + Recycle Bin Snapshots"| Local["%LocalAppData%\\GravityBox<br/>State · Ledger · Dict Overrides · Snapshots"]
 ```
 
 ### Build & Verification Commands
 
-> Requires Xcode Command Line Tools and Node.js `>=22.15.0 <23`.
+> Requires Node.js `>=22.15.0 <23`, `pnpm`, and Rust toolchain (`x86_64-pc-windows-gnu` or MSVC).
 
-```bash
-git clone https://github.com/Enzoo404/gravitybox.git
-cd gravitybox
+```powershell
+git clone https://github.com/Citrus0914/gravitybox-windows.git
+cd gravitybox-windows
 npm ci
+pnpm --dir desktop install
 
-# TypeScript build, pricing sync check, and unit/integration tests
-npm test
+# Run full Windows verification suite (privacy + docs + Rust tests + desktop build + unit/integration tests + dict gates)
+npm run verify:win
 
-# Swift native UI compilation and layout verification
-npm run check:swift
-
-# Full release verification gate (TS + tests + headless browser + Swift + dict checks)
-npm run verify
-
-# Package local Apple Silicon .app and distributable .dmg
-npm run package:mac
+# Package Windows portable directory & .zip archive (output in build/)
+npm run package:win
 ```
 
 <details>
 <summary>Repository layout</summary>
 
 ```text
-gravitybox/
-├── native/          # Swift 6 / AppKit Main Console, Menu Bar Panel, L10n runtime, and App Updater
-├── src/             # TypeScript core engine (IPC, bilingual i18n, 4-phase switching, quota fusion, SQLite ledger, HUD state)
+gravitybox-windows/
+├── desktop/         # Windows desktop app (Tauri 2 Rust host + React/TypeScript 5-page console & tray panel)
+├── native-win/      # Dependency-free Win32 Rust helper (gb-win-helper.exe)
+├── native/          # Original macOS Swift 6 / AppKit UI (from upstream Enzoo404/gravitybox)
+├── src/             # Cross-platform TypeScript core engine (incl. src/platform/ Windows abstraction)
 ├── runtime/         # CDP-injected runtime scripts (localization engine, DOM guards, and bilingual Telemetry HUD)
-├── dict/ & ui-strings/ # Versioned bilingual dictionaries, frozen maps, and official UI string snapshots (2.23.0 ~ 2.32.2)
-├── assets/          # App icons, bilingual packs (i18n/), Retina screenshots, dated pricing feed, and model catalog
-├── test/            # Unit, integration, bilingual foundation/native tests, headless Chromium, and Swift UI suites
-└── tools/           # Release integrity, privacy, doc consistency gates, screenshot generator, and macOS DMG packager
+├── dict/ & ui-strings/ # Versioned bilingual dictionaries and official UI string snapshots (2.23.0 ~ 2.32.2)
+├── assets/          # App icons, bilingual packs (i18n/), screenshots, dated pricing feed, and model catalog
+├── test/            # Unit, integration, Windows Named Pipe contract tests, bilingual and browser suites
+└── tools/           # Windows/macOS build, verification gates, privacy/doc checks, and packagers
 ```
 
 </details>
@@ -465,14 +458,15 @@ Because GravityBox never patches `/Applications/Antigravity.app`, official updat
 
 ---
 
-## 🤝 Contributing & License
+## 🤝 Acknowledgements, Contributing & License
 
-- Please review [CONTRIBUTING.md](./CONTRIBUTING.md), [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md), and [SECURITY.md](./SECURITY.md) before opening an [Issue](https://github.com/Enzoo404/gravitybox/issues) or Pull Request.
-- Full release history is available in [CHANGELOG.md](./CHANGELOG.md) and [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases).
+- **Credits to Original Author**: This Windows port is built on top of the original macOS project [**Enzoo404/gravitybox**](https://github.com/Enzoo404/gravitybox) created by [**Enzoo404**](https://github.com/Enzoo404). Huge thanks to the original author for all foundational architecture, runtime localization, Telemetry HUD, quota aggregation, SQLite ledger, and safe switching design.
+- Please review [CONTRIBUTING.md](./CONTRIBUTING.md), [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md), and [SECURITY.md](./SECURITY.md) before opening an [Issue](https://github.com/Citrus0914/gravitybox-windows/issues) or Pull Request.
+- Full release history is available in [CHANGELOG.md](./CHANGELOG.md) and [GitHub Releases](https://github.com/Citrus0914/gravitybox-windows/releases).
 
 <div align="center">
-  <a href="https://star-history.com/#Enzoo404/gravitybox&Date">
-    <img src="https://api.star-history.com/svg?repos=Enzoo404/gravitybox&type=Date" alt="Star History Chart" width="720" />
+  <a href="https://star-history.com/#Citrus0914/gravitybox-windows&Date">
+    <img src="https://api.star-history.com/svg?repos=Citrus0914/gravitybox-windows&type=Date" alt="Star History Chart" width="720" />
   </a>
 </div>
 
