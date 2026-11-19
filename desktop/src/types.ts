@@ -36,8 +36,14 @@ export interface StatusSnapshot {
   translationEnabled?: boolean;
   hudEnabled?: boolean;
   version?: string;
+  appVersion?: string;
   port?: number;
   targets?: number;
+  windows?: number;
+  message?: string;
+  dictionaryError?: string;
+  errors?: string[];
+  runningTasks?: number;
   error?: string;
   lastError?: string;
   oauthClientConfigured?: boolean;

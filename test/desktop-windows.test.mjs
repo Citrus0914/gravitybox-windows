@@ -161,6 +161,15 @@ test('desktop/src/format: extractQuotaBars 兼容 ProjectedQuotaGroup 与旧式�
   assert.equal(legacyBars.length, 2);
   assert.equal(legacyBars[0].percentage, 90);
   assert.equal(legacyBars[1].percentage, 45);
+
+  assert.equal(mod.statusColorForMode('adaptive', true), 'green');
+  assert.equal(mod.statusColorForMode('waiting-window', true), 'amber');
+  assert.equal(mod.statusColorForMode('legacy-blocked', true), 'amber');
+  assert.equal(mod.formatStatusLabel({ mode: 'adaptive', translationEnabled: true }, true, 'zh-Hans', t), 'status.connected');
+  assert.equal(mod.formatStatusLabel({ mode: 'adaptive', translationEnabled: false }, true, 'zh-Hans', t), 'status.connected_english');
+  assert.equal(mod.formatStatusLabel({ mode: 'paused', locale: 'en', windows: 1 }, true, 'en', t), 'status.connected_english');
+  assert.equal(mod.formatStatusLabel({ mode: 'waiting-window' }, true, 'zh-Hans', t), 'status.waiting_window');
+  assert.equal(mod.formatStatusLabel({ mode: 'legacy-blocked' }, true, 'zh-Hans', t), 'status.legacy_blocked');
 });
 
 test('tools/win-installer.nsi 与 CI windows-desktop 门禁契约完整', () => {

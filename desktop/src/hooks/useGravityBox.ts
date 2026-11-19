@@ -6,6 +6,7 @@ import {
   loadAppConfig,
   saveAppConfig,
 } from '../ipc';
+import { formatStatusLabel } from '../format';
 import { resolveLocaleFromPreference, translate, type ResolvedLocale } from '../i18n';
 import type { AppConfig, AppRuntimeInfo, StatusSnapshot, TaskItem } from '../types';
 
@@ -174,24 +175,10 @@ export function useGravityBox() {
     [refreshStatus, showToast],
   );
 
-  const statusLabel = useMemo(() => {
-    if (!reachable) return t('status.disconnected');
-    const mode = status?.mode ?? '';
-    if (mode === 'connected' || mode === 'active') {
-      return locale === 'en' || status?.translationEnabled === false
-        ? t('status.connected_english')
-        : t('status.connected');
-    }
-    if (mode === 'paused') return t('status.paused');
-    if (mode === 'waiting_window') return t('status.waiting_window');
-    if (mode === 'waiting_app') return t('status.waiting_app');
-    if (mode === 'waiting' || mode === 'starting') return t('status.waiting');
-    if (mode === 'unsupported') return t('status.unsupported');
-    if (mode === 'legacy_blocked') return t('status.legacy_blocked');
-    if (mode === 'error') return t('status.error');
-    if (mode === 'stopped') return t('status.stopped');
-    return t('status.waiting_app');
-  }, [locale, reachable, status?.mode, status?.translationEnabled, t]);
+  const statusLabel = useMemo(
+    () => formatStatusLabel(status, reachable, locale, t),
+    [locale, reachable, status, t],
+  );
 
   return {
     config,

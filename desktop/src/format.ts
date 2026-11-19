@@ -1,4 +1,4 @@
-import type { AccountItem, QuotaGroup } from './types';
+import type { AccountItem, QuotaGroup, StatusSnapshot } from './types';
 
 export function formatCompactTokens(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return '--';
@@ -223,18 +223,60 @@ export function statusColorForMode(mode: string | undefined, reachable: boolean)
     case 'connected':
     case 'active':
     case 'english':
+    case 'adaptive':
       return 'green';
     case 'paused':
     case 'waiting':
+    case 'waiting-window':
     case 'waiting_window':
+    case 'waiting-app':
     case 'waiting_app':
     case 'starting':
+    case 'unsupported':
+    case 'legacy-blocked':
+    case 'legacy_blocked':
       return 'amber';
     case 'error':
-    case 'legacy_blocked':
     case 'stopped':
       return 'red';
     default:
       return 'gray';
   }
+}
+
+export function formatStatusLabel(
+  status: StatusSnapshot | null | undefined,
+  reachable: boolean,
+  locale: string,
+  t: (key: string, params?: Record<string, string | number>, fallback?: string) => string,
+): string {
+  if (!reachable) return t('status.disconnected');
+  if (status?.dictionaryError) return t('status.check_dictionary');
+  if (Array.isArray(status?.errors) && status.errors.length > 0) return t('status.check_partial');
+  const mode = status?.mode ?? '';
+  const pausedOrFailed = ['paused', 'unsupported', 'legacy-blocked', 'legacy_blocked', 'stopped', 'error'].includes(mode);
+  if ((status?.runningTasks ?? 0) > 0 && status?.translationEnabled !== false && !pausedOrFailed) {
+    return t('status.running_tasks');
+  }
+  if (mode === 'connected' || mode === 'active' || mode === 'adaptive') {
+    return locale === 'en' || status?.translationEnabled === false
+      ? t('status.connected_english')
+      : t('status.connected');
+  }
+  if (mode === 'paused') {
+    if (locale === 'en' || status?.locale === 'en') {
+      return (status?.windows ?? 0) > 0
+        ? t('status.connected_english')
+        : t('status.english_mode');
+    }
+    return t('status.paused');
+  }
+  if (mode === 'waiting-window' || mode === 'waiting_window') return t('status.waiting_window');
+  if (mode === 'waiting-app' || mode === 'waiting_app') return t('status.waiting_app');
+  if (mode === 'waiting' || mode === 'starting') return t('status.waiting');
+  if (mode === 'unsupported') return t('status.unsupported');
+  if (mode === 'legacy-blocked' || mode === 'legacy_blocked') return t('status.legacy_blocked');
+  if (mode === 'error') return t('status.error');
+  if (mode === 'stopped') return t('status.stopped');
+  return t('status.waiting_app');
 }
