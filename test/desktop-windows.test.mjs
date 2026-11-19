@@ -391,3 +391,14 @@ test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为�
   assert.equal(stopRes.ok, true);
   assert.equal(await exitPromise, 0);
 });
+
+test('desktop 用量页导出使用原生 Tauri save_json_file 而非 WebView2 失效的 Blob 下载', () => {
+  const usagePageSrc = readFileSync(join(root, 'desktop', 'src', 'pages', 'UsagePage.tsx'), 'utf8');
+  assert.equal(usagePageSrc.includes('URL.createObjectURL'), false, '不应在 WebView2 中使用失效的 Blob/a.download 导出');
+  assert.ok(usagePageSrc.includes('saveJsonFile'), 'UsagePage 应调用 saveJsonFile');
+  const ipcSrc = readFileSync(join(root, 'desktop', 'src', 'ipc.ts'), 'utf8');
+  assert.ok(ipcSrc.includes("'save_json_file'"), 'ipc.ts 应封装 save_json_file 命令');
+  const mainRs = readFileSync(join(root, 'desktop', 'src-tauri', 'src', 'main.rs'), 'utf8');
+  assert.ok(mainRs.includes('fn save_json_file'), 'main.rs 应定义 save_json_file 命令');
+  assert.ok(mainRs.includes('save_json_file,'), 'main.rs 应在 invoke_handler 中注册 save_json_file');
+});

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { RefreshCw, Download, ListFilter, Tags, Search } from 'lucide-react';
-import { ipcRequest } from '../ipc';
+import { ipcRequest, saveJsonFile } from '../ipc';
 import { formatCompactTokens, formatCount, formatTimestampShort, formatUsd } from '../format';
 import { BarChart } from '../components/BarChart';
 import { DonutChart, DONUT_PALETTE } from '../components/DonutChart';
@@ -17,6 +17,7 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
   const [accountId, setAccountId] = useState<string>('all');
   const [data, setData] = useState<UsagePeriodData | null>(null);
   const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [showLogModal, setShowLogModal] = useState(false);
   const [showPricingModal, setShowPricingModal] = useState(false);
 
@@ -43,15 +44,33 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
     void fetchUsage(false);
   }, [fetchUsage]);
 
-  const handleExport = () => {
-    if (!data) return;
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `gravitybox-usage-${period}-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const handleExport = async () => {
+    if (!data || loading || exporting || data.period !== period) return;
+    setExporting(true);
+    try {
+      const defaultName = t(
+        'usage.models.export_filename',
+        { period },
+        `gravitybox-usage-${period}-${new Date().toISOString().slice(0, 10)}.json`,
+      );
+      const res = await saveJsonFile({
+        defaultName,
+        content: JSON.stringify(data, null, 2),
+        title: store.locale === 'en' ? 'Export Usage Data' : '导出用量数据',
+        filterLabel: store.locale === 'en' ? 'JSON Files' : 'JSON 文件',
+        allFilesLabel: store.locale === 'en' ? 'All Files' : '所有文件',
+      });
+      if (res.saved) {
+        store.showToast(t('usage_log.export.done', undefined, '用量记录已导出'));
+      }
+    } catch (err) {
+      store.showToast(
+        t('usage_log.export.failed', { error: String(err) }, `导出失败：${String(err)}`),
+        true,
+      );
+    } finally {
+      setExporting(false);
+    }
   };
 
   const summary = data?.summary;
@@ -124,7 +143,11 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
             <RefreshCw size={13} />
             {t('common.refresh')}
           </button>
-          <button className="btn" onClick={handleExport} disabled={!data}>
+          <button
+            className="btn"
+            onClick={() => void handleExport()}
+            disabled={!data || loading || exporting || data.period !== period}
+          >
             <Download size={13} />
             {t('usage.export_btn')}
           </button>
