@@ -209,11 +209,62 @@ jobs:
       - name: Native Swift Unit Tests
         run: node tools/run-tests.mjs --native
 
+  windows-desktop:
+    name: Windows Desktop Build, Tests & Installer
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Root Dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install Desktop Dependencies
+        run: pnpm --dir desktop install --frozen-lockfile
+
+      - name: Privacy Gate
+        run: node tools/check-privacy.mjs
+
+      - name: Source Docs Consistency Check
+        run: node tools/check-docs.mjs --source-only
+
+      - name: Tauri Rust Unit Tests
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml
+
+      - name: Build, Test & Package Windows Portable + NSIS Installer
+        run: node tools/package-win.mjs --require-installer
+
+      - name: Supported Dictionary Gates
+        run: node tools/verify.mjs --dict-only --no-vendor
+
+      - name: Upload Windows Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-desktop-${{ github.run_id }}
+          path: |
+            build/GravityBox-*.zip*
+            build/GravityBox-*-setup.exe*
+          retention-days: 7
+          if-no-files-found: error
+
   ci-gate:
     name: CI Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [changes, docs-check, unit-and-dict, browser-e2e, native-swift]
+    needs: [changes, docs-check, unit-and-dict, browser-e2e, native-swift, windows-desktop]
     steps:
       - name: Evaluate Required Gate Status
         shell: bash
@@ -223,7 +274,7 @@ jobs:
             exit 1
           fi
           if [ "${{ needs.changes.outputs.code }}" = "true" ]; then
-            for res in "${{ needs.unit-and-dict.result }}" "${{ needs.browser-e2e.result }}" "${{ needs.native-swift.result }}"; do
+            for res in "${{ needs.unit-and-dict.result }}" "${{ needs.browser-e2e.result }}" "${{ needs.native-swift.result }}" "${{ needs.windows-desktop.result }}"; do
               if [ "$res" != "success" ]; then
                 echo "Code verification job failed or skipped: $res"
                 exit 1

@@ -8,6 +8,25 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const desktopDir = join(root, 'desktop');
 const tauriManifest = join(desktopDir, 'src-tauri', 'Cargo.toml');
 
+export function warnIfLowIntegrityDir(dirPath) {
+  if (process.platform !== 'win32' || !dirPath || !existsSync(dirPath)) return;
+  try {
+    const acl = execFileSync('icacls', [dirPath], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (/Low Mandatory Level/i.test(acl)) {
+      process.stdout.write(
+        `⚠️ Output directory carries Windows Low Mandatory Level (${dirPath}); ` +
+          'Tauri/WebView2 GUI binaries cannot initialize from a Low-Integrity drive (0xC0000142). ' +
+          'Extract the .zip package to a normal Medium-Integrity directory (e.g. %LocalAppData%\\Programs\\GravityBox) before launching.\n',
+      );
+    }
+  } catch {
+    // ignore
+  }
+}
+
 export function resolveAsciiCargoTargetDir() {
   if (process.env.CARGO_TARGET_DIR && !/[^\x00-\x7F]/.test(process.env.CARGO_TARGET_DIR)) {
     return process.env.CARGO_TARGET_DIR;
@@ -88,6 +107,8 @@ export function buildDesktop({ release = true, skipBackend = false } = {}) {
     loaderDst = join(outDir, 'WebView2Loader.dll');
     copyFileSync(loaderSrc, loaderDst);
   }
+
+  warnIfLowIntegrityDir(outDir);
 
   process.stdout.write(`✅ Desktop build ready: ${exeDst}\n`);
   return { outDir, exePath: exeDst, loaderPath: loaderDst, profileDir };

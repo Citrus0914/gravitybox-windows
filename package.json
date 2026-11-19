@@ -27,6 +27,7 @@
     "start": "node dist/main.js",
     "verify": "node tools/verify.mjs",
     "verify:strict": "node tools/verify.mjs --strict",
+    "verify:win": "node tools/verify-win.mjs",
     "package:mac": "npm run verify && node tools/package-mac.mjs",
     "package:mac:full": "npm run verify && node tools/package-mac.mjs && node tools/update-acceptance.mjs && node tools/check-docs.mjs",
     "desktop:build": "node tools/build-desktop.mjs",

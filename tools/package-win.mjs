@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { buildDesktop } from './build-desktop.mjs';
+import { buildDesktop, warnIfLowIntegrityDir } from './build-desktop.mjs';
 import { scanDirectoryForPrivacy } from './check-privacy.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -12,7 +12,32 @@ function sha256File(filePath) {
   return createHash('sha256').update(readFileSync(filePath)).digest('hex');
 }
 
-export async function packageWindows({ skipTests = false } = {}) {
+function findMakensis() {
+  const candidates = [];
+  if (process.env.MAKENSIS_PATH) {
+    candidates.push(process.env.MAKENSIS_PATH);
+  }
+  try {
+    const out = execFileSync('where.exe', ['makensis'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+    });
+    for (const line of out.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed) candidates.push(trimmed);
+    }
+  } catch {}
+  candidates.push(
+    'C:\\Program Files (x86)\\NSIS\\makensis.exe',
+    'C:\\Program Files\\NSIS\\makensis.exe',
+  );
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+export async function packageWindows({ skipTests = false, requireInstaller = false } = {}) {
   if (process.platform !== 'win32') {
     throw new Error('tools/package-win.mjs must be run on Windows');
   }
@@ -77,12 +102,14 @@ export async function packageWindows({ skipTests = false } = {}) {
     if (existsSync(src)) copyFileSync(src, join(stageDir, doc));
   }
 
-  // 4. Privacy gate on staged core bundle
-  const privacy = await scanDirectoryForPrivacy(coreDir);
-  if (privacy.issues.length > 0) {
-    throw new Error(
-      `Privacy check failed on staged package (${privacy.issues.length} issues): ${privacy.issues[0].file}:${privacy.issues[0].line}`,
-    );
+  // 4. Privacy gate on staged core bundle (scan both coreDir and coreDir/dist explicitly because SKIPPED_DIRS excludes 'dist' segments)
+  for (const target of [coreDir, coreDist]) {
+    const privacy = await scanDirectoryForPrivacy(target);
+    if (privacy.issues.length > 0) {
+      throw new Error(
+        `Privacy check failed on staged package (${privacy.issues.length} issues): ${privacy.issues[0].file}:${privacy.issues[0].line}`,
+      );
+    }
   }
 
   // 5. Create portable ZIP & SHA-256 checksum
@@ -101,13 +128,56 @@ export async function packageWindows({ skipTests = false } = {}) {
   const shaPath = `${zipPath}.sha256`;
   writeFileSync(shaPath, `${checksum}  ${stageName}.zip\n`, 'utf8');
 
+  // 6. Optional / CI-required NSIS installer build
+  let installerPath = null;
+  let installerShaPath = null;
+  let installerChecksum = null;
+  const makensis = findMakensis();
+  const nsiScript = join(root, 'tools', 'win-installer.nsi');
+  if (makensis && existsSync(nsiScript)) {
+    installerPath = join(root, 'build', `${stageName}-setup.exe`);
+    execFileSync(
+      makensis,
+      [
+        '/V2',
+        `/DAPP_VERSION=${version}`,
+        `/DSTAGE_DIR=${stageDir}`,
+        `/DOUT_FILE=${installerPath}`,
+        `/DICON_FILE=${join(root, 'desktop', 'src-tauri', 'icons', 'icon.ico')}`,
+        `/DLICENSE_FILE=${join(root, 'LICENSE')}`,
+        nsiScript,
+      ],
+      { cwd: root, stdio: 'inherit' },
+    );
+    installerChecksum = sha256File(installerPath);
+    installerShaPath = `${installerPath}.sha256`;
+    writeFileSync(installerShaPath, `${installerChecksum}  ${stageName}-setup.exe\n`, 'utf8');
+  } else if (requireInstaller) {
+    throw new Error('NSIS compiler (makensis.exe) not found; cannot build required Windows installer');
+  } else {
+    process.stdout.write('ℹ️ NSIS (makensis.exe) not found; skipping setup.exe installer build.\n');
+  }
+
   process.stdout.write(`✅ Windows portable package created:\n   ${stageDir}\n   ${zipPath}\n   sha256: ${checksum}\n`);
-  return { stageDir, zipPath, shaPath, checksum };
+  if (installerPath) {
+    process.stdout.write(`✅ Windows NSIS installer created:\n   ${installerPath}\n   sha256: ${installerChecksum}\n`);
+  }
+  warnIfLowIntegrityDir(stageDir);
+  return {
+    stageDir,
+    zipPath,
+    shaPath,
+    checksum,
+    installerPath,
+    installerShaPath,
+    installerChecksum,
+  };
 }
 
 if (typeof process.argv[1] === 'string' && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const skipTests = process.argv.includes('--skip-tests');
-  packageWindows({ skipTests }).catch((err) => {
+  const requireInstaller = process.argv.includes('--require-installer');
+  packageWindows({ skipTests, requireInstaller }).catch((err) => {
     process.stderr.write(`❌ package:win failed: ${err?.message || String(err)}\n`);
     process.exitCode = 1;
   });
