@@ -119,9 +119,11 @@ export function extractQuotaBars(
                   ? ''
                   : (win.label ?? '');
           const label = periodLabel && !baseTitle.includes(periodLabel) ? `${baseTitle} · ${periodLabel}` : baseTitle;
-          const rawPct = typeof win.remaining === 'number'
-            ? win.remaining
-            : (typeof win.percentage === 'number' ? win.percentage : null);
+          const rawPct = typeof win.percentage === 'number' && Number.isFinite(win.percentage)
+            ? win.percentage
+            : (typeof win.remaining === 'number' && Number.isFinite(win.remaining)
+                ? Math.round(Math.min(1, Math.max(0, win.remaining)) * 100)
+                : null);
           const percentage = win.known === false ? null : rawPct;
           const winKey = win.id ?? win.key ?? win.period ?? label;
           bars.push({

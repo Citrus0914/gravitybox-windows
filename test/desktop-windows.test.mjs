@@ -96,8 +96,8 @@ test('desktop/src/format: extractQuotaBars 兼容 ProjectedQuotaGroup 与旧式�
           availability: 'available',
           quotaState: 'known',
           windows: [
-            { id: '5h', period: '5h', remaining: 82, known: true, resetCountdown: '3h 10m', stale: false },
-            { id: 'weekly', period: 'weekly', remaining: 64, known: true, resetCountdown: '4d', stale: false },
+            { id: '5h', period: '5h', remaining: 0.82, known: true, resetCountdown: '3h 10m', stale: false },
+            { id: 'weekly', period: 'weekly', remaining: 0.64, known: true, resetCountdown: '4d', stale: false },
           ],
         },
         {
@@ -107,7 +107,7 @@ test('desktop/src/format: extractQuotaBars 兼容 ProjectedQuotaGroup 与旧式�
           availability: 'available',
           quotaState: 'stale',
           windows: [
-            { id: '5h', period: '5h', remaining: 15, known: true, resetCountdown: '1h', stale: true },
+            { id: '5h', period: '5h', remaining: 0.15, known: true, resetCountdown: '1h', stale: true },
           ],
         },
         {
