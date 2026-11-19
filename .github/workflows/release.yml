@@ -87,7 +87,7 @@ jobs:
         run: npm run doctor
 
       - name: Cache Pinned Test Browser
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .cache/test-chrome-*
           key: ${{ runner.os }}-${{ runner.arch }}-chrome-${{ hashFiles('tools/setup-test-browser.mjs') }}
