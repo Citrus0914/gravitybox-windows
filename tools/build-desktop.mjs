@@ -82,7 +82,7 @@ export function buildDesktop({ release = true, skipBackend = false } = {}) {
 
   const cargoTargetDir = resolveAsciiCargoTargetDir();
   mkdirSync(cargoTargetDir, { recursive: true });
-  const cargoArgs = ['build', '--manifest-path', tauriManifest];
+  const cargoArgs = ['build', '--manifest-path', tauriManifest, '--features', 'custom-protocol'];
   if (release) cargoArgs.push('--release');
 
   runSync('cargo', cargoArgs, desktopDir, {
