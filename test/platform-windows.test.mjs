@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { lstat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { BundleCache } from '../dist/bundle-cache.js';
+import { nativeSources } from '../dist/coverage.js';
 import { isOwnedByCurrentUser, isWindows } from '../dist/platform/fs.js';
 import {
   bundleLayoutPaths,
@@ -92,4 +95,33 @@ test('Windows 原生辅助程序: WinCred 读写删、PE 签名元数据与进�
   );
   assert.equal(captured.startsWith('{'), true);
   assert.equal(decodeKeyringPayload(captured)?.token?.email, 'win@example.test');
+});
+
+test('Windows 解包目录布局: BundleCache 与 nativeSources 兼容 resources/app 无需 Contents/Resources/app.asar', { skip: !isWindows }, async (t) => {
+  const appDir = await mkdtemp(join(tmpdir(), 'gb-win-unpacked-'));
+  t.after(async () => {
+    await rm(appDir, { recursive: true, force: true });
+  });
+  await mkdir(join(appDir, 'resources', 'app', 'dist'), { recursive: true });
+  await writeFile(join(appDir, 'resources', 'app', 'package.json'), JSON.stringify({ name: 'antigravity', version: '2.33.0' }));
+  await writeFile(join(appDir, 'resources', 'app', 'dist', 'main.js'), 'console.log("Settings");');
+
+  let reads = 0;
+  const cache = new BundleCache();
+  const fetcher = async () => ({ hash: `h-${++reads}`, source: 'body', bytes: 4 });
+  const first = await cache.read(appDir, 100, '2.33.0', 'http://127.0.0.1:5191', fetcher);
+  assert.equal(first.cacheHit, false);
+  const second = await cache.read(appDir, 100, '2.33.0', 'http://127.0.0.1:5191', fetcher);
+  assert.equal(second.cacheHit, true);
+  assert.equal(reads, 1);
+
+  await writeFile(join(appDir, 'resources', 'app', 'dist', 'main.js'), 'console.log("Settings Updated");');
+  const third = await cache.read(appDir, 100, '2.33.0', 'http://127.0.0.1:5191', fetcher);
+  assert.equal(third.cacheHit, false);
+  assert.equal(reads, 2);
+
+  const sources = await nativeSources(appDir);
+  assert.equal(sources.length, 1);
+  assert.equal(sources[0].id, 'app.asar/dist/main.js');
+  assert.match(sources[0].source, /Settings Updated/);
 });
