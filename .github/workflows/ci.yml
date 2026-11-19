@@ -223,7 +223,7 @@ jobs:
           node-version: 22
           cache: 'npm'
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
 
