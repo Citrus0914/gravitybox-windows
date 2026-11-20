@@ -213,19 +213,27 @@ function sendPipeCommand(pipePath, payload, timeoutMs = 8000) {
   });
 }
 
-async function waitForPipePing(pipePath, deadlineMs = 8000) {
+async function waitForPipePing(pipePath, deadlineMs = 15000, child = null, getStderr = null) {
   const deadline = Date.now() + deadlineMs;
   let lastErr;
   while (Date.now() < deadline) {
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      const stderr = getStderr ? getStderr() : '';
+      throw new Error(
+        `Backend exited early (code=${child.exitCode}, signal=${child.signalCode}): ${stderr || '<no stderr>'}`,
+      );
+    }
     try {
       const res = await sendPipeCommand(pipePath, { command: 'ping' }, 1500);
       if (res?.ok) return res;
     } catch (err) {
       lastErr = err;
     }
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 50));
   }
-  throw lastErr || new Error('Timed out waiting for Windows Named Pipe');
+  const stderr = getStderr ? getStderr() : '';
+  const baseMsg = lastErr?.message || 'Timed out waiting for Windows Named Pipe';
+  throw new Error(stderr ? `${baseMsg} (stderr: ${stderr})` : baseMsg);
 }
 
 test('Windows Named Pipe 后端 IPC 实机契约闭环', { skip: !isWindows }, async (t) => {
@@ -259,11 +267,15 @@ test('Windows Named Pipe 后端 IPC 实机契约闭环', { skip: !isWindows }, a
     ],
     {
       cwd: root,
-      env: { ...process.env, GRAVITYBOX_CONTROL_ENDPOINT: pipePath },
+      env: { ...process.env, GRAVITYBOX_CONTROL_ENDPOINT: pipePath, GRAVITYBOX_PROBE_LS: 'false' },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     },
   );
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr += chunk.toString('utf8');
+  });
 
   t.after(() => {
     if (child.exitCode === null && child.signalCode === null) {
@@ -271,7 +283,7 @@ test('Windows Named Pipe 后端 IPC 实机契约闭环', { skip: !isWindows }, a
     }
   });
 
-  const pingRes = await waitForPipePing(pipePath);
+  const pingRes = await waitForPipePing(pipePath, 15000, child, () => stderr);
   assert.equal(pingRes.ok, true);
   assert.equal(typeof pingRes.pid, 'number');
 
@@ -350,11 +362,21 @@ test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为�
     mkdirSync(d, { recursive: true });
   }
   const pipePath = controlEndpointForStateDir(stateDir);
-  const verbatimEntry = `\\\\?\\${join(root, 'dist', 'main.js')}`;
+  const realEntry = join(root, 'dist', 'main.js');
+  const verbatimEntry = `\\\\?\\${realEntry}`;
+  // Node 22 在 CLI 直接传入 \\?\ 入口路径时会在内部 cjs/loader realpathSync 阶段触发 EISDIR lstat 'D:'；
+  // 通过独立进程注入 verbatim process.argv[1] 后导入真实入口，可在 Node 22+ 稳定验证 src/main.ts 的 normalizeEntryPath 剥离逻辑。
+  const bootstrap =
+    "import { pathToFileURL } from 'node:url'; " +
+    'process.argv = [process.execPath, process.env.GB_VERBATIM_ENTRY, ...process.argv.slice(1)]; ' +
+    'await import(pathToFileURL(process.env.GB_REAL_ENTRY).href);';
   const child = spawn(
     process.execPath,
     [
-      verbatimEntry,
+      '--input-type=module',
+      '-e',
+      bootstrap,
+      '--',
       '--state-dir',
       stateDir,
       '--gemini-dir',
@@ -370,11 +392,21 @@ test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为�
     ],
     {
       cwd: root,
-      env: { ...process.env, GRAVITYBOX_CONTROL_ENDPOINT: pipePath },
+      env: {
+        ...process.env,
+        GB_REAL_ENTRY: realEntry,
+        GB_VERBATIM_ENTRY: verbatimEntry,
+        GRAVITYBOX_CONTROL_ENDPOINT: pipePath,
+        GRAVITYBOX_PROBE_LS: 'false',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     },
   );
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr += chunk.toString('utf8');
+  });
 
   t.after(() => {
     if (child.exitCode === null && child.signalCode === null) {
@@ -382,7 +414,7 @@ test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为�
     }
   });
 
-  const pingRes = await waitForPipePing(pipePath);
+  const pingRes = await waitForPipePing(pipePath, 15000, child, () => stderr);
   assert.equal(pingRes.ok, true);
   const exitPromise = new Promise((resolveExit) => {
     child.once('exit', (code) => resolveExit(code));
@@ -390,4 +422,15 @@ test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为�
   const stopRes = await sendPipeCommand(pipePath, { command: 'stop' });
   assert.equal(stopRes.ok, true);
   assert.equal(await exitPromise, 0);
+});
+
+test('desktop 用量页导出使用原生 Tauri save_json_file 而非 WebView2 失效的 Blob 下载', () => {
+  const usagePageSrc = readFileSync(join(root, 'desktop', 'src', 'pages', 'UsagePage.tsx'), 'utf8');
+  assert.equal(usagePageSrc.includes('URL.createObjectURL'), false, '不应在 WebView2 中使用失效的 Blob/a.download 导出');
+  assert.ok(usagePageSrc.includes('saveJsonFile'), 'UsagePage 应调用 saveJsonFile');
+  const ipcSrc = readFileSync(join(root, 'desktop', 'src', 'ipc.ts'), 'utf8');
+  assert.ok(ipcSrc.includes("'save_json_file'"), 'ipc.ts 应封装 save_json_file 命令');
+  const mainRs = readFileSync(join(root, 'desktop', 'src-tauri', 'src', 'main.rs'), 'utf8');
+  assert.ok(mainRs.includes('fn save_json_file'), 'main.rs 应定义 save_json_file 命令');
+  assert.ok(mainRs.includes('save_json_file,'), 'main.rs 应在 invoke_handler 中注册 save_json_file');
 });

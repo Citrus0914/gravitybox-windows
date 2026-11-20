@@ -580,8 +580,6 @@ test('translation_set 独立汉化开关写入 config.json 并在重启及切换
         dir,
         '--gemini-dir',
         join(dir, 'gemini'),
-        '--locale',
-        'system',
         '--system-locales',
         'zh-CN',
       ],
@@ -646,6 +644,32 @@ test('translation_set 独立汉化开关写入 config.json 并在重启及切换
     assert.equal(reEnabled.status.translationEnabled, true);
     const cfgAfterEnable = JSON.parse(await readFile(join(dir, 'config.json'), 'utf8'));
     assert.equal(cfgAfterEnable.translationEnabled, true);
+
+    // 切换软件显示语言为 English 时，只改变软件与 HUD 语言，不关闭 Antigravity 汉化
+    const enWhileTranslated = await rpc(dir, { command: 'language_set', language: 'en' });
+    assert.equal(enWhileTranslated.ok, true);
+    assert.equal(enWhileTranslated.status.locale, 'en');
+    assert.equal(enWhileTranslated.status.translationEnabled, true);
+    assert.ok(enWhileTranslated.status.entries > 0);
+
+    await rpc(dir, { command: 'stop' });
+    await until(async () => child.exitCode === 0, 10000);
+    await sleep(50);
+
+    // 重启后 appLanguage='en' 且 translationEnabled=true 各自独立生效
+    child = spawnBackend();
+    await until(async () => {
+      try {
+        return (await rpc(dir, { command: 'status', includeTasks: false })).ok;
+      } catch {
+        return false;
+      }
+    }, 15000);
+    const enTranslatedRestart = await rpc(dir, { command: 'status', includeTasks: false });
+    assert.equal(enTranslatedRestart.ok, true);
+    assert.equal(enTranslatedRestart.status.locale, 'en');
+    assert.equal(enTranslatedRestart.status.translationEnabled, true);
+    assert.ok(enTranslatedRestart.status.entries > 0);
 
     await rpc(dir, { command: 'stop' });
     await until(async () => child.exitCode === 0, 10000);
