@@ -362,11 +362,21 @@ test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为�
     mkdirSync(d, { recursive: true });
   }
   const pipePath = controlEndpointForStateDir(stateDir);
-  const verbatimEntry = `\\\\?\\${join(root, 'dist', 'main.js')}`;
+  const realEntry = join(root, 'dist', 'main.js');
+  const verbatimEntry = `\\\\?\\${realEntry}`;
+  // Node 22 在 CLI 直接传入 \\?\ 入口路径时会在内部 cjs/loader realpathSync 阶段触发 EISDIR lstat 'D:'；
+  // 通过独立进程注入 verbatim process.argv[1] 后导入真实入口，可在 Node 22+ 稳定验证 src/main.ts 的 normalizeEntryPath 剥离逻辑。
+  const bootstrap =
+    "import { pathToFileURL } from 'node:url'; " +
+    'process.argv = [process.execPath, process.env.GB_VERBATIM_ENTRY, ...process.argv.slice(1)]; ' +
+    'await import(pathToFileURL(process.env.GB_REAL_ENTRY).href);';
   const child = spawn(
     process.execPath,
     [
-      verbatimEntry,
+      '--input-type=module',
+      '-e',
+      bootstrap,
+      '--',
       '--state-dir',
       stateDir,
       '--gemini-dir',
@@ -382,7 +392,13 @@ test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为�
     ],
     {
       cwd: root,
-      env: { ...process.env, GRAVITYBOX_CONTROL_ENDPOINT: pipePath, GRAVITYBOX_PROBE_LS: 'false' },
+      env: {
+        ...process.env,
+        GB_REAL_ENTRY: realEntry,
+        GB_VERBATIM_ENTRY: verbatimEntry,
+        GRAVITYBOX_CONTROL_ENDPOINT: pipePath,
+        GRAVITYBOX_PROBE_LS: 'false',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     },
