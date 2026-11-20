@@ -186,9 +186,15 @@ test('安全防投毒校验：单价超过 $500/MTok 时严密拦截', async () 
   await rm(temp, { recursive: true, force: true });
 });
 
-test('全自动智能补齐未计价（零按钮、用户无感）：仅补齐未计价历史，已锁定账本绝不动摇', async () => {
+test('全自动智能补齐未计价（零按钮、用户无感）：仅补齐未计价历史，已锁定账本绝不动摇', async t => {
   const temp = await mkdtemp(join(tmpdir(), 'gravitybox-autoheal-'));
-  const manager = new UsageStatsManager({ stateDir: temp, geminiDir: join(temp, 'gemini') });
+  t.after(() => rm(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const manager = new UsageStatsManager({
+    stateDir: temp,
+    geminiDir: join(temp, 'gemini'),
+    remotePricingUrl: 'http://127.0.0.1:9999/nonexistent.json',
+    fallbackPricingUrls: [],
+  });
   manager.setAutoRemotePricingSync(true);
 
   // 1. 手动注入账本：1 条已锁定的正常计价记录 ($5.00) + 1 条历史未计价记录 ($0.00)
@@ -208,8 +214,6 @@ test('全自动智能补齐未计价（零按钮、用户无感）：仅补齐�
   assert.equal(healed, 1, '应精准识别并清理 1 条未计价条目');
   assert.equal(manager.rateLocks[lockedKey].usd, 5.0, '原本正常锁定的记录金额绝不受影响');
   assert.equal(manager.rateLocks[unpricedKey], undefined, '未计价记录旧锁已被释放以允许重新匹配新价');
-
-  await rm(temp, { recursive: true, force: true });
 });
 
 test('Hydrogen 定价、xhigh 后缀匹配与 Antigravity 动态模型过滤（不影响历史计价）', async t => {

@@ -183,8 +183,8 @@ Hover over (or click to pin) any capsule to open its detailed breakdown card:
 
 | Section | Option | Choices / Control | What It Does & When to Use It |
 | :--- | :--- | :--- | :--- |
-| **Antigravity Enhancement** | **Display Language** | `Follow System` (default)<br>`简体中文`<br>`English` | **Panel & HUD language selector**: Controls GravityBox's UI and HUD language. Selecting `English` keeps GravityBox, HUD, and Antigravity in clean English immediately—no restart needed. |
-| **Antigravity Enhancement** | **Antigravity UI Translation** | Toggle (default `On`) | **Persistent independent translation switch**: Controls whether GravityBox translates Antigravity's UI at runtime. Turn it off to keep it persistently disabled (for example when using another static localization patch) while keeping GravityBox and the HUD in Chinese. |
+| **Antigravity Enhancement** | **Display Language** | `Follow System` (default)<br>`简体中文`<br>`English` | **Panel & HUD language selector**: Controls GravityBox's UI and HUD language only **without affecting Antigravity**—no restart needed. |
+| **Antigravity Enhancement** | **Antigravity UI Translation** | Toggle (default `On`) | **Persistent independent translation switch**: Controls whether GravityBox translates Antigravity's UI into Chinese at runtime, completely independent of Display Language. Turn it off to keep Antigravity untouched (or use another static patch) while keeping GravityBox and the HUD in your chosen language. |
 | **Antigravity Enhancement** | **Conversation HUD** | Toggle (default `On`) | Shows or hides the 3-capsule Telemetry HUD below Antigravity's chat box. **Independent of translation**—you can keep Antigravity untouched while using the HUD. |
 | **Quota & Pricing** | **Quota Refresh Interval** | `Manual Refresh` (default)<br>`Every 5 / 10 / 15 / 30 / 60 min` | How often GravityBox polls remaining quotas for saved accounts in the background. Leave on `Manual Refresh` for single-account use, or `10–15 min` when rotating accounts. |
 | **Quota & Pricing** | **Auto-Update Pricing Feed** | `Check Now` button + Toggle (default `Off`) | Syncs the public model pricing feed every 24 hours so newly launched models get accurate cost estimates without waiting for an app update.<br>Click **Check Now** to open the **Pricing Feed** dialog—inspect per-model input, cache read/write, and output rates with official source links, and automatically heal historical unpriced entries. |
@@ -436,7 +436,7 @@ Antigravity holds live SQLite and credential locks while running. Force-killing 
 <details>
 <summary><b>2. Can I use the Telemetry HUD while keeping Antigravity in English?</b></summary>
 
-Yes! Set **Settings → Display Language** to **`English`** and keep **Conversation HUD** turned **`On`**. Antigravity stays 100% in original English while displaying the English HUD below the chat box.
+Yes. Turn off **Settings → Antigravity Enhancement → Antigravity UI Translation** and keep **Conversation HUD** turned **`On`**. This setting persists across restarts—Antigravity remains untouched (or uses your own static patch) while GravityBox and the HUD stay in your chosen Display Language (`简体中文` or `English`).
 
 </details>
 

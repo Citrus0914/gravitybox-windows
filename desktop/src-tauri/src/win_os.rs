@@ -328,6 +328,170 @@ pub fn quit_antigravity_and_wait(helper_exe: Option<&Path>) -> Result<bool, Stri
     Ok(!is_antigravity_running(helper_exe))
 }
 
+#[cfg(windows)]
+#[link(name = "comdlg32")]
+extern "system" {
+    fn GetSaveFileNameW(lpofn: *mut OpenFileNameW) -> i32;
+    fn CommDlgExtendedError() -> u32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct OpenFileNameW {
+    l_struct_size: u32,
+    hwnd_owner: *mut c_void,
+    h_instance: *mut c_void,
+    lpstr_filter: *const u16,
+    lpstr_custom_filter: *mut u16,
+    n_max_cust_filter: u32,
+    n_filter_index: u32,
+    lpstr_file: *mut u16,
+    n_max_file: u32,
+    lpstr_file_title: *mut u16,
+    n_max_file_title: u32,
+    lpstr_initial_dir: *const u16,
+    lpstr_title: *const u16,
+    flags: u32,
+    n_file_offset: u16,
+    n_file_extension: u16,
+    lpstr_def_ext: *const u16,
+    l_cust_data: isize,
+    lpfn_hook: *const c_void,
+    lp_template_name: *const u16,
+    pv_reserved: *mut c_void,
+    dw_reserved: u32,
+    flags_ex: u32,
+}
+
+#[cfg(windows)]
+const OFN_OVERWRITEPROMPT: u32 = 0x0000_0002;
+#[cfg(windows)]
+const OFN_NOCHANGEDIR: u32 = 0x0000_0008;
+#[cfg(windows)]
+const OFN_PATHMUSTEXIST: u32 = 0x0000_0800;
+#[cfg(windows)]
+const OFN_EXPLORER: u32 = 0x0008_0000;
+
+pub fn sanitize_export_filename(name: &str) -> String {
+    let mut cleaned: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() {
+        cleaned = "gravitybox-export".to_string();
+    }
+    if !cleaned.to_ascii_lowercase().ends_with(".json") {
+        cleaned.push_str(".json");
+    }
+    cleaned
+}
+
+#[cfg(windows)]
+fn build_json_filter_wide(filter_label: &str, all_files_label: &str) -> Vec<u16> {
+    let json_desc = if filter_label.trim().is_empty() {
+        "JSON (*.json)".to_string()
+    } else {
+        format!("{} (*.json)", filter_label.trim())
+    };
+    let all_desc = if all_files_label.trim().is_empty() {
+        "All Files (*.*)".to_string()
+    } else {
+        format!("{} (*.*)", all_files_label.trim())
+    };
+
+    let mut wide = Vec::new();
+    for segment in [json_desc.as_str(), "*.json", all_desc.as_str(), "*.*"] {
+        wide.extend(std::ffi::OsStr::new(segment).encode_wide());
+        wide.push(0);
+    }
+    wide.push(0);
+    wide
+}
+
+pub fn pick_save_json_path(
+    owner_hwnd: isize,
+    default_name: &str,
+    title: Option<&str>,
+    filter_label: Option<&str>,
+    all_files_label: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    #[cfg(windows)]
+    {
+        let safe_name = sanitize_export_filename(default_name);
+        let name_wide: Vec<u16> = std::ffi::OsStr::new(&safe_name).encode_wide().collect();
+        let mut file_buf = vec![0u16; 4096];
+        let copy_len = name_wide.len().min(file_buf.len() - 1);
+        file_buf[..copy_len].copy_from_slice(&name_wide[..copy_len]);
+
+        let filter_wide = build_json_filter_wide(
+            filter_label.unwrap_or("JSON"),
+            all_files_label.unwrap_or("All Files"),
+        );
+        let def_ext = to_wide_null("json");
+        let title_wide = title.filter(|s| !s.trim().is_empty()).map(to_wide_null);
+
+        let mut ofn = OpenFileNameW {
+            l_struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
+            hwnd_owner: owner_hwnd as *mut c_void,
+            h_instance: std::ptr::null_mut(),
+            lpstr_filter: filter_wide.as_ptr(),
+            lpstr_custom_filter: std::ptr::null_mut(),
+            n_max_cust_filter: 0,
+            n_filter_index: 1,
+            lpstr_file: file_buf.as_mut_ptr(),
+            n_max_file: file_buf.len() as u32,
+            lpstr_file_title: std::ptr::null_mut(),
+            n_max_file_title: 0,
+            lpstr_initial_dir: std::ptr::null(),
+            lpstr_title: title_wide
+                .as_ref()
+                .map_or(std::ptr::null(), |v| v.as_ptr()),
+            flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER,
+            n_file_offset: 0,
+            n_file_extension: 0,
+            lpstr_def_ext: def_ext.as_ptr(),
+            l_cust_data: 0,
+            lpfn_hook: std::ptr::null(),
+            lp_template_name: std::ptr::null(),
+            pv_reserved: std::ptr::null_mut(),
+            dw_reserved: 0,
+            flags_ex: 0,
+        };
+
+        let ok = unsafe { GetSaveFileNameW(&mut ofn) };
+        if ok != 0 {
+            let end = file_buf
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(file_buf.len());
+            let selected = String::from_utf16_lossy(&file_buf[..end]);
+            if selected.trim().is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(PathBuf::from(selected)));
+        }
+
+        let err = unsafe { CommDlgExtendedError() };
+        if err == 0 {
+            Ok(None)
+        } else {
+            Err(format!("Save dialog failed (0x{:04x})", err))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (owner_hwnd, default_name, title, filter_label, all_files_label);
+        Err("Native save dialog is only supported on Windows".to_string())
+    }
+}
+
 pub fn reveal_in_explorer(path: &Path) -> Result<(), String> {
     let mut cmd = Command::new("explorer.exe");
     if path.is_file() {
@@ -470,5 +634,26 @@ mod tests {
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert_eq!(args, vec!["--remote-debugging-port=0"]);
+    }
+
+    #[test]
+    fn sanitize_export_filename_strips_invalid_chars_and_ensures_json_ext() {
+        assert_eq!(
+            sanitize_export_filename("GravityBox-用量-today"),
+            "GravityBox-用量-today.json"
+        );
+        assert_eq!(
+            sanitize_export_filename("bad:name*with/slashes?.JSON"),
+            "bad-name-with-slashes-.JSON"
+        );
+        assert_eq!(sanitize_export_filename("   ...  "), "gravitybox-export.json");
+    }
+
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    #[test]
+    fn open_file_name_struct_matches_win64_layout() {
+        assert_eq!(std::mem::size_of::<OpenFileNameW>(), 152);
+        let filter = build_json_filter_wide("JSON 文件", "所有文件");
+        assert!(filter.ends_with(&[0, 0]));
     }
 }
