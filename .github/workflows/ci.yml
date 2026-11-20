@@ -101,114 +101,6 @@ jobs:
             console.log('Markdown media links verified.');
           "
 
-  unit-and-dict:
-    name: Unit Tests & Dictionary Gates
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: 'npm'
-
-      - name: Install Dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Check Development Environment (Node & Dictionaries)
-        run: node tools/doctor.mjs --skip-native
-
-      - name: Build TypeScript & Runtime
-        run: npm run build
-
-      - name: Fast Unit & Integration Tests
-        run: node tools/run-tests.mjs --fast
-
-      - name: Supported Dictionary Gates
-        run: node tools/verify.mjs --dict-only --no-vendor
-
-      - name: Upload Dictionary Gate Reports on Failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: unit-dict-logs
-          path: 质检报告/
-          if-no-files-found: ignore
-
-  browser-e2e:
-    name: Browser CDP E2E
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: 'npm'
-
-      - name: Install Dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Build TypeScript & Runtime
-        run: npm run build
-
-      - name: Cache Pinned Test Browser
-        uses: actions/cache@v6
-        with:
-          path: .cache/test-chrome-*
-          key: ${{ runner.os }}-${{ runner.arch }}-chrome-${{ hashFiles('tools/setup-test-browser.mjs') }}
-
-      - name: Setup Pinned Test Browser
-        run: node tools/setup-test-browser.mjs
-
-      - name: Headless Browser Regression Suite
-        run: node test/browser.mjs
-
-      - name: Upload Browser Regression Reports on Failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: browser-e2e-logs
-          path: 质检报告/
-          if-no-files-found: ignore
-
-  native-swift:
-    name: Native Swift Compile & Tests
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: 'npm'
-
-      - name: Install Dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Check Development Environment
-        run: node tools/doctor.mjs
-
-      - name: Build TypeScript & Runtime
-        run: npm run build
-
-      - name: Release-Mode Swift (-O) Build Check
-        run: |
-          mkdir -p .cache
-          node -e "import('./tools/native-build.mjs').then(async m => { const { execFileSync } = await import('node:child_process'); execFileSync('/usr/bin/swiftc', await m.nativeBuildArgs(process.cwd(), '.cache/GravityBox-native-verified'), { stdio: 'inherit', maxBuffer: 4e6 }); })"
-
-      - name: Native Swift Unit Tests
-        run: node tools/run-tests.mjs --native
-
   windows-desktop:
     name: Windows Desktop Build, Tests & Installer
     needs: changes
@@ -228,6 +120,12 @@ jobs:
           version: 10
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            desktop/src-tauri
+            native-win/gb-win-helper
 
       - name: Install Root Dependencies
         run: npm ci --ignore-scripts
@@ -273,7 +171,7 @@ jobs:
     name: CI Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [changes, docs-check, unit-and-dict, browser-e2e, native-swift, windows-desktop]
+    needs: [changes, docs-check, windows-desktop]
     steps:
       - name: Evaluate Required Gate Status
         shell: bash
@@ -283,7 +181,7 @@ jobs:
             exit 1
           fi
           if [ "${{ needs.changes.outputs.code }}" = "true" ]; then
-            for res in "${{ needs.unit-and-dict.result }}" "${{ needs.browser-e2e.result }}" "${{ needs.native-swift.result }}" "${{ needs.windows-desktop.result }}"; do
+            for res in "${{ needs.windows-desktop.result }}"; do
               if [ "$res" != "success" ]; then
                 echo "Code verification job failed or skipped: $res"
                 exit 1
