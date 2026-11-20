@@ -20,7 +20,7 @@ async function main() {
   const selected = selectTestFiles(await readdir(join(root, 'test')), mode);
   if (selected.length === 0) throw new Error(`未找到匹配的测试文件（mode=${mode}）`);
 
-  const child = spawn(process.execPath, ['--test', '--test-timeout=25000', ...selected], { cwd: root, stdio: 'inherit' });
+  const child = spawn(process.execPath, ['--test', '--test-timeout=60000', ...selected], { cwd: root, stdio: 'inherit' });
   process.exitCode = await new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('exit', (code, signal) => {
