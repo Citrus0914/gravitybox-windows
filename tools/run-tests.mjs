@@ -1,7 +1,7 @@
 import { readdir, realpath } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 export function selectTestFiles(entries, mode = 'all') {
@@ -30,7 +30,14 @@ async function main() {
   });
 }
 
+const selfPath = await realpath(fileURLToPath(import.meta.url)).catch(() => fileURLToPath(import.meta.url));
 const entryPath = process.argv[1] ? await realpath(process.argv[1]).catch(() => null) : null;
-if (entryPath && import.meta.url === pathToFileURL(entryPath).href) {
+const isDirectEntry = Boolean(
+  entryPath &&
+    (process.platform === 'win32'
+      ? selfPath.toLowerCase() === entryPath.toLowerCase()
+      : selfPath === entryPath),
+);
+if (isDirectEntry) {
   main().catch(error => { console.error(error.message); process.exitCode = 1; });
 }

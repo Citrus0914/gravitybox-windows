@@ -1,4 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync } from 'node:sqlite';
 import { type ApplicationChannel, type ApplicationTarget, applicationTarget } from './application-target.js';
 import { readFile, mkdir, lstat, unlink, readdir } from 'node:fs/promises';
 import { join, sep } from 'node:path';
@@ -58,21 +58,25 @@ export class DatabaseTransaction {
   private failed = false;
   private closed = false;
   private inTx = false;
-  constructor(dbPath: string) {
-    try {
-      this.db = new DatabaseSync(dbPath);
-    } catch {
-      this.failed = true;
-    }
-  }
-  private ensureOpen(): DatabaseSync {
-    if (this.failed || this.closed || !this.db) {
+  constructor(private readonly dbPath: string) {}
+  private async ensureOpen(): Promise<DatabaseSync> {
+    if (this.failed || this.closed) {
       throw new Error(bt(this.closed ? 'switch.err.db_closed' : 'switch.err.db_tx_failed'));
+    }
+    if (!this.db) {
+      try {
+        // Lazy-load node:sqlite so main.ts startup does not trigger Node 22 ExperimentalWarning on stderr.
+        const { DatabaseSync } = await import('node:sqlite');
+        this.db = new DatabaseSync(this.dbPath);
+      } catch {
+        this.failed = true;
+        throw new Error(bt('switch.err.db_tx_failed'));
+      }
     }
     return this.db;
   }
   async begin() {
-    const db = this.ensureOpen();
+    const db = await this.ensureOpen();
     try {
       db.exec('PRAGMA busy_timeout = 3000;');
       db.exec('BEGIN IMMEDIATE;');
@@ -85,7 +89,7 @@ export class DatabaseTransaction {
     }
   }
   async rows(): Promise<Rows> {
-    const db = this.ensureOpen();
+    const db = await this.ensureOpen();
     try {
       const placeholders = KEYS.map(() => '?').join(',');
       const stmt = db.prepare(`SELECT key, value FROM ItemTable WHERE key IN (${placeholders});`);
@@ -97,7 +101,7 @@ export class DatabaseTransaction {
     }
   }
   async replace(rows: Rows) {
-    const db = this.ensureOpen();
+    const db = await this.ensureOpen();
     try {
       const placeholders = KEYS.map(() => '?').join(',');
       db.prepare(`DELETE FROM ItemTable WHERE key IN (${placeholders});`).run(...KEYS);
@@ -111,7 +115,7 @@ export class DatabaseTransaction {
     }
   }
   async finish(commit: boolean) {
-    const db = this.ensureOpen();
+    const db = await this.ensureOpen();
     try {
       if (this.inTx) {
         db.exec(commit ? 'COMMIT;' : 'ROLLBACK;');

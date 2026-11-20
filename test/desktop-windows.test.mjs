@@ -213,19 +213,27 @@ function sendPipeCommand(pipePath, payload, timeoutMs = 8000) {
   });
 }
 
-async function waitForPipePing(pipePath, deadlineMs = 8000) {
+async function waitForPipePing(pipePath, deadlineMs = 15000, child = null, getStderr = null) {
   const deadline = Date.now() + deadlineMs;
   let lastErr;
   while (Date.now() < deadline) {
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      const stderr = getStderr ? getStderr() : '';
+      throw new Error(
+        `Backend exited early (code=${child.exitCode}, signal=${child.signalCode}): ${stderr || '<no stderr>'}`,
+      );
+    }
     try {
       const res = await sendPipeCommand(pipePath, { command: 'ping' }, 1500);
       if (res?.ok) return res;
     } catch (err) {
       lastErr = err;
     }
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 50));
   }
-  throw lastErr || new Error('Timed out waiting for Windows Named Pipe');
+  const stderr = getStderr ? getStderr() : '';
+  const baseMsg = lastErr?.message || 'Timed out waiting for Windows Named Pipe';
+  throw new Error(stderr ? `${baseMsg} (stderr: ${stderr})` : baseMsg);
 }
 
 test('Windows Named Pipe 后端 IPC 实机契约闭环', { skip: !isWindows }, async (t) => {
@@ -259,11 +267,15 @@ test('Windows Named Pipe 后端 IPC 实机契约闭环', { skip: !isWindows }, a
     ],
     {
       cwd: root,
-      env: { ...process.env, GRAVITYBOX_CONTROL_ENDPOINT: pipePath },
+      env: { ...process.env, GRAVITYBOX_CONTROL_ENDPOINT: pipePath, GRAVITYBOX_PROBE_LS: 'false' },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     },
   );
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr += chunk.toString('utf8');
+  });
 
   t.after(() => {
     if (child.exitCode === null && child.signalCode === null) {
@@ -271,7 +283,7 @@ test('Windows Named Pipe 后端 IPC 实机契约闭环', { skip: !isWindows }, a
     }
   });
 
-  const pingRes = await waitForPipePing(pipePath);
+  const pingRes = await waitForPipePing(pipePath, 15000, child, () => stderr);
   assert.equal(pingRes.ok, true);
   assert.equal(typeof pingRes.pid, 'number');
 
@@ -370,11 +382,15 @@ test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为�
     ],
     {
       cwd: root,
-      env: { ...process.env, GRAVITYBOX_CONTROL_ENDPOINT: pipePath },
+      env: { ...process.env, GRAVITYBOX_CONTROL_ENDPOINT: pipePath, GRAVITYBOX_PROBE_LS: 'false' },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     },
   );
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr += chunk.toString('utf8');
+  });
 
   t.after(() => {
     if (child.exitCode === null && child.signalCode === null) {
@@ -382,7 +398,7 @@ test('Windows verbatim \\\\?\\ 路径启动 dist/main.js 仍可正常识别为�
     }
   });
 
-  const pingRes = await waitForPipePing(pipePath);
+  const pingRes = await waitForPipePing(pipePath, 15000, child, () => stderr);
   assert.equal(pingRes.ok, true);
   const exitPromise = new Promise((resolveExit) => {
     child.once('exit', (code) => resolveExit(code));
