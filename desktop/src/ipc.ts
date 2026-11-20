@@ -50,6 +50,22 @@ export function openExternalUrl(url: string): Promise<void> {
   return invoke<void>('open_external_url', { url });
 }
 
+export interface SaveFileResult {
+  saved: boolean;
+  cancelled: boolean;
+  path?: string | null;
+}
+
+export function saveJsonFile(options: {
+  defaultName: string;
+  content: string;
+  title?: string;
+  filterLabel?: string;
+  allFilesLabel?: string;
+}): Promise<SaveFileResult> {
+  return invoke<SaveFileResult>('save_json_file', options);
+}
+
 export function openMainWindow(page?: number): Promise<void> {
   return invoke<void>('open_main_window', { page: page ?? null });
 }

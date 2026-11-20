@@ -174,6 +174,73 @@ fn open_external_url(url: String) -> Result<(), String> {
     win_os::open_external_url(&url)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveFileResult {
+    saved: bool,
+    cancelled: bool,
+    path: Option<String>,
+}
+
+#[tauri::command]
+async fn save_json_file(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    default_name: String,
+    content: String,
+    title: Option<String>,
+    filter_label: Option<String>,
+    all_files_label: Option<String>,
+) -> Result<SaveFileResult, String> {
+    #[cfg(windows)]
+    let owner_hwnd = window.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+    #[cfg(not(windows))]
+    let owner_hwnd: isize = {
+        let _ = &window;
+        0
+    };
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Option<std::path::PathBuf>, String>>(1);
+    app.run_on_main_thread(move || {
+        let res = win_os::pick_save_json_path(
+            owner_hwnd,
+            &default_name,
+            title.as_deref(),
+            filter_label.as_deref(),
+            all_files_label.as_deref(),
+        );
+        let _ = tx.send(res);
+    })
+    .map_err(|e| e.to_string())?;
+
+    let chosen = tauri::async_runtime::spawn_blocking(move || {
+        rx.recv()
+            .map_err(|e| format!("Save dialog channel closed: {}", e))?
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let Some(path) = chosen else {
+        return Ok(SaveFileResult {
+            saved: false,
+            cancelled: true,
+            path: None,
+        });
+    };
+
+    let write_path = path.clone();
+    tauri::async_runtime::spawn_blocking(move || std::fs::write(&write_path, content.as_bytes()))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+
+    Ok(SaveFileResult {
+        saved: true,
+        cancelled: false,
+        path: Some(path.to_string_lossy().to_string()),
+    })
+}
+
 fn show_main_window(app: &AppHandle, page: Option<usize>) {
     if let Some(tray) = app.get_webview_window("tray") {
         let _ = tray.hide();
@@ -481,6 +548,7 @@ fn main() {
             reveal_state_dir,
             reveal_path,
             open_external_url,
+            save_json_file,
             open_main_window,
             hide_tray_panel,
             quit_app,
