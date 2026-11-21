@@ -140,6 +140,8 @@ export async function packageWindows({ skipTests = false, requireInstaller = fal
       makensis,
       [
         '/V2',
+        '/INPUTCHARSET',
+        'UTF8',
         `/DAPP_VERSION=${version}`,
         `/DSTAGE_DIR=${stageDir}`,
         `/DOUT_FILE=${installerPath}`,
