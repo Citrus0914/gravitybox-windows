@@ -29,16 +29,15 @@ InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Gravi
 RequestExecutionLevel user
 ShowInstDetails show
 ShowUninstDetails show
+AutoCloseWindow true
 SetCompressor /SOLID lzma
 
 !define MUI_ICON "${ICON_FILE}"
 !define MUI_UNICON "${ICON_FILE}"
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN "$INSTDIR\GravityBox.exe"
-!define MUI_FINISHPAGE_RUN_TEXT "Launch GravityBox"
+!define MUI_FINISHPAGE_RUN_TEXT "$(LaunchAppText)"
 
-!insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "${LICENSE_FILE}"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -48,6 +47,9 @@ SetCompressor /SOLID lzma
 
 !insertmacro MUI_LANGUAGE "SimpChinese"
 !insertmacro MUI_LANGUAGE "English"
+
+LangString LaunchAppText ${LANG_SIMPCHINESE} "立即启动 GravityBox"
+LangString LaunchAppText ${LANG_ENGLISH} "Launch GravityBox"
 
 Function .onInit
   ; Warn non-blocking if Microsoft Edge WebView2 Runtime is missing (only in interactive UI)
