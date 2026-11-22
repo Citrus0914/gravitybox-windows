@@ -66,12 +66,23 @@ Function .onInit
   ${EndIf}
 FunctionEnd
 
+!macro StopGravityBoxProcesses
+  ; Stop GravityBox.exe together with its child process tree and helper
+  nsExec::Exec 'taskkill.exe /IM GravityBox.exe /T /F'
+  nsExec::Exec 'taskkill.exe /IM gb-win-helper.exe /F'
+  ; Also terminate any orphaned node.exe whose exact path is $INSTDIR\runtime\node.exe
+  System::Call 'Kernel32::SetEnvironmentVariableW(w "GB_INSTDIR", w "$INSTDIR")'
+  nsExec::Exec `powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "$$target = [System.IO.Path]::GetFullPath((Join-Path $$env:GB_INSTDIR 'runtime\node.exe')); Get-Process -Name node -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and [System.IO.Path]::GetFullPath($$_.Path).Equals($$target, [System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $$_ | Stop-Process -Force -ErrorAction SilentlyContinue; try { $$_.WaitForExit(3000) | Out-Null } catch {} }"`
+  Sleep 500
+!macroend
+
 Section "GravityBox" SecMain
   SectionIn RO
 
-  ; Stop any running GravityBox process before replacing files
-  nsExec::Exec 'taskkill.exe /IM GravityBox.exe /F'
-  Sleep 400
+  !insertmacro StopGravityBoxProcesses
+
+  ; Clear obsolete files (e.g. when switching between Full and Lite editions); %LocalAppData%\GravityBox is untouched
+  RMDir /r "$INSTDIR\core"
 
   SetOutPath "$INSTDIR"
   File /r "${STAGE_DIR}\*.*"
@@ -96,8 +107,7 @@ Section "GravityBox" SecMain
 SectionEnd
 
 Section "Uninstall"
-  nsExec::Exec 'taskkill.exe /IM GravityBox.exe /F'
-  Sleep 400
+  !insertmacro StopGravityBoxProcesses
 
   ; Remove shortcuts
   Delete "$DESKTOP\GravityBox.lnk"

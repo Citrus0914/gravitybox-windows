@@ -91,7 +91,7 @@ test('desktop/src/format: statusColorForMode 与 formatStatusLabel 符合 Lite �
 
 test('tools/win-installer.nsi 与 CI windows-desktop 门禁契约完整', () => {
   const nsi = readFileSync(join(root, 'tools', 'win-installer.nsi'), 'utf8');
-  for (const token of ['APP_VERSION', 'STAGE_DIR', 'OUT_FILE', 'Uninstall\\GravityBox', 'RequestExecutionLevel user']) {
+  for (const token of ['APP_VERSION', 'STAGE_DIR', 'OUT_FILE', 'Uninstall\\GravityBox', 'RequestExecutionLevel user', '/IM GravityBox.exe /T /F', 'runtime\\node.exe']) {
     assert.ok(nsi.includes(token), `NSIS 脚本缺少 ${token}`);
   }
   const ci = readFileSync(join(root, '.github', 'workflows', 'ci.yml'), 'utf8');
