@@ -4,7 +4,7 @@ import { existsSync, lstatSync, readFileSync, writeFileSync, chmodSync, mkdirSyn
 import { createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import type { LedgerEvent } from './usage-ledger.js';
-import { aggregateLedger, ledgerEventPage } from './usage-aggregate.js';
+import { aggregateLedger, ledgerBreakdownBuckets, ledgerEventPage } from './usage-aggregate.js';
 import { revalueLedger } from './usage-revalue.js';
 import { resetAndRegisterRemoteModelMetadata } from './model-catalog.js';
 import { PRICING_METADATA } from './pricing.js';
@@ -427,7 +427,7 @@ function runRequest(payload: {
         return legacyEvents.length;
     if (!existsSync(path) && operation === 'locks')
         return {};
-    if (!existsSync(path) && operation === 'events')
+    if (!existsSync(path) && (operation === 'events' || operation === 'breakdown'))
         throw Error(bt('ledger.err.snapshot_unavailable'));
     if (!existsSync(path) && operation === 'load')
         return [...result.values()];
@@ -493,6 +493,8 @@ function runRequest(payload: {
         db.exec('INSERT INTO event_revisions(event_key,timestamp,payload) SELECT event_key,timestamp,payload FROM events WHERE NOT EXISTS(SELECT 1 FROM event_revisions LIMIT 1);');
         if (operation === 'events')
             return ledgerEventPage(db, options);
+        if (operation === 'breakdown')
+            return ledgerBreakdownBuckets(db, options);
         if (operation === 'renew') {
             const revision = Number(db.prepare('SELECT COALESCE(MAX(seq),0) AS n FROM event_revisions').get()?.n);
             if (options.revision !== revision || !options.snapshotId)

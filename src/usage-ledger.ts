@@ -5,6 +5,7 @@ import { mkdir } from 'node:fs/promises';
 import { withProcessLease } from './process-lock.js';
 import type { GenerationEvent } from './usage.js';
 import type { AggregateOptions, LedgerSnapshot } from './usage-aggregate.js';
+import type { DbModelUsageBucket } from './usage-conversations.js';
 import type { TokenUsageSummary } from './usage.js';
 import { bt, getActiveLocale } from './i18n.js';
 export type LedgerEvent = GenerationEvent & {
@@ -176,12 +177,18 @@ export class UsageLedger {
         offset: number;
         limit: number;
         targetEmail?: string;
+        dbFiles?: string[];
     }): Promise<{
         rows: any[];
         total: number;
         offset: number;
         limit: number;
     }> { return this.request('events', undefined, options); }
+    breakdown(options: {
+        snapshot: LedgerSnapshot;
+        period: string;
+        targetEmail?: string;
+    }): Promise<DbModelUsageBucket[]> { return this.request('breakdown', undefined, options); }
     async save(events: LedgerEvent[]): Promise<void> { if (events.length)
         await this.request('save', events); }
 }

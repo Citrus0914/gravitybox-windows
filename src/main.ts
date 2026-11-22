@@ -561,6 +561,7 @@ async function run() {
           'usage_snapshot_release',
           'usage_events',
           'usage_summary',
+          'usage_breakdown',
           'usage_ledger_review',
           'api_pricing_get',
           'pricing_sync_status',
@@ -590,6 +591,9 @@ async function run() {
             }
             if (command === 'usage_events') {
               const period = ['today', '7d', '30d', 'all'].includes(String(parsed.period)) ? String(parsed.period) : 'today';
+              const dbFiles = Array.isArray(parsed.dbFiles)
+                ? parsed.dbFiles.map((v: unknown) => String(v ?? '').trim()).filter(Boolean).slice(0, 64)
+                : undefined;
               reply({
                 ok: true,
                 ...(await usageManager.getUsageEvents(
@@ -599,7 +603,9 @@ async function run() {
                   Number(parsed.limit),
                   typeof parsed.snapshotId === 'string' ? parsed.snapshotId : undefined,
                   parsed.pinSnapshot === true,
-                  Boolean(parsed.force)
+                  Boolean(parsed.force),
+                  undefined,
+                  dbFiles
                 )),
               });
               return;
@@ -608,6 +614,20 @@ async function run() {
               const force = Boolean(parsed.force);
               const usage = await usageManager.getUsageSummary(force);
               reply(projectUsagePeriodSummary(usage, parsed.period, { includeAllPeriods: true }));
+              return;
+            }
+            if (command === 'usage_breakdown') {
+              const period = ['today', '7d', '30d', 'all'].includes(String(parsed.period))
+                ? (String(parsed.period) as 'today' | '7d' | '30d' | 'all')
+                : 'today';
+              reply({
+                ok: true,
+                ...(await usageManager.getUsageBreakdown(period, {
+                  force: Boolean(parsed.force),
+                  projectId: typeof parsed.projectId === 'string' ? parsed.projectId : undefined,
+                  snapshotId: typeof parsed.snapshotId === 'string' ? parsed.snapshotId : undefined,
+                })),
+              });
               return;
             }
             if (command === 'api_pricing_get') {

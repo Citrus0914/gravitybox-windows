@@ -118,6 +118,70 @@ export interface UsagePeriodData {
   todayHourly: HourlyTrendPoint[];
 }
 
+export interface BreakdownModelEntry {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  requestCount: number;
+  estimatedUsd: number;
+}
+
+export interface ProjectUsageBreakdown {
+  id: string;
+  name: string;
+  workspacePath: string | null;
+  conversationCount: number;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  estimatedUsd: number;
+  cacheHitRate: number;
+  lastActiveAt: number;
+  topModels: BreakdownModelEntry[];
+}
+
+export interface ConversationUsageBreakdown {
+  id: string;
+  title: string;
+  projectId: string;
+  projectName: string;
+  workspacePath: string | null;
+  dbFiles: string[];
+  subagentCount: number;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  estimatedUsd: number;
+  cacheHitRate: number;
+  firstActiveAt: number;
+  lastActiveAt: number;
+  byModel: BreakdownModelEntry[];
+}
+
+export interface UsageBreakdownData {
+  period: string;
+  snapshotId?: string;
+  generatedAt: number;
+  totals: {
+    totalTokens: number;
+    estimatedUsd: number;
+    requestCount: number;
+    projectCount: number;
+    conversationCount: number;
+  };
+  projects: ProjectUsageBreakdown[];
+  conversations: ConversationUsageBreakdown[];
+}
+
 export interface DashboardSummary {
   usage?: {
     todayTokens?: number;
