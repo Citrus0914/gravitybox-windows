@@ -3,24 +3,15 @@ import {readFile} from 'node:fs/promises';
 import {execFileSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {join} from 'node:path';
-const root=fileURLToPath(new URL('../',import.meta.url)),setup=process.argv.includes('--setup'),install=setup||process.argv.includes('--install'),skipNative=process.argv.includes('--skip-native');
+const root=fileURLToPath(new URL('../',import.meta.url)),setup=process.argv.includes('--setup'),install=setup||process.argv.includes('--install');
 const version=JSON.parse(await readFile(join(root,'package.json'))).version;
 const nodeMajor = Number(process.versions.node.split('.')[0]);
 if (!Number.isFinite(nodeMajor) || nodeMajor < 22) { process.stderr.write('开发需要 Node 22+。当前应用已自带运行环境，日常使用不受影响。\n'); process.exit(1); }
 function run(args) { execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', args, { cwd: root, stdio: 'inherit', shell: process.platform === 'win32' }); }
 if(install&&!existsSync(join(root,'node_modules/typescript/bin/tsc')))run(['ci','--ignore-scripts','--no-audit','--no-fund']);
 let ready=true;
-for(const file of ['package-lock.json','node_modules/typescript/bin/tsc','native/Assistant.swift','runtime/engine.js'])if(!existsSync(join(root,file))){ready=false;process.stderr.write('缺少：'+file+'\n');}
-const bundleSource=await readFile(join(root,'src/bundle.ts'),'utf8');
-const bundleBlock=bundleSource.match(/export const SUPPORTED_BUNDLES\s*=\s*new Map\(\[([\s\S]*?)\]\);/)?.[1]??'';
-for(const [,supportedVersion] of bundleBlock.matchAll(/\['(\d+\.\d+\.\d+)'\s*,/g)){
-  const dictFile=`ui-strings/${supportedVersion}.json`;
-  if(!existsSync(join(root,dictFile))){ready=false;process.stderr.write(`缺少已收录版本词典：${dictFile}\n`);}
-}
-if (!skipNative && process.platform === 'darwin') {
-  try { execFileSync('/usr/bin/xcrun', ['--find', 'swiftc'], { stdio: 'pipe' }); } catch { ready = false; process.stderr.write('缺少 Apple 命令行开发工具。\n'); }
-}
-if(!ready){process.stderr.write('先运行 npm run setup:dev 准备依赖；缺少系统开发工具时按 macOS 提示安装。\n');process.exit(1);}
+for(const file of ['package-lock.json','node_modules/typescript/bin/tsc','runtime/engine.js','desktop/src-tauri/Cargo.toml'])if(!existsSync(join(root,file))){ready=false;process.stderr.write('缺少：'+file+'\n');}
+if(!ready){process.stderr.write('先运行 npm run setup:dev 准备依赖。\n');process.exit(1);}
 
 // Git pre-commit / pre-push hook 门禁配置
 let hooksConfigured = false;

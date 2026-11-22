@@ -122,24 +122,27 @@ test('IPC v2：只读命令 dashboard_summary 支持立即应答且异常信息�
     const rep = JSON.parse(raw.split('\n')[0]);
     assert.equal(rep.ok, true);
     assert.equal(rep.id, 'dash-01');
-    assert.ok(rep.dictionary);
+    assert.ok(rep.usage);
 
     // 测试错误脱敏：请求未知命令或非法参数时，返回信息不得包含敏感物理路径
-    const badRaw = await exchange(backend.directory, [JSON.stringify({ command: 'account_upsert', data: { id: '/Users/private/bad' } }) + '\n']);
+    const badRaw = await exchange(backend.directory, [JSON.stringify({ command: 'maintenance_restore', snapshotId: '/Users/private/bad' }) + '\n']);
     const badRep = JSON.parse(badRaw.split('\n')[0]);
     assert.equal(badRep.ok, false);
     assert.ok(!badRep.error.includes('/Users/private'), '异常文案中不得泄漏系统物理路径');
   } finally { backend.child.kill(); }
 });
 
-test('幂等键绑定业务账号，传输 requestId 不参与业务指纹', async()=>{
- const backend=await startBackend(); try {
-  await waitForStatus(backend.directory);
-  const payload={command:'account_upsert',data:{email:'idempotent@example.invalid',refreshToken:'synthetic-refresh',accessToken:'synthetic-access',expiresIn:3600},idempotencyKey:'write-once'};
-  const replies=await Promise.all(['one','two'].map(requestId=>exchange(backend.directory,[JSON.stringify({...payload,requestId})+'\n'])));
-  const values=replies.map(JSON.parse); for(const value of values)assert.equal(value.ok,true);
-  assert.equal(values[0].account.id,values[1].account.id);assert.notEqual(values[0].requestId,values[1].requestId);
-  const conflict=JSON.parse(await exchange(backend.directory,[JSON.stringify({...payload,data:{...payload.data,email:'different@example.invalid'}})+'\n']));
-  assert.equal(conflict.ok,false);assert.match(conflict.error,/其他请求/);
- }finally{backend.child.kill();}
+test('幂等键绑定业务载荷，传输 requestId 不参与业务指纹', async () => {
+  const backend = await startBackend();
+  try {
+    await waitForStatus(backend.directory);
+    const payload = { command: 'pricing_sync_set', enabled: true, idempotencyKey: 'write-once' };
+    const replies = await Promise.all(['one', 'two'].map(requestId => exchange(backend.directory, [JSON.stringify({ ...payload, requestId }) + '\n'])));
+    const values = replies.map(JSON.parse);
+    for (const value of values) assert.equal(value.ok, true);
+    assert.notEqual(values[0].requestId, values[1].requestId);
+    const conflict = JSON.parse(await exchange(backend.directory, [JSON.stringify({ ...payload, enabled: false }) + '\n']));
+    assert.equal(conflict.ok, false);
+    assert.match(conflict.error, /其他请求/);
+  } finally { backend.child.kill(); }
 });

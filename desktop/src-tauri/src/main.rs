@@ -250,7 +250,7 @@ fn show_main_window(app: &AppHandle, page: Option<usize>) {
         let _ = main_win.show();
         let _ = main_win.set_focus();
         if let Some(p) = page {
-            let _ = main_win.emit("navigate-page", p);
+            let _ = main_win.emit("navigate-page", p.min(2));
         }
     }
 }

@@ -99,8 +99,7 @@ test('B07/B09/N12: 真实后台 status.json 与 socket status 契约、usage_sum
     await until(async () => { try { return (await rpc(directory, { command: 'status' })).ok; } catch { return false; } });
     const status = await rpc(directory, { command: 'status' });
     assert.equal(status.ok, true);
-    assert.ok(Object.hasOwn(status.status, 'activeAccountEmail'), 'socket status 必须提供账号字段');
-    assert.ok(Object.hasOwn(status.status, 'accountsRevision'), 'socket status 必须提供 accountsRevision');
+    assert.equal(typeof status.status.hudEnabled, 'boolean');
     assert.equal(typeof status.taskRevision, 'number');
     assert.equal(typeof status.runningTasks, 'number');
 
@@ -110,7 +109,6 @@ test('B07/B09/N12: 真实后台 status.json 与 socket status 契约、usage_sum
     assert.equal(typeof persisted.pid, 'number');
     assert.equal(typeof persisted.taskRevision, 'number');
     assert.equal(typeof persisted.runningTasks, 'number');
-    assert.equal(Object.hasOwn(persisted, 'activeAccountEmail'), false, 'status.json 不承载账号字段，需由原生合并保留');
 
     const usage = await rpc(directory, { command: 'usage_summary', period: 'today' });
     assert.equal(usage.ok, true);

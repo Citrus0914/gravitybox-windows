@@ -54,7 +54,7 @@ export const AboutPage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
                   <span className="badge">v{runtime?.version || '1.1.1'}</span>
                 </div>
                 <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>
-                  Windows Desktop Edition · {store.statusLabel}
+                  Windows Lite Edition · {store.statusLabel}
                 </div>
               </div>
             </div>
@@ -91,7 +91,7 @@ export const AboutPage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
                 <span>{t('about.target_app')}</span>
               </div>
               <span style={{ fontWeight: 600 }}>
-                {status?.version ? `Antigravity ${status.version}` : t('about.antigravity_stable')}
+                {status?.appVersion ? `Antigravity ${status.appVersion}` : t('about.antigravity_stable')}
               </span>
             </div>
 

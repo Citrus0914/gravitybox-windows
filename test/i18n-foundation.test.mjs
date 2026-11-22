@@ -267,12 +267,10 @@ test('macOS 无 LANG 环境或遵循 AppleLanguages 时 system 语言解析与�
     assert.equal(statusResp?.ok, true);
     assert.equal(statusResp.status.configuredLanguage, 'system');
     assert.equal(statusResp.status.locale, 'zh-Hans');
-    assert.equal(statusResp.status.translationEnabled, true);
 
     const switchEn = await rpc(directory, { command: 'language_set', language: 'en' });
     assert.equal(switchEn.ok, true);
     assert.equal(switchEn.status.locale, 'en');
-    assert.equal(switchEn.status.translationEnabled, true);
 
     const switchSys = await rpc(directory, {
       command: 'language_set',
@@ -282,7 +280,6 @@ test('macOS 无 LANG 环境或遵循 AppleLanguages 时 system 语言解析与�
     assert.equal(switchSys.ok, true);
     assert.equal(switchSys.status.configuredLanguage, 'system');
     assert.equal(switchSys.status.locale, 'zh-Hans');
-    assert.equal(switchSys.status.translationEnabled, true);
 
     await rpc(directory, { command: 'stop' });
     await closed;
@@ -404,23 +401,21 @@ test('P1-13 & P1-14 & P2-19: app/backend 命名空间禁绝占位符冲突重名
   assert.equal(zhPack.backend['deep_scan.report_filename'], '界面深度扫描报告.md');
   assert.equal(enPack.backend['deep_scan.report_filename'], 'UI-Deep-Scan-Report.md');
 
-  // P1-14: Controller 在 zh-Hans 环境下暂停网页翻译时，status.locale 与文案仍保持中文，不强切为英文
+  // P1-14: Controller 在 zh-Hans 环境下暂停 HUD 时，status.locale 与文案仍保持中文，不强切为英文
   const { Controller } = await import('../dist/controller.js');
-  const { dictionaryFromEntries } = await import('../dist/dictionary.js');
   const ctrl = new Controller({
     appPath: '/nonexistent',
     profile: '/nonexistent-profile',
-    dictionary: dictionaryFromEntries({}),
     hudEnabled: false,
     locale: 'zh-Hans',
     configuredLanguage: 'zh-Hans',
     onStatus() {},
   });
   try {
-    await ctrl.pause();
+    await ctrl.configureHud(false);
     const pausedStatus = ctrl.snapshot();
     assert.equal(pausedStatus.mode, 'paused');
-    assert.equal(pausedStatus.translationEnabled, false);
+    assert.equal(pausedStatus.hudEnabled, false);
     assert.equal(pausedStatus.locale, 'zh-Hans');
     assert.equal(pausedStatus.message, zhPack.backend['status.paused']);
   } finally {

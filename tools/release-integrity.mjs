@@ -33,7 +33,9 @@ export async function sourceDigest(root) {
       else if (entry.isFile()) files.push(path);
     }
   }
-  for (const directory of ['src','runtime','native','tools','test','dict','ui-strings','assets','licenses']) await walk(directory);
+  for (const directory of ['src','runtime','native','tools','test','dict','ui-strings','assets','licenses']) {
+    if (await exists(join(root, directory))) await walk(directory);
+  }
   if (await exists(join(root, 'vendor'))) await walk('vendor');
   files.push('package.json','package-lock.json','tsconfig.json','README.md','THIRD_PARTY_NOTICES.md');
   for (const doc of [

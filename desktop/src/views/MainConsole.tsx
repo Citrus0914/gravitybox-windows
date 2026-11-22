@@ -1,8 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import {
-  LayoutGrid,
-  Users,
   BarChart2,
   Settings,
   Info,
@@ -11,8 +9,6 @@ import {
 import { launchAntigravity } from '../ipc';
 import { statusColorForMode } from '../format';
 import { BrandLogo } from '../components/ModelIcon';
-import { OverviewPage } from '../pages/OverviewPage';
-import { AccountsPage } from '../pages/AccountsPage';
 import { UsagePage } from '../pages/UsagePage';
 import { SettingsPage } from '../pages/SettingsPage';
 import { AboutPage } from '../pages/AboutPage';
@@ -20,18 +16,18 @@ import type { GravityBoxStore } from '../hooks/useGravityBox';
 
 export const MainConsole: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
   const { t, config, status, reachable, statusLabel } = store;
-  const [page, setPage] = useState<number>(config?.lastPage ?? 0);
+  const [page, setPage] = useState<number>(Math.min(2, Math.max(0, config?.lastPage ?? 0)));
 
   useEffect(() => {
     if (typeof config?.lastPage === 'number') {
-      setPage(Math.min(4, Math.max(0, config.lastPage)));
+      setPage(Math.min(2, Math.max(0, config.lastPage)));
     }
   }, [config?.lastPage]);
 
   useEffect(() => {
     const unlistenPromise = listen<number>('navigate-page', (ev) => {
       if (typeof ev.payload === 'number') {
-        setPage(Math.min(4, Math.max(0, ev.payload)));
+        setPage(Math.min(2, Math.max(0, ev.payload)));
       }
     });
     return () => {
@@ -40,16 +36,15 @@ export const MainConsole: React.FC<{ store: GravityBoxStore }> = ({ store }) => 
   }, []);
 
   const selectPage = (next: number) => {
-    setPage(next);
-    void store.updateConfig({ lastPage: next }).catch(() => {});
+    const clamped = Math.min(2, Math.max(0, next));
+    setPage(clamped);
+    void store.updateConfig({ lastPage: clamped }).catch(() => {});
   };
 
   const navItems = [
-    { id: 0, label: t('nav.overview'), Icon: LayoutGrid },
-    { id: 1, label: t('nav.accounts'), Icon: Users },
-    { id: 2, label: t('nav.usage'), Icon: BarChart2 },
-    { id: 3, label: t('nav.settings'), Icon: Settings },
-    { id: 4, label: t('nav.about'), Icon: Info },
+    { id: 0, label: t('nav.usage'), Icon: BarChart2 },
+    { id: 1, label: t('nav.settings'), Icon: Settings },
+    { id: 2, label: t('nav.about'), Icon: Info },
   ];
 
   const dotColor = statusColorForMode(status?.mode, reachable);
@@ -94,11 +89,9 @@ export const MainConsole: React.FC<{ store: GravityBoxStore }> = ({ store }) => 
       </aside>
 
       <main className="main-area">
-        {page === 0 && <OverviewPage store={store} onNavigate={selectPage} />}
-        {page === 1 && <AccountsPage store={store} />}
-        {page === 2 && <UsagePage store={store} />}
-        {page === 3 && <SettingsPage store={store} />}
-        {page === 4 && <AboutPage store={store} />}
+        {page === 0 && <UsagePage store={store} />}
+        {page === 1 && <SettingsPage store={store} />}
+        {page === 2 && <AboutPage store={store} />}
       </main>
     </div>
   );

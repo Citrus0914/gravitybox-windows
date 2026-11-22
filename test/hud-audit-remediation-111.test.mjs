@@ -10,7 +10,6 @@ import {
 } from '../dist/hud.js';
 import { runHudDbScanInWorker } from '../dist/sqlite-read.js';
 import { Controller } from '../dist/controller.js';
-import { dictionaryFromEntries } from '../dist/dictionary.js';
 import { HudInstance } from '../runtime/hud-instance.js';
 import { AntigravityHudManager } from '../runtime/hud-manager.js';
 import { HUD_STYLES_CSS } from '../runtime/hud-styles.js';
@@ -870,20 +869,17 @@ test('P2-07: >3 模型切换回早期模型时保留活跃阶段槽位，且空�
   assert.equal(mOpusPicker.tokens.estimatedCostUsd, mSonnetPicker.tokens.estimatedCostUsd);
 });
 
-test('P1-05: Controller.pause 就地切换 HUD-only 不断开 CDP，且 queueBootstrap 保留快捷键切换后的英文模式', async () => {
+test('P1-05: Controller.configureHud 保持 HUD 生命周期与语言同步，queueBootstrap 注入 HUD 且不主动断连有效会话', async () => {
   const engineSrc = fs.readFileSync(new URL('../runtime/engine.js', import.meta.url), 'utf8');
-  const keepMatches = engineSrc.match(/if\s*\(\s*!opts\?\.keepHud\s*\)/g) || [];
-  assert.equal(keepMatches.length >= 2, true, 'HUD-only 与完整引擎两个 dispose 分支均须支持 keepHud');
+  assert.match(engineSrc, /if\s*\(\s*!opts\?\.keepHud\s*\)/, '轻量引擎 dispose 必须支持 keepHud');
 
-  const dict = dictionaryFromEntries({ Settings: '设置' });
   const fixtureOrigin = 'http://localhost:43210';
   const controller = new Controller({
     appPath: path.join(os.tmpdir(), 'gb-nonexistent.app'),
     profile: path.join(os.tmpdir(), 'gb-nonexistent-profile'),
-    dictionary: dict,
     hudEnabled: true,
-    locale: 'zh-Hans',
-    configuredLanguage: 'zh-Hans',
+    locale: 'en',
+    configuredLanguage: 'en',
     fixture: { origin: fixtureOrigin },
     onStatus: () => {},
   });
@@ -895,7 +891,6 @@ test('P1-05: Controller.pause 就地切换 HUD-only 不断开 CDP，且 queueBoo
     url: `${fixtureOrigin}/fixture`,
     contextId: 7,
     registration: 'reg-1',
-    languageMode: 'en',
     detaching: false,
     updateChain: Promise.resolve(),
     cdp: {
@@ -911,7 +906,7 @@ test('P1-05: Controller.pause 就地切换 HUD-only 不断开 CDP，且 queueBoo
       evaluate: async (expr) => {
         evaluated.push(expr);
         if (expr === 'globalThis.__GRAVITYBOX_ENGINE_V1__?.state()') {
-          return { active: true, version: dict.version, runtimeId: controller.runtimeId, languageMode: 'en' };
+          return { active: true, runtimeId: controller.runtimeId, languageMode: 'en' };
         }
         return true;
       },
@@ -924,21 +919,11 @@ test('P1-05: Controller.pause 就地切换 HUD-only 不断开 CDP，且 queueBoo
   try {
     controller.pages.set('target-p105', fakeSession);
     await controller.queueBootstrap(fakeSession);
-    assert.equal(fakeSession.languageMode, 'en');
+    assert.equal(cdpClosed, false);
     assert.equal(
       evaluated.some((e) => e.includes('setLanguage?.("en")')),
       true,
-      '快捷键处于英文态时 queueBootstrap 必须让 HUD 保持英文'
-    );
-
-    evaluated.length = 0;
-    await controller.transitionActiveSessionsToHudOnly();
-    assert.equal(cdpClosed, false, 'pause 切换到 HUD-only 时不得关闭现有页面 CDP 连接');
-    assert.equal(controller.pages.has('target-p105'), true);
-    assert.equal(
-      evaluated.some((e) => e.includes('dispose?.({keepHud:true})')),
-      true,
-      '必须通过 dispose({keepHud:true}) 无闪烁保留 HUD 实例'
+      'queueBootstrap 必须将 HUD 语言同步为 controller.locale'
     );
   } finally {
     controller.pages.clear();

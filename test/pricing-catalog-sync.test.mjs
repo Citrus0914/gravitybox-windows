@@ -23,11 +23,9 @@ import {
   sanitizeRemoteModelMetadata,
 } from '../dist/model-catalog.js';
 import { UsageStatsManager } from '../dist/usage.js';
-import { AccountsManager } from '../dist/accounts.js';
 import {
   readInstalledAppBundleVersion,
   readValidLiveIdeModelsSnapshot,
-  sanitizeLiveIdeModelsSnapshot,
 } from '../dist/main.js';
 import { controlEndpointForStateDir } from '../dist/platform/paths.js';
 
@@ -347,13 +345,12 @@ test('远端缓存与用户自定义价格追踪 publicPricingKeys，同时屏�
   assert.equal(snap.retiredPrices['gemini-4-argon-trial'], undefined);
 });
 
-test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js IPC 端到端契约', async (t) => {
+test('live-ide-models.json 持久化、appVersion 失效判定与 main.js IPC 端到端契约', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'gb-catalog-ipc-'));
   t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
 
   const appDir = join(dir, 'MockAntigravity.app');
   await mkdir(join(appDir, 'Contents'), { recursive: true });
-  await mkdir(join(dir, '词典'), { recursive: true });
   await mkdir(join(dir, 'profile'), { recursive: true });
   await mkdir(join(dir, 'home'), { recursive: true });
   await mkdir(join(dir, 'appsupport'), { recursive: true });
@@ -367,92 +364,27 @@ test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js 
   await writePlist('2.32.1');
   assert.equal(await readInstalledAppBundleVersion(appDir), '2.32.1');
 
-  // 1) 验证 sanitizeLiveIdeModelsSnapshot 不含 email / name / token 等敏感字段
-  const sanitized = sanitizeLiveIdeModelsSnapshot(
-    {
-      email: 'secret-user@example.invalid',
-      name: 'Secret Name',
-      tier: 'PRO',
-      quota: {
-        last_updated: Math.floor(Date.now() / 1000),
-        is_forbidden: false,
-        subscription_tier: 'PRO',
-        model_forwarding_rules: {},
-        models: [
-          { name: 'gemini-4-carbon-disabled', model_id: 'gemini-4-carbon-disabled', display_name: 'Gemini 4 Carbon', disabled: true, percentage: 0, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gemini-4-argon', model_id: 'gemini-4-argon', display_name: 'Gemini 4 Argon', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gemini-4-hydrogen', model_id: 'gemini-4-hydrogen', display_name: 'Gemini 4 Hydrogen', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gemini-3.8-flash', model_id: 'gemini-3.8-flash', display_name: 'Gemini 3.8 Flash', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'claude-opus-5-5', model_id: 'claude-opus-5-5', display_name: 'Claude Opus 5.5', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'claude-sonnet-5-5', model_id: 'claude-sonnet-5-5', display_name: 'Claude Sonnet 5.5', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gpt-oss-120b', model_id: 'gpt-oss-120b', display_name: 'GPT-OSS 120B', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gemini-5-nova', model_id: 'gemini-5-nova', display_name: 'Gemini 5 Nova', model_or_alias: 'MODEL_PLACEHOLDER_M700', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-        ],
-      },
-    },
-    '2.32.1'
-  );
-  assert.ok(sanitized);
-  const serialized = JSON.stringify(sanitized);
-  assert.equal(serialized.includes('secret-user@example.invalid'), false);
-  assert.equal(serialized.includes('Secret Name'), false);
-  assert.equal(sanitized.schema, 1);
-  assert.equal(sanitized.appVersion, '2.32.1');
-  assert.equal(sanitized.tier, 'PRO');
-
+  const snapshotPayload = {
+    schema: 1,
+    appVersion: '2.32.1',
+    tier: 'PRO',
+    observedAt: Math.floor(Date.now() / 1000),
+    models: [
+      { id: 'gemini-4-carbon-disabled', displayName: 'Gemini 4 Carbon', modelOrAlias: null, disabled: true },
+      { id: 'gemini-4-argon', displayName: 'Gemini 4 Argon', modelOrAlias: null, disabled: false },
+      { id: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen', modelOrAlias: null, disabled: false },
+      { id: 'gemini-3.8-flash', displayName: 'Gemini 3.8 Flash', modelOrAlias: null, disabled: false },
+      { id: 'claude-opus-5-5', displayName: 'Claude Opus 5.5', modelOrAlias: null, disabled: false },
+      { id: 'claude-sonnet-5-5', displayName: 'Claude Sonnet 5.5', modelOrAlias: null, disabled: false },
+      { id: 'gpt-oss-120b', displayName: 'GPT-OSS 120B', modelOrAlias: null, disabled: false },
+      { id: 'gemini-5-nova', displayName: 'Gemini 5 Nova', modelOrAlias: 'MODEL_PLACEHOLDER_M700', disabled: false },
+    ],
+  };
   const snapshotPath = join(dir, 'live-ide-models.json');
-  await writeFile(snapshotPath, serialized);
+  await writeFile(snapshotPath, JSON.stringify(snapshotPayload));
   assert.ok(await readValidLiveIdeModelsSnapshot(snapshotPath, '2.32.1'));
   assert.equal(await readValidLiveIdeModelsSnapshot(snapshotPath, '2.33.0'), null);
   assert.equal(await readValidLiveIdeModelsSnapshot(snapshotPath, ''), null);
-
-  // 2) 配置本地多账号池（ULTRA 主账号 + FREE 备用账号）与本地 mock 价格源
-  const accMgr = new AccountsManager(dir);
-  const ultraAcc = await accMgr.upsertAccount({
-    email: 'ultra@example.invalid',
-    refreshToken: 'rt-ultra',
-    accessToken: 'at-ultra',
-    expiresIn: 3600,
-  });
-  ultraAcc.quota = {
-    source: 'cloud',
-    subscription_tier: 'ULTRA',
-    last_updated: Math.floor(Date.now() / 1000),
-    is_forbidden: false,
-    model_forwarding_rules: {},
-    models: ACTIVE_MODEL_KEYS.map((id) => ({
-      name: id,
-      model_id: id,
-      percentage: 90,
-      reset_time: '',
-      disabled: false,
-      quota_source: 'cloud',
-    })),
-  };
-  await accMgr.saveAccount(ultraAcc);
-
-  const freeAcc = await accMgr.upsertAccount({
-    email: 'free@example.invalid',
-    refreshToken: 'rt-free',
-    accessToken: 'at-free',
-    expiresIn: 3600,
-  });
-  freeAcc.quota = {
-    source: 'cloud',
-    subscription_tier: 'FREE',
-    last_updated: Math.floor(Date.now() / 1000),
-    is_forbidden: false,
-    model_forwarding_rules: {},
-    models: [
-      { name: 'gemini-3.8-flash', model_id: 'gemini-3.8-flash', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
-      { name: 'claude-opus-4-6', model_id: 'claude-opus-4-6', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
-      { name: 'claude-sonnet-4-6', model_id: 'claude-sonnet-4-6', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
-      { name: 'gemini-2.5-pro', model_id: 'gemini-2.5-pro', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
-      { name: 'chat_20706', model_id: 'chat_20706', percentage: 100, reset_time: '', disabled: false, quota_source: 'cloud' },
-    ],
-  };
-  await accMgr.saveAccount(freeAcc);
-  await accMgr.setCurrentAccount(ultraAcc.id, 'app');
 
   const feedServer = createServer((_req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -470,36 +402,25 @@ test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js 
 
   const backend = await startBackend(dir, appDir);
   try {
-    // 2a) appVersion=2.32.1 时命中 live-ide-models.json（PRO + gemini-4-carbon tier_locked + gemini-5-nova unpricedLive）
     const resMatch = await rpc(dir, { command: 'api_pricing_get' });
     assert.equal(resMatch.ok, true);
-    assert.equal(Object.keys(resMatch.prices).length, 9); // 7 live + 2 FREE other_tier_only
+    assert.equal(Object.keys(resMatch.prices).length, 7);
     assert.equal(resMatch.modelCatalogState['gemini-4-carbon']?.availability, 'tier_locked');
-    assert.equal(resMatch.modelCatalogState['claude-opus-4-6']?.availability, 'other_tier_only');
-    assert.deepEqual(resMatch.modelCatalogState['claude-opus-4-6']?.availableInTiers, ['FREE']);
     assert.equal(resMatch.unpricedLiveModels.length, 1);
     assert.equal(resMatch.unpricedLiveModels[0].key, 'gemini-5-nova');
     assert.equal(resMatch.status.modelCount, Object.keys(resMatch.prices).length + resMatch.unpricedLiveModels.length);
-    assert.equal(resMatch.status.modelCount, 10);
 
-    // 2b) 模拟 Antigravity 升级至 2.33.0：旧版 2.32.1 快照必须立即失效并回退到当前保存账号 ULTRA + FREE 池
     await writePlist('2.33.0');
     const resUpgraded = await rpc(dir, { command: 'pricing_sync_check', feedUrl: `http://127.0.0.1:${port}/feed.json` });
     assert.equal(resUpgraded.ok, true);
     assert.equal(resUpgraded.synced, true);
     assert.deepEqual(resUpgraded.unpricedLiveModels, []);
-    assert.equal(Object.keys(resUpgraded.prices).length, 9);
     assert.equal(resUpgraded.modelCatalogState['gemini-4-carbon']?.availability, 'available');
-    assert.equal(resUpgraded.modelCatalogState['gemini-4-carbon']?.activeTier, 'ULTRA');
-    assert.equal(resUpgraded.modelCatalogState['claude-opus-4-6']?.availability, 'other_tier_only');
-    assert.deepEqual(resUpgraded.modelCatalogState['claude-opus-4-6']?.availableInTiers, ['FREE']);
     assert.equal(resUpgraded.prices['gemini-2.5-pro'], undefined);
     assert.ok(resUpgraded.retiredPrices['gemini-2.5-pro']);
-    assert.equal(resUpgraded.status.modelCount, 9);
 
     const syncStatusRes = await rpc(dir, { command: 'pricing_sync_status' });
     assert.equal(syncStatusRes.ok, true);
-    assert.equal(syncStatusRes.status.modelCount, 9);
     assert.equal(backend.stderr(), '');
 
     await rpc(dir, { command: 'stop' });

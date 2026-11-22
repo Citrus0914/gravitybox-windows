@@ -1,4 +1,4 @@
-import type { AccountItem, QuotaGroup, StatusSnapshot } from './types';
+import type { StatusSnapshot } from './types';
 
 export function formatCompactTokens(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return '--';
@@ -48,182 +48,11 @@ export function formatTimeOnly(ts: number | string | null | undefined): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-export interface NormalizedQuotaBar {
-  key: string;
-  label: string;
-  family: 'gemini' | 'claude' | 'argon' | 'carbon' | 'other';
-  percentage: number | null;
-  resetCountdown: string;
-  stale: boolean;
-}
-
-export function extractQuotaBars(
-  source: Pick<
-    AccountItem,
-    | 'quotaGroups'
-    | 'geminiFiveHourRemaining'
-    | 'geminiWeeklyRemaining'
-    | 'geminiFiveHourResetCountdown'
-    | 'geminiWeeklyResetCountdown'
-    | 'claudeFiveHourRemaining'
-    | 'claudeWeeklyRemaining'
-    | 'claudeFiveHourResetCountdown'
-    | 'claudeWeeklyResetCountdown'
-    | 'argonWeeklyRemaining'
-    | 'argonWeeklyResetCountdown'
-    | 'carbonWeeklyRemaining'
-    | 'carbonWeeklyResetCountdown'
-    | 'staleGroups'
-  > | null | undefined,
-  t: (key: string, params?: Record<string, string | number>, fallback?: string) => string,
-): NormalizedQuotaBar[] {
-  if (!source) return [];
-  const staleSet = new Set(
-    (source.staleGroups ?? [])
-      .map((s) => (typeof s === 'string' ? s : s?.name ?? ''))
-      .filter(Boolean)
-      .map((s) => s.toLowerCase()),
-  );
-  const bars: NormalizedQuotaBar[] = [];
-
-  if (Array.isArray(source.quotaGroups) && source.quotaGroups.length > 0) {
-    for (const grp of source.quotaGroups as QuotaGroup[]) {
-      const hasWindows = Array.isArray(grp.windows) && grp.windows.length > 0;
-      if (grp.availability === 'unavailable' && !hasWindows) {
-        continue;
-      }
-      const grpKey = String(
-        grp.key || grp.id || grp.displayName || grp.summaryLabel || grp.title || grp.label || '',
-      );
-      const famLower = `${(grp.brands ?? []).join(' ')} ${grp.family ?? ''} ${grpKey}`.toLowerCase();
-      const family: NormalizedQuotaBar['family'] = famLower.includes('claude') || famLower.includes('gpt')
-        ? 'claude'
-        : famLower.includes('argon')
-          ? 'argon'
-          : famLower.includes('carbon')
-            ? 'carbon'
-            : famLower.includes('gemini')
-              ? 'gemini'
-              : 'other';
-
-      const baseTitle = grp.displayName || grp.summaryLabel || grp.title || grp.label || grpKey;
-      if (hasWindows) {
-        for (const win of grp.windows!) {
-          const periodLabel = win.period === '5h'
-            ? t('common.period.5h', undefined, '5h')
-            : win.period === 'weekly'
-              ? t('common.period.weekly', undefined, 'Weekly')
-              : win.period === 'daily'
-                ? t('common.period.daily', undefined, 'Daily')
-                : win.period === 'unspecified'
-                  ? ''
-                  : (win.label ?? '');
-          const label = periodLabel && !baseTitle.includes(periodLabel) ? `${baseTitle} · ${periodLabel}` : baseTitle;
-          const rawPct = typeof win.percentage === 'number' && Number.isFinite(win.percentage)
-            ? win.percentage
-            : (typeof win.remaining === 'number' && Number.isFinite(win.remaining)
-                ? Math.round(Math.min(1, Math.max(0, win.remaining)) * 100)
-                : null);
-          const percentage = win.known === false ? null : rawPct;
-          const winKey = win.id ?? win.key ?? win.period ?? label;
-          bars.push({
-            key: `${grpKey}:${winKey}`,
-            label,
-            family,
-            percentage,
-            resetCountdown: win.resetCountdown ?? '',
-            stale: Boolean(
-              win.stale ||
-                grp.stale ||
-                grp.quotaState === 'stale' ||
-                staleSet.has(grpKey.toLowerCase()),
-            ),
-          });
-        }
-      } else {
-        bars.push({
-          key: grpKey || String(bars.length),
-          label: baseTitle,
-          family,
-          percentage: typeof grp.percentage === 'number' ? grp.percentage : null,
-          resetCountdown: grp.resetCountdown ?? '',
-          stale: Boolean(grp.stale || grp.quotaState === 'stale' || staleSet.has(grpKey.toLowerCase())),
-        });
-      }
-    }
-    if (bars.length > 0) return bars;
-  }
-
-  if (source.geminiFiveHourRemaining !== undefined && source.geminiFiveHourRemaining !== null) {
-    bars.push({
-      key: 'gemini-5h',
-      label: t('quota.bar.gemini_5h', undefined, 'Gemini · 5h'),
-      family: 'gemini',
-      percentage: source.geminiFiveHourRemaining,
-      resetCountdown: source.geminiFiveHourResetCountdown ?? '',
-      stale: staleSet.has('gemini_5h'),
-    });
-  }
-  if (source.geminiWeeklyRemaining !== undefined && source.geminiWeeklyRemaining !== null) {
-    bars.push({
-      key: 'gemini-weekly',
-      label: t('quota.bar.gemini_weekly', undefined, 'Gemini · Weekly'),
-      family: 'gemini',
-      percentage: source.geminiWeeklyRemaining,
-      resetCountdown: source.geminiWeeklyResetCountdown ?? '',
-      stale: staleSet.has('gemini_weekly'),
-    });
-  }
-  if (source.claudeFiveHourRemaining !== undefined && source.claudeFiveHourRemaining !== null) {
-    bars.push({
-      key: 'claude-5h',
-      label: t('quota.bar.claude_5h', undefined, 'Claude/GPT · 5h'),
-      family: 'claude',
-      percentage: source.claudeFiveHourRemaining,
-      resetCountdown: source.claudeFiveHourResetCountdown ?? '',
-      stale: staleSet.has('claude_5h'),
-    });
-  }
-  if (source.claudeWeeklyRemaining !== undefined && source.claudeWeeklyRemaining !== null) {
-    bars.push({
-      key: 'claude-weekly',
-      label: t('quota.bar.claude_weekly', undefined, 'Claude/GPT · Weekly'),
-      family: 'claude',
-      percentage: source.claudeWeeklyRemaining,
-      resetCountdown: source.claudeWeeklyResetCountdown ?? '',
-      stale: staleSet.has('claude_weekly'),
-    });
-  }
-  if (source.argonWeeklyRemaining !== undefined && source.argonWeeklyRemaining !== null) {
-    bars.push({
-      key: 'argon-weekly',
-      label: `Gemini 4 Argon · ${t('common.period.weekly', undefined, 'Weekly')}`,
-      family: 'argon',
-      percentage: source.argonWeeklyRemaining,
-      resetCountdown: source.argonWeeklyResetCountdown ?? '',
-      stale: staleSet.has('argon_weekly'),
-    });
-  }
-  if (source.carbonWeeklyRemaining !== undefined && source.carbonWeeklyRemaining !== null) {
-    bars.push({
-      key: 'carbon-weekly',
-      label: `Gemini 4 Carbon · ${t('common.period.weekly', undefined, 'Weekly')}`,
-      family: 'carbon',
-      percentage: source.carbonWeeklyRemaining,
-      resetCountdown: source.carbonWeeklyResetCountdown ?? '',
-      stale: staleSet.has('carbon_weekly'),
-    });
-  }
-  return bars;
-}
-
 export function statusColorForMode(mode: string | undefined, reachable: boolean): 'green' | 'amber' | 'red' | 'gray' {
   if (!reachable) return 'red';
   switch (mode) {
     case 'connected':
     case 'active':
-    case 'english':
-    case 'adaptive':
       return 'green';
     case 'paused':
     case 'waiting':
@@ -232,9 +61,6 @@ export function statusColorForMode(mode: string | undefined, reachable: boolean)
     case 'waiting-app':
     case 'waiting_app':
     case 'starting':
-    case 'unsupported':
-    case 'legacy-blocked':
-    case 'legacy_blocked':
       return 'amber';
     case 'error':
     case 'stopped':
@@ -251,31 +77,17 @@ export function formatStatusLabel(
   t: (key: string, params?: Record<string, string | number>, fallback?: string) => string,
 ): string {
   if (!reachable) return t('status.disconnected');
-  if (status?.dictionaryError) return t('status.check_dictionary');
   if (Array.isArray(status?.errors) && status.errors.length > 0) return t('status.check_partial');
   const mode = status?.mode ?? '';
-  const pausedOrFailed = ['paused', 'unsupported', 'legacy-blocked', 'legacy_blocked', 'stopped', 'error'].includes(mode);
-  if ((status?.runningTasks ?? 0) > 0 && status?.translationEnabled !== false && !pausedOrFailed) {
-    return t('status.running_tasks');
-  }
-  if (mode === 'connected' || mode === 'active' || mode === 'adaptive') {
-    return locale === 'en' || status?.translationEnabled === false
-      ? t('status.connected_english')
-      : t('status.connected');
+  if (mode === 'connected' || mode === 'active') {
+    return t('status.hud_connected', undefined, locale === 'en' ? 'HUD Connected' : 'HUD 已连接');
   }
   if (mode === 'paused') {
-    if (locale === 'en' || status?.locale === 'en') {
-      return (status?.windows ?? 0) > 0
-        ? t('status.connected_english')
-        : t('status.english_mode');
-    }
-    return t('status.paused');
+    return t('status.hud_paused', undefined, locale === 'en' ? 'HUD Paused' : 'HUD 已暂停');
   }
   if (mode === 'waiting-window' || mode === 'waiting_window') return t('status.waiting_window');
   if (mode === 'waiting-app' || mode === 'waiting_app') return t('status.waiting_app');
   if (mode === 'waiting' || mode === 'starting') return t('status.waiting');
-  if (mode === 'unsupported') return t('status.unsupported');
-  if (mode === 'legacy-blocked' || mode === 'legacy_blocked') return t('status.legacy_blocked');
   if (mode === 'error') return t('status.error');
   if (mode === 'stopped') return t('status.stopped');
   return t('status.waiting_app');

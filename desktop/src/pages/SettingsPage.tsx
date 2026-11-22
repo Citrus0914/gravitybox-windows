@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   Globe,
-  Languages,
   Activity,
   RefreshCw,
   DollarSign,
@@ -79,7 +78,6 @@ export const SettingsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
   const safeBytes = scan?.buckets?.runtimeCache?.clearableBytes ?? scan?.safeBytes ?? 0;
   const statefulBytes = scan?.buckets?.historyLogs?.clearableBytes ?? scan?.statefulBytes ?? 0;
   const hudEnabled = status?.hudEnabled ?? config?.hudEnabled ?? true;
-  const translationSettingEnabled = config?.translationEnabled ?? status?.translationEnabled ?? true;
 
   return (
     <>
@@ -88,7 +86,7 @@ export const SettingsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
       </div>
 
       <div className="page-scroll">
-        {/* Section 1: Antigravity Enhancement */}
+        {/* Section 1: App & HUD */}
         <div>
           <div className="section-label">{t('settings.section.enhance')}</div>
           <div className="card list-card">
@@ -98,7 +96,7 @@ export const SettingsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
                 <div>
                   <div style={{ fontWeight: 600 }}>{t('settings.language.title')}</div>
                   <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                    {t('settings.language.subtitle')}
+                    {t('settings.language.lite_subtitle', undefined, store.locale === 'en' ? 'Sets UI language for GravityBox and Session HUD' : '设置 GravityBox 与底部对话状态栏（HUD）的显示语言')}
                   </div>
                 </div>
               </div>
@@ -111,26 +109,6 @@ export const SettingsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
                 <option value="zh-Hans">简体中文</option>
                 <option value="en">English</option>
               </select>
-            </div>
-
-            <div className="list-row">
-              <div className="list-row-left">
-                <span className="icon-tile"><Languages size={16} /></span>
-                <div>
-                  <div style={{ fontWeight: 600 }}>{t('settings.translation.title')}</div>
-                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                    {t('settings.translation.subtitle')}
-                  </div>
-                </div>
-              </div>
-              <label className="switch">
-                <input
-                  type="checkbox"
-                  checked={Boolean(translationSettingEnabled)}
-                  onChange={(e) => void store.setTranslationEnabled(e.target.checked)}
-                />
-                <span className="switch-slider" />
-              </label>
             </div>
 
             <div className="list-row">
@@ -155,34 +133,10 @@ export const SettingsPage: React.FC<{ store: GravityBoxStore }> = ({ store }) =>
           </div>
         </div>
 
-        {/* Section 2: Quota & Pricing */}
+        {/* Section 2: Pricing */}
         <div>
-          <div className="section-label">{t('settings.section.quota_pricing')}</div>
+          <div className="section-label">{t('settings.section.pricing', undefined, store.locale === 'en' ? 'Pricing' : '计价基准')}</div>
           <div className="card list-card">
-            <div className="list-row">
-              <div className="list-row-left">
-                <span className="icon-tile"><RefreshCw size={16} /></span>
-                <div>
-                  <div style={{ fontWeight: 600 }}>{t('settings.refresh.title')}</div>
-                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                    {t('settings.refresh.subtitle')}
-                  </div>
-                </div>
-              </div>
-              <select
-                className="select"
-                value={String(config?.quotaRefreshMinutes ?? 0)}
-                onChange={(e) => void store.updateConfig({ quotaRefreshMinutes: Number(e.target.value) })}
-              >
-                <option value="0">{t('settings.refresh.manual')}</option>
-                <option value="5">{t('settings.refresh.5m')}</option>
-                <option value="10">{t('settings.refresh.10m')}</option>
-                <option value="15">{t('settings.refresh.15m')}</option>
-                <option value="30">{t('settings.refresh.30m')}</option>
-                <option value="60">{t('settings.refresh.60m')}</option>
-              </select>
-            </div>
-
             <div className="list-row">
               <div className="list-row-left">
                 <span className="icon-tile"><DollarSign size={16} /></span>

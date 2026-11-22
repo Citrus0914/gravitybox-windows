@@ -17,12 +17,8 @@ pub struct AppConfig {
     pub last_page: usize,
     #[serde(default = "default_nav_version")]
     pub navigation_version: Option<u32>,
-    #[serde(default)]
-    pub quota_refresh_minutes: u32,
     #[serde(default = "default_true")]
     pub hud_enabled: bool,
-    #[serde(default = "default_true")]
-    pub translation_enabled: bool,
     #[serde(default)]
     pub auto_pricing_sync_enabled: bool,
     #[serde(default)]
@@ -31,10 +27,6 @@ pub struct AppConfig {
     pub auto_update_enabled: bool,
     #[serde(default)]
     pub last_cleaned_version: String,
-    #[serde(default)]
-    pub accounts_collapsed: bool,
-    #[serde(default)]
-    pub menu_selected_tab: usize,
     #[serde(default)]
     pub menu_usage_period: usize,
     #[serde(default = "default_trend_metric")]
@@ -67,15 +59,11 @@ impl Default for AppConfig {
             schema: 2,
             last_page: 0,
             navigation_version: Some(5),
-            quota_refresh_minutes: 0,
             hud_enabled: true,
-            translation_enabled: true,
             auto_pricing_sync_enabled: false,
             sync_antigravity_lifecycle: false,
             auto_update_enabled: false,
             last_cleaned_version: String::new(),
-            accounts_collapsed: false,
-            menu_selected_tab: 0,
             menu_usage_period: 0,
             menu_trend_metric: "tokens".to_string(),
             application_channel: "stable".to_string(),
@@ -93,8 +81,7 @@ pub fn load_config(state_dir: &Path) -> Result<AppConfig, String> {
     let mut cfg: AppConfig =
         serde_json::from_str(&raw).map_err(|e| format!("Corrupted config.json: {}", e))?;
     cfg.application_channel = "stable".to_string();
-    cfg.last_page = cfg.last_page.min(4);
-    cfg.menu_selected_tab = cfg.menu_selected_tab.min(2);
+    cfg.last_page = cfg.last_page.min(2);
     cfg.menu_usage_period = cfg.menu_usage_period.min(3);
     Ok(cfg)
 }
@@ -117,6 +104,8 @@ pub fn save_config(state_dir: &Path, mut cfg: AppConfig) -> Result<AppConfig, St
     fs::create_dir_all(state_dir).map_err(|e| e.to_string())?;
     cfg.schema = 2;
     cfg.application_channel = "stable".to_string();
+    cfg.last_page = cfg.last_page.min(2);
+    cfg.menu_usage_period = cfg.menu_usage_period.min(3);
     if cfg.menu_trend_metric != "requests" {
         cfg.menu_trend_metric = "tokens".to_string();
     }
@@ -152,26 +141,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_config_preserves_unknown_fields() {
+    fn merge_config_preserves_unknown_and_legacy_fields() {
         let mut cfg = AppConfig::default();
-        cfg.last_page = 2;
-        cfg.quota_refresh_minutes = 15;
-        let out = merge_config_document(Some(r#"{"schema":2,"customExternalFlag":true}"#), &cfg).unwrap();
+        cfg.last_page = 1;
+        let legacy_json = r#"{"schema":2,"translationEnabled":false,"quotaRefreshMinutes":5,"customExternalFlag":true}"#;
+        let parsed: AppConfig = serde_json::from_str(legacy_json).unwrap();
+        assert!(parsed.hud_enabled);
+
+        let out = merge_config_document(Some(legacy_json), &cfg).unwrap();
         let raw: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(raw["customExternalFlag"], Value::Bool(true));
-        assert_eq!(raw["lastPage"], serde_json::json!(2));
-        assert_eq!(raw["quotaRefreshMinutes"], serde_json::json!(15));
+        assert_eq!(raw["translationEnabled"], Value::Bool(false));
+        assert_eq!(raw["quotaRefreshMinutes"], serde_json::json!(5));
+        assert_eq!(raw["lastPage"], serde_json::json!(1));
     }
 
     #[test]
-    fn translation_enabled_defaults_to_true_and_roundtrips_false() {
-        let legacy: AppConfig = serde_json::from_str(r#"{"schema":2,"hudEnabled":true}"#).unwrap();
-        assert!(legacy.translation_enabled);
+    fn hud_enabled_defaults_to_true_and_roundtrips_false() {
+        let legacy: AppConfig = serde_json::from_str(r#"{"schema":2}"#).unwrap();
+        assert!(legacy.hud_enabled);
 
         let mut cfg = AppConfig::default();
-        cfg.translation_enabled = false;
+        cfg.hud_enabled = false;
         let out = merge_config_document(None, &cfg).unwrap();
         let parsed: AppConfig = serde_json::from_str(&out).unwrap();
-        assert!(!parsed.translation_enabled);
+        assert!(!parsed.hud_enabled);
     }
 }
