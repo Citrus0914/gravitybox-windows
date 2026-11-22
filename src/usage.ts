@@ -6,6 +6,17 @@ import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { defaultCacheDir, defaultStateDir } from './platform/paths.js';
 import { atomicJson, atomicText } from './files.js';
+import { runSummariesCatalogInWorker } from './sqlite-read.js';
+import {
+  buildConversationCatalog,
+  buildUsageBreakdownFromDbBuckets,
+  type BreakdownModelEntry,
+  type ConversationCatalog,
+  type ConversationUsageBreakdown,
+  type DbModelUsageBucket,
+  type ProjectUsageBreakdown,
+  type UsageBreakdownResult,
+} from './usage-conversations.js';
 import { bt, getActiveLocale } from './i18n.js';
 import { createModelQueryMatcher, formatLocalDate, isUnpricedZeroSentinel, type LedgerSnapshot } from './usage-aggregate.js';
 import { UsageLedger, type LedgerEvent } from './usage-ledger.js';
@@ -53,13 +64,17 @@ import { buildPricingWarningCodes, buildUsageSummaryReport } from './usage-repor
 export {
   resolveDatabaseModelFullName,
   type AvailableAccountUsageOption,
+  type BreakdownModelEntry,
+  type ConversationUsageBreakdown,
   type DailyTokenUsage,
   type GenerationEvent,
   type HourlyTokenUsage,
   type ModelTokenUsage,
+  type ProjectUsageBreakdown,
   type TokenUsagePeriod,
   type TokenUsageSummary,
   type TokenUsageTotals,
+  type UsageBreakdownResult,
 };
 
 export class UsageStatsManager {
@@ -142,6 +157,7 @@ export class UsageStatsManager {
   private lastSyncedVersion = '';
   private activeOfficialModels: string[] | null = null;
   private activeUnpricedOfficialModels: string[] | null = null;
+  private conversationCatalogCache = new Map<string, { stamp: string; catalog: ConversationCatalog }>();
 
   constructor(options?: { geminiDir?: string; stateDir?: string; remotePricingUrl?: string; fallbackPricingUrls?: string[]; dataDirectoryName?: DataDirectoryName }) {
     const defaultGeminiDir = join(homedir(), '.gemini');
@@ -1142,14 +1158,167 @@ export class UsageStatsManager {
     return scanDatabaseEventsWithContext(this.scanContext(), dbPath, bypassCache, signal);
   }
 
+  private async loadConversationCatalog(): Promise<ConversationCatalog> {
+    const cacheKey = this.dataDirectoryNames.join(',');
+    const dbTargets: Array<{ path: string; stampPart: string }> = [];
+    for (const dirName of this.dataDirectoryNames) {
+      const dbPath = join(this.geminiDir, dirName, 'conversation_summaries.db');
+      const st = await lstat(dbPath).catch(() => null);
+      if (!st || !st.isFile() || st.isSymbolicLink()) continue;
+      const wal = await lstat(`${dbPath}-wal`).catch(() => null);
+      dbTargets.push({
+        path: dbPath,
+        stampPart: `${dbPath}:${st.mtimeMs}:${st.size}:${wal?.mtimeMs ?? 0}:${wal?.size ?? 0}`,
+      });
+    }
+    const stamp = dbTargets.map(t => t.stampPart).join('|');
+    const cached = this.conversationCatalogCache.get(cacheKey);
+    if (cached && cached.stamp === stamp) {
+      return cached.catalog;
+    }
+    if (dbTargets.length === 0) {
+      const empty = buildConversationCatalog(null);
+      this.conversationCatalogCache.set(cacheKey, { stamp, catalog: empty });
+      return empty;
+    }
+    const rawResults = await Promise.all(
+      dbTargets.map(target => runSummariesCatalogInWorker({ dbPath: target.path }).catch(() => null))
+    );
+    const catalog = buildConversationCatalog(rawResults);
+    if (rawResults.every(r => r !== null)) {
+      this.conversationCatalogCache.set(cacheKey, { stamp, catalog });
+    }
+    return catalog;
+  }
+
+  async getUsageBreakdown(
+    period: 'today' | '7d' | '30d' | 'all' = 'today',
+    options?: { force?: boolean; projectId?: string; snapshotId?: string; accountId?: string }
+  ): Promise<UsageBreakdownResult> {
+    const accKey = options?.accountId || 'all';
+    const force = Boolean(options?.force);
+    let snapshot = !force && options?.snapshotId ? this.snapshots.get(options.snapshotId) : undefined;
+    if (!snapshot || snapshot.expires < Date.now()) {
+      const summary = await this.getUsageSummary(force, options?.accountId);
+      snapshot = this.snapshots.get(summary.snapshot_id ?? this.cachedSummariesByAccount.get(accKey)?.data.snapshot_id ?? '');
+    }
+    if (!snapshot || snapshot.expires < Date.now()) {
+      throw Error(bt('usage.err.snapshot_expired'));
+    }
+    snapshot.expires = Date.now() + 600000;
+
+    let buckets: DbModelUsageBucket[];
+    if (snapshot.ledger) {
+      const snapshotAccountId = snapshot.ledger.accountId ?? 'all';
+      if (options?.accountId && snapshotAccountId !== 'all' && options.accountId !== snapshotAccountId) {
+        throw Error(bt('usage.err.snapshot_account_mismatch'));
+      }
+      const effectiveAccountId = options?.accountId || snapshotAccountId;
+      const targetEmail = this.knownAccounts.find(account => account.id === effectiveAccountId)?.email;
+      const effectiveSnapshot = effectiveAccountId === snapshotAccountId
+        ? snapshot.ledger
+        : { ...snapshot.ledger, accountId: effectiveAccountId };
+      buckets = await this.ledger.breakdown({ snapshot: effectiveSnapshot, period, targetEmail });
+    } else {
+      const { summary, prices, rawPricing } = snapshot as any;
+      const snapshotAccountId: string = summary.selected_account_id ?? 'all';
+      if (options?.accountId && snapshotAccountId !== 'all' && options.accountId !== snapshotAccountId) {
+        throw Error(bt('usage.err.snapshot_account_mismatch'));
+      }
+      const effectiveAccountId = options?.accountId ?? snapshotAccountId;
+      const start = new Date(summary.generated_at * 1000);
+      start.setHours(0, 0, 0, 0);
+      if (period === '7d') start.setDate(start.getDate() - 6);
+      if (period === '30d') start.setDate(start.getDate() - 29);
+      const cutoff = period === 'all' ? 0 : start.getTime() / 1000;
+      const end = new Date(summary.generated_at * 1000);
+      end.setHours(24, 0, 0, 0);
+      const upper = end.getTime() / 1000;
+
+      let events = snapshot.events.filter(
+        e => period === 'all' || (e.timestamp_seconds >= cutoff && e.timestamp_seconds < upper)
+      );
+      if (effectiveAccountId && effectiveAccountId !== 'all') {
+        const targetOpt = this.knownAccounts.find(
+          a => a.id === effectiveAccountId || (a.email && a.email.toLowerCase() === effectiveAccountId.toLowerCase())
+        );
+        const targetEmail =
+          targetOpt?.email?.toLowerCase() || (effectiveAccountId.includes('@') ? effectiveAccountId.toLowerCase() : null);
+        events = events.filter(e => {
+          if (e.account_id && e.account_id === effectiveAccountId) return true;
+          if (targetEmail && e.account_email && e.account_email.toLowerCase() === targetEmail) return true;
+          return false;
+        });
+      }
+
+      const pricingSource = rawPricing ?? prices;
+      const bucketMap = new Map<string, DbModelUsageBucket>();
+      for (const e of events) {
+        const resolvedModel = resolveDatabaseModelFullName(e.model, null);
+        const dbFile = typeof e.db_file === 'string' ? e.db_file : '';
+        const key = `${dbFile}\0${resolvedModel}`;
+        const price = this.resolvePricing(pricingSource, resolvedModel, e.timestamp_seconds);
+        const cost = this.lockedCost(e, price);
+        let bucket = bucketMap.get(key);
+        if (!bucket) {
+          bucket = {
+            dbFile,
+            model: resolvedModel,
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: 0,
+            requestCount: 0,
+            estimatedUsd: 0,
+            firstActiveAt: 0,
+            lastActiveAt: 0,
+          };
+          bucketMap.set(key, bucket);
+        }
+        bucket.inputTokens += e.input_tokens;
+        bucket.outputTokens += e.output_tokens;
+        bucket.cachedTokens += e.cached_tokens;
+        bucket.cacheWriteTokens += e.cache_write_tokens ?? 0;
+        bucket.totalTokens += e.total_tokens;
+        bucket.requestCount += 1;
+        if (cost !== null) bucket.estimatedUsd += cost;
+        if (e.timestamp_seconds > 0) {
+          if (bucket.firstActiveAt === 0 || e.timestamp_seconds < bucket.firstActiveAt) {
+            bucket.firstActiveAt = e.timestamp_seconds;
+          }
+          if (e.timestamp_seconds > bucket.lastActiveAt) {
+            bucket.lastActiveAt = e.timestamp_seconds;
+          }
+        }
+      }
+      if (this.rateLocksDirty) {
+        this.rateLocksDirty = false;
+        await this.saveRateLocks().catch(() => {});
+      }
+      buckets = [...bucketMap.values()];
+    }
+
+    const catalog = await this.loadConversationCatalog();
+    return buildUsageBreakdownFromDbBuckets(buckets, catalog, {
+      period,
+      snapshotId: snapshot.summary.snapshot_id,
+      generatedAt: snapshot.summary.generated_at,
+      projectId: options?.projectId,
+    });
+  }
+
   /** Privacy-preserving request rows: metrics only, no database paths or conversation content. */
-  async getUsageEvents(period: string, query = '', offset = 0, limit = 200, snapshotId?: string, pin = false, force = false, accountId?: string) {
+  async getUsageEvents(period: string, query = '', offset = 0, limit = 200, snapshotId?: string, pin = false, force = false, accountId?: string, dbFiles?: string[]) {
     const accKey = accountId || 'all';
     if (!snapshotId || force) await this.getUsageSummary(force, accountId);
     const snapshot=(!force && snapshotId)?this.snapshots.get(snapshotId):this.snapshots.get(this.cachedSummariesByAccount.get(accKey)?.data.snapshot_id??'');
     if (!snapshot || snapshot.expires<Date.now()) throw Error(bt('usage.err.snapshot_expired'));
     if (pin) snapshot.pins++;
     if (snapshot.pins > 0) snapshot.expires = Date.now()+600000;
+    const normalizedDbFiles = Array.isArray(dbFiles)
+      ? [...new Set(dbFiles.map(f => String(f).trim().toLowerCase()).filter(Boolean))]
+      : [];
     if (snapshot.ledger) {
       const snapshotAccountId = snapshot.ledger.accountId ?? 'all';
       if (accountId && snapshotAccountId !== 'all' && accountId !== snapshotAccountId) {
@@ -1160,7 +1329,7 @@ export class UsageStatsManager {
       const effectiveSnapshot = effectiveAccountId === snapshotAccountId
         ? snapshot.ledger
         : { ...snapshot.ledger, accountId: effectiveAccountId };
-      const page = await this.ledger.events({ snapshot: effectiveSnapshot, period, query: query.slice(0, 200), offset: Math.max(0, Math.floor(offset) || 0), limit: Math.min(500, Math.max(1, Math.floor(limit) || 200)), targetEmail });
+      const page = await this.ledger.events({ snapshot: effectiveSnapshot, period, query: query.slice(0, 200), offset: Math.max(0, Math.floor(offset) || 0), limit: Math.min(500, Math.max(1, Math.floor(limit) || 200)), targetEmail, dbFiles: normalizedDbFiles.length > 0 ? normalizedDbFiles : undefined });
       return { ...page, generated_at: snapshot.summary.generated_at, snapshot_id: snapshot.summary.snapshot_id, availability: snapshot.summary.availability, scope: snapshot.summary.scan_scope_description };
     }
     const {summary,prices,rawPricing}=snapshot as any;
@@ -1176,7 +1345,12 @@ export class UsageStatsManager {
     const end = new Date(summary.generated_at*1000); end.setHours(24,0,0,0);
     const upper = end.getTime()/1000;
     const matcher = createModelQueryMatcher(query);
-    let events = snapshot.events.filter(e => (period === 'all' || (e.timestamp_seconds >= cutoff && e.timestamp_seconds < upper)) && matcher(e.model));
+    const dbFileSet = normalizedDbFiles.length > 0 ? new Set(normalizedDbFiles) : null;
+    let events = snapshot.events.filter(e =>
+      (period === 'all' || (e.timestamp_seconds >= cutoff && e.timestamp_seconds < upper)) &&
+      matcher(e.model) &&
+      (!dbFileSet || dbFileSet.has((e.db_file ?? '').toLowerCase()))
+    );
     if (effectiveAccountId && effectiveAccountId !== 'all') {
       const targetOpt = this.knownAccounts.find(a => a.id === effectiveAccountId || (a.email && a.email.toLowerCase() === effectiveAccountId.toLowerCase()));
       const targetEmail = targetOpt?.email?.toLowerCase() || (effectiveAccountId.includes('@') ? effectiveAccountId.toLowerCase() : null);

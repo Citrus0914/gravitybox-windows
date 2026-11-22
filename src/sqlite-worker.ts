@@ -732,6 +732,95 @@ function executeSummariesLookup(req: SummariesLookupRequest): SummariesLookupRes
   }
 }
 
+export interface SummariesCatalogRequest {
+  dbPath: string;
+}
+
+export interface SummariesCatalogRow {
+  conversationId: string;
+  title: string;
+  workspaceUris: string;
+  projectId: string;
+  parentConversationId: string;
+  lastModifiedTime: string;
+  stepCount: number;
+}
+
+export interface SummariesCatalogResult {
+  foundTable: boolean;
+  rows: SummariesCatalogRow[];
+  parents: Array<{ childId: string; parentId: string }>;
+}
+
+function executeSummariesCatalog(req: SummariesCatalogRequest): SummariesCatalogResult {
+  const db = new DatabaseSync(req.dbPath, { readOnly: true });
+  try {
+    db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 400;');
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('conversation_summaries', 'conversation_parents')")
+      .all() as Array<{ name?: unknown }>;
+    const tableSet = new Set(tables.map(t => String(t.name ?? '')));
+    if (!tableSet.has('conversation_summaries') && !tableSet.has('conversation_parents')) {
+      return { foundTable: false, rows: [], parents: [] };
+    }
+
+    const rows: SummariesCatalogRow[] = [];
+    if (tableSet.has('conversation_summaries')) {
+      const cols = new Set(
+        (db.prepare('PRAGMA table_info(conversation_summaries)').all() as Array<{ name?: unknown }>).map(c => String(c.name ?? ''))
+      );
+      const idCol = cols.has('conversation_id') ? 'conversation_id' : cols.has('id') ? 'id' : '';
+      if (idCol) {
+        const titleExpr = cols.has('title') ? 'title' : "''";
+        const wsExpr = cols.has('workspace_uris') ? 'workspace_uris' : "''";
+        const projExpr = cols.has('project_id') ? 'project_id' : "''";
+        const parentCol = cols.has('parent_conversation_id') ? 'parent_conversation_id' : cols.has('parent_id') ? 'parent_id' : '';
+        const parentExpr = parentCol || "''";
+        const modifiedExpr = cols.has('last_modified_time') ? 'last_modified_time' : "''";
+        const stepExpr = cols.has('step_count') ? 'step_count' : '0';
+        const stmt = db.prepare(
+          `SELECT ${idCol} AS cid, ${titleExpr} AS title, ${wsExpr} AS workspace_uris, ${projExpr} AS project_id, ${parentExpr} AS parent_conversation_id, ${modifiedExpr} AS last_modified_time, ${stepExpr} AS step_count FROM conversation_summaries`
+        );
+        for (const r of stmt.all() as Array<Record<string, unknown>>) {
+          const conversationId = String(r.cid ?? '').trim().toLowerCase();
+          if (!conversationId) continue;
+          rows.push({
+            conversationId,
+            title: String(r.title ?? '').trim(),
+            workspaceUris: String(r.workspace_uris ?? '').trim(),
+            projectId: String(r.project_id ?? '').trim(),
+            parentConversationId: String(r.parent_conversation_id ?? '').trim().toLowerCase(),
+            lastModifiedTime: String(r.last_modified_time ?? '').trim(),
+            stepCount: Number.isFinite(Number(r.step_count)) ? Number(r.step_count) : 0,
+          });
+        }
+      }
+    }
+
+    const parents: Array<{ childId: string; parentId: string }> = [];
+    if (tableSet.has('conversation_parents')) {
+      const pCols = new Set(
+        (db.prepare('PRAGMA table_info(conversation_parents)').all() as Array<{ name?: unknown }>).map(c => String(c.name ?? ''))
+      );
+      const childCol = pCols.has('conversation_id') ? 'conversation_id' : pCols.has('child_id') ? 'child_id' : '';
+      const parentCol = pCols.has('parent_id') ? 'parent_id' : pCols.has('parent_conversation_id') ? 'parent_conversation_id' : '';
+      if (childCol && parentCol) {
+        for (const r of db.prepare(`SELECT ${childCol} AS cid, ${parentCol} AS pid FROM conversation_parents`).all() as Array<Record<string, unknown>>) {
+          const childId = String(r.cid ?? '').trim().toLowerCase();
+          const parentId = String(r.pid ?? '').trim().toLowerCase();
+          if (childId && parentId && childId !== parentId) {
+            parents.push({ childId, parentId });
+          }
+        }
+      }
+    }
+
+    return { foundTable: true, rows, parents };
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
 function hasValidStartedAtField4(startBuf: Uint8Array): boolean {
   const cStart = { pos: 0 };
   while (cStart.pos < startBuf.length) {
@@ -1039,9 +1128,18 @@ function executeUsageScan(req: UsageWorkerScanRequest): { result: UsageWorkerSca
   }
 }
 
-parentPort?.on('message', (request: { id: string; locale?: string; open?: string; sql?: string; verify?: boolean; close?: boolean; reusable?: boolean; projection?: {table:string;column:string;idx:number}; hudScan?: HudWorkerScanRequest; usageScan?: UsageWorkerScanRequest; summariesLookup?: SummariesLookupRequest }) => {
+parentPort?.on('message', (request: { id: string; locale?: string; open?: string; sql?: string; verify?: boolean; close?: boolean; reusable?: boolean; projection?: {table:string;column:string;idx:number}; hudScan?: HudWorkerScanRequest; usageScan?: UsageWorkerScanRequest; summariesLookup?: SummariesLookupRequest; summariesCatalog?: SummariesCatalogRequest }) => {
   if (typeof request.locale === 'string' && request.locale) {
     setActiveLocale(request.locale);
+  }
+  if (request.summariesCatalog) {
+    try {
+      const summariesCatalogResult = executeSummariesCatalog(request.summariesCatalog);
+      parentPort?.postMessage({ id: request.id, ok: true, summariesCatalogResult });
+    } catch (error) {
+      parentPort?.postMessage({ id: request.id, ok: false, error: (error as Error).message });
+    }
+    return;
   }
   if (request.summariesLookup) {
     try {

@@ -114,6 +114,7 @@ export interface GenerationEvent {
   cache_write_tokens?: number;
   total_tokens: number;
   timestamp_seconds: number;
+  db_file?: string;
   account_id?: string;
   account_email?: string;
   account_type?: 'consumer' | 'enterprise_vertex' | 'unknown';

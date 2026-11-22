@@ -459,8 +459,56 @@ html, body, #root {
   padding: 12px 16px;
 }
 
-.list-row + .list-row {
+.list-row + .list-row,
+.list-group + .list-group {
   border-top: 1px solid var(--border);
+}
+
+.list-row.clickable {
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.list-row.clickable:hover {
+  background: var(--bg-hover);
+}
+
+.breakdown-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.project-path {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 420px;
+}
+
+.conv-detail {
+  background: var(--bg-card-subtle);
+  border-top: 1px solid var(--border);
+  padding: 10px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.detail-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(115px, 1fr));
+  gap: 8px;
+}
+
+.detail-metric-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
 }
 
 .list-row-left {

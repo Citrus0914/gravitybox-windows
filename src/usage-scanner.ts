@@ -479,6 +479,7 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
   for (const event of events) {
     ctx.upsertLedger({ ...event, db_file: basename(dbPath) });
     Object.assign(event, ctx.getLedgerEvent(event.event_key!));
+    if (!event.db_file) event.db_file = basename(dbPath);
   }
   const unknownTime = events.some(event => event.timestamp_seconds <= 0);
   const hasError = !stepOk && unknownTime;

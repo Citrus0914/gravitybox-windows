@@ -1,6 +1,6 @@
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
-import type { HudWorkerScanRequest, HudWorkerScanResult, SummariesLookupRequest, SummariesLookupResult, UsageWorkerScanRequest, UsageWorkerScanResult } from './sqlite-worker.js';
+import type { HudWorkerScanRequest, HudWorkerScanResult, SummariesCatalogRequest, SummariesCatalogResult, SummariesLookupRequest, SummariesLookupResult, UsageWorkerScanRequest, UsageWorkerScanResult } from './sqlite-worker.js';
 import { bt, getActiveLocale } from './i18n.js';
 
 const MAX_IDLE_WORKERS = 8;
@@ -348,5 +348,57 @@ export async function runSummariesLookupInWorker(
     worker.once('error', onError);
     worker.once('exit', onExit);
     worker.postMessage({ id, summariesLookup, locale: getActiveLocale() });
+  });
+}
+
+export async function runSummariesCatalogInWorker(
+  summariesCatalog: SummariesCatalogRequest,
+  timeoutMs = 2000
+): Promise<SummariesCatalogResult | null> {
+  const worker = acquirePooledWorker('');
+  const id = randomUUID();
+  return new Promise<SummariesCatalogResult | null>((resolve) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      worker.removeListener('message', onMessage);
+      worker.removeListener('error', onError);
+      worker.removeListener('exit', onExit);
+    };
+    const onMessage = (msg: any) => {
+      if (!msg || msg.id !== id || settled) return;
+      settled = true;
+      cleanup();
+      releasePooledWorker(worker);
+      if (msg.ok && msg.summariesCatalogResult) {
+        resolve(msg.summariesCatalogResult as SummariesCatalogResult);
+      } else {
+        resolve(null);
+      }
+    };
+    const onError = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      void worker.terminate();
+      resolve(null);
+    };
+    const onExit = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(null);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      void worker.terminate();
+      resolve(null);
+    }, timeoutMs);
+    worker.on('message', onMessage);
+    worker.once('error', onError);
+    worker.once('exit', onExit);
+    worker.postMessage({ id, summariesCatalog, locale: getActiveLocale() });
   });
 }

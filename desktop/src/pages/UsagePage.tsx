@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { RefreshCw, Download, ListFilter, Tags, Search } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { RefreshCw, Download, ListFilter, Tags, Search, Folder, MessageSquare, ChevronRight, ChevronDown } from 'lucide-react';
 import { ipcRequest, saveJsonFile } from '../ipc';
 import { formatCompactTokens, formatCount, formatTimestampShort, formatUsd, statusColorForMode } from '../format';
 import { BarChart } from '../components/BarChart';
@@ -7,32 +7,59 @@ import { DonutChart, DONUT_PALETTE } from '../components/DonutChart';
 import { ModelIcon } from '../components/ModelIcon';
 import { Modal } from '../components/Modal';
 import type { GravityBoxStore } from '../hooks/useGravityBox';
-import type { UsagePeriodData } from '../types';
+import type { UsageBreakdownData, UsagePeriodData } from '../types';
 
 const PERIODS = ['today', '7d', '30d', 'all'] as const;
+type BreakdownTab = 'models' | 'projects' | 'conversations';
+type BreakdownSort = 'tokens' | 'cost' | 'recent';
 
 export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
   const { t, reachable, status, statusLabel } = store;
   const [period, setPeriod] = useState<(typeof PERIODS)[number]>('today');
   const [data, setData] = useState<UsagePeriodData | null>(null);
+  const [breakdown, setBreakdown] = useState<UsageBreakdownData | null>(null);
+  const [activeTab, setActiveTab] = useState<BreakdownTab>('models');
+  const [selectedProjectId, setSelectedProjectId] = useState<string>('all');
+  const [sortBy, setSortBy] = useState<BreakdownSort>('tokens');
+  const [projectQuery, setProjectQuery] = useState('');
+  const [convQuery, setConvQuery] = useState('');
+  const [expandedConvId, setExpandedConvId] = useState<string | null>(null);
+  const [visibleConvCount, setVisibleConvCount] = useState(50);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
-  const [showLogModal, setShowLogModal] = useState(false);
+  const [logFilter, setLogFilter] = useState<{ dbFiles?: string[]; title?: string } | null>(null);
   const [showPricingModal, setShowPricingModal] = useState(false);
+  const fetchSeqRef = useRef(0);
 
   const fetchUsage = useCallback(
     async (force = false) => {
+      const seq = ++fetchSeqRef.current;
       setLoading(true);
       try {
         const res = await ipcRequest<UsagePeriodData & { ok?: boolean }>('usage_summary', {
           period,
           force,
         });
+        if (seq !== fetchSeqRef.current) return;
         setData(res);
+        try {
+          const bd = await ipcRequest<UsageBreakdownData & { ok?: boolean }>('usage_breakdown', {
+            period,
+            force: false,
+            snapshotId: res.snapshotId,
+          });
+          if (seq !== fetchSeqRef.current) return;
+          setBreakdown(bd);
+          setSelectedProjectId((prev) =>
+            prev !== 'all' && !(bd.projects ?? []).some((p) => p.id === prev) ? 'all' : prev,
+          );
+        } catch {
+          if (seq === fetchSeqRef.current) setBreakdown(null);
+        }
       } catch (err) {
-        if (force) store.showToast(String(err), true);
+        if (force && seq === fetchSeqRef.current) store.showToast(String(err), true);
       } finally {
-        setLoading(false);
+        if (seq === fetchSeqRef.current) setLoading(false);
       }
     },
     [period, store],
@@ -41,6 +68,11 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
   useEffect(() => {
     void fetchUsage(false);
   }, [fetchUsage]);
+
+  useEffect(() => {
+    setVisibleConvCount(50);
+    setExpandedConvId(null);
+  }, [period, selectedProjectId, convQuery, sortBy]);
 
   const handleExport = async () => {
     if (!data || loading || exporting || data.period !== period) return;
@@ -51,9 +83,13 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
         { period },
         `gravitybox-usage-${period}-${new Date().toISOString().slice(0, 10)}.json`,
       );
+      const exportPayload = {
+        ...data,
+        ...(breakdown && breakdown.period === period ? { breakdown } : {}),
+      };
       const res = await saveJsonFile({
         defaultName,
-        content: JSON.stringify(data, null, 2),
+        content: JSON.stringify(exportPayload, null, 2),
         title: store.locale === 'en' ? 'Export Usage Data' : '导出用量数据',
         filterLabel: store.locale === 'en' ? 'JSON Files' : 'JSON 文件',
         allFilesLabel: store.locale === 'en' ? 'All Files' : '所有文件',
@@ -108,6 +144,57 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
   const avgTokensPerReq =
     summary && summary.requestCount > 0 ? summary.totalTokens / summary.requestCount : 0;
   const dotColor = statusColorForMode(status?.mode, reachable);
+
+  const activeProjects = useMemo(() => {
+    const list = breakdown?.period === period ? breakdown.projects : [];
+    const q = projectQuery.trim().toLowerCase();
+    const filtered = q
+      ? list.filter(
+          (p) =>
+            p.name.toLowerCase().includes(q) ||
+            (p.workspacePath && p.workspacePath.toLowerCase().includes(q)),
+        )
+      : list;
+    return [...filtered].sort((a, b) => {
+      if (sortBy === 'cost') return b.estimatedUsd - a.estimatedUsd || b.totalTokens - a.totalTokens;
+      if (sortBy === 'recent') return b.lastActiveAt - a.lastActiveAt || b.totalTokens - a.totalTokens;
+      return b.totalTokens - a.totalTokens || b.estimatedUsd - a.estimatedUsd;
+    });
+  }, [breakdown, period, projectQuery, sortBy]);
+
+  const selectedProject = useMemo(() => {
+    if (selectedProjectId === 'all' || breakdown?.period !== period) return null;
+    return breakdown.projects.find((p) => p.id === selectedProjectId) ?? null;
+  }, [breakdown, period, selectedProjectId]);
+
+  const activeConversations = useMemo(() => {
+    const list = breakdown?.period === period ? breakdown.conversations : [];
+    const q = convQuery.trim().toLowerCase();
+    const filtered = list.filter((c) => {
+      if (selectedProjectId !== 'all' && c.projectId !== selectedProjectId) return false;
+      if (!q) return true;
+      return (
+        c.title.toLowerCase().includes(q) ||
+        c.projectName.toLowerCase().includes(q) ||
+        c.id.toLowerCase().includes(q)
+      );
+    });
+    return [...filtered].sort((a, b) => {
+      if (sortBy === 'cost') return b.estimatedUsd - a.estimatedUsd || b.totalTokens - a.totalTokens;
+      if (sortBy === 'recent') return b.lastActiveAt - a.lastActiveAt || b.totalTokens - a.totalTokens;
+      return b.totalTokens - a.totalTokens || b.lastActiveAt - a.lastActiveAt;
+    });
+  }, [breakdown, convQuery, period, selectedProjectId, sortBy]);
+
+  const visibleConversations = activeConversations.slice(0, visibleConvCount);
+  const convDenominator = selectedProject ? selectedProject.totalTokens : totalTokens;
+
+  const breakdownCountLabel =
+    activeTab === 'models'
+      ? t('overview.bento.n_models', { count: byModel.length })
+      : activeTab === 'projects'
+        ? t('usage.breakdown.count_projects', { count: activeProjects.length }, `${activeProjects.length} 个项目`)
+        : t('usage.breakdown.count_conversations', { count: activeConversations.length }, `${activeConversations.length} 个对话`);
 
   return (
     <>
@@ -250,7 +337,7 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
           <div className="card" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between', gap: 12 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <span style={{ fontWeight: 700 }}>{t('usage.section.requests_cache')}</span>
-              <button className="btn btn-sm" onClick={() => setShowLogModal(true)}>
+              <button className="btn btn-sm" onClick={() => setLogFilter({})}>
                 <ListFilter size={12} />
                 {t('usage.request_details_btn')}
               </button>
@@ -294,56 +381,390 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
           </div>
         </div>
 
-        {/* Model Breakdown */}
-        <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontWeight: 700 }}>{t('usage.section.model_breakdown')}</span>
-            <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-              {t('overview.bento.n_models', { count: byModel.length })}
-            </span>
+        {/* Breakdown Card: By Model / By Project / By Conversation */}
+        <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+            <div className="segmented" role="tablist" aria-label={t('usage.section.model_breakdown')}>
+              <button
+                className={`segmented-btn ${activeTab === 'models' ? 'active' : ''}`}
+                onClick={() => setActiveTab('models')}
+              >
+                {t('usage.tab.models', undefined, '按模型')}
+              </button>
+              <button
+                className={`segmented-btn ${activeTab === 'projects' ? 'active' : ''}`}
+                onClick={() => setActiveTab('projects')}
+              >
+                {t('usage.tab.projects', undefined, '按项目')}
+              </button>
+              <button
+                className={`segmented-btn ${activeTab === 'conversations' ? 'active' : ''}`}
+                onClick={() => setActiveTab('conversations')}
+              >
+                {t('usage.tab.conversations', undefined, '按对话')}
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                {breakdownCountLabel}
+              </span>
+              {activeTab !== 'models' && (
+                <select
+                  className="select"
+                  style={{ height: 26, fontSize: 12 }}
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as BreakdownSort)}
+                >
+                  <option value="tokens">{t('usage.breakdown.sort.tokens', undefined, '按 Token')}</option>
+                  <option value="cost">{t('usage.breakdown.sort.cost', undefined, '按费用')}</option>
+                  <option value="recent">{t('usage.breakdown.sort.recent', undefined, '最近活跃')}</option>
+                </select>
+              )}
+            </div>
           </div>
 
-          {byModel.length === 0 ? (
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' }}>
-              {t('overview.bento.empty_title')}
-            </div>
-          ) : (
-            <div className="list-card" style={{ border: '1px solid var(--border)', borderRadius: 10 }}>
-              {byModel.map((m) => {
-                const share = totalTokens > 0 ? Math.round((m.totalTokens / totalTokens) * 100) : 0;
-                return (
-                  <div key={m.model} className="list-row">
-                    <div className="list-row-left">
-                      <span className="icon-tile gray"><ModelIcon name={m.model} size={15} /></span>
-                      <div>
-                        <div style={{ fontWeight: 600 }}>{m.model}</div>
+          {activeTab === 'models' && (
+            byModel.length === 0 ? (
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' }}>
+                {t('overview.bento.empty_title')}
+              </div>
+            ) : (
+              <div className="list-card" style={{ border: '1px solid var(--border)', borderRadius: 10 }}>
+                {byModel.map((m) => {
+                  const share = totalTokens > 0 ? Math.round((m.totalTokens / totalTokens) * 100) : 0;
+                  return (
+                    <div key={m.model} className="list-row">
+                      <div className="list-row-left">
+                        <span className="icon-tile gray"><ModelIcon name={m.model} size={15} /></span>
+                        <div>
+                          <div style={{ fontWeight: 600 }}>{m.model}</div>
+                          <div className="tabular" style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                            {formatCompactTokens(m.totalTokens)} Token · {formatCount(m.requestCount)}{' '}
+                            {store.locale === 'en' ? 'reqs' : '次请求'}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ textAlign: 'right' }}>
+                        <div className="tabular" style={{ fontWeight: 700 }}>
+                          {m.estimatedUsd > 0 ? formatUsd(m.estimatedUsd) : '--'}
+                        </div>
                         <div className="tabular" style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
-                          {formatCompactTokens(m.totalTokens)} Token · {formatCount(m.requestCount)}{' '}
-                          {store.locale === 'en' ? 'reqs' : '次请求'}
+                          Token {share}%
                         </div>
                       </div>
                     </div>
-                    <div style={{ textAlign: 'right' }}>
-                      <div className="tabular" style={{ fontWeight: 700 }}>
-                        {m.estimatedUsd > 0 ? formatUsd(m.estimatedUsd) : '--'}
+                  );
+                })}
+              </div>
+            )
+          )}
+
+          {activeTab === 'projects' && (
+            <>
+              <div className="breakdown-toolbar">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 180 }}>
+                  <Search size={13} style={{ color: 'var(--text-secondary)', flexShrink: 0 }} />
+                  <input
+                    className="input"
+                    style={{ width: '100%', height: 28 }}
+                    placeholder={t('usage.breakdown.search_projects', undefined, '搜索项目名称或路径…')}
+                    value={projectQuery}
+                    onChange={(e) => setProjectQuery(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              {activeProjects.length === 0 ? (
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' }}>
+                  {t('usage.breakdown.empty_projects', undefined, '当前时段暂无项目用量记录')}
+                </div>
+              ) : (
+                <div className="list-card" style={{ border: '1px solid var(--border)', borderRadius: 10 }}>
+                  {activeProjects.map((p) => {
+                    const share = totalTokens > 0 ? Math.round((p.totalTokens / totalTokens) * 100) : 0;
+                    return (
+                      <div
+                        key={p.id}
+                        className="list-row clickable"
+                        onClick={() => {
+                          setSelectedProjectId(p.id);
+                          setActiveTab('conversations');
+                        }}
+                      >
+                        <div className="list-row-left" style={{ flex: 1 }}>
+                          <span className="icon-tile"><Folder size={15} /></span>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                              <span style={{ fontWeight: 600 }}>{p.name}</span>
+                              {p.topModels.slice(0, 2).map((tm) => (
+                                <span key={tm.model} className="badge neutral" style={{ fontWeight: 500 }}>
+                                  {tm.model}
+                                </span>
+                              ))}
+                            </div>
+                            {p.workspacePath && (
+                              <div className="project-path" title={p.workspacePath}>
+                                {p.workspacePath}
+                              </div>
+                            )}
+                            <div className="tabular" style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 1 }}>
+                              {t(
+                                'usage.breakdown.project_meta',
+                                {
+                                  conversations: formatCount(p.conversationCount),
+                                  requests: formatCount(p.requestCount),
+                                  cacheRate: p.cacheHitRate.toFixed(1),
+                                },
+                                `${p.conversationCount} 个对话 · ${p.requestCount} 次请求 · 缓存命中 ${p.cacheHitRate.toFixed(1)}%`,
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+                          <div style={{ textAlign: 'right' }}>
+                            <div className="tabular" style={{ fontWeight: 700 }}>
+                              {p.estimatedUsd > 0 ? formatUsd(p.estimatedUsd) : '--'}
+                            </div>
+                            <div className="tabular" style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                              {formatCompactTokens(p.totalTokens)} · {share}%
+                            </div>
+                          </div>
+                          <ChevronRight size={14} style={{ color: 'var(--text-tertiary)' }} />
+                        </div>
                       </div>
-                      <div className="tabular" style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
-                        Token {share}%
-                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          )}
+
+          {activeTab === 'conversations' && (
+            <>
+              <div className="breakdown-toolbar">
+                <select
+                  className="select"
+                  style={{ height: 28, maxWidth: 220 }}
+                  value={selectedProjectId}
+                  onChange={(e) => setSelectedProjectId(e.target.value)}
+                >
+                  <option value="all">{t('usage.breakdown.all_projects', undefined, '全部项目')}</option>
+                  {(breakdown?.period === period ? breakdown.projects : []).map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 180 }}>
+                  <Search size={13} style={{ color: 'var(--text-secondary)', flexShrink: 0 }} />
+                  <input
+                    className="input"
+                    style={{ width: '100%', height: 28 }}
+                    placeholder={t('usage.breakdown.search_conversations', undefined, '搜索对话标题或项目…')}
+                    value={convQuery}
+                    onChange={(e) => setConvQuery(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              {selectedProject && (
+                <div className="card-subtle" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, fontSize: 12.5 }}>{selectedProject.name}</div>
+                    <div className="tabular" style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                      {formatCompactTokens(selectedProject.totalTokens)} Token · {formatUsd(selectedProject.estimatedUsd)} ·{' '}
+                      {t(
+                        'usage.breakdown.project_meta',
+                        {
+                          conversations: formatCount(selectedProject.conversationCount),
+                          requests: formatCount(selectedProject.requestCount),
+                          cacheRate: selectedProject.cacheHitRate.toFixed(1),
+                        },
+                        `${selectedProject.conversationCount} 个对话 · ${selectedProject.requestCount} 次请求 · 缓存命中 ${selectedProject.cacheHitRate.toFixed(1)}%`,
+                      )}
                     </div>
                   </div>
-                );
-              })}
-            </div>
+                  <button className="btn btn-sm" onClick={() => setSelectedProjectId('all')}>
+                    {t('usage.breakdown.clear_project_filter', undefined, '查看全部项目')}
+                  </button>
+                </div>
+              )}
+
+              {activeConversations.length === 0 ? (
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' }}>
+                  {t('usage.breakdown.empty_conversations', undefined, '当前时段暂无对话用量记录')}
+                </div>
+              ) : (
+                <>
+                  <div className="list-card" style={{ border: '1px solid var(--border)', borderRadius: 10 }}>
+                    {visibleConversations.map((c) => {
+                      const isExpanded = expandedConvId === c.id;
+                      const share = convDenominator > 0 ? Math.round((c.totalTokens / convDenominator) * 100) : 0;
+                      return (
+                        <div key={c.id} className="list-group">
+                          <div
+                            className="list-row clickable"
+                            onClick={() => setExpandedConvId(isExpanded ? null : c.id)}
+                          >
+                            <div className="list-row-left" style={{ flex: 1 }}>
+                              <span className="icon-tile purple"><MessageSquare size={15} /></span>
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                                  <span style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                    {c.title}
+                                  </span>
+                                  {selectedProjectId === 'all' && (
+                                    <span className="badge neutral">{c.projectName}</span>
+                                  )}
+                                  {c.subagentCount > 0 && (
+                                    <span className="badge">
+                                      {t('usage.breakdown.subagents', { count: c.subagentCount }, `+${c.subagentCount} 子智能体`)}
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="tabular" style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 2 }}>
+                                  {t(
+                                    'usage.breakdown.conv_meta',
+                                    {
+                                      time: c.lastActiveAt > 0 ? formatTimestampShort(c.lastActiveAt) : '--',
+                                      requests: formatCount(c.requestCount),
+                                      cacheRate: c.cacheHitRate.toFixed(1),
+                                    },
+                                    `${c.lastActiveAt > 0 ? formatTimestampShort(c.lastActiveAt) : '--'} · ${c.requestCount} 次请求 · 缓存命中 ${c.cacheHitRate.toFixed(1)}%`,
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+                              <div style={{ textAlign: 'right' }}>
+                                <div className="tabular" style={{ fontWeight: 700 }}>
+                                  {c.estimatedUsd > 0 ? formatUsd(c.estimatedUsd) : '--'}
+                                </div>
+                                <div className="tabular" style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                                  {formatCompactTokens(c.totalTokens)} · {share}%
+                                </div>
+                              </div>
+                              {isExpanded ? (
+                                <ChevronDown size={14} style={{ color: 'var(--text-secondary)' }} />
+                              ) : (
+                                <ChevronRight size={14} style={{ color: 'var(--text-tertiary)' }} />
+                              )}
+                            </div>
+                          </div>
+
+                          {isExpanded && (
+                            <div className="conv-detail">
+                              <div className="detail-metric-grid">
+                                <div className="detail-metric-box">
+                                  <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                                    {t('usage.breakdown.detail.input', undefined, '未缓存输入')}
+                                  </div>
+                                  <div className="tabular" style={{ fontWeight: 600, fontSize: 12.5 }}>
+                                    {formatCompactTokens(c.inputTokens)}
+                                  </div>
+                                </div>
+                                <div className="detail-metric-box">
+                                  <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                                    {t('usage.breakdown.detail.cached', undefined, '缓存读取')}
+                                  </div>
+                                  <div className="tabular" style={{ fontWeight: 600, fontSize: 12.5 }}>
+                                    {formatCompactTokens(c.cachedTokens)}
+                                  </div>
+                                </div>
+                                {c.cacheWriteTokens > 0 && (
+                                  <div className="detail-metric-box">
+                                    <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                                      {t('usage.breakdown.detail.cache_write', undefined, '缓存写入')}
+                                    </div>
+                                    <div className="tabular" style={{ fontWeight: 600, fontSize: 12.5 }}>
+                                      {formatCompactTokens(c.cacheWriteTokens)}
+                                    </div>
+                                  </div>
+                                )}
+                                <div className="detail-metric-box">
+                                  <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                                    {t('usage.breakdown.detail.output', undefined, '输出')}
+                                  </div>
+                                  <div className="tabular" style={{ fontWeight: 600, fontSize: 12.5 }}>
+                                    {formatCompactTokens(c.outputTokens)}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-secondary)' }}>
+                                  {t('usage.breakdown.detail.models', undefined, '该对话模型分布')}
+                                </div>
+                                {c.byModel.map((m) => (
+                                  <div
+                                    key={m.model}
+                                    style={{
+                                      display: 'flex',
+                                      justifyContent: 'space-between',
+                                      alignItems: 'center',
+                                      fontSize: 12,
+                                      padding: '3px 0',
+                                    }}
+                                  >
+                                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 500 }}>
+                                      <ModelIcon name={m.model} size={13} />
+                                      {m.model}
+                                    </span>
+                                    <span className="tabular" style={{ color: 'var(--text-secondary)' }}>
+                                      {formatCompactTokens(m.totalTokens)} Token · {formatCount(m.requestCount)}{' '}
+                                      {store.locale === 'en' ? 'reqs' : '次'} · {m.estimatedUsd > 0 ? formatUsd(m.estimatedUsd) : '--'}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+
+                              {c.dbFiles.length > 0 && (
+                                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                                  <button
+                                    className="btn btn-sm"
+                                    onClick={() => setLogFilter({ dbFiles: c.dbFiles, title: c.title })}
+                                  >
+                                    <ListFilter size={12} />
+                                    {t('usage.breakdown.view_requests', undefined, '查看该对话请求明细…')}
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {activeConversations.length > visibleConvCount && (
+                    <div style={{ display: 'flex', justifyContent: 'center' }}>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => setVisibleConvCount((prev) => prev + 50)}
+                      >
+                        {t(
+                          'usage.breakdown.show_more',
+                          { remaining: activeConversations.length - visibleConvCount },
+                          `显示更多（还有 ${activeConversations.length - visibleConvCount} 条）`,
+                        )}
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
           )}
         </div>
       </div>
 
-      {showLogModal && (
+      {logFilter !== null && (
         <UsageLogModal
           store={store}
           period={period}
-          onClose={() => setShowLogModal(false)}
+          dbFiles={logFilter.dbFiles}
+          subtitle={logFilter.title}
+          onClose={() => setLogFilter(null)}
         />
       )}
 
@@ -361,8 +782,10 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
 const UsageLogModal: React.FC<{
   store: GravityBoxStore;
   period: string;
+  dbFiles?: string[];
+  subtitle?: string;
   onClose: () => void;
-}> = ({ store, period, onClose }) => {
+}> = ({ store, period, dbFiles, subtitle, onClose }) => {
   const { t } = store;
   const [query, setQuery] = useState('');
   const [events, setEvents] = useState<Array<Record<string, unknown>>>([]);
@@ -371,6 +794,7 @@ const UsageLogModal: React.FC<{
   const snapshotIdRef = useRef<string | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const limit = 40;
+  const dbFilesKey = dbFiles ? dbFiles.join('|') : '';
 
   useEffect(() => {
     let active = true;
@@ -388,6 +812,7 @@ const UsageLogModal: React.FC<{
           query,
           offset,
           limit,
+          ...(dbFiles && dbFiles.length > 0 ? { dbFiles } : {}),
           snapshotId: snapshotIdRef.current,
           pinSnapshot: !snapshotIdRef.current,
         });
@@ -408,7 +833,7 @@ const UsageLogModal: React.FC<{
     return () => {
       active = false;
     };
-  }, [offset, period, query]);
+  }, [offset, period, query, dbFilesKey]);
 
   useEffect(() => {
     return () => {
@@ -419,9 +844,12 @@ const UsageLogModal: React.FC<{
     };
   }, []);
 
+  const baseTitle = t('usage_log.title', undefined, '请求明细');
+  const modalTitle = subtitle ? `${baseTitle} · ${subtitle}` : baseTitle;
+
   return (
     <Modal
-      title={t('usage_log.title', undefined, '请求明细')}
+      title={modalTitle}
       wide
       onClose={onClose}
       footer={

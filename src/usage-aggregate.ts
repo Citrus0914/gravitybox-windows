@@ -6,6 +6,7 @@ import { resolveDatabaseModelFullName } from './usage-types.js';
 import { getEffectiveModelAliasKeys } from './model-catalog.js';
 import { normalizeModelId } from './model-identity.js';
 import { DEFAULT_API_PRICES, resolveContextTierPricing, resolvePricingForTimestamp, matchPricingKeys, calculateEstimatedUsd, priceStatus, type ApiPricing, type ApiPricingEntry } from './pricing.js';
+import type { DbModelUsageBucket } from './usage-conversations.js';
 import { bt } from './i18n.js';
 
 export function isUnpricedZeroSentinel(price: ApiPricing | null | undefined): boolean {
@@ -294,15 +295,12 @@ export function createModelQueryMatcher(rawQuery: string): (candidate: string) =
     };
 }
 
-export function ledgerEventPage(db: DatabaseSync, options: {
-    snapshot: LedgerSnapshot;
-    period: string;
-    query: string;
-    offset: number;
-    limit: number;
-    targetEmail?: string;
-}) {
-    const { snapshot } = options;
+function buildPinnedLedgerFilter(
+    db: DatabaseSync,
+    snapshot: LedgerSnapshot,
+    periodName: string,
+    targetEmail?: string
+): { conditions: string[]; params: Array<string | number> } {
     if (!snapshot.snapshotId || !db.prepare('SELECT 1 AS pinned FROM snapshot_pins WHERE snapshot_id=? AND expires>=?').get(snapshot.snapshotId, Date.now()))
         throw Error(bt('usage.err.snapshot_expired'));
     db.prepare('UPDATE snapshot_pins SET expires=? WHERE snapshot_id=?').run(Date.now() + 600000, snapshot.snapshotId);
@@ -310,12 +308,41 @@ export function ledgerEventPage(db: DatabaseSync, options: {
         throw Error(bt('usage.err.rates_changed_reexport'));
     const start = new Date(snapshot.generatedAt * 1000);
     start.setHours(0, 0, 0, 0);
-    if (options.period === '7d')
+    if (periodName === '7d')
         start.setDate(start.getDate() - 6);
-    if (options.period === '30d')
+    if (periodName === '30d')
         start.setDate(start.getDate() - 29);
     const end = new Date(snapshot.generatedAt * 1000);
     end.setHours(24, 0, 0, 0);
+    const conditions = [
+        'r.seq<=?',
+        'NOT EXISTS(SELECT 1 FROM event_revisions n WHERE n.event_key=r.event_key AND n.seq>r.seq AND n.seq<=?)',
+        'NOT EXISTS(SELECT 1 FROM event_aliases a WHERE a.legacy_key=r.event_key)',
+        "COALESCE(json_extract(r.payload,'$.db_file'),'') NOT IN ('recovered_session.db','recovered_enterprise_session.db')",
+    ];
+    const params: Array<string | number> = [snapshot.revision, snapshot.revision];
+    if (periodName !== 'all') {
+        conditions.push('r.timestamp>=? AND r.timestamp<?');
+        params.push(start.getTime() / 1000, end.getTime() / 1000);
+    }
+    if (snapshot.accountId !== 'all') {
+        conditions.push("(json_extract(r.payload,'$.account_id')=? OR lower(json_extract(r.payload,'$.account_email'))=?)");
+        params.push(snapshot.accountId, targetEmail?.toLowerCase() || snapshot.accountId.toLowerCase());
+    }
+    return { conditions, params };
+}
+
+export function ledgerEventPage(db: DatabaseSync, options: {
+    snapshot: LedgerSnapshot;
+    period: string;
+    query: string;
+    offset: number;
+    limit: number;
+    targetEmail?: string;
+    dbFiles?: string[];
+}) {
+    const { snapshot } = options;
+    const base = buildPinnedLedgerFilter(db, snapshot, options.period, options.targetEmail);
     const rawQuery = options.query ?? '';
     const qLower = rawQuery.trim().toLowerCase();
     const qNorm = qLower ? normalizeModelId(rawQuery) : '';
@@ -351,26 +378,14 @@ export function ledgerEventPage(db: DatabaseSync, options: {
     const modelClause = aliasMatches.length > 0
         ? `(${likeClauses} OR lower(json_extract(r.payload,'$.model')) IN (${aliasMatches.map(() => '?').join(',')}))`
         : `(${likeClauses})`;
-    const conditions = [
-        'r.seq<=?',
-        'NOT EXISTS(SELECT 1 FROM event_revisions n WHERE n.event_key=r.event_key AND n.seq>r.seq AND n.seq<=?)',
-        'NOT EXISTS(SELECT 1 FROM event_aliases a WHERE a.legacy_key=r.event_key)',
-        "COALESCE(json_extract(r.payload,'$.db_file'),'') NOT IN ('recovered_session.db','recovered_enterprise_session.db')",
-        modelClause,
-    ];
-    const params: Array<string | number> = [
-        snapshot.revision,
-        snapshot.revision,
-        ...likePatterns,
-        ...aliasMatches,
-    ];
-    if (options.period !== 'all') {
-        conditions.push('r.timestamp>=? AND r.timestamp<?');
-        params.push(start.getTime() / 1000, end.getTime() / 1000);
-    }
-    if (snapshot.accountId !== 'all') {
-        conditions.push("(json_extract(r.payload,'$.account_id')=? OR lower(json_extract(r.payload,'$.account_email'))=?)");
-        params.push(snapshot.accountId, options.targetEmail?.toLowerCase() || snapshot.accountId.toLowerCase());
+    const conditions = [...base.conditions, modelClause];
+    const params: Array<string | number> = [...base.params, ...likePatterns, ...aliasMatches];
+    const normalizedDbFiles = Array.isArray(options.dbFiles)
+        ? [...new Set(options.dbFiles.map(f => String(f).trim().toLowerCase()).filter(Boolean))]
+        : [];
+    if (normalizedDbFiles.length > 0) {
+        conditions.push(`lower(COALESCE(json_extract(r.payload,'$.db_file'),'')) IN (${normalizedDbFiles.map(() => '?').join(',')})`);
+        params.push(...normalizedDbFiles);
     }
     const where = conditions.join(' AND ');
     const total = Number(db.prepare(`SELECT COUNT(*) AS count FROM event_revisions r WHERE ${where}`).get(...params)?.count);
@@ -383,4 +398,55 @@ export function ledgerEventPage(db: DatabaseSync, options: {
         return { ...publicEvent, estimated_usd: cost, priced: cost !== null };
     });
     return { rows, total, offset: options.offset, limit: options.limit };
+}
+
+export function ledgerBreakdownBuckets(db: DatabaseSync, options: {
+    snapshot: LedgerSnapshot;
+    period: string;
+    targetEmail?: string;
+}): DbModelUsageBucket[] {
+    const base = buildPinnedLedgerFilter(db, options.snapshot, options.period, options.targetEmail);
+    const where = base.conditions.join(' AND ');
+    const buckets = new Map<string, DbModelUsageBucket>();
+    for (const row of db.prepare(`SELECT r.payload,l.unit_price FROM event_revisions r LEFT JOIN rate_locks l ON l.event_key=r.event_key WHERE ${where}`).iterate(...base.params)) {
+        const event = JSON.parse(String(row.payload)) as LedgerEvent;
+        const model = resolveDatabaseModelFullName(event.model, null);
+        const dbFile = typeof event.db_file === 'string' ? event.db_file : '';
+        const price = row.unit_price ? JSON.parse(String(row.unit_price)) as ApiPricing : null;
+        const cost = event.timestamp_seconds > 0 ? calculateLockedEventUsd(event, price) : null;
+        const key = `${dbFile}\0${model}`;
+        let bucket = buckets.get(key);
+        if (!bucket) {
+            bucket = {
+                dbFile,
+                model,
+                inputTokens: 0,
+                outputTokens: 0,
+                cachedTokens: 0,
+                cacheWriteTokens: 0,
+                totalTokens: 0,
+                requestCount: 0,
+                estimatedUsd: 0,
+                firstActiveAt: 0,
+                lastActiveAt: 0,
+            };
+            buckets.set(key, bucket);
+        }
+        bucket.inputTokens += event.input_tokens;
+        bucket.outputTokens += event.output_tokens;
+        bucket.cachedTokens += event.cached_tokens;
+        bucket.cacheWriteTokens += event.cache_write_tokens ?? 0;
+        bucket.totalTokens += event.total_tokens;
+        bucket.requestCount += 1;
+        if (cost !== null) bucket.estimatedUsd += cost;
+        if (event.timestamp_seconds > 0) {
+            if (bucket.firstActiveAt === 0 || event.timestamp_seconds < bucket.firstActiveAt) {
+                bucket.firstActiveAt = event.timestamp_seconds;
+            }
+            if (event.timestamp_seconds > bucket.lastActiveAt) {
+                bucket.lastActiveAt = event.timestamp_seconds;
+            }
+        }
+    }
+    return [...buckets.values()];
 }
