@@ -77,10 +77,6 @@ export async function verifyWindows() {
     runCmd(process.execPath, [join(root, 'tools', 'run-tests.mjs'), '--fast']);
   });
 
-  step('Dictionary Gates (No Vendor)', () => {
-    runCmd(process.execPath, [join(root, 'tools', 'verify.mjs'), '--dict-only', '--no-vendor']);
-  });
-
   const totalSec = ((performance.now() - totalStart) / 1000).toFixed(2);
   process.stdout.write(`\n✅ All Windows verification gates passed in ${totalSec}s\n`);
 }

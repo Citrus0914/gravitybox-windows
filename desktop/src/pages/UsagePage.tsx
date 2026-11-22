@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { RefreshCw, Download, ListFilter, Tags, Search } from 'lucide-react';
 import { ipcRequest, saveJsonFile } from '../ipc';
-import { formatCompactTokens, formatCount, formatTimestampShort, formatUsd } from '../format';
+import { formatCompactTokens, formatCount, formatTimestampShort, formatUsd, statusColorForMode } from '../format';
 import { BarChart } from '../components/BarChart';
 import { DonutChart, DONUT_PALETTE } from '../components/DonutChart';
 import { ModelIcon } from '../components/ModelIcon';
@@ -12,9 +12,8 @@ import type { UsagePeriodData } from '../types';
 const PERIODS = ['today', '7d', '30d', 'all'] as const;
 
 export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
-  const { t, reachable } = store;
+  const { t, reachable, status, statusLabel } = store;
   const [period, setPeriod] = useState<(typeof PERIODS)[number]>('today');
-  const [accountId, setAccountId] = useState<string>('all');
   const [data, setData] = useState<UsagePeriodData | null>(null);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -28,7 +27,6 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
         const res = await ipcRequest<UsagePeriodData & { ok?: boolean }>('usage_summary', {
           period,
           force,
-          ...(accountId && accountId !== 'all' ? { accountId } : {}),
         });
         setData(res);
       } catch (err) {
@@ -37,7 +35,7 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
         setLoading(false);
       }
     },
-    [accountId, period, store],
+    [period, store],
   );
 
   useEffect(() => {
@@ -109,25 +107,19 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
 
   const avgTokensPerReq =
     summary && summary.requestCount > 0 ? summary.totalTokens / summary.requestCount : 0;
+  const dotColor = statusColorForMode(status?.mode, reachable);
 
   return (
     <>
       <div className="page-header">
-        <h1 className="page-title">{t('usage.title')}</h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <h1 className="page-title">{t('usage.title')}</h1>
+          <span className="badge neutral" style={{ padding: '4px 10px', gap: 6 }}>
+            <span className={`status-dot ${dotColor}`} />
+            {statusLabel}
+          </span>
+        </div>
         <div className="page-actions">
-          {(data?.availableAccounts?.length ?? 0) > 1 && (
-            <select
-              className="select"
-              value={accountId}
-              onChange={(e) => setAccountId(e.target.value)}
-            >
-              {data!.availableAccounts!.map((opt) => (
-                <option key={opt.id} value={opt.id}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          )}
           <div className="segmented" role="tablist" aria-label={t('usage.period_a11y')}>
             {PERIODS.map((p) => (
               <button
@@ -351,7 +343,6 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
         <UsageLogModal
           store={store}
           period={period}
-          accountId={accountId}
           onClose={() => setShowLogModal(false)}
         />
       )}
@@ -370,9 +361,8 @@ export const UsagePage: React.FC<{ store: GravityBoxStore }> = ({ store }) => {
 const UsageLogModal: React.FC<{
   store: GravityBoxStore;
   period: string;
-  accountId: string;
   onClose: () => void;
-}> = ({ store, period, accountId, onClose }) => {
+}> = ({ store, period, onClose }) => {
   const { t } = store;
   const [query, setQuery] = useState('');
   const [events, setEvents] = useState<Array<Record<string, unknown>>>([]);
@@ -400,7 +390,6 @@ const UsageLogModal: React.FC<{
           limit,
           snapshotId: snapshotIdRef.current,
           pinSnapshot: !snapshotIdRef.current,
-          ...(accountId && accountId !== 'all' ? { accountId } : {}),
         });
         if (!active) return;
         setEvents(res.rows ?? res.events ?? []);
@@ -419,7 +408,7 @@ const UsageLogModal: React.FC<{
     return () => {
       active = false;
     };
-  }, [accountId, offset, period, query]);
+  }, [offset, period, query]);
 
   useEffect(() => {
     return () => {

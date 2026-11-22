@@ -66,10 +66,10 @@ async function stop(child){if(!child||child.exitCode!==null||child.signalCode!==
 const rpc=(dir,p)=>new Promise((resolve,reject)=>{const s=createConnection(controlEndpointForStateDir(dir));let b='';s.on('error',reject);s.on('connect',()=>s.write(JSON.stringify(p)+'\n'));s.setTimeout(10000,()=>{s.destroy();reject(new Error('timeout'));});s.on('data',c=>{b+=c;if(b.includes('\n')){s.end();resolve(JSON.parse(b.split('\n')[0]));}});});
 async function ready(dir){const ep=controlEndpointForStateDir(dir);for(let i=0;i<300;i++){try{if(!ep.startsWith('\\\\.\\pipe\\'))await access(ep);await new Promise((res,rej)=>{const s=createConnection(ep);s.once('connect',()=>{s.destroy();res();});s.once('error',rej);});return;}catch{}await pause(20);}throw Error('backend not ready');}
 
-test('任务快照竞争和重复后台启动均保持唯一、可见的终态', {timeout:20000},()=>fixture(async dir=>{
- const preload=join(dir,'preload.mjs');await writeFile(preload,`import{AccountsManager}from ${JSON.stringify(pathToFileURL(join(process.cwd(),'dist/accounts.js')).href)};AccountsManager.prototype.probeLiveLanguageServer=async()=>{await new Promise(r=>setTimeout(r,350));return null;};AccountsManager.prototype.listAccounts=async()=>({accounts:[],active_account:null,active_account_id:null,revision:'fixture'});AccountsManager.prototype.refreshAllQuotas=async()=>{await new Promise(r=>setTimeout(r,50));return{accounts:[],failures:[]}};`);
- const args=['--import',pathToFileURL(preload).href,'dist/main.js','--state-dir',dir,'--app','/nonexistent','--profile',join(dir,'profile'),'--home-dir',dir,'--app-support-dir',dir,'--gemini-dir',dir];const one=spawn(process.execPath,args,{stdio:'ignore',env:{...process.env,GRAVITYBOX_PROBE_LS:'false'}});let two;
- try{await ready(dir);const reading=rpc(dir,{command:'status',includeTasks:true,tasksSince:-1});await pause(30);const start=await rpc(dir,{command:'quota_refresh_start'});const first=await reading;assert.ok(first.tasks.find(t=>t.id===start.taskId&&t.state==='succeeded'));const next=await rpc(dir,{command:'status',includeTasks:true,tasksSince:first.taskRevision});assert.ok(!next.tasks||next.tasks.some(t=>t.id===start.taskId));
+test('任务快照与单实例租约在重复后台启动下保持唯一、可见', {timeout:20000},()=>fixture(async dir=>{
+ const args=['dist/main.js','--state-dir',dir,'--app','/nonexistent','--profile',join(dir,'profile'),'--gemini-dir',dir];
+ const one=spawn(process.execPath,args,{stdio:'ignore',env:{...process.env}});let two;
+ try{await ready(dir);const first=await rpc(dir,{command:'status',includeTasks:true,tasksSince:-1});assert.equal(first.ok,true);assert.ok(Array.isArray(first.tasks));
  two=spawn(process.execPath,args,{stdio:'ignore'});await once(two,'exit');assert.notEqual(two.exitCode,0);assert.equal((await rpc(dir,{command:'ping'})).pid,one.pid);assert.equal(one.exitCode,null);
  }finally{await stop(two);await stop(one);}
 }));

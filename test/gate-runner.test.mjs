@@ -9,19 +9,16 @@ import { selectTestFiles } from '../tools/run-tests.mjs';
 
 const run = promisify(execFile);
 
-test('默认测试范围完整分区：保留原生行为，浏览器与完整原生 UI 夹具独立执行', async () => {
+test('默认测试范围完整分区：browser 独立执行，selectTestFiles 参数校验有效', async () => {
   const entries = await readdir(new URL('./', import.meta.url));
   const all = selectTestFiles(entries);
   const fast = selectTestFiles(entries, 'fast');
   const native = selectTestFiles(entries, 'native');
-  assert.ok(fast.length > 0 && native.length > 0);
+  assert.ok(fast.length > 0);
   assert.equal(new Set([...fast, ...native]).size, fast.length + native.length);
   assert.deepEqual([...fast, ...native].sort(), all);
   assert.deepEqual(all, entries.filter(name => name.endsWith('.test.mjs')).sort().map(name => join('test', name)));
   assert.ok(!all.includes(join('test', 'browser.mjs')));
-  assert.ok(entries.includes('native-ui.mjs'));
-  assert.ok(!all.includes(join('test', 'native-ui.mjs')));
-  assert.ok(native.includes(join('test', 'native-quota.test.mjs')) && native.includes(join('test', 'native-repair.test.mjs')) && native.includes(join('test', 'native-update.test.mjs')));
   assert.throws(() => selectTestFiles(entries, 'typo'), /未知测试范围/);
 });
 

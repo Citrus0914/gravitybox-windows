@@ -175,32 +175,11 @@ impl BackendSupervisor {
         let value: Value = serde_json::from_slice(&line)
             .map_err(|e| format!("Invalid JSON reply from backend: {}", e))?;
         if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-            let is_partial_accounts = value.get("partial").and_then(|v| v.as_bool()) == Some(true)
-                && value.get("accounts").and_then(|v| v.as_array()).is_some();
-            if is_partial_accounts {
-                return Ok(value);
-            }
-            let failure_msg = value
-                .get("failures")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| {
-                    if arr.is_empty() {
-                        None
-                    } else {
-                        arr[0]
-                            .get("error")
-                            .or_else(|| arr[0].get("message"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .or_else(|| Some(format!("{} account refresh failure(s)", arr.len())))
-                    }
-                });
             let msg = value
                 .get("error")
                 .or_else(|| value.get("message"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .or(failure_msg)
                 .unwrap_or_else(|| "Operation incomplete".to_string());
             return Err(msg);
         }

@@ -54,7 +54,6 @@ export function useGravityBox() {
       }>('status', {
         includeTasks: true,
         tasksSince: forceTasks ? -1 : lastTaskRevisionRef.current,
-        includeAccounts: true,
       });
       setReachable(true);
       if (res.status) setStatus(res.status);
@@ -93,16 +92,6 @@ export function useGravityBox() {
       void unlistenPromise.then((fn) => fn());
     };
   }, [refreshRuntime, refreshStatus]);
-
-  useEffect(() => {
-    const minutes = config?.quotaRefreshMinutes ?? 0;
-    const isMainView = new URLSearchParams(window.location.search).get('view') !== 'tray';
-    if (!isMainView || !reachable || minutes <= 0) return;
-    const timer = window.setInterval(() => {
-      void ipcRequest('quota_refresh_start').catch(() => {});
-    }, minutes * 60_000);
-    return () => window.clearInterval(timer);
-  }, [config?.quotaRefreshMinutes, reachable]);
 
   const configuredLanguage = useMemo(() => {
     return (
@@ -162,27 +151,6 @@ export function useGravityBox() {
     [showToast, updateConfig],
   );
 
-  const setTranslationEnabled = useCallback(
-    async (enabled: boolean) => {
-      await updateConfig({ translationEnabled: enabled });
-      try {
-        const res = await ipcRequest<{ status?: StatusSnapshot }>('translation_set', { enabled });
-        if (res.status) setStatus(res.status);
-        void refreshStatus(false);
-      } catch (err) {
-        showToast(String(err), true);
-      }
-    },
-    [refreshStatus, showToast, updateConfig],
-  );
-
-  const setTranslationPaused = useCallback(
-    async (paused: boolean) => {
-      await setTranslationEnabled(!paused);
-    },
-    [setTranslationEnabled],
-  );
-
   const statusLabel = useMemo(
     () => formatStatusLabel(status, reachable, locale, t),
     [locale, reachable, status, t],
@@ -205,8 +173,6 @@ export function useGravityBox() {
     updateConfig,
     setLanguage,
     setHudEnabled,
-    setTranslationEnabled,
-    setTranslationPaused,
     t,
   };
 }

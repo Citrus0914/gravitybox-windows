@@ -71,7 +71,7 @@ async function loadAndSyncHudI18n(rawHudI18nSource) {
 
 export async function copyRuntime(distUrl = new URL('../dist/', import.meta.url)) {
   const baseSources = await Promise.all(
-    ['engine.js', 'deep-scan.js'].map((name) =>
+    ['engine.js'].map((name) =>
       readFile(new URL('../runtime/' + name, import.meta.url), 'utf8')
     )
   );

@@ -13,29 +13,16 @@ import {
   applicationTarget,
   channelStateDirectory,
   detectInstalledChannels,
-  matchingTargetForLanguageServerCommand,
   probeBundleCapabilities,
   targetForApp,
 } from '../dist/application-target.js';
-import { compareLayers } from '../dist/dictionary.js';
-import { decodeKeyringPayload } from '../dist/account-keychain.js';
 import { controlEndpointForStateDir, defaultAppBundleName, defaultProfileDir } from '../dist/platform/paths.js';
-import { languageServerBinaryPath } from '../dist/platform/process.js';
 import { UsageStatsManager } from '../dist/usage.js';
-import { AccountsManager, MockKeychainAdapter, cloudProviderContextFromCommand, validCachedCloudProviderContext } from '../dist/accounts.js';
-import { AccountSwitchService } from '../dist/account-switch.js';
 
-const temporary = async t => { const dir = await mkdtemp(join(tmpdir(), 'gb-channel-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; };
-const quota = fraction => ({ models: [], last_updated: 1700000000, is_forbidden: false, model_forwarding_rules: {}, subscription_tier: fraction });
-const account = {
-  id: 'fixture',
-  email: 'fixture@example.invalid',
-  token: { access_token: 'synthetic', refresh_token: 'synthetic-refresh', expiry_timestamp: 9999999999 },
-  disabled: false,
-  protected_models: [],
-  validation_blocked: false,
-  created_at: 1,
-  last_used: 1,
+const temporary = async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-channel-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  return dir;
 };
 
 test('仅正式版可作为运行目标，旧持久配置可迁移而显式 Insiders 请求失败', () => {
@@ -75,7 +62,6 @@ test('只发现正式版，不向仅安装的 Insiders 回落；保留正式版 
   assert.deepEqual(onlyInsiders.channels, []);
   assert.equal(onlyInsiders.effectiveChannel, 'stable');
 
-  // Stable 2.29 uses WCV as well; removing Insiders must not remove this support.
   const futureStableApp = join(appsDir, 'Antigravity.app');
   await mkdir(join(futureStableApp, 'Contents', 'Resources'), { recursive: true });
   const pkgJson = Buffer.from(JSON.stringify({ version: '2.29.0', productName: 'Antigravity' }), 'utf8');
@@ -98,10 +84,7 @@ test('只发现正式版，不向仅安装的 Insiders 回落；保留正式版 
 
   const futureCaps = probeBundleCapabilities(futureStableApp, 'stable');
   assert.equal(futureCaps.architecture, 'wcv-hub');
-  assert.equal(futureCaps.supportsAccountSwitch, true);
   assert.equal(futureCaps.dataDirectoryName, 'antigravity');
-
-  assert.equal(compareLayers('2.28.0.json', '1.0.20261103010115.json') < 0, true);
 });
 
 test('仅统计正式版会话库，排除 Insiders、备份、IDE 和符号链接', async t => {
@@ -117,7 +100,6 @@ test('仅统计正式版会话库，排除 Insiders、备份、IDE 和符号链�
     if (error?.code !== 'EPERM') throw error;
   }
 
-  // Default discovery must never count Insiders data.
   const unifiedManager = new UsageStatsManager({ geminiDir: root, stateDir: root });
   const unifiedPaths = await unifiedManager.discoverDatabaseFiles();
   assert.deepEqual(
@@ -128,107 +110,25 @@ test('仅统计正式版会话库，排除 Insiders、备份、IDE 和符号链�
     ].sort(),
   );
 
-  // Explicit single-directory filter still works when specified
-  for (const name of ['antigravity']) {
-    const manager = new UsageStatsManager({ geminiDir: root, stateDir: root, dataDirectoryName: name });
-    const paths = await manager.discoverDatabaseFiles();
-    assert.deepEqual(paths.sort(), [join(root, name, 'conversations', 'same.db'), join(root, name, 'token_usage_archive.db')].sort());
-  }
-});
-
-test('正式版 WCV 无 state.vscdb 时仍支持保存、切号和回滚', async t => {
-  const state = await temporary(t);
-  const profileDir = await temporary(t);
-  const stable = new AccountsManager(state);
-  const manager = new AccountsManager(state, { target: applicationTarget('stable') });
-
-  await stable.saveAccount({ ...account, quota: quota('PRO') });
-  const fromInsiders = await manager.getAccount(account.id);
-  assert.equal(fromInsiders.quota.subscription_tier, 'PRO');
-
-  // Switch account and rollback on stable WCV 2.29+ profile where state.vscdb does NOT exist
-  const keychain = new MockKeychainAdapter();
-  await keychain.writePassword('gemini', 'antigravity', 'go-keyring-base64:previous-session');
-  const switchService = new AccountSwitchService(manager, {
-    stateDir: state,
-    profile: profileDir,
-    channel: 'stable',
-    keychain,
-    isRunning: async () => false,
-  });
-
-  const switched = await switchService.switchAccount(account.id);
-  assert.equal(switched.switchedTo, account.email);
-  const writtenKeychain = await keychain.readPassword('gemini', 'antigravity');
-  if (process.platform === 'win32') assert.equal(decodeKeyringPayload(writtenKeychain)?.token?.email, account.email);
-  else assert.match(writtenKeychain ?? '', /^go-keyring-base64:/);
-
-  // Rollback restores previous Keychain credential and account records even without state.vscdb
-  const rolledBack = await switchService.rollback();
-  assert.match(rolledBack.message, /已恢复切换前的账号记录/);
-  assert.equal(await keychain.readPassword('gemini', 'antigravity'), 'go-keyring-base64:previous-session');
-
-  // Re-switch and verify saveCurrentAccount from Keychain in stable mode
-  await switchService.switchAccount(account.id);
-  const captured = await manager.saveCurrentAccount({
-    keychain,
-    homeDir: profileDir,
-    appSupportDir: profileDir,
-  });
-  assert.equal(captured.email, account.email);
-});
-
-test('旧共享恢复记录原样保留，不能被正式版自动回滚', async t => {
-  const state = await temporary(t);
-  const manager = new AccountsManager(state);
-  const legacyPath = join(state, 'account-switch-journal.json');
-  const legacy = JSON.stringify({ version: 1, status: 'complete', at: new Date().toISOString(),
-    before: { oauthToken: 'synthetic-old-channel' }, after: {}, files: [],
-    keychainBefore: 'synthetic-previous', keychainAfter: 'synthetic-next' });
-  await writeFile(legacyPath, legacy);
-  const service = new AccountSwitchService(manager, { stateDir: state, profile: state,
-    keychain: new MockKeychainAdapter(), isRunning: async () => false });
-  assert.equal((await service.recoveryInfo()).available, false);
-  await assert.rejects(service.rollback(), /ENOENT/);
-  assert.equal(await readFile(legacyPath, 'utf8'), legacy);
-  await manager.saveAccount(account);
-  await service.switchAccount(account.id);
-  assert.equal((await service.recoveryInfo()).available, true);
-  assert.equal(await readFile(legacyPath, 'utf8'), legacy);
-});
-
-test('语言服务只匹配正式版并保留 WCV hub 身份，拒绝 Insiders 进程', () => {
-  const target = applicationTarget('stable');
-  const version = '2.29.0';
-  const command = languageServerBinaryPath(target.appPath) + ' --cloud_code_endpoint https://daily-cloudcode-pa.googleapis.com --subclient_type hub --override_ide_version ' + version;
-  assert.equal(matchingTargetForLanguageServerCommand(command)?.channel, 'stable');
-  const context = cloudProviderContextFromCommand(command, version, target);
-  assert.equal(cloudProviderContextFromCommand(command + ' --app_data_dir antigravity-insiders', version, target), null);
-  assert.equal(context.userAgent, 'antigravity/hub/' + version);
-  assert.equal(validCachedCloudProviderContext(context, version, target), true);
-  const unsupported = command.replace(target.appPath, target.appPath + ' - Insiders');
-  assert.equal(matchingTargetForLanguageServerCommand(unsupported), null);
-  assert.equal(cloudProviderContextFromCommand(unsupported, version), null);
-});
-
-test('历史 Insiders 配额原样保留但不作为正式版配额展示', async t => {
-  const state = await temporary(t);
-  const manager = new AccountsManager(state);
-  await manager.saveAccount({ ...account, insiders_quota: quota('ULTRA') });
-  const loaded = await manager.getAccount(account.id);
-  assert.equal(loaded.quota ?? null, null);
-  assert.equal(loaded.insiders_quota.subscription_tier, 'ULTRA');
-  assert.throws(() => new UsageStatsManager({ stateDir: state, dataDirectoryName: 'antigravity-insiders' }), /仅统计/);
-  const usage = new UsageStatsManager({ stateDir: state });
-  assert.throws(() => usage.setDataDirectoryName('antigravity-insiders'), /仅统计/);
+  const manager = new UsageStatsManager({ geminiDir: root, stateDir: root, dataDirectoryName: 'antigravity' });
+  const paths = await manager.discoverDatabaseFiles();
+  assert.deepEqual(paths.sort(), [join(root, 'antigravity', 'conversations', 'same.db'), join(root, 'antigravity', 'token_usage_archive.db')].sort());
+  assert.throws(() => new UsageStatsManager({ stateDir: root, dataDirectoryName: 'antigravity-insiders' }), /仅统计/);
 });
 
 function request(socket, command) {
   return new Promise((resolve, reject) => {
-    const client = createConnection(socket); let data = '';
+    const client = createConnection(socket);
+    let data = '';
     client.setTimeout(4000, () => client.destroy(new Error('fixture timeout')));
     client.on('connect', () => client.write(JSON.stringify(command) + '\n'));
-    client.on('data', b => { data += b; if (data.includes('\n')) { client.end(); resolve(JSON.parse(data.split('\n')[0])); } });
+    client.on('data', b => {
+      data += b;
+      if (data.includes('\n')) {
+        client.end();
+        resolve(JSON.parse(data.split('\n')[0]));
+      }
+    });
     client.on('error', reject);
   });
 }
@@ -240,9 +140,14 @@ test('IPC 将旧 Insiders 配置备份后迁移到正式版，拒绝通道切换
   const child = spawn(
     process.execPath,
     ['dist/main.js', '--state-dir', state, '--profile', join(state, 'profile'), '--gemini-dir', join(state, 'gemini')],
-    { env: { ...process.env, GRAVITYBOX_PROBE_LS: 'false' }, stdio: 'ignore' },
+    { env: { ...process.env }, stdio: 'ignore' },
   );
-  t.after(async () => { if (child.exitCode === null) { child.kill('SIGTERM'); await once(child, 'exit'); } });
+  t.after(async () => {
+    if (child.exitCode === null) {
+      child.kill('SIGTERM');
+      await once(child, 'exit');
+    }
+  });
   const socket = controlEndpointForStateDir(state);
   let ready = false;
   for (let i = 0; i < 100; i++) {
@@ -251,32 +156,28 @@ test('IPC 将旧 Insiders 配置备份后迁移到正式版，拒绝通道切换
   }
   assert.equal(ready, true);
 
-  const preflight = await request(socket, { command: 'account_switch_preflight', id: 'fixture' });
-  assert.equal(preflight.ok, true);
-
-  const status = await request(socket, { command: 'status', includeAccounts: false });
-  assert.equal(status.status.accountSwitchSupported, true);
+  const status = await request(socket, { command: 'status' });
   assert.equal(status.status.applicationLabel, 'Antigravity');
-
   assert.equal(status.status.applicationChannel, 'stable');
   assert.equal(status.status.bothApplicationsInstalled, false);
+
   const persisted = JSON.parse(await readFile(join(state, 'config.json'), 'utf8'));
   assert.equal(persisted.applicationChannel, 'stable');
   assert.equal(persisted.futureSetting, 'preserve');
   const backup = JSON.parse(await readFile(join(state, 'config-before-stable-only.json'), 'utf8'));
   assert.equal(backup.applicationChannel, 'insiders');
+
   const rejected = await request(socket, { command: 'set_application_channel', channel: 'insiders' });
   assert.equal(rejected.ok, false);
   assert.match(rejected.error, /仅支持/);
+
   const beforePid = status.status.pid;
   const switched = await request(socket, { command: 'set_application_channel', channel: 'stable' });
   assert.equal(switched.ok, true);
   assert.equal(switched.applicationLabel, 'Antigravity');
-  assert.equal(switched.accountSwitchSupported, true);
-  const statusAfter = await request(socket, { command: 'status', includeAccounts: false });
+
+  const statusAfter = await request(socket, { command: 'status' });
   assert.equal(statusAfter.status.pid, beforePid);
-  assert.equal(statusAfter.status.applicationLabel, 'Antigravity');
-  assert.equal(statusAfter.status.accountSwitchSupported, true);
 
   await request(socket, { command: 'stop' });
   if (child.exitCode === null) await once(child, 'exit');

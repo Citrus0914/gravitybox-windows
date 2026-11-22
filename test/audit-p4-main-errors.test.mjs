@@ -7,72 +7,50 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { controlEndpointForStateDir } from '../dist/platform/paths.js';
-import { AccountsManager } from '../dist/accounts.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// 以“仅导入”模式加载主进程模块：临时 state 目录 + 禁止自动 run()，不触碰真实用户数据/socket。
 const importState = await mkdtemp(join(tmpdir(), 'gb-p4-import-'));
 const savedArgv = process.argv.slice();
-process.argv.push('--state-dir', importState, '--app', '/nonexistent', '--profile', join(importState, 'profile'),
-  '--gemini-dir', join(importState, 'gemini'), '--home-dir', importState, '--app-support-dir', importState);
+process.argv.push(
+  '--state-dir', importState, '--app', '/nonexistent', '--profile', join(importState, 'profile'),
+  '--gemini-dir', join(importState, 'gemini'), '--home-dir', importState, '--app-support-dir', importState,
+);
 process.env.GRAVITYBOX_IMPORT_ONLY = '1';
-const { buildDashboardAggregate, normalizeSubscriptionTier } = await import('../dist/main.js');
-process.argv.length = 0; process.argv.push(...savedArgv);
+const { buildDashboardAggregate } = await import('../dist/main.js');
+process.argv.length = 0;
+process.argv.push(...savedArgv);
 delete process.env.GRAVITYBOX_IMPORT_ONLY;
 after(async () => { await rm(importState, { recursive: true, force: true }); });
 
-const TIERS = ['FREE', 'PLUS', 'PRO', 'TEAM', 'ULTRA', 'ENTERPRISE', '待确认'];
-
 function healthyDeps(overrides = {}) {
-  const account = { id: 'acc-1', email: 'user@example.test', name: '用户', quota: { subscription_tier: 'PRO', last_updated: 1 } };
   return {
-    listAccounts: async () => ({ active_account_id: 'acc-1', active_account: account, accounts: [account], revision: 'rev-1' }),
-    getAutoSwitchConfig: async () => ({ enabled: false }),
-    probeLiveLanguageServer: async () => null,
-    getAccount: async () => account,
-    getAccountQuotaOverview: () => ({
-      subscriptionTier: 'PRO', fiveHourRemaining: 66, weeklyRemaining: 80, geminiFiveHourRemaining: 66,
-      geminiWeeklyRemaining: 80, geminiFiveHourResetCountdown: '', geminiWeeklyResetCountdown: '', geminiResetCountdown: '',
-      claudeFiveHourRemaining: null, claudeWeeklyRemaining: null, claudeFiveHourResetCountdown: '',
-      claudeWeeklyResetCountdown: '', claudeResetCountdown: '', argonWeeklyRemaining: null,
-      argonWeeklyResetCountdown: '', argonResetCountdown: '', resetTime: null, resetCountdown: '',
-      quotaGroups: [], staleGroups: [], models: [], lastUpdated: 1, isStale: false, staleHours: 0,
-    }),
     getUsageSummary: async () => ({
       today: { totals: { total_tokens: 1234, input_tokens: 1000, output_tokens: 234, cached_tokens: 0, request_count: 5 }, estimated_usd: 0.5 },
       all_time: { totals: { total_tokens: 9999, input_tokens: 8000, output_tokens: 1999, cached_tokens: 0, request_count: 40 }, estimated_usd: 3.2 },
-      unpriced_models: 1, priced_models: 2, databases_scanned: 3, databases_discovered: 5,
-      scan_scope_description: '最近活跃 3 个会话库', has_error: false, failed_databases_count: 0,
+      unpriced_models: 1,
+      priced_models: 2,
+      databases_scanned: 3,
+      databases_discovered: 5,
+      scan_scope_description: '最近活跃 3 个会话库',
+      has_error: false,
+      failed_databases_count: 0,
     }),
     getPricingTable: async () => ({ a: {}, b: {} }),
     ...overrides,
   };
 }
 
-// B12: accounts 失败但 usage 成功 —— 必须给出脱敏 accountsError 且保留 usage 可用数据。
-test('B12: accounts 聚合失败返回脱敏 accountsError，usage 数据保留', async () => {
-  const leakedPath = '/Users/alice/Library/Application Support/GravityBox/accounts.json';
-  const leakedToken = 'sk-live-abcdefghijklmnop';
-  const deps = healthyDeps({
-    listAccounts: async () => { throw new Error(`读取账号索引失败 ${leakedPath} Authorization: Bearer ${leakedToken}`); },
-  });
-  const result = await buildDashboardAggregate(deps);
-  assert.equal(result.accounts, null);
-  assert.ok(result.accountsError.length > 0, 'accounts 失败必须有明确错误');
-  assert.equal(result.accountsError.includes('/Users/'), false, '错误不得泄漏绝对路径');
-  assert.equal(result.accountsError.includes('alice'), false, '错误不得泄漏用户名/路径');
-  assert.equal(result.accountsError.includes('sk-live'), false, '错误不得泄漏密钥');
-  assert.equal(result.accountsError.includes('Bearer sk-live'), false, '错误不得泄漏认证头');
-  assert.ok(result.usage, 'usage 成功时仍须返回可用部分数据');
+test('B12: usage 聚合成功返回今日与累计统计', async () => {
+  const result = await buildDashboardAggregate(healthyDeps());
   assert.equal(result.usageError, '');
+  assert.ok(result.usage);
   assert.equal(result.usage.todayTokens, 1234);
   assert.equal(result.usage.totalTokens, 9999);
 });
 
-// B12: usage 失败但 accounts 成功 —— accounts 数据保留且套餐已规范化。
-test('B12: usage 聚合失败返回脱敏 usageError，accounts 数据保留', async () => {
+test('B12: usage 聚合失败返回脱敏 usageError（不含物理路径与凭据）', async () => {
   const deps = healthyDeps({
     getUsageSummary: async () => { throw new Error('读取用量库失败 /private/var/folders/x/usage.sqlite token=ya29.abcdefghijklmnop'); },
   });
@@ -81,61 +59,8 @@ test('B12: usage 聚合失败返回脱敏 usageError，accounts 数据保留', a
   assert.ok(result.usageError.length > 0);
   assert.equal(result.usageError.includes('/private/'), false, '错误不得泄漏绝对路径');
   assert.equal(result.usageError.includes('ya29.'), false, '错误不得泄漏凭据');
-  assert.ok(result.accounts, 'accounts 成功时仍须返回可用部分数据');
-  assert.equal(result.accountsError, '');
-  assert.equal(result.accounts.activeEmail, 'user@example.test');
-  assert.equal(result.accounts.activeTier, 'PRO');
 });
 
-// B12: accounts 与 usage 同时失败 —— 同一响应可读，两段互不吞并。
-test('B12: accounts 与 usage 同时失败时两段错误分别返回且不抛出', async () => {
-  const deps = healthyDeps({
-    listAccounts: async () => { throw new Error('账号索引损坏'); },
-    getUsageSummary: async () => { throw new Error('用量缓存损坏'); },
-  });
-  const result = await buildDashboardAggregate(deps);
-  assert.equal(result.accounts, null);
-  assert.equal(result.usage, null);
-  assert.match(result.accountsError, /账号索引损坏/);
-  assert.match(result.usageError, /用量缓存损坏/);
-});
-
-// B13: 套餐枚举归一化。
-test('B13: subscriptionTier 空值/未知值统一为 待确认，合法值收敛为标准套餐枚举', async () => {
-  const cases = [
-    ['FREE', 'FREE'], ['free', 'FREE'], ['Free', 'FREE'], ['starter', 'FREE'],
-    ['PLUS', 'PLUS'], ['Google One AI Plus', 'PLUS'],
-    ['PRO', 'PRO'], ['pro', 'PRO'], ['Google AI Pro', 'PRO'],
-    ['TEAM', 'TEAM'], ['Workspace Team', 'TEAM'],
-    ['ULTRA', 'ULTRA'], ['Ultra', 'ULTRA'], ['Gemini Ultra', 'ULTRA'],
-    ['ENTERPRISE', 'ENTERPRISE'], ['Cloud Enterprise Standard', 'ENTERPRISE'],
-    ['', '待确认'], ['   ', '待确认'], [null, '待确认'], [undefined, '待确认'], ['mystery-tier', '待确认'], [123, '待确认'],
-  ];
-  for (const [input, expected] of cases) {
-    assert.equal(normalizeSubscriptionTier(input), expected, `tier ${JSON.stringify(input)} 应归一为 ${expected}`);
-    assert.ok(TIERS.includes(normalizeSubscriptionTier(input)));
-  }
-});
-
-// B13: 聚合结果里的 activeTier 不得出现空串或任意原始值。
-test('B13: 聚合 accounts.activeTier 对空串/未知值回落 待确认', async () => {
-  for (const [raw, expected] of [['', '待确认'], [null, '待确认'], ['mystery', '待确认'], ['PRO', 'PRO'], ['ULTRA', 'ULTRA']]) {
-    const deps = healthyDeps();
-    deps.getAccountQuotaOverview = () => ({
-      subscriptionTier: raw, fiveHourRemaining: null, weeklyRemaining: null, geminiFiveHourRemaining: null,
-      geminiWeeklyRemaining: null, geminiFiveHourResetCountdown: '', geminiWeeklyResetCountdown: '', geminiResetCountdown: '',
-      claudeFiveHourRemaining: null, claudeWeeklyRemaining: null, claudeFiveHourResetCountdown: '',
-      claudeWeeklyResetCountdown: '', claudeResetCountdown: '', argonWeeklyRemaining: null,
-      argonWeeklyResetCountdown: '', argonResetCountdown: '', resetTime: null, resetCountdown: '',
-      quotaGroups: [], staleGroups: [], models: [], lastUpdated: null, isStale: false, staleHours: 0,
-    });
-    const result = await buildDashboardAggregate(deps);
-    assert.equal(result.accounts.activeTier, expected);
-    assert.ok(TIERS.includes(result.accounts.activeTier));
-  }
-});
-
-// 真实后台契约：dashboard_summary 仍 ok:true，并稳定携带 errors 字段与枚举套餐。
 function rpc(directory, payload) {
   return new Promise((resolve, reject) => {
     const socket = createConnection(controlEndpointForStateDir(directory));
@@ -152,20 +77,15 @@ function rpc(directory, payload) {
     });
   });
 }
+
 async function until(fn, timeout = 15000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) { const value = await fn(); if (value) return value; await sleep(30); }
   throw new Error('测试等待超时');
 }
 
-test('B12/B13: 真实后台 dashboard_summary 返回可读错误字段与枚举套餐', { timeout: 60000 }, async () => {
+test('B12: 真实后台 dashboard_summary 返回 usage 与 usageError', { timeout: 60000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'gb-p4-contract-'));
-  const manager = new AccountsManager(directory);
-  const fixture = await manager.upsertAccount({email:'quota-contract@example.test',refreshToken:'synthetic-contract-refresh'});
-  fixture.quota = manager.fuseQuota({models:{'gemini-pro':{quotaInfo:{remainingFraction:.85}},
-    'gemini-4-argon':{disabled:false,quotaInfo:{remainingFraction:.45}}}},
-    {groups:[{displayName:'Gemini',buckets:[{bucketId:'gemini-weekly',window:'weekly',remainingFraction:.7}]}]});
-  await manager.saveAccount(fixture); await manager.setCurrentAccount(fixture.id);
   const child = spawn(process.execPath, [
     join(root, 'dist/main.js'),
     '--state-dir', directory,
@@ -174,41 +94,17 @@ test('B12/B13: 真实后台 dashboard_summary 返回可读错误字段与枚举�
     '--gemini-dir', join(directory, 'gemini'),
     '--home-dir', directory,
     '--app-support-dir', directory,
-  ], { stdio: ['ignore', 'ignore', 'pipe'], env:{...process.env,GRAVITYBOX_PROBE_LS:'false'} });
+  ], { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env } });
   let errors = '';
   child.stderr.on('data', bytes => { errors += bytes; });
   const closed = new Promise(resolve => child.once('close', resolve));
   try {
     await until(async () => { try { return (await rpc(directory, { command: 'status' })).ok; } catch { return false; } });
-    const status = await rpc(directory, { command: 'status' });
-    assert.ok(TIERS.includes(status.status.activeSubscriptionTier), `status 套餐必须是枚举值，实际 ${status.status.activeSubscriptionTier}`);
-
     const dashboard = await rpc(directory, { command: 'dashboard_summary' });
     assert.equal(dashboard.ok, true);
-    assert.equal(typeof dashboard.accountsError, 'string');
     assert.equal(typeof dashboard.usageError, 'string');
-    assert.equal(dashboard.accountsError, '');
     assert.equal(dashboard.usageError, '');
-    assert.ok(dashboard.accounts && typeof dashboard.accounts === 'object');
     assert.ok(dashboard.usage && typeof dashboard.usage === 'object');
-    assert.ok(TIERS.includes(dashboard.accounts.activeTier), `activeTier 必须是枚举值，实际 ${dashboard.accounts.activeTier}`);
-
-    const accounts = await rpc(directory, { command: 'account_list' });
-    assert.equal(accounts.ok, true);
-    assert.equal(accounts.accounts.length,1);
-    const contractAccount=accounts.accounts[0];
-    assert.equal(contractAccount.familyWindows.gemini.weekly.remaining,.7);
-    assert.equal(contractAccount.familyWindows.gemini.fiveHour,null);
-    assert.equal(contractAccount.argonStatus.period,'unspecified');
-    assert.equal(contractAccount.argonStatus.remaining,.45);
-    assert.deepEqual(contractAccount.quota.argonStatus,contractAccount.argonStatus);
-    assert.deepEqual(dashboard.accounts.familyWindows,contractAccount.familyWindows);
-    assert.deepEqual(dashboard.accounts.argonStatus,contractAccount.argonStatus);
-    assert.equal(JSON.stringify(accounts).includes('synthetic-contract-refresh'),false);
-    for (const account of accounts.accounts) {
-      assert.ok(TIERS.includes(account.subscription_tier), `账号套餐必须是枚举值，实际 ${account.subscription_tier}`);
-      if (account.quota) assert.ok(TIERS.includes(account.quota.subscription_tier));
-    }
 
     assert.equal((await rpc(directory, { command: 'stop' })).ok, true);
     await closed;

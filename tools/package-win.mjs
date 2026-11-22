@@ -72,12 +72,10 @@ export async function packageWindows({ skipTests = false, requireInstaller = fal
   // 2. Node.js runtime
   copyFileSync(process.execPath, join(runtimeDir, 'node.exe'));
 
-  // 3. Core Node backend, dicts, and runtime assets
+  // 3. Core Node backend and runtime assets
   const coreDist = join(coreDir, 'dist');
   mkdirSync(coreDist, { recursive: true });
   cpSync(join(root, 'dist'), coreDist, { recursive: true, force: true });
-
-  cpSync(join(root, 'dict'), join(coreDir, 'dict'), { recursive: true, force: true });
 
   const assetsDst = join(coreDir, 'assets');
   mkdirSync(assetsDst, { recursive: true });
@@ -88,7 +86,6 @@ export async function packageWindows({ skipTests = false, requireInstaller = fal
     'master-1024.png',
     'model-catalog.json',
     'pricing-feed.json',
-    'ui-extraction-manifest.json',
   ]) {
     const src = join(root, 'assets', item);
     if (existsSync(src)) {

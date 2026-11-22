@@ -6,12 +6,10 @@ import { readOptionalJson } from './files.js';
 import { isOwnedByCurrentUser, isWindows } from './platform/fs.js';
 import { bundleLayoutPaths } from './platform/paths.js';
 import { winExeInfo } from './platform/win-helper.js';
-import type { AccountsManager, LiveLanguageServerStatus } from './accounts.js';
 import type { UsageStatsManager } from './usage.js';
 import {
   normalizeCatalogTierLabel,
   resolvePricingCatalogSnapshot,
-  type PricingCatalogModelInput,
   type PricingCatalogSnapshotResult,
   type PricingCatalogSourceInput,
 } from './pricing.js';
@@ -68,42 +66,6 @@ export async function readInstalledAppBundleVersion(appPath: string): Promise<st
   }
 }
 
-export function sanitizeLiveIdeModelsSnapshot(
-  live: LiveLanguageServerStatus | null | undefined,
-  appVersion: string
-): LiveIdeModelsSnapshot | null {
-  const rawModels = live?.quota?.models;
-  if (!Array.isArray(rawModels) || rawModels.length === 0) return null;
-  const models: LiveIdeModelSnapshotEntry[] = [];
-  for (const m of rawModels.slice(0, MAX_LIVE_IDE_SNAPSHOT_MODELS)) {
-    if (!m || typeof m !== 'object') continue;
-    if (m.stale === true || m.quota_source === 'carried') continue;
-    const id = String(m.model_id ?? m.name ?? '').trim();
-    if (!id) continue;
-    const displayName = typeof m.display_name === 'string' && m.display_name.trim()
-      ? m.display_name.trim()
-      : null;
-    const modelOrAlias = typeof m.model_or_alias === 'string' && m.model_or_alias.trim()
-      ? m.model_or_alias.trim()
-      : null;
-    const disabled = m.disabled === true || /(?:^|[-_])disabled$/i.test(id);
-    models.push({ id, displayName, modelOrAlias, disabled });
-  }
-  if (models.length === 0) return null;
-  const tier = normalizeCatalogTierLabel(live?.tier || live?.quota?.subscription_tier || '');
-  const rawObserved = live?.quota?.last_updated;
-  const observedAt = typeof rawObserved === 'number' && Number.isFinite(rawObserved) && rawObserved > 0
-    ? rawObserved
-    : Math.floor(Date.now() / 1000);
-  return {
-    schema: 1,
-    appVersion: String(appVersion || '').trim(),
-    tier,
-    observedAt,
-    models,
-  };
-}
-
 export async function readValidLiveIdeModelsSnapshot(
   snapshotPath: string,
   installedAppVersion: string
@@ -144,65 +106,25 @@ export async function readValidLiveIdeModelsSnapshot(
 export async function buildPricingCatalogPayloadSnapshot(params: {
   appPath: string;
   liveIdeModelsPath: string;
-  probeLiveCached: () => Promise<LiveLanguageServerStatus | null>;
   usageManager: UsageStatsManager;
-  accountsManager: AccountsManager;
 }): Promise<PricingCatalogSnapshotResult> {
-  const { appPath, liveIdeModelsPath, probeLiveCached, usageManager, accountsManager } = params;
-  const [live, installedAppVersion, catalogRaw] = await Promise.all([
-    probeLiveCached().catch(() => null),
+  const { appPath, liveIdeModelsPath, usageManager } = params;
+  const [installedAppVersion, catalogRaw] = await Promise.all([
     readInstalledAppBundleVersion(appPath),
     usageManager.getRawPricingCatalog(),
   ]);
-  const liveModels = Array.isArray(live?.quota?.models) ? live.quota.models : [];
-  const snapshot = liveModels.length === 0
-    ? await readValidLiveIdeModelsSnapshot(liveIdeModelsPath, installedAppVersion)
-    : null;
-  const listRes = await accountsManager.listAccounts({ liveEmailHint: live?.email ?? null }).catch(() => null);
-  const activeId = listRes?.active_account_id ?? null;
-  const activeEmail = (live?.email || listRes?.active_account?.email || '').toLowerCase();
-  const matchedSaved = listRes?.active_account
-    ?? (activeEmail ? listRes?.accounts.find((a) => a.email.toLowerCase() === activeEmail) : undefined);
-
-  const liveTierRaw = live?.tier || live?.quota?.subscription_tier || matchedSaved?.quota?.subscription_tier || '';
-  const liveInput: PricingCatalogSourceInput | null = liveModels.length > 0
-    ? { tier: liveTierRaw, source: 'live', models: liveModels as PricingCatalogModelInput[] }
-    : null;
+  const snapshot = await readValidLiveIdeModelsSnapshot(liveIdeModelsPath, installedAppVersion);
   const snapshotInput: PricingCatalogSourceInput | null = snapshot
     ? { tier: snapshot.tier, source: 'snapshot', models: snapshot.models }
     : null;
 
-  const savedActiveAcc = listRes?.active_account;
-  const activeAccountInput: PricingCatalogSourceInput | null =
-    savedActiveAcc?.quota && Array.isArray(savedActiveAcc.quota.models) && savedActiveAcc.quota.models.length > 0
-      ? {
-          tier: savedActiveAcc.quota.subscription_tier ?? '',
-          source: savedActiveAcc.quota.source ?? 'cloud',
-          models: savedActiveAcc.quota.models as PricingCatalogModelInput[],
-        }
-      : null;
-
-  const poolAccountsInput: PricingCatalogSourceInput[] = [];
-  for (const acc of listRes?.accounts ?? []) {
-    if (acc.disabled) continue;
-    if (activeId && acc.id === activeId) continue;
-    if (activeEmail && acc.email.toLowerCase() === activeEmail) continue;
-    if (!acc.quota || acc.quota.is_forbidden) continue;
-    if (!Array.isArray(acc.quota.models) || acc.quota.models.length === 0) continue;
-    poolAccountsInput.push({
-      tier: acc.quota.subscription_tier ?? '',
-      source: acc.quota.source ?? 'cloud',
-      models: acc.quota.models as PricingCatalogModelInput[],
-    });
-  }
-
   const payload = resolvePricingCatalogSnapshot({
     rawPricingTable: catalogRaw.raw,
     publicPricingKeys: catalogRaw.publicKeys,
-    live: liveInput,
+    live: null,
     snapshot: snapshotInput,
-    activeAccount: activeAccountInput,
-    poolAccounts: poolAccountsInput,
+    activeAccount: null,
+    poolAccounts: [],
   });
 
   usageManager.setActiveOfficialModels(
